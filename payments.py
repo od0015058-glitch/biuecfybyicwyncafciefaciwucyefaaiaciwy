@@ -89,7 +89,11 @@ async def payment_webhook(request: web.Request):
                 print("⚠️ Webhook missing payment_id; ignoring")
                 return web.Response(status=200, text="OK")
 
-            row = await db.complete_transaction(str(payment_id))
+            # Atomic: flip the PENDING transaction to SUCCESS and credit the
+            # user's wallet in a single DB transaction. If either the status
+            # flip or the credit fails, the whole thing rolls back and the
+            # row stays PENDING so a webhook retry can finalize it.
+            row = await db.finalize_payment(str(payment_id))
             if row is None:
                 # Either we've never seen this payment_id (no PENDING row
                 # was created on our side) or it was already SUCCESS.
@@ -105,13 +109,24 @@ async def payment_webhook(request: web.Request):
             telegram_id = row['telegram_id']
             amount_usd = float(row['amount_usd_credited'])
 
-            await db.add_balance(telegram_id, amount_usd)
-
+            # Best-effort user notification. The wallet has already been
+            # credited in finalize_payment; a Telegram error must not cause us
+            # to return 500 and trigger a NowPayments retry (the retry would
+            # be a no-op because the row is no longer PENDING).
             bot: Bot = request.app['bot']
-            await bot.send_message(
-                chat_id=telegram_id,
-                text=f"✅ پرداخت تایید شد! مبلغ ${amount_usd} به حساب شما اضافه شد.",
-            )
+            try:
+                await bot.send_message(
+                    chat_id=telegram_id,
+                    text=(
+                        f"✅ پرداخت تایید شد! مبلغ ${amount_usd} "
+                        "به حساب شما اضافه شد."
+                    ),
+                )
+            except Exception as send_err:
+                print(
+                    f"⚠️ Failed to notify user {telegram_id} about credit "
+                    f"of ${amount_usd}: {send_err}"
+                )
 
         return web.Response(status=200, text="OK")
     except Exception as e:

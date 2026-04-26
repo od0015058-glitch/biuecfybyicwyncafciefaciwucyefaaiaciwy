@@ -107,23 +107,39 @@ class Database:
             )
         return row is not None
 
-    async def complete_transaction(self, gateway_invoice_id: str):
-        """Marks a PENDING transaction SUCCESS. Returns the row dict if the
-        update happened, or None if the transaction was already finalized,
-        not found, or in a non-PENDING state.
+    async def finalize_payment(self, gateway_invoice_id: str):
+        """Atomically mark a PENDING transaction SUCCESS *and* credit the user's
+        wallet, in a single DB transaction.
 
-        The atomic UPDATE ... WHERE status = 'PENDING' guarantees idempotency:
-        replayed webhooks for the same payment will see no row to update and
-        will return None, so the caller must skip crediting.
+        Returns the (telegram_id, amount_usd_credited) row if the update
+        happened, or None if the transaction was already finalized, not found,
+        or in a non-PENDING state.
+
+        The status flip and the wallet credit must happen in the same DB
+        transaction: otherwise a crash or DB error between them would mark the
+        ledger SUCCESS but leave the user uncredited, and webhook retries
+        would forever skip crediting (status is no longer PENDING).
         """
-        query = """
+        flip_query = """
             UPDATE transactions
             SET status = 'SUCCESS', completed_at = CURRENT_TIMESTAMP
             WHERE gateway_invoice_id = $1 AND status = 'PENDING'
             RETURNING telegram_id, amount_usd_credited
         """
+        credit_query = """
+            UPDATE users
+            SET balance_usd = balance_usd + $1
+            WHERE telegram_id = $2
+        """
         async with self.pool.acquire() as connection:
-            return await connection.fetchrow(query, gateway_invoice_id)
+            async with connection.transaction():
+                row = await connection.fetchrow(flip_query, gateway_invoice_id)
+                if row is None:
+                    return None
+                await connection.execute(
+                    credit_query, row["amount_usd_credited"], row["telegram_id"]
+                )
+                return row
 
 # Export a single instance to be used across the app
 db = Database()
