@@ -4,6 +4,7 @@ import os
 import aiohttp
 
 from database import db
+from pricing import calculate_cost
 
 log = logging.getLogger("bot.ai_engine")
 
@@ -54,9 +55,7 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
                 if free_msgs > 0:
                     await db.decrement_free_message(telegram_id)
                 else:
-                    # MVP Math: Assuming a flat rate for testing (e.g., $1 per 1M tokens)
-                    # You will map exact model prices here later.
-                    cost = (prompt_tokens + completion_tokens) * 0.000001
+                    cost = calculate_cost(active_model, prompt_tokens, completion_tokens)
                     deducted = await db.deduct_balance(telegram_id, cost)
                     if not deducted:
                         # Balance was sufficient at the pre-check but a
@@ -64,10 +63,10 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
                         # usage with cost_deducted_usd=0 so SUM(cost) on
                         # usage_logs still reconciles with actual balance
                         # changes; the next call is blocked by the pre-check.
-                        print(
-                            f"⚠️ Insufficient balance at settlement for user "
-                            f"{telegram_id} (would-be cost ${cost:.6f}); "
-                            f"logging at $0.00."
+                        log.warning(
+                            "Insufficient balance at settlement for user %d "
+                            "(would-be cost $%.6f); logging at $0.00.",
+                            telegram_id, cost,
                         )
                     charged = cost if deducted else 0.0
                     await db.log_usage(telegram_id, active_model, prompt_tokens, completion_tokens, charged)
