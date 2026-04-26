@@ -51,14 +51,17 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
                     deducted = await db.deduct_balance(telegram_id, cost)
                     if not deducted:
                         # Balance was sufficient at the pre-check but a
-                        # concurrent request already drained it. Log usage
-                        # anyway so we have a cost record; the next call is
-                        # blocked by the pre-check at the top of this function.
+                        # concurrent request already drained it. Record the
+                        # usage with cost_deducted_usd=0 so SUM(cost) on
+                        # usage_logs still reconciles with actual balance
+                        # changes; the next call is blocked by the pre-check.
                         print(
                             f"⚠️ Insufficient balance at settlement for user "
-                            f"{telegram_id} (cost ${cost:.6f}); usage logged anyway."
+                            f"{telegram_id} (would-be cost ${cost:.6f}); "
+                            f"logging at $0.00."
                         )
-                    await db.log_usage(telegram_id, active_model, prompt_tokens, completion_tokens, cost)
+                    charged = cost if deducted else 0.0
+                    await db.log_usage(telegram_id, active_model, prompt_tokens, completion_tokens, charged)
                     
                 return reply_text
                 
