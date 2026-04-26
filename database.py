@@ -54,11 +54,22 @@ class Database:
         async with self.pool.acquire() as connection:
             return await connection.fetchval(query, telegram_id)
 
-    async def deduct_balance(self, telegram_id: int, cost_usd: float):
-        """Safely deducts USD cost from the wallet."""
-        query = "UPDATE users SET balance_usd = balance_usd - $1 WHERE telegram_id = $2"
+    async def deduct_balance(self, telegram_id: int, cost_usd: float) -> bool:
+        """Atomically deducts USD cost from the wallet.
+
+        Returns True iff the user had enough balance and the row was updated.
+        Returns False if the user does not exist or has insufficient funds;
+        in that case no balance change is made.
+        """
+        query = """
+            UPDATE users
+            SET balance_usd = balance_usd - $1
+            WHERE telegram_id = $2 AND balance_usd >= $1
+            RETURNING balance_usd
+        """
         async with self.pool.acquire() as connection:
-            await connection.execute(query, cost_usd, telegram_id)
+            new_balance = await connection.fetchval(query, cost_usd, telegram_id)
+        return new_balance is not None
 
     async def log_usage(self, telegram_id: int, model: str, prompt_tokens: int, completion_tokens: int, cost: float):
         """Logs the exact token usage for accounting."""
