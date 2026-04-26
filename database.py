@@ -75,5 +75,71 @@ class Database:
         async with self.pool.acquire() as connection:
             await connection.execute(query, amount_usd, telegram_id)
 
+    async def create_pending_transaction(
+        self,
+        telegram_id: int,
+        gateway: str,
+        currency_used: str,
+        amount_crypto: float,
+        amount_usd: float,
+        gateway_invoice_id: str,
+    ) -> bool:
+        """Records a payment as PENDING. Returns True iff a new row was inserted.
+
+        ON CONFLICT on the unique gateway_invoice_id makes this safe to retry;
+        a duplicate invoice id will not create a second row.
+        """
+        query = """
+            INSERT INTO transactions (
+                telegram_id, gateway, currency_used,
+                amount_crypto_or_rial, amount_usd_credited,
+                status, gateway_invoice_id
+            )
+            VALUES ($1, $2, $3, $4, $5, 'PENDING', $6)
+            ON CONFLICT (gateway_invoice_id) DO NOTHING
+            RETURNING transaction_id
+        """
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchval(
+                query,
+                telegram_id, gateway, currency_used,
+                amount_crypto, amount_usd, gateway_invoice_id,
+            )
+        return row is not None
+
+    async def finalize_payment(self, gateway_invoice_id: str):
+        """Atomically mark a PENDING transaction SUCCESS *and* credit the user's
+        wallet, in a single DB transaction.
+
+        Returns the (telegram_id, amount_usd_credited) row if the update
+        happened, or None if the transaction was already finalized, not found,
+        or in a non-PENDING state.
+
+        The status flip and the wallet credit must happen in the same DB
+        transaction: otherwise a crash or DB error between them would mark the
+        ledger SUCCESS but leave the user uncredited, and webhook retries
+        would forever skip crediting (status is no longer PENDING).
+        """
+        flip_query = """
+            UPDATE transactions
+            SET status = 'SUCCESS', completed_at = CURRENT_TIMESTAMP
+            WHERE gateway_invoice_id = $1 AND status = 'PENDING'
+            RETURNING telegram_id, amount_usd_credited
+        """
+        credit_query = """
+            UPDATE users
+            SET balance_usd = balance_usd + $1
+            WHERE telegram_id = $2
+        """
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(flip_query, gateway_invoice_id)
+                if row is None:
+                    return None
+                await connection.execute(
+                    credit_query, row["amount_usd_credited"], row["telegram_id"]
+                )
+                return row
+
 # Export a single instance to be used across the app
 db = Database()

@@ -32,6 +32,35 @@ async def create_crypto_invoice(telegram_id: int, amount_usd: float, currency: s
                     if response.status in [200, 201]:
                         data = await response.json()
                         if data.get('pay_address') and data.get('pay_amount'):
+                            payment_id = data.get('payment_id')
+                            if payment_id is not None:
+                                # Record a PENDING transaction so the IPN
+                                # webhook can finalize idempotently.
+                                try:
+                                    await db.create_pending_transaction(
+                                        telegram_id=telegram_id,
+                                        gateway='NowPayments',
+                                        currency_used=currency,
+                                        amount_crypto=float(data.get('pay_amount')),
+                                        amount_usd=float(amount_usd),
+                                        gateway_invoice_id=str(payment_id),
+                                    )
+                                except Exception as exc:
+                                    # If we can't record PENDING, the webhook
+                                    # will refuse to credit later. Surface it
+                                    # to ops; do NOT silently return the
+                                    # invoice as if everything is fine.
+                                    print(
+                                        f"❌ Failed to record PENDING transaction "
+                                        f"for payment_id={payment_id}: {exc}"
+                                    )
+                                    return None
+                            else:
+                                print(
+                                    "⚠️ NowPayments response missing payment_id; "
+                                    "refusing to issue invoice without an idempotency key."
+                                )
+                                return None
                             return data
                         else:
                             print(f"⚠️ پاسخ ناقص از NowPayments: {data}")
@@ -55,14 +84,50 @@ async def payment_webhook(request: web.Request):
     try:
         data = await request.json()
         if data.get('payment_status') == 'finished':
-            telegram_id = int(data.get('order_id'))
-            amount_usd = float(data.get('price_amount'))
-            
-            await db.add_balance(telegram_id, amount_usd)
-            
+            payment_id = data.get('payment_id')
+            if payment_id is None:
+                print("⚠️ Webhook missing payment_id; ignoring")
+                return web.Response(status=200, text="OK")
+
+            # Atomic: flip the PENDING transaction to SUCCESS and credit the
+            # user's wallet in a single DB transaction. If either the status
+            # flip or the credit fails, the whole thing rolls back and the
+            # row stays PENDING so a webhook retry can finalize it.
+            row = await db.finalize_payment(str(payment_id))
+            if row is None:
+                # Either we've never seen this payment_id (no PENDING row
+                # was created on our side) or it was already SUCCESS.
+                # Either way: do NOT credit. The whole point of the
+                # transactions ledger is that a replayed or unknown IPN
+                # cannot mint money.
+                print(
+                    f"ℹ️ Webhook for payment_id={payment_id} ignored "
+                    f"(unknown or already finalized)."
+                )
+                return web.Response(status=200, text="OK")
+
+            telegram_id = row['telegram_id']
+            amount_usd = float(row['amount_usd_credited'])
+
+            # Best-effort user notification. The wallet has already been
+            # credited in finalize_payment; a Telegram error must not cause us
+            # to return 500 and trigger a NowPayments retry (the retry would
+            # be a no-op because the row is no longer PENDING).
             bot: Bot = request.app['bot']
-            await bot.send_message(chat_id=telegram_id, text=f"✅ پرداخت تایید شد! مبلغ ${amount_usd} به حساب شما اضافه شد.")
-            
+            try:
+                await bot.send_message(
+                    chat_id=telegram_id,
+                    text=(
+                        f"✅ پرداخت تایید شد! مبلغ ${amount_usd} "
+                        "به حساب شما اضافه شد."
+                    ),
+                )
+            except Exception as send_err:
+                print(
+                    f"⚠️ Failed to notify user {telegram_id} about credit "
+                    f"of ${amount_usd}: {send_err}"
+                )
+
         return web.Response(status=200, text="OK")
     except Exception as e:
         print(f"⚠️ خطای وب‌هوک: {e}")
