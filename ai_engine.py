@@ -1,7 +1,11 @@
-import aiohttp
+import logging
 import os
-import json
+
+import aiohttp
+
 from database import db
+
+log = logging.getLogger("bot.ai_engine")
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
@@ -34,7 +38,12 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
         async with aiohttp.ClientSession() as session:
             async with session.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload) as response:
                 if response.status != 200:
-                    return f"❌ خطای سرور OpenRouter: {response.status}"
+                    body = await response.text()
+                    log.error(
+                        "OpenRouter HTTP %d for user %d model=%s: %s",
+                        response.status, telegram_id, active_model, body,
+                    )
+                    return "❌ سرور هوش مصنوعی موقتاً در دسترس نیست. لطفاً دوباره تلاش کنید."
                 
                 data = await response.json()
                 reply_text = data['choices'][0]['message']['content']
@@ -53,5 +62,6 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
                     
                 return reply_text
                 
-    except Exception as e:
-        return f"❌ خطای ارتباطی: {str(e)}"
+    except Exception:
+        log.exception("Unexpected error in chat_with_model for user %d", telegram_id)
+        return "❌ خطای ارتباطی موقت رخ داد. لطفاً چند لحظه دیگر دوباره تلاش کنید."

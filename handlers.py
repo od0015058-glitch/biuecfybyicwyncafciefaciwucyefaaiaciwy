@@ -1,3 +1,5 @@
+import logging
+
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import Command
@@ -8,6 +10,8 @@ from aiogram.fsm.state import State, StatesGroup
 from database import db
 from payments import create_crypto_invoice
 from ai_engine import chat_with_model
+
+log = logging.getLogger("bot.handlers")
 
 router = Router()
 
@@ -245,10 +249,17 @@ async def process_custom_currency_selection(callback: CallbackQuery, state: FSMC
             builder = InlineKeyboardBuilder()
             builder.button(text="🔙 تلاش مجدد", callback_data="back_to_wallet")
             await callback.message.edit_text("❌ درگاه پاسخگو نیست.", reply_markup=builder.as_markup())
-    except Exception as e:
+    except Exception:
+        log.exception(
+            "Failed to create custom-amount invoice for user %d",
+            callback.from_user.id,
+        )
         builder = InlineKeyboardBuilder()
         builder.button(text="🔙 بازگشت", callback_data="back_to_wallet")
-        await callback.message.edit_text(f"❌ خطا: {e}", reply_markup=builder.as_markup())
+        await callback.message.edit_text(
+            "❌ ایجاد فاکتور با خطا مواجه شد. لطفاً دوباره تلاش کنید.",
+            reply_markup=builder.as_markup(),
+        )
         
     await callback.answer()
 
@@ -289,10 +300,17 @@ async def process_final_invoice(callback: CallbackQuery):
             builder = InlineKeyboardBuilder()
             builder.button(text="🔙 تلاش مجدد", callback_data="back_to_wallet")
             await callback.message.edit_text("❌ درگاه در حال حاضر پاسخگو نیست. تنظیمات پنل ناوپیمنتس را چک کنید.", reply_markup=builder.as_markup())
-    except Exception as e:
+    except Exception:
+        log.exception(
+            "Failed to create invoice for user %d",
+            callback.from_user.id,
+        )
         builder = InlineKeyboardBuilder()
         builder.button(text="🔙 بازگشت به کیف پول", callback_data="back_to_wallet")
-        await callback.message.edit_text(f"❌ خطای سیستم: {e}", reply_markup=builder.as_markup())
+        await callback.message.edit_text(
+            "❌ ایجاد فاکتور با خطا مواجه شد. لطفاً دوباره تلاش کنید.",
+            reply_markup=builder.as_markup(),
+        )
         
     await callback.answer()
 
