@@ -1,12 +1,45 @@
 import aiohttp
-import os
 import asyncio
-from aiohttp import web
-from database import db
+import hashlib
+import hmac
+import json
+import os
+
 from aiogram import Bot
+from aiohttp import web
+
+from database import db
 
 NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY")
+NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET")
 CALLBACK_URL = "http://212.87.199.41:8080/nowpayments-webhook"  # ✅ مطابق با main.py 
+
+
+def _verify_ipn_signature(raw_body: bytes, signature_header: str | None) -> bool:
+    """Verify the x-nowpayments-sig HMAC-SHA512 signature.
+
+    NowPayments signs the IPN payload with the IPN secret using the
+    canonicalized JSON form (recursively sorted keys, no whitespace
+    separators) and sends the lowercase hex digest in the
+    'x-nowpayments-sig' header. We re-canonicalize the parsed body the
+    same way and compare in constant time.
+    """
+    if not NOWPAYMENTS_IPN_SECRET:
+        print("❌ NOWPAYMENTS_IPN_SECRET is not set; refusing to process IPN.")
+        return False
+    if not signature_header:
+        return False
+    try:
+        payload = json.loads(raw_body)
+    except (ValueError, TypeError):
+        return False
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    expected = hmac.new(
+        NOWPAYMENTS_IPN_SECRET.encode("utf-8"),
+        canonical.encode("utf-8"),
+        hashlib.sha512,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature_header.lower())
 
 async def create_crypto_invoice(telegram_id: int, amount_usd: float, currency: str, max_retries: int = 3):
     url = "https://api.nowpayments.io/v1/payment"
@@ -53,7 +86,16 @@ async def create_crypto_invoice(telegram_id: int, amount_usd: float, currency: s
 
 async def payment_webhook(request: web.Request):
     try:
-        data = await request.json()
+        raw_body = await request.read()
+        signature = request.headers.get("x-nowpayments-sig")
+
+        if not _verify_ipn_signature(raw_body, signature):
+            print(
+                f"⚠️ IPN signature verification failed (remote={request.remote})"
+            )
+            return web.Response(status=401, text="Invalid signature")
+
+        data = json.loads(raw_body)
         if data.get('payment_status') == 'finished':
             telegram_id = int(data.get('order_id'))
             amount_usd = float(data.get('price_amount'))
