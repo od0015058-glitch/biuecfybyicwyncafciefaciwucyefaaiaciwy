@@ -75,5 +75,55 @@ class Database:
         async with self.pool.acquire() as connection:
             await connection.execute(query, amount_usd, telegram_id)
 
+    async def create_pending_transaction(
+        self,
+        telegram_id: int,
+        gateway: str,
+        currency_used: str,
+        amount_crypto: float,
+        amount_usd: float,
+        gateway_invoice_id: str,
+    ) -> bool:
+        """Records a payment as PENDING. Returns True iff a new row was inserted.
+
+        ON CONFLICT on the unique gateway_invoice_id makes this safe to retry;
+        a duplicate invoice id will not create a second row.
+        """
+        query = """
+            INSERT INTO transactions (
+                telegram_id, gateway, currency_used,
+                amount_crypto_or_rial, amount_usd_credited,
+                status, gateway_invoice_id
+            )
+            VALUES ($1, $2, $3, $4, $5, 'PENDING', $6)
+            ON CONFLICT (gateway_invoice_id) DO NOTHING
+            RETURNING transaction_id
+        """
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchval(
+                query,
+                telegram_id, gateway, currency_used,
+                amount_crypto, amount_usd, gateway_invoice_id,
+            )
+        return row is not None
+
+    async def complete_transaction(self, gateway_invoice_id: str):
+        """Marks a PENDING transaction SUCCESS. Returns the row dict if the
+        update happened, or None if the transaction was already finalized,
+        not found, or in a non-PENDING state.
+
+        The atomic UPDATE ... WHERE status = 'PENDING' guarantees idempotency:
+        replayed webhooks for the same payment will see no row to update and
+        will return None, so the caller must skip crediting.
+        """
+        query = """
+            UPDATE transactions
+            SET status = 'SUCCESS', completed_at = CURRENT_TIMESTAMP
+            WHERE gateway_invoice_id = $1 AND status = 'PENDING'
+            RETURNING telegram_id, amount_usd_credited
+        """
+        async with self.pool.acquire() as connection:
+            return await connection.fetchrow(query, gateway_invoice_id)
+
 # Export a single instance to be used across the app
 db = Database()
