@@ -1,0 +1,47 @@
+import aiohttp
+import os
+from aiohttp import web
+from database import db
+from aiogram import Bot
+
+NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY")
+
+async def create_crypto_invoice(telegram_id: int, amount_usd: float = 5.0, currency: str = "ton"):
+    """Calls NowPayments to create a $5 deposit invoice."""
+    url = "https://api.nowpayments.io/v1/payment"
+    headers = {
+        "x-api-key": NOWPAYMENTS_API_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "price_amount": amount_usd,
+        "price_currency": "usd",
+        "pay_currency": currency,
+        "order_id": str(telegram_id), # We map the invoice to the user's Telegram ID
+        "order_description": "AI Wallet Top-up"
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=payload) as response:
+            if response.status == 201:
+                return await response.json()
+            return None
+
+async def payment_webhook(request: web.Request):
+    """Listens for the successful payment confirmation from NowPayments."""
+    try:
+        data = await request.json()
+        
+        # Check if the payment actually finished on the blockchain
+        if data.get('payment_status') == 'finished':
+            telegram_id = int(data.get('order_id'))
+            amount_usd = float(data.get('price_amount'))
+            
+            # 1. Add money to the database
+            await db.add_balance(telegram_id, amount_usd)
+            
+            # 2. Send a success message to the user on Telegram
+            bot: Bot = request.app['bot']
+            success_msg = f"✅ پرداخت شما با موفقیت تایید شد!\nمبلغ ${amount_usd} به کیف پول شما اضافه شد."
+            await bot.send_message(chat_id=telegram_id, text=success_msg)
+        

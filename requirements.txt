@@ -1,0 +1,4 @@
+aiogram>=3.4.0      # The modern, asynchronous Telegram bot framework
+asyncpg>=0.29.0     # The fastest async PostgreSQL driver for Python
+python-dotenv>=1.0.1 # Securely loads your API keys from the .env file
+aiohttp>=3.9.3      # Asynchronous HTTP requests (for OpenRouter & NowPayments)
