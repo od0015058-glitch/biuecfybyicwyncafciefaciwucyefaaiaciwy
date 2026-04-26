@@ -47,8 +47,17 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
                 else:
                     # MVP Math: Assuming a flat rate for testing (e.g., $1 per 1M tokens)
                     # You will map exact model prices here later.
-                    cost = (prompt_tokens + completion_tokens) * 0.000001 
-                    await db.deduct_balance(telegram_id, cost)
+                    cost = (prompt_tokens + completion_tokens) * 0.000001
+                    deducted = await db.deduct_balance(telegram_id, cost)
+                    if not deducted:
+                        # Balance was sufficient at the pre-check but a
+                        # concurrent request already drained it. Log usage
+                        # anyway so we have a cost record; the next call is
+                        # blocked by the pre-check at the top of this function.
+                        print(
+                            f"⚠️ Insufficient balance at settlement for user "
+                            f"{telegram_id} (cost ${cost:.6f}); usage logged anyway."
+                        )
                     await db.log_usage(telegram_id, active_model, prompt_tokens, completion_tokens, cost)
                     
                 return reply_text
