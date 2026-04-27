@@ -23,7 +23,10 @@ SUPPORTED_LANGUAGES = ("fa", "en")
 # Mapping: lang -> {key -> string}.
 _STRINGS: dict[str, dict[str, str]] = {
     "fa": {
-        # ---- Top-level reply keyboard ----
+        # ---- Legacy reply-keyboard labels (kept so old clients with a
+        # cached ReplyKeyboardMarkup at the bottom can still reach the
+        # bot — those handlers now just re-render the inline hub and
+        # send ReplyKeyboardRemove). New users never see these.
         "kbd_models": "🤖 مدل‌های هوش مصنوعی",
         "kbd_wallet": "💰 کیف پول",
         "kbd_support": "🎧 پشتیبانی",
@@ -31,15 +34,38 @@ _STRINGS: dict[str, dict[str, str]] = {
         # ---- Generic nav buttons ----
         "btn_back": "🔙 بازگشت",
         "btn_home": "🏠 منوی اصلی",
+        "btn_back_to_menu": "🏠 بازگشت به منو",
         "btn_back_to_wallet": "🔙 کیف پول",
         "btn_cancel": "❌ انصراف",
         "btn_close_menu": "❌ بستن منو",
         "btn_retry": "🔄 تلاش مجدد",
+        # ---- Inline hub (single-message UI, /start renders this) ----
+        "hub_title": (
+            "🐱 **Meowassist**\n\n"
+            "🤖 مدل فعال: `{active_model}`\n"
+            "💰 موجودی: `${balance:.2f}`\n"
+            "🌍 زبان: `{lang_label}`\n\n"
+            "از دکمه‌های زیر برای ادامه استفاده کنید:"
+        ),
+        "hub_btn_wallet": "💰 کیف پول",
+        "hub_btn_models": "🤖 مدل‌های هوش مصنوعی",
+        "hub_btn_new_chat": "🆕 گفتگوی جدید",
+        "hub_btn_support": "💬 پشتیبانی",
+        "hub_btn_language": "🌍 تغییر زبان",
+        "hub_no_active_model": "—",
+        "hub_lang_label_fa": "🇮🇷 فارسی",
+        "hub_lang_label_en": "🇬🇧 English",
+        "hub_new_chat_pending": (
+            "🆕 **گفتگوی جدید**\n\n"
+            "این قابلیت در حال توسعه است. "
+            "در نسخه بعد، دکمه‌ای برای فعال‌سازی حافظه و یک دکمه برای پاک کردن "
+            "گفتگوی فعلی اضافه می‌شود.\n\n"
+            "فعلاً ربات هر پیام را مستقل پاسخ می‌دهد."
+        ),
         # ---- /start ----
         "start_greeting": (
             "سلام {first_name}!\n\n"
-            "به دروازه هوش مصنوعی ما خوش آمدید. "
-            "برای شروع از منوی زیر استفاده کنید:"
+            "به دروازه هوش مصنوعی ما خوش آمدید."
         ),
         # ---- Support ----
         "support_text": (
@@ -200,7 +226,10 @@ _STRINGS: dict[str, dict[str, str]] = {
         "promo_invalid_already_used": "❌ شما قبلاً از این کد تخفیف استفاده کرده‌اید.",
     },
     "en": {
-        # ---- Top-level reply keyboard ----
+        # ---- Legacy reply-keyboard labels (kept so old clients with a
+        # cached ReplyKeyboardMarkup at the bottom can still reach the
+        # bot — those handlers now just re-render the inline hub and
+        # send ReplyKeyboardRemove). New users never see these.
         "kbd_models": "🤖 AI Models",
         "kbd_wallet": "💰 Wallet",
         "kbd_support": "🎧 Support",
@@ -208,15 +237,38 @@ _STRINGS: dict[str, dict[str, str]] = {
         # ---- Generic nav buttons ----
         "btn_back": "🔙 Back",
         "btn_home": "🏠 Main menu",
+        "btn_back_to_menu": "🏠 Back to menu",
         "btn_back_to_wallet": "🔙 Wallet",
         "btn_cancel": "❌ Cancel",
         "btn_close_menu": "❌ Close",
         "btn_retry": "🔄 Try again",
+        # ---- Inline hub (single-message UI, /start renders this) ----
+        "hub_title": (
+            "🐱 **Meowassist**\n\n"
+            "🤖 Active model: `{active_model}`\n"
+            "💰 Balance: `${balance:.2f}`\n"
+            "🌍 Language: `{lang_label}`\n\n"
+            "Tap a button to continue:"
+        ),
+        "hub_btn_wallet": "💰 Wallet",
+        "hub_btn_models": "🤖 AI Models",
+        "hub_btn_new_chat": "🆕 New Chat",
+        "hub_btn_support": "💬 Support",
+        "hub_btn_language": "🌍 Change language",
+        "hub_no_active_model": "—",
+        "hub_lang_label_fa": "🇮🇷 فارسی",
+        "hub_lang_label_en": "🇬🇧 English",
+        "hub_new_chat_pending": (
+            "🆕 **New Chat**\n\n"
+            "This feature is being built. The next release will add a memory "
+            "toggle so the bot can remember your last messages, plus a button "
+            "to clear that memory and start fresh.\n\n"
+            "For now every message is independent."
+        ),
         # ---- /start ----
         "start_greeting": (
             "Hi {first_name}!\n\n"
-            "Welcome to our AI gateway. "
-            "Use the menu below to get started:"
+            "Welcome to our AI gateway."
         ),
         # ---- Support ----
         "support_text": (
