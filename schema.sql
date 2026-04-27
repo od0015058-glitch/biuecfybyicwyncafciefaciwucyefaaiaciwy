@@ -6,7 +6,7 @@ CREATE TABLE users (
     username VARCHAR(255),
     language_code VARCHAR(10) DEFAULT 'fa', -- Defaults to Farsi
     balance_usd DECIMAL(10, 4) DEFAULT 0.0000, -- Precise to 4 decimal places for micro-cent API costs
-    free_messages_left INT DEFAULT 5, -- The Freemium Funnel
+    free_messages_left INT DEFAULT 10, -- The Freemium Funnel
     active_model VARCHAR(255) DEFAULT 'openai/gpt-3.5-turbo',
     -- P3-5 conversation memory opt-in. OFF by default; enabling
     -- causes ai_engine to prepend the user's recent conversation_messages
