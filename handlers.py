@@ -115,6 +115,11 @@ async def back_to_wallet_handler(callback: CallbackQuery):
 # مرحله ۱: انتخاب مبلغ
 @router.callback_query(F.data == "add_crypto")
 async def process_add_crypto_amount(callback: CallbackQuery, state: FSMContext):
+    # This callback is also the "cancel" target of the custom-amount screen
+    # (which puts the FSM in waiting_custom_amount). Clear any lingering state
+    # so the user isn't stuck — otherwise their next free-text message would
+    # be intercepted by process_custom_amount_input instead of process_chat.
+    await state.clear()
     builder = InlineKeyboardBuilder()
     builder.button(text="💵 $5", callback_data="amt_5")
     builder.button(text="💵 $10", callback_data="amt_10")
@@ -130,28 +135,11 @@ async def process_add_crypto_amount(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
-# مرحله ۲: انتخاب ارز
-@router.callback_query(F.data.startswith("amt_"))
-async def process_add_crypto_currency(callback: CallbackQuery):
-    amount = callback.data.split("_")[1]
-    
-    builder = InlineKeyboardBuilder()
-    builder.button(text="₿ Bitcoin", callback_data=f"pay_btc_{amount}")
-    builder.button(text="Ξ Ethereum", callback_data=f"pay_eth_{amount}")
-    builder.button(text="💎 TON", callback_data=f"pay_ton_{amount}")
-    builder.button(text="💵 USDT (TRC20)", callback_data=f"pay_usdttrc20_{amount}")
-    builder.button(text="💵 USDT (ERC20)", callback_data=f"pay_usdterc20_{amount}")
-    builder.button(text="🔷 Litecoin", callback_data=f"pay_ltc_{amount}")
-    builder.button(text="🔙 بازگشت", callback_data="add_crypto")
-    builder.adjust(2, 2, 2, 1)
-    
-    await callback.message.edit_text(
-        f"💰 مبلغ: **${amount}**\n\n🪙 ارز خود را انتخاب کنید:",
-        parse_mode="Markdown",
-        reply_markup=builder.as_markup()
-    )
-    await callback.answer()
-
+# مرحله ۲: انتخاب مبلغ
+# IMPORTANT: the specific "amt_custom" handler must be registered BEFORE the
+# generic "amt_*" prefix handler. aiogram v3 dispatches the first matching
+# handler, so registering the prefix first would swallow "amt_custom" and
+# the custom-amount flow would be unreachable.
 @router.callback_query(F.data == "amt_custom")
 async def process_custom_amount_request(callback: CallbackQuery, state: FSMContext):
     await state.set_state(UserStates.waiting_custom_amount)
@@ -169,7 +157,29 @@ async def process_custom_amount_request(callback: CallbackQuery, state: FSMConte
     await callback.answer()
 
 
-# اضافه کن بعد از خط 183 (قبل از @router.message(F.text & ~F.text.startswith('/'))
+# مرحله ۲: انتخاب ارز برای مبالغ ثابت ($5 / $10 / $20)
+@router.callback_query(F.data.startswith("amt_"))
+async def process_add_crypto_currency(callback: CallbackQuery):
+    amount = callback.data.split("_")[1]
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="₿ Bitcoin", callback_data=f"pay_btc_{amount}")
+    builder.button(text="Ξ Ethereum", callback_data=f"pay_eth_{amount}")
+    builder.button(text="💎 TON", callback_data=f"pay_ton_{amount}")
+    builder.button(text="💵 USDT (TRC20)", callback_data=f"pay_usdttrc20_{amount}")
+    builder.button(text="💵 USDT (ERC20)", callback_data=f"pay_usdterc20_{amount}")
+    builder.button(text="🔷 Litecoin", callback_data=f"pay_ltc_{amount}")
+    builder.button(text="🔙 بازگشت", callback_data="add_crypto")
+    builder.adjust(2, 2, 2, 1)
+
+    await callback.message.edit_text(
+        f"💰 مبلغ: **${amount}**\n\n🪙 ارز خود را انتخاب کنید:",
+        parse_mode="Markdown",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+
 @router.message(UserStates.waiting_custom_amount)
 async def process_custom_amount_input(message: Message, state: FSMContext):
     try:
