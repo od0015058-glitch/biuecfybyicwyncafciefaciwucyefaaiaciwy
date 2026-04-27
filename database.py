@@ -65,6 +65,104 @@ class Database:
         async with self.pool.acquire() as connection:
             return await connection.fetchval(query, telegram_id)
 
+    # ------------------------------------------------------------------
+    # P3-5 conversation memory.
+    #
+    # The toggle is a single boolean column on users; the running buffer
+    # is conversation_messages (one row per turn, role=user|assistant).
+    # ai_engine only reads/writes the buffer when memory_enabled=TRUE.
+    # ------------------------------------------------------------------
+    # Soft cap on per-message stored content. Telegram caps user messages
+    # at 4096 chars but model replies can be much longer (and we feed
+    # them back into the next turn). Truncating before insert keeps row
+    # sizes bounded; the UI displays the original full reply, only the
+    # *retained-as-context* snapshot is trimmed.
+    MEMORY_CONTENT_MAX_CHARS = 8000
+    # Default number of most-recent messages to feed back as context.
+    MEMORY_CONTEXT_LIMIT = 30
+
+    async def get_memory_enabled(self, telegram_id: int) -> bool:
+        """Returns True iff the user opted into conversation memory.
+
+        Returns False for unknown users (caller is responsible for the
+        upsert-via-middleware contract — if we get None back, we treat
+        it as 'no memory' which is the safe default).
+        """
+        query = "SELECT memory_enabled FROM users WHERE telegram_id = $1"
+        async with self.pool.acquire() as connection:
+            value = await connection.fetchval(query, telegram_id)
+        return bool(value) if value is not None else False
+
+    async def set_memory_enabled(self, telegram_id: int, enabled: bool) -> bool:
+        """Flips the memory toggle. Returns True iff a row was updated."""
+        query = """
+            UPDATE users
+            SET memory_enabled = $1
+            WHERE telegram_id = $2
+            RETURNING telegram_id
+        """
+        async with self.pool.acquire() as connection:
+            result = await connection.fetchval(query, enabled, telegram_id)
+        return result is not None
+
+    async def append_conversation_message(
+        self, telegram_id: int, role: str, content: str
+    ) -> None:
+        """Persist one turn (user prompt or assistant reply).
+
+        Caller is responsible for only invoking this when memory is
+        enabled — we don't re-check the flag here so the FK violation
+        (no users row) is the only thing the DB will reject.
+        """
+        if role not in ("user", "assistant"):
+            raise ValueError(f"invalid role: {role}")
+        if len(content) > self.MEMORY_CONTENT_MAX_CHARS:
+            content = content[: self.MEMORY_CONTENT_MAX_CHARS]
+        query = """
+            INSERT INTO conversation_messages (telegram_id, role, content)
+            VALUES ($1, $2, $3)
+        """
+        async with self.pool.acquire() as connection:
+            await connection.execute(query, telegram_id, role, content)
+
+    async def get_recent_messages(
+        self, telegram_id: int, limit: int | None = None
+    ) -> list[dict]:
+        """Return the user's last <limit> messages in chronological order.
+
+        Returns an empty list if memory is disabled OR the buffer is
+        empty. The list is ready to drop into an OpenAI-style
+        ``messages`` array (each element has ``role`` and ``content``).
+        """
+        cap = limit if limit is not None else self.MEMORY_CONTEXT_LIMIT
+        # Pull newest-first from the index-friendly side, then reverse
+        # client-side so the oldest message comes first in the array.
+        query = """
+            SELECT role, content
+              FROM conversation_messages
+             WHERE telegram_id = $1
+             ORDER BY created_at DESC, id DESC
+             LIMIT $2
+        """
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(query, telegram_id, cap)
+        return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+    async def clear_conversation(self, telegram_id: int) -> int:
+        """Delete every conversation_message for the user.
+
+        Returns the number of rows deleted (used for the 'cleared N
+        messages' confirmation in the UI).
+        """
+        query = "DELETE FROM conversation_messages WHERE telegram_id = $1"
+        async with self.pool.acquire() as connection:
+            result = await connection.execute(query, telegram_id)
+        # asyncpg returns "DELETE <count>"; parse the integer suffix.
+        try:
+            return int(result.split()[-1])
+        except (ValueError, IndexError):
+            return 0
+
     async def set_active_model(self, telegram_id: int, model_id: str) -> bool:
         """Updates the user's active OpenRouter model id.
 

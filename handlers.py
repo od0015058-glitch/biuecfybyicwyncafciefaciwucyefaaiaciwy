@@ -117,8 +117,9 @@ async def _hub_text_and_kb(
 ) -> tuple[str, InlineKeyboardBuilder]:
     """Render the hub: title text + 5-button inline keyboard.
 
-    Pulls live state (active model, balance, current language) from
-    the DB so the user always sees their settings without digging.
+    Pulls live state (active model, balance, current language,
+    memory toggle) from the DB so the user always sees their
+    settings without digging into sub-screens.
     """
     user = await db.get_user(telegram_id)
     active_model = (
@@ -128,6 +129,10 @@ async def _hub_text_and_kb(
     )
     balance = float(user["balance_usd"]) if user else 0.0
     lang_label = t(lang, f"hub_lang_label_{lang}")
+    # asyncpg.Record supports "key in record"; the migration may not
+    # have run yet on the production DB so be defensive.
+    memory_on = bool(user["memory_enabled"]) if user and "memory_enabled" in user else False
+    memory_label = t(lang, "memory_state_on" if memory_on else "memory_state_off")
 
     text = t(
         lang,
@@ -135,6 +140,7 @@ async def _hub_text_and_kb(
         active_model=active_model,
         balance=balance,
         lang_label=lang_label,
+        memory_label=memory_label,
     )
 
     kb = InlineKeyboardBuilder()
@@ -304,26 +310,87 @@ async def hub_language_handler(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+async def _render_memory_screen(callback: CallbackQuery, lang: str) -> None:
+    """Render the conversation-memory settings screen (P3-5).
+
+    Shows the user's current memory state, a toggle, and — if memory
+    is enabled — a "Reset conversation" button. The screen also
+    surfaces the cost trade-off in plain language so the user can
+    make an informed call before flipping it on.
+    """
+    enabled = await db.get_memory_enabled(callback.from_user.id)
+    state_label = t(lang, "memory_state_on" if enabled else "memory_state_off")
+    text = t(lang, "memory_screen", state=state_label)
+
+    builder = InlineKeyboardBuilder()
+    if enabled:
+        builder.button(
+            text=t(lang, "btn_memory_disable"), callback_data="mem_toggle"
+        )
+        # Only meaningful when memory is on — otherwise there's nothing
+        # to reset. Keep the screen tidy when it's off.
+        builder.button(
+            text=t(lang, "btn_memory_reset"), callback_data="mem_reset"
+        )
+    else:
+        builder.button(
+            text=t(lang, "btn_memory_enable"), callback_data="mem_toggle"
+        )
+    _back_to_menu_button(builder, lang)
+    builder.adjust(1)
+    await callback.message.edit_text(
+        text, parse_mode="Markdown", reply_markup=builder.as_markup()
+    )
+
+
 @router.callback_query(F.data == "hub_newchat")
 async def hub_newchat_handler(callback: CallbackQuery, state: FSMContext):
-    """Placeholder for the conversation-memory feature (P3-4 / P3-6).
+    """Open the conversation-memory settings screen.
 
-    Today the bot has no memory: every message is independent. This
-    button currently shows a notice explaining what's coming and
-    offers a back-to-menu button. Once memory + the per-user toggle
-    land, this handler will clear the user's conversation buffer and
-    return to the hub with a fresh-chat indicator.
+    The hub button is labelled "🆕 New Chat" because that's the most
+    common operation users want here (start a fresh conversation),
+    but the screen also exposes the memory toggle since the two
+    concepts are tied — "new chat" only matters when memory is on.
     """
     await state.clear()
     lang = await _get_user_language(callback.from_user.id)
-    builder = InlineKeyboardBuilder()
-    _back_to_menu_button(builder, lang)
-    await callback.message.edit_text(
-        t(lang, "hub_new_chat_pending"),
-        parse_mode="Markdown",
-        reply_markup=builder.as_markup(),
-    )
+    await _render_memory_screen(callback, lang)
     await callback.answer()
+
+
+@router.callback_query(F.data == "mem_toggle")
+async def memory_toggle_handler(callback: CallbackQuery, state: FSMContext):
+    """Flip the per-user memory_enabled flag and re-render the screen."""
+    await state.clear()
+    lang = await _get_user_language(callback.from_user.id)
+    current = await db.get_memory_enabled(callback.from_user.id)
+    new_value = not current
+    updated = await db.set_memory_enabled(callback.from_user.id, new_value)
+    if not updated:
+        # Should be unreachable thanks to the upsert middleware, but
+        # surface as alert rather than silently no-op'ing.
+        await callback.answer(t(lang, "ai_no_account"), show_alert=True)
+        return
+    # Telegram alert toast confirms the flip — same pattern as the
+    # language switcher. Then re-render the screen so the buttons
+    # reflect the new state immediately.
+    await callback.answer(
+        t(lang, "memory_toggled_on" if new_value else "memory_toggled_off")
+    )
+    await _render_memory_screen(callback, lang)
+
+
+@router.callback_query(F.data == "mem_reset")
+async def memory_reset_handler(callback: CallbackQuery, state: FSMContext):
+    """Wipe the user's conversation buffer ("🆕 New chat")."""
+    await state.clear()
+    lang = await _get_user_language(callback.from_user.id)
+    deleted = await db.clear_conversation(callback.from_user.id)
+    # Toast tells the user how many turns were cleared. If the buffer
+    # was already empty (deleted=0), the message still makes sense
+    # ("conversation reset, 0 messages cleared").
+    await callback.answer(t(lang, "memory_reset_done", count=deleted))
+    await _render_memory_screen(callback, lang)
 
 
 @router.callback_query(F.data.startswith("set_lang_"))
@@ -576,6 +643,16 @@ async def show_others_providers(callback: CallbackQuery):
         if eligible:
             others.append((provider, eligible))
     others.sort(key=lambda pc: (-pc[1], pc[0]))
+
+    # Defensive: if the catalog refreshed between the user seeing the
+    # 🌐 Others entry and tapping it, every non-prominent provider may
+    # now be empty (or filtered out). Without this guard we'd render
+    # an Others screen with a title and Back button but zero rows —
+    # confusing dead-end. Surface as an alert and bail out instead.
+    # (Devin Review caught this on PR #28.)
+    if not others:
+        await callback.answer(t(lang, "models_picker_empty"), show_alert=True)
+        return
 
     total_pages = max(1, (len(others) + _OTHERS_PER_PAGE - 1) // _OTHERS_PER_PAGE)
     page = max(0, min(page, total_pages - 1))
