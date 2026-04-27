@@ -210,16 +210,22 @@ async def create_crypto_invoice(
         "order_id": str(telegram_id),
         "order_description": "شارژ کیف پول",
         "ipn_callback_url": CALLBACK_URL,
-        # is_fee_paid_by_user pushes the gateway service fee onto
-        # the payer; without it, NowPayments adds the fee to the
-        # merchant-side floor and lower-value invoices get rejected.
-        "is_fee_paid_by_user": True,
-        # is_fixed_rate locks the conversion rate at invoice time,
-        # which lets NowPayments skip the slippage buffer they
-        # otherwise add to the per-currency minimum. Combined with
-        # is_fee_paid_by_user, this is the standard low-minimum
-        # invoice config used by other Telegram crypto bots.
-        "is_fixed_rate": True,
+        # We deliberately DO NOT set is_fee_paid_by_user. Per
+        # NowPayments' own FAQ
+        # (nowpayments.io/help/payments/api/...), enabling that
+        # flag automatically pins the invoice to fixed-rate mode
+        # and bakes the ~0.5% gateway service fee into the
+        # quoted pay_amount. The combined effect raises the
+        # effective per-currency floor past $5 even on cheap
+        # chains like TRX / USDT-BEP20, which is exactly the
+        # rejection users were hitting.
+        #
+        # By leaving the flag off the merchant absorbs the
+        # gateway's 0.5% service fee (~$0.025 on a $5 top-up,
+        # ~$0.50 on a $100 top-up). The model-call markup more
+        # than covers that, and the alternative (a $5 invoice
+        # that NowPayments rejects with "amountTo is too small")
+        # is much worse for retention.
     }
 
     for attempt in range(max_retries):
