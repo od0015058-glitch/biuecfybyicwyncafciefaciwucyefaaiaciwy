@@ -338,9 +338,18 @@ async def _render_memory_screen(callback: CallbackQuery, lang: str) -> None:
         )
     _back_to_menu_button(builder, lang)
     builder.adjust(1)
-    await callback.message.edit_text(
-        text, parse_mode="Markdown", reply_markup=builder.as_markup()
-    )
+    # Wipe ("🆕 New chat") followed by a re-render is the canonical
+    # case where the new screen content is identical to the existing
+    # one (toggle state didn't change). Telegram raises
+    # ``TelegramBadRequest: Message is not modified`` for that, which
+    # propagates up the dispatcher as an error log line. The toast was
+    # already shown, so the UX is fine — just swallow the no-op.
+    try:
+        await callback.message.edit_text(
+            text, parse_mode="Markdown", reply_markup=builder.as_markup()
+        )
+    except Exception:
+        log.debug("memory screen edit_text was a no-op", exc_info=True)
 
 
 @router.callback_query(F.data == "hub_newchat")
@@ -464,6 +473,49 @@ def _eligible_model(model: CatalogModel) -> bool:
     return len(f"sm:{model.id}".encode("utf-8")) <= _CB_MAX_BYTES
 
 
+def _is_free_model(model: CatalogModel) -> bool:
+    """True if this model is OpenRouter's free tier.
+
+    OpenRouter marks free variants with a ``:free`` suffix on the slug.
+    We also accept any model whose published price is exactly $0/M on
+    both sides as a defensive belt-and-braces check (it's how the
+    catalog computes pricing today, but the suffix is the canonical
+    signal).
+    """
+    if model.id.endswith(":free"):
+        return True
+    return (
+        model.price.input_per_1m_usd == 0.0
+        and model.price.output_per_1m_usd == 0.0
+    )
+
+
+def _strip_provider_prefix(name: str, provider: str) -> str:
+    """Trim a redundant ``"<Provider>: "`` head from a model display name.
+
+    OpenRouter names follow the pattern ``"OpenAI: GPT-4.1 Mini"``, but
+    once the user has tapped 🟢 OpenAI we don't need to repeat it on
+    every row — it's noise. We strip the prefix case-insensitively and
+    also try the human-readable display label (so ``"x-ai"`` matches
+    ``"xAI: ..."``). If no known prefix matches, we return the name
+    unchanged so unfamiliar providers still render their full name.
+    """
+    candidates = {provider.lower()}
+    pretty = _PROVIDER_DISPLAY_OVERRIDE.get(provider, "")
+    if pretty:
+        # Drop the leading emoji + space if present, keep the brand name.
+        parts = pretty.split(" ", 1)
+        if len(parts) == 2:
+            candidates.add(parts[1].lower())
+    candidates.add(provider.replace("-", "").lower())
+    candidates.add(provider.replace("-", " ").lower())
+    for prefix in candidates:
+        head = f"{prefix}: "
+        if name.lower().startswith(head):
+            return name[len(head):]
+    return name
+
+
 async def _send_provider_list(
     message_or_callback,
     *,
@@ -502,6 +554,21 @@ async def _send_provider_list(
                 text=_provider_display(provider),
                 callback_data=f"mp:{provider}:0",
             )
+    # P3-6: surface a top-level "🆓 Free models" entry that aggregates
+    # every free-tier model across providers. Free models still appear
+    # under their provider category (so OpenAI's free tier remains
+    # under 🟢 OpenAI), but the dedicated entry makes them easy to find
+    # — the user reported "free models are hard to find right now".
+    has_free = any(
+        _is_free_model(m) and _eligible_model(m)
+        for ms in catalog.by_provider.values()
+        for m in ms
+    )
+    if has_free:
+        builder.button(
+            text=t(lang, "btn_models_free"), callback_data="fm:0"
+        )
+
     # Anything that isn't a prominent provider goes under the Others
     # bucket. We only render the entry button if there's at least one
     # eligible non-prominent provider — otherwise it's a dead-end click.
@@ -562,9 +629,12 @@ async def show_provider_models(callback: CallbackQuery):
             input=model.price.input_per_1m_usd,
             output=model.price.output_per_1m_usd,
         )
-        # Telegram inline button labels can be ~64 chars, so squeeze the
-        # name + price onto one line. Truncate the name first if needed.
-        label = f"{marker}{model.name} • {price_label}"
+        # The user has already tapped this provider, so dropping the
+        # "OpenAI: " / "Google: " prefix from each row removes
+        # redundant noise (P3-6 feedback: "user knows he is using
+        # google, dont need to say google: gemini").
+        display_name = _strip_provider_prefix(model.name, provider)
+        label = f"{marker}{display_name} • {price_label}"
         if len(label) > 60:
             label = label[:57] + "…"
         builder.button(text=label, callback_data=f"sm:{model.id}")
@@ -687,6 +757,90 @@ async def show_others_providers(callback: CallbackQuery):
     title = t(
         lang,
         "models_others_title",
+        page=page + 1,
+        total_pages=total_pages,
+    )
+    await callback.message.edit_text(
+        title, reply_markup=builder.as_markup(), parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("fm:"))
+async def show_free_models(callback: CallbackQuery):
+    """Paginated list of all free-tier models across providers.
+
+    P3-6: the user reported that free models were hard to find under
+    the per-provider buckets. This screen aggregates every model
+    flagged free by ``_is_free_model`` into a single flat list,
+    sorted by provider for grouping then by name. Free models still
+    appear under their provider category — this is an additional
+    entry point, not a relocation.
+    """
+    try:
+        page = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Bad data", show_alert=True)
+        return
+
+    lang = await _get_user_language(callback.from_user.id)
+    user = await db.get_user(callback.from_user.id)
+    active_model = user["active_model"] if user else "—"
+
+    catalog = await get_catalog()
+    free_models: list[CatalogModel] = []
+    for provider in sorted(catalog.by_provider):
+        for m in catalog.by_provider[provider]:
+            if _is_free_model(m) and _eligible_model(m):
+                free_models.append(m)
+    # Stable sort so pagination is deterministic across catalog refreshes.
+    free_models.sort(key=lambda m: (m.provider, m.name.lower(), m.id))
+
+    if not free_models:
+        await callback.answer(t(lang, "models_picker_empty"), show_alert=True)
+        return
+
+    total_pages = max(1, (len(free_models) + _MODELS_PER_PAGE - 1) // _MODELS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    page_slice = free_models[page * _MODELS_PER_PAGE : (page + 1) * _MODELS_PER_PAGE]
+
+    builder = InlineKeyboardBuilder()
+    for model in page_slice:
+        marker = "✅ " if model.id == active_model else ""
+        # Inside the Free list we need the provider hint back on the
+        # row (the user is browsing across providers here).
+        pretty_provider = _provider_display(model.provider).split(" ", 1)
+        provider_label = (
+            pretty_provider[1] if len(pretty_provider) == 2 else model.provider
+        )
+        clean_name = _strip_provider_prefix(model.name, model.provider)
+        label = f"{marker}{provider_label} • {clean_name}"
+        if len(label) > 60:
+            label = label[:57] + "…"
+        builder.button(text=label, callback_data=f"sm:{model.id}")
+    builder.adjust(*([1] * len(page_slice)))
+
+    nav = InlineKeyboardBuilder()
+    if page > 0:
+        nav.button(
+            text=t(lang, "btn_models_prev_page"),
+            callback_data=f"fm:{page - 1}",
+        )
+    if page < total_pages - 1:
+        nav.button(
+            text=t(lang, "btn_models_next_page"),
+            callback_data=f"fm:{page + 1}",
+        )
+    nav.button(text=t(lang, "btn_back"), callback_data="mp_back")
+    nav.button(text=t(lang, "btn_back_to_menu"), callback_data="back_to_hub")
+    nav.adjust(2, 2)
+    for row in nav.export():
+        builder.row(*row)
+
+    title = t(
+        lang,
+        "models_free_title",
+        active_model=active_model,
         page=page + 1,
         total_pages=total_pages,
     )
