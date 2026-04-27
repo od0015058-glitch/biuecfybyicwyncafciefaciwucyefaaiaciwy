@@ -47,6 +47,24 @@ class Database:
         async with self.pool.acquire() as connection:
             await connection.execute(query, telegram_id, username)
 
+    async def set_language(self, telegram_id: int, language_code: str) -> bool:
+        """Sets the user's preferred language. Returns True iff a row was updated."""
+        query = """
+            UPDATE users
+            SET language_code = $1
+            WHERE telegram_id = $2
+            RETURNING telegram_id
+        """
+        async with self.pool.acquire() as connection:
+            result = await connection.fetchval(query, language_code, telegram_id)
+        return result is not None
+
+    async def get_user_language(self, telegram_id: int) -> str | None:
+        """Returns the user's stored language_code, or None if the user doesn't exist."""
+        query = "SELECT language_code FROM users WHERE telegram_id = $1"
+        async with self.pool.acquire() as connection:
+            return await connection.fetchval(query, telegram_id)
+
     async def decrement_free_message(self, telegram_id: int):
         """Safely deducts 1 free message using an atomic update."""
         query = """

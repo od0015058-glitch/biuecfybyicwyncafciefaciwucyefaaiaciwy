@@ -10,6 +10,7 @@ from aiogram import Bot
 from aiohttp import web
 
 from database import db
+from strings import t
 
 log = logging.getLogger("bot.payments")
 
@@ -199,47 +200,13 @@ def _compute_actually_paid_usd(data: dict) -> float | None:
     usd = actually_paid / pay_amount * price_amount
     return min(usd, price_amount)
 
-# User-facing notification text per terminal failure status.
-# Two variants per status:
-#   "from_pending": the user paid nothing
-#   "from_partial": the user paid some crypto already and we credited the
-#                   proportional USD when partially_paid arrived; we keep
-#                   that credit and just close the row.
-_TERMINAL_FAILURE_MESSAGES = {
-    "expired": {
-        "from_pending": (
-            "⏰ مهلت پرداخت فاکتور شما به پایان رسید و وجهی دریافت نشد. "
-            "اگر می‌خواهید شارژ کنید، لطفاً یک فاکتور جدید ایجاد کنید."
-        ),
-        "from_partial": (
-            "⏰ مهلت پرداخت فاکتور شما به پایان رسید. "
-            "مبلغ ${credited:.4f} که قبلاً پرداخت کرده بودید "
-            "به حساب شما اضافه شده است. برای پرداخت مابقی، "
-            "لطفاً یک فاکتور جدید ایجاد کنید."
-        ),
-    },
-    "failed": {
-        "from_pending": (
-            "❌ پرداخت شما ناموفق بود. "
-            "اگر مبلغی از حساب شما کسر شده است، با پشتیبانی تماس بگیرید."
-        ),
-        "from_partial": (
-            "❌ پرداخت شما ناموفق اعلام شد. "
-            "مبلغ ${credited:.4f} که قبلاً موفق پرداخت شده بود "
-            "همچنان در حساب شما باقی می‌ماند. "
-            "اگر مبلغ بیشتری از حساب شما کسر شده، با پشتیبانی تماس بگیرید."
-        ),
-    },
-    "refunded": {
-        "from_pending": (
-            "↩️ پرداخت شما بازگشت داده شد و به حساب شما اضافه نشد."
-        ),
-        "from_partial": (
-            "↩️ پرداخت شما بازگشت داده شد. "
-            "مبلغ ${credited:.4f} که قبلاً به حساب شما اضافه شده بود "
-            "همچنان قابل استفاده است. اگر این طور نیست با پشتیبانی تماس بگیرید."
-        ),
-    },
+# Maps an IPN failure status -> (strings.py key for PENDING-row variant,
+# strings.py key for PARTIAL-row variant). The actual translated text is
+# looked up at notification time using the user's stored language.
+_TERMINAL_FAILURE_MESSAGE_KEYS = {
+    "expired": ("pay_expired_pending", "pay_expired_partial"),
+    "failed": ("pay_failed_pending", "pay_failed_partial"),
+    "refunded": ("pay_refunded_pending", "pay_refunded_partial"),
 }
 
 
@@ -308,21 +275,16 @@ async def payment_webhook(request: web.Request):
             # credited in finalize_payment; a Telegram error must not cause us
             # to return 500 and trigger a NowPayments retry (the retry would
             # be a no-op because the row is no longer PENDING/PARTIAL).
+            lang = await db.get_user_language(telegram_id)
             if delta_credited > 0:
                 # Either a fresh full payment, or the remainder after a
                 # partially_paid earlier credited some.
-                msg = (
-                    f"✅ پرداخت تایید شد! مبلغ ${delta_credited:.4f} "
-                    "به حساب شما اضافه شد."
-                )
+                msg = t(lang, "pay_credited_full", delta=delta_credited)
             else:
                 # We've already credited the full amount earlier (e.g.
                 # partially_paid covered the full price). Just close the
                 # loop with the user.
-                msg = (
-                    "✅ پرداخت شما تکمیل شد. "
-                    f"در مجموع مبلغ ${total_credited:.4f} به حساب شما اضافه شده است."
-                )
+                msg = t(lang, "pay_credited_total_only", total=total_credited)
             try:
                 await bot.send_message(chat_id=telegram_id, text=msg)
             except Exception:
@@ -368,12 +330,10 @@ async def payment_webhook(request: web.Request):
                 previous_status,
                 credited_so_far,
             )
-            variant = (
-                "from_partial" if previous_status == "PARTIAL" else "from_pending"
-            )
-            text = _TERMINAL_FAILURE_MESSAGES[status][variant].format(
-                credited=credited_so_far
-            )
+            pending_key, partial_key = _TERMINAL_FAILURE_MESSAGE_KEYS[status]
+            string_key = partial_key if previous_status == "PARTIAL" else pending_key
+            lang = await db.get_user_language(telegram_id)
+            text = t(lang, string_key, credited=credited_so_far)
             try:
                 await bot.send_message(chat_id=telegram_id, text=text)
             except Exception:
@@ -429,16 +389,11 @@ async def payment_webhook(request: web.Request):
             # Only notify when there was actually new money to credit, so a
             # replayed IPN with the same actually_paid doesn't re-spam the user.
             if delta > 0:
+                lang = await db.get_user_language(telegram_id)
                 try:
                     await bot.send_message(
                         chat_id=telegram_id,
-                        text=(
-                            f"⚠️ پرداخت شما کمتر از مبلغ فاکتور بود. "
-                            f"مبلغ ${delta:.4f} به حساب شما اضافه شد "
-                            f"(مجموع شارژ این فاکتور: ${total_credited:.4f}). "
-                            "اگر می‌خواهید مابقی را پرداخت کنید، می‌توانید "
-                            "همچنان به همان آدرس واریز کنید."
-                        ),
+                        text=t(lang, "pay_partial", delta=delta, total=total_credited),
                     )
                 except Exception:
                     log.exception(

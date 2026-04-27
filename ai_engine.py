@@ -5,6 +5,7 @@ import aiohttp
 
 from database import db
 from pricing import calculate_cost
+from strings import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, t
 
 log = logging.getLogger("bot.ai_engine")
 
@@ -14,15 +15,17 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
     # 1. Fetch user data and check limits
     user = await db.get_user(telegram_id)
     if not user:
-        return "❌ حساب کاربری شما یافت نشد. لطفا ابتدا ربات را /start کنید."
+        # No row yet -> user never /started. Greet in the default locale.
+        return t(DEFAULT_LANGUAGE, "ai_no_account")
 
     free_msgs = user['free_messages_left']
     balance = float(user['balance_usd'])
     active_model = user['active_model']
+    lang = user['language_code'] if user['language_code'] in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
 
     # 2. Hard block if they are out of free messages and out of money
     if free_msgs <= 0 and balance < 0.05:
-        return "⚠️ اعتبار شما کافی نیست. لطفا از منوی کیف پول، حساب خود را شارژ کنید."
+        return t(lang, "ai_insufficient_balance")
 
     # 3. Call OpenRouter API
     headers = {
@@ -44,7 +47,7 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
                         "OpenRouter HTTP %d for user %d model=%s: %s",
                         response.status, telegram_id, active_model, body,
                     )
-                    return "❌ سرور هوش مصنوعی موقتاً در دسترس نیست. لطفاً دوباره تلاش کنید."
+                    return t(lang, "ai_provider_unavailable")
                 
                 data = await response.json()
                 reply_text = data['choices'][0]['message']['content']
@@ -75,4 +78,4 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
                 
     except Exception:
         log.exception("Unexpected error in chat_with_model for user %d", telegram_id)
-        return "❌ خطای ارتباطی موقت رخ داد. لطفاً چند لحظه دیگر دوباره تلاش کنید."
+        return t(lang, "ai_transient_error")

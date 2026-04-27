@@ -1,105 +1,162 @@
 import logging
 
-from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
+from aiogram import F, Router
 from aiogram.filters import Command
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    CallbackQuery,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from ai_engine import chat_with_model
 from database import db
 from payments import create_crypto_invoice
-from ai_engine import chat_with_model
+from strings import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, all_button_labels, t
 
 log = logging.getLogger("bot.handlers")
 
 router = Router()
 
+
 class UserStates(StatesGroup):
     waiting_custom_amount = State()
 
 
-# Footer-row label constants for nested inline menus. Keeping these in one
-# place lets us swap the wording or i18n-ify them later (P2-2) without
-# touching every screen.
-BTN_BACK = "🔙 بازگشت"
-BTN_HOME = "🏠 منوی اصلی"
-BTN_BACK_TO_WALLET = "🔙 کیف پول"
-BTN_CANCEL = "❌ انصراف"
+# Pre-compute the set of all main-keyboard button labels (across every
+# supported language). aiogram dispatches handlers by F.text == "..."
+# *before* we get a chance to look up the user's language from the DB,
+# so we have to match against every locale's spelling of each button.
+_KBD_KEYS = ("kbd_models", "kbd_wallet", "kbd_support", "kbd_language")
+_ALL_KBD_LABELS: tuple[str, ...] = tuple(
+    label for k in _KBD_KEYS for label in all_button_labels(k)
+)
+_MODEL_LABELS = all_button_labels("kbd_models")
+_WALLET_LABELS = all_button_labels("kbd_wallet")
+_SUPPORT_LABELS = all_button_labels("kbd_support")
+_LANGUAGE_LABELS = all_button_labels("kbd_language")
+
+
+async def _get_user_language(telegram_id: int) -> str:
+    """Look up the user's preferred language, falling back to the default.
+
+    Used at the top of every handler. We keep it tiny on purpose; if the
+    user row is missing (e.g. they never sent /start), we just default,
+    matching the existing 'don't crash if not registered' behaviour
+    elsewhere in this file.
+    """
+    lang = await db.get_user_language(telegram_id)
+    if lang in SUPPORTED_LANGUAGES:
+        return lang
+    return DEFAULT_LANGUAGE
 
 
 # ==========================================
-# کیبورد اصلی (همیشه پایین صفحه)
+# Bottom reply keyboard (always visible at the top level)
 # ==========================================
-def get_main_keyboard():
+def get_main_keyboard(lang: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🤖 مدل‌های هوش مصنوعی"), KeyboardButton(text="💰 کیف پول")],
-            [KeyboardButton(text="🎧 پشتیبانی"), KeyboardButton(text="🌍 تغییر زبان")]
+            [
+                KeyboardButton(text=t(lang, "kbd_models")),
+                KeyboardButton(text=t(lang, "kbd_wallet")),
+            ],
+            [
+                KeyboardButton(text=t(lang, "kbd_support")),
+                KeyboardButton(text=t(lang, "kbd_language")),
+            ],
         ],
         resize_keyboard=True,
-        is_persistent=True
+        is_persistent=True,
     )
+
 
 # ==========================================
 # COMMAND: /start
 # ==========================================
 @router.message(Command("start"))
 async def cmd_start(message: Message):
-    # ثبت کاربر در دیتابیس
     await db.create_user(message.from_user.id, message.from_user.username or "Unknown")
-    
-    text = (
-        f"سلام {message.from_user.first_name}!\n\n"
-        "به دروازه هوش مصنوعی ما خوش آمدید. برای شروع از منوی زیر استفاده کنید:"
-    )
-    await message.answer(text, reply_markup=get_main_keyboard())
+    lang = await _get_user_language(message.from_user.id)
+    text = t(lang, "start_greeting", first_name=message.from_user.first_name or "")
+    await message.answer(text, reply_markup=get_main_keyboard(lang))
+
 
 # ==========================================
-# هندلرهای دکمه‌های اصلی (متنی زیر صفحه)
+# Top-level reply-keyboard handlers (matched across all languages)
 # ==========================================
-@router.message(F.text == "🎧 پشتیبانی")
+@router.message(F.text.in_(_SUPPORT_LABELS))
 async def support_text_handler(message: Message):
-    await message.answer(
-        "🎧 **پشتیبانی فنی**\n\n"
-        "برای ارتباط با ادمین به آیدی @Mahan\\_Admin پیام دهید.",
-        parse_mode="Markdown",
-    )
+    lang = await _get_user_language(message.from_user.id)
+    await message.answer(t(lang, "support_text"), parse_mode="Markdown")
 
-@router.message(F.text == "🌍 تغییر زبان")
+
+@router.message(F.text.in_(_LANGUAGE_LABELS))
 async def language_text_handler(message: Message):
-    await message.answer("🌍 این بخش به زودی فعال می‌شود. در حال حاضر فقط زبان فارسی پشتیبانی می‌شود.")
-
-@router.message(F.text == "🤖 مدل‌های هوش مصنوعی")
-async def models_text_handler(message: Message):
+    lang = await _get_user_language(message.from_user.id)
     builder = InlineKeyboardBuilder()
-    builder.button(text="❌ بستن منو", callback_data="close_menu")
-    
-    text = (
-        "🤖 **مدل‌های هوش مصنوعی**\n\n"
-        "✅ GPT-4o (فعال)\n"
-        "⏳ Claude 3.5 (بزودی...)\n"
-        "⏳ Gemini Pro (بزودی...)"
-    )
-    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+    builder.button(text=t(lang, "btn_lang_fa"), callback_data="set_lang_fa")
+    builder.button(text=t(lang, "btn_lang_en"), callback_data="set_lang_en")
+    builder.button(text=t(lang, "btn_close_menu"), callback_data="close_menu")
+    builder.adjust(2, 1)
+    await message.answer(t(lang, "language_picker_title"), reply_markup=builder.as_markup())
 
-@router.message(F.text == "💰 کیف پول")
+
+@router.callback_query(F.data.startswith("set_lang_"))
+async def set_language_handler(callback: CallbackQuery):
+    new_lang = callback.data.removeprefix("set_lang_")
+    if new_lang not in SUPPORTED_LANGUAGES:
+        await callback.answer("Unknown language", show_alert=True)
+        return
+    await db.set_language(callback.from_user.id, new_lang)
+    # Show the confirmation in the *new* language so the user immediately
+    # sees the switch took effect.
+    await callback.message.edit_text(t(new_lang, "language_changed"))
+    # The bottom reply keyboard was rendered before the user changed
+    # language; re-render it so the four top-level buttons are localized.
+    # Send as a fresh message because edit_text can't change reply_markup
+    # to a ReplyKeyboardMarkup (only inline markups are editable).
+    await callback.message.answer(
+        t(new_lang, "start_greeting", first_name=callback.from_user.first_name or ""),
+        reply_markup=get_main_keyboard(new_lang),
+    )
+    await callback.answer()
+
+
+@router.message(F.text.in_(_MODEL_LABELS))
+async def models_text_handler(message: Message):
+    lang = await _get_user_language(message.from_user.id)
+    builder = InlineKeyboardBuilder()
+    builder.button(text=t(lang, "btn_close_menu"), callback_data="close_menu")
+    await message.answer(
+        t(lang, "models_text"), reply_markup=builder.as_markup(), parse_mode="Markdown"
+    )
+
+
+def _build_wallet_keyboard(lang: str) -> InlineKeyboardBuilder:
+    builder = InlineKeyboardBuilder()
+    builder.button(text=t(lang, "btn_add_crypto"), callback_data="add_crypto")
+    builder.button(text=t(lang, "btn_close_menu"), callback_data="close_menu")
+    builder.adjust(1, 1)
+    return builder
+
+
+@router.message(F.text.in_(_WALLET_LABELS))
 async def wallet_text_handler(message: Message):
     user_id = message.from_user.id
+    lang = await _get_user_language(user_id)
     user_data = await db.get_user(user_id)
-    # جلوگیری از ارور در صورت ثبت نشدن یوزر
-    balance = user_data['balance_usd'] if user_data else 0.0
-    
-    builder = InlineKeyboardBuilder()
-    builder.button(text="➕ شارژ حساب (Crypto)", callback_data="add_crypto")
-    builder.button(text="❌ بستن منو", callback_data="close_menu")
-    builder.adjust(1, 1)
-    
-    text = f"👛 **کیف پول شما**\n\nموجودی فعلی: ${balance:.2f}\n\nبرای شارژ حساب کلیک کنید:"
+    balance = float(user_data["balance_usd"]) if user_data else 0.0
+    text = t(lang, "wallet_text", balance=balance)
+    builder = _build_wallet_keyboard(lang)
     await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
 
+
 # ==========================================
-# هندلرهای دکمه‌های شیشه‌ای (ناوبری و بازگشت)
+# Inline navigation callbacks
 # ==========================================
 @router.callback_query(F.data == "close_menu")
 async def close_menu_handler(callback: CallbackQuery, state: FSMContext):
@@ -113,26 +170,24 @@ async def close_menu_handler(callback: CallbackQuery, state: FSMContext):
     await callback.message.delete()
     await callback.answer()
 
+
 @router.callback_query(F.data == "back_to_wallet")
 async def back_to_wallet_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
+    lang = await _get_user_language(user_id)
     user_data = await db.get_user(user_id)
-    balance = user_data['balance_usd'] if user_data else 0.0
-    
-    builder = InlineKeyboardBuilder()
-    builder.button(text="➕ شارژ حساب (Crypto)", callback_data="add_crypto")
-    builder.button(text="❌ بستن منو", callback_data="close_menu")
-    builder.adjust(1, 1)
-    
-    text = f"👛 **کیف پول شما**\n\nموجودی فعلی: ${balance:.2f}\n\nبرای شارژ حساب کلیک کنید:"
+    balance = float(user_data["balance_usd"]) if user_data else 0.0
+    builder = _build_wallet_keyboard(lang)
+    text = t(lang, "wallet_text", balance=balance)
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
     await callback.answer()
 
+
 # ==========================================
-# سیستم پرداخت حرفه ای (قیف ۳ مرحله ای)
+# Charge wallet flow (3 steps)
 # ==========================================
 
-# مرحله ۱: انتخاب مبلغ
+# Step 1: pick an amount
 @router.callback_query(F.data == "add_crypto")
 async def process_add_crypto_amount(callback: CallbackQuery, state: FSMContext):
     # This callback is also the "cancel" target of the custom-amount screen
@@ -140,25 +195,22 @@ async def process_add_crypto_amount(callback: CallbackQuery, state: FSMContext):
     # so the user isn't stuck — otherwise their next free-text message would
     # be intercepted by process_custom_amount_input instead of process_chat.
     await state.clear()
+    lang = await _get_user_language(callback.from_user.id)
     builder = InlineKeyboardBuilder()
-    builder.button(text="💵 $5", callback_data="amt_5")
-    builder.button(text="💵 $10", callback_data="amt_10")
-    builder.button(text="💵 $20", callback_data="amt_20")
-    builder.button(text="✏️ مبلغ دلخواه", callback_data="amt_custom")
-    # Footer: back to wallet + home (close inline menu, the bottom reply
-    # keyboard remains visible so the user is back at the top level).
-    builder.button(text=BTN_BACK_TO_WALLET, callback_data="back_to_wallet")
-    builder.button(text=BTN_HOME, callback_data="close_menu")
+    builder.button(text=t(lang, "btn_amt_5"), callback_data="amt_5")
+    builder.button(text=t(lang, "btn_amt_10"), callback_data="amt_10")
+    builder.button(text=t(lang, "btn_amt_20"), callback_data="amt_20")
+    builder.button(text=t(lang, "btn_amt_custom"), callback_data="amt_custom")
+    builder.button(text=t(lang, "btn_back_to_wallet"), callback_data="back_to_wallet")
+    builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
     builder.adjust(3, 1, 2)
-    
     await callback.message.edit_text(
-        "💰 مبلغ شارژ را انتخاب کنید:\n\n"
-        "💡 حداقل مبلغ: $5",
-        reply_markup=builder.as_markup()
+        t(lang, "charge_pick_amount"), reply_markup=builder.as_markup()
     )
     await callback.answer()
 
-# مرحله ۲: انتخاب مبلغ
+
+# Step 2 (custom-amount path): prompt for free-text input
 # IMPORTANT: the specific "amt_custom" handler must be registered BEFORE the
 # generic "amt_*" prefix handler. aiogram v3 dispatches the first matching
 # handler, so registering the prefix first would swallow "amt_custom" and
@@ -166,27 +218,22 @@ async def process_add_crypto_amount(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "amt_custom")
 async def process_custom_amount_request(callback: CallbackQuery, state: FSMContext):
     await state.set_state(UserStates.waiting_custom_amount)
-    # بقیه کد...
-    
+    lang = await _get_user_language(callback.from_user.id)
     builder = InlineKeyboardBuilder()
-    builder.button(text=BTN_CANCEL, callback_data="add_crypto")
-    builder.button(text=BTN_HOME, callback_data="close_menu")
+    builder.button(text=t(lang, "btn_cancel"), callback_data="add_crypto")
+    builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
     builder.adjust(2)
-
     await callback.message.edit_text(
-        "✏️ مبلغ دلخواه خود را وارد کنید:\n\n"
-        "💡 حداقل: $5\n"
-        "💡 مثال: 15 یا 25.5",
-        reply_markup=builder.as_markup()
+        t(lang, "charge_custom_prompt"), reply_markup=builder.as_markup()
     )
     await callback.answer()
 
 
-# مرحله ۲: انتخاب ارز برای مبالغ ثابت ($5 / $10 / $20)
+# Step 2 (fixed-amount path): pick a currency
 @router.callback_query(F.data.startswith("amt_"))
 async def process_add_crypto_currency(callback: CallbackQuery):
     amount = callback.data.split("_")[1]
-
+    lang = await _get_user_language(callback.from_user.id)
     builder = InlineKeyboardBuilder()
     builder.button(text="₿ Bitcoin", callback_data=f"pay_btc_{amount}")
     builder.button(text="Ξ Ethereum", callback_data=f"pay_eth_{amount}")
@@ -194,187 +241,188 @@ async def process_add_crypto_currency(callback: CallbackQuery):
     builder.button(text="💵 USDT (TRC20)", callback_data=f"pay_usdttrc20_{amount}")
     builder.button(text="💵 USDT (ERC20)", callback_data=f"pay_usdterc20_{amount}")
     builder.button(text="🔷 Litecoin", callback_data=f"pay_ltc_{amount}")
-    builder.button(text=BTN_BACK, callback_data="add_crypto")
-    builder.button(text=BTN_HOME, callback_data="close_menu")
+    builder.button(text=t(lang, "btn_back"), callback_data="add_crypto")
+    builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
     builder.adjust(2, 2, 2, 2)
-
     await callback.message.edit_text(
-        f"💰 مبلغ: **${amount}**\n\n🪙 ارز خود را انتخاب کنید:",
+        t(lang, "charge_pick_currency", amount=amount),
         parse_mode="Markdown",
-        reply_markup=builder.as_markup()
+        reply_markup=builder.as_markup(),
     )
     await callback.answer()
 
 
 @router.message(UserStates.waiting_custom_amount)
 async def process_custom_amount_input(message: Message, state: FSMContext):
+    lang = await _get_user_language(message.from_user.id)
     try:
-        amount = float(message.text.strip().replace('$', ''))
-        
-        if amount < 5:
-            await message.answer("❌ حداقل مبلغ $5 است.")
-            return
-        
-        # پاک کردن state
-        await state.clear()
-        
-        # نمایش منوی انتخاب ارز
-        builder = InlineKeyboardBuilder()
-        currencies = [
-            ("Bitcoin (BTC)", "cur_btc"),
-            ("Ethereum (ETH)", "cur_eth"),
-            ("TON", "cur_ton"),
-            ("USDT-TRC20", "cur_usdttrc20"),
-            ("USDT-ERC20", "cur_usdterc20"),
-            ("Litecoin (LTC)", "cur_ltc"),
-        ]
-        for name, callback_data in currencies:
-            builder.button(text=name, callback_data=callback_data)
-        # Footer: back to amount entry + home. Going back to amt_custom
-        # re-prompts for the amount (clearing state) so the user can pick a
-        # different value without restarting from the wallet.
-        builder.button(text=BTN_BACK, callback_data="amt_custom")
-        builder.button(text=BTN_HOME, callback_data="close_menu")
-        builder.adjust(2, 2, 2, 2)
-
-        # ذخیره مبلغ در state برای استفاده بعدی
-        await state.update_data(custom_amount=amount)
-
-        await message.answer(
-            f"💵 مبلغ ${amount:.2f} ثبت شد.\n\n🪙 ارز مورد نظر را انتخاب کنید:",
-            reply_markup=builder.as_markup()
-        )
-        
+        amount = float(message.text.strip().replace("$", ""))
     except ValueError:
-        await message.answer("❌ لطفاً یک عدد معتبر وارد کنید (مثال: 15 یا 20.5)")
+        await message.answer(t(lang, "charge_custom_invalid"))
+        return
+
+    if amount < 5:
+        await message.answer(t(lang, "charge_custom_min_error"))
+        return
+
+    await state.clear()
+
+    builder = InlineKeyboardBuilder()
+    currencies = [
+        ("Bitcoin (BTC)", "cur_btc"),
+        ("Ethereum (ETH)", "cur_eth"),
+        ("TON", "cur_ton"),
+        ("USDT-TRC20", "cur_usdttrc20"),
+        ("USDT-ERC20", "cur_usdterc20"),
+        ("Litecoin (LTC)", "cur_ltc"),
+    ]
+    for name, callback_data in currencies:
+        builder.button(text=name, callback_data=callback_data)
+    # Footer: back to amount entry + home. Going back to amt_custom
+    # re-prompts for the amount (clearing state) so the user can pick a
+    # different value without restarting from the wallet.
+    builder.button(text=t(lang, "btn_back"), callback_data="amt_custom")
+    builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+    builder.adjust(2, 2, 2, 2)
+
+    await state.update_data(custom_amount=amount)
+
+    await message.answer(
+        t(lang, "charge_custom_amount_saved", amount=amount),
+        reply_markup=builder.as_markup(),
+    )
+
 
 @router.callback_query(F.data.startswith("cur_"))
 async def process_custom_currency_selection(callback: CallbackQuery, state: FSMContext):
-    currency = callback.data.split("_")[1]  # مثلاً btc
-    
-    # بازیابی مبلغ از state
+    currency = callback.data.split("_")[1]
+    lang = await _get_user_language(callback.from_user.id)
+
     data = await state.get_data()
-    amount = data.get('custom_amount')
-    
+    amount = data.get("custom_amount")
     if not amount:
-        await callback.answer("❌ مبلغ یافت نشد. دوباره تلاش کنید.", show_alert=True)
+        await callback.answer(t(lang, "charge_amount_lost"), show_alert=True)
         return
-    
-    await state.clear()  # پاک کردن state
-    
-    # ارسال به handler فاکتور
-    await callback.message.edit_text("⏳ در حال ارتباط با درگاه ناوپیمنتس...")
-    
+
+    await state.clear()
+    await callback.message.edit_text(t(lang, "charge_creating_invoice"))
+
     try:
-        invoice = await create_crypto_invoice(callback.from_user.id, amount_usd=float(amount), currency=currency)
-        if invoice:
-            pay_address = invoice.get('pay_address')
-            pay_amount = invoice.get('pay_amount')
-            
-            builder = InlineKeyboardBuilder()
-            builder.button(text=BTN_BACK_TO_WALLET, callback_data="back_to_wallet")
-            builder.button(text=BTN_HOME, callback_data="close_menu")
-            builder.adjust(2)
-
-            text = (
-                f"🧾 **فاکتور شارژ حساب**\n\n"
-                f"مبلغ شارژ خالص: `${amount}`\n"
-                f"ارز انتخابی: `{currency.upper()}`\n\n"
-                f"مبلغ قابل پرداخت (با احتساب کارمزد):\n"
-                f"**`{pay_amount}`**\n\n"
-                f"آدرس واریز:\n`{pay_address}`\n\n"
-                "⚠️ دقیقاً همین مبلغ را واریز کنید."
-            )
-
-            await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=builder.as_markup())
-        else:
-            builder = InlineKeyboardBuilder()
-            builder.button(text="🔄 تلاش مجدد", callback_data="add_crypto")
-            builder.button(text=BTN_HOME, callback_data="close_menu")
-            builder.adjust(2)
-            await callback.message.edit_text("❌ درگاه پاسخگو نیست.", reply_markup=builder.as_markup())
+        invoice = await create_crypto_invoice(
+            callback.from_user.id, amount_usd=float(amount), currency=currency
+        )
     except Exception:
         log.exception(
-            "Failed to create custom-amount invoice for user %d",
-            callback.from_user.id,
+            "Failed to create custom-amount invoice for user %d", callback.from_user.id
         )
         builder = InlineKeyboardBuilder()
-        builder.button(text="🔄 تلاش مجدد", callback_data="add_crypto")
-        builder.button(text=BTN_HOME, callback_data="close_menu")
+        builder.button(text=t(lang, "btn_retry"), callback_data="add_crypto")
+        builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
         builder.adjust(2)
         await callback.message.edit_text(
-            "❌ ایجاد فاکتور با خطا مواجه شد. لطفاً دوباره تلاش کنید.",
-            reply_markup=builder.as_markup(),
+            t(lang, "charge_invoice_error"), reply_markup=builder.as_markup()
         )
-        
+        await callback.answer()
+        return
+
+    if invoice:
+        builder = InlineKeyboardBuilder()
+        builder.button(text=t(lang, "btn_back_to_wallet"), callback_data="back_to_wallet")
+        builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+        builder.adjust(2)
+        text = t(
+            lang,
+            "charge_invoice_text",
+            amount=amount,
+            currency=currency.upper(),
+            pay_amount=invoice.get("pay_amount"),
+            pay_address=invoice.get("pay_address"),
+        )
+        await callback.message.edit_text(
+            text, parse_mode="Markdown", reply_markup=builder.as_markup()
+        )
+    else:
+        builder = InlineKeyboardBuilder()
+        builder.button(text=t(lang, "btn_retry"), callback_data="add_crypto")
+        builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+        builder.adjust(2)
+        await callback.message.edit_text(
+            t(lang, "charge_gateway_unreachable"), reply_markup=builder.as_markup()
+        )
+
     await callback.answer()
 
-# مرحله ۳: صدور فاکتور نهایی
+
+# Step 3: emit the final invoice (fixed-amount path)
 @router.callback_query(F.data.startswith("pay_"))
 async def process_final_invoice(callback: CallbackQuery):
     parts = callback.data.split("_")
+    lang = await _get_user_language(callback.from_user.id)
     if len(parts) != 3:
-        await callback.answer("❌ دیتای نامعتبر!", show_alert=True)
+        await callback.answer("Invalid data", show_alert=True)
         return
-        
+
     currency = parts[1]
     amount = parts[2]
-    
-    await callback.message.edit_text("⏳ در حال ارتباط با درگاه ناوپیمنتس. لطفا صبر کنید...")
-    
+
+    await callback.message.edit_text(t(lang, "charge_creating_invoice"))
+
     try:
-        invoice = await create_crypto_invoice(callback.from_user.id, amount_usd=float(amount), currency=currency)
-        if invoice:
-            pay_address = invoice.get('pay_address')
-            pay_amount = invoice.get('pay_amount')
-            
-            builder = InlineKeyboardBuilder()
-            builder.button(text=BTN_BACK_TO_WALLET, callback_data="back_to_wallet")
-            builder.button(text=BTN_HOME, callback_data="close_menu")
-            builder.adjust(2)
-
-            text = (
-                f"🧾 **فاکتور شارژ حساب**\n\n"
-                f"مبلغ شارژ خالص: `${amount}`\n"
-                f"ارز انتخابی: `{currency.upper()}`\n\n"
-                f"مبلغ قابل پرداخت (با احتساب کارمزد شبکه و درگاه):\n"
-                f"**`{pay_amount}`**\n\n"
-                f"آدرس واریز:\n`{pay_address}`\n\n"
-                "⚠️ لطفاً دقیقاً همین مبلغ را واریز کنید. ربات منتظر تایید شبکه است."
-            )
-
-            await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=builder.as_markup())
-        else:
-            builder = InlineKeyboardBuilder()
-            builder.button(text="🔄 تلاش مجدد", callback_data="add_crypto")
-            builder.button(text=BTN_HOME, callback_data="close_menu")
-            builder.adjust(2)
-            await callback.message.edit_text("❌ درگاه در حال حاضر پاسخگو نیست. تنظیمات پنل ناوپیمنتس را چک کنید.", reply_markup=builder.as_markup())
-    except Exception:
-        log.exception(
-            "Failed to create invoice for user %d",
-            callback.from_user.id,
+        invoice = await create_crypto_invoice(
+            callback.from_user.id, amount_usd=float(amount), currency=currency
         )
+    except Exception:
+        log.exception("Failed to create invoice for user %d", callback.from_user.id)
         builder = InlineKeyboardBuilder()
-        builder.button(text=BTN_BACK_TO_WALLET, callback_data="back_to_wallet")
-        builder.button(text=BTN_HOME, callback_data="close_menu")
+        builder.button(text=t(lang, "btn_back_to_wallet"), callback_data="back_to_wallet")
+        builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
         builder.adjust(2)
         await callback.message.edit_text(
-            "❌ ایجاد فاکتور با خطا مواجه شد. لطفاً دوباره تلاش کنید.",
+            t(lang, "charge_invoice_error"), reply_markup=builder.as_markup()
+        )
+        await callback.answer()
+        return
+
+    if invoice:
+        builder = InlineKeyboardBuilder()
+        builder.button(text=t(lang, "btn_back_to_wallet"), callback_data="back_to_wallet")
+        builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+        builder.adjust(2)
+        text = t(
+            lang,
+            "charge_invoice_text",
+            amount=amount,
+            currency=currency.upper(),
+            pay_amount=invoice.get("pay_amount"),
+            pay_address=invoice.get("pay_address"),
+        )
+        await callback.message.edit_text(
+            text, parse_mode="Markdown", reply_markup=builder.as_markup()
+        )
+    else:
+        builder = InlineKeyboardBuilder()
+        builder.button(text=t(lang, "btn_retry"), callback_data="add_crypto")
+        builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+        builder.adjust(2)
+        await callback.message.edit_text(
+            t(lang, "charge_gateway_unreachable_long"),
             reply_markup=builder.as_markup(),
         )
-        
+
     await callback.answer()
 
+
 # ==========================================
-# چت با هوش مصنوعی (ارسال درخواست‌ها به موتور)
+# AI chat (free-text outside any reserved button or FSM state)
 # ==========================================
-@router.message(F.text & ~F.text.startswith('/'))
+@router.message(F.text & ~F.text.startswith("/"))
 async def process_chat(message: Message):
-    reserved_buttons = ["🤖 مدل‌های هوش مصنوعی", "💰 کیف پول", "🎧 پشتیبانی", "🌍 تغییر زبان"]
-    if message.text in reserved_buttons:
+    # Reserved-buttons guard: the bottom reply-keyboard buttons reach this
+    # handler too because they're plain text. Drop them — there's a
+    # dedicated handler for each, registered above.
+    if message.text in _ALL_KBD_LABELS:
         return
-        
+
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     reply = await chat_with_model(message.from_user.id, message.text)
     await message.answer(reply)
