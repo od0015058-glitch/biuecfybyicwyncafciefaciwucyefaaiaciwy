@@ -176,12 +176,28 @@ async def get_catalog() -> Catalog:
 
 
 async def get_model_price(model_id: str) -> ModelPrice:
-    """Resolve a model's price using the catalog, then static table, then fallback."""
+    """Resolve a model's price using the catalog, then static table, then fallback.
+
+    If the model is present in the live catalog, return its price
+    unconditionally — including legitimately-free models (e.g.
+    ``meta-llama/llama-3.2-1b-instruct:free``) where both
+    ``input_per_1m_usd`` and ``output_per_1m_usd`` are 0. The earlier
+    ``> 0`` guard mistook those for missing data and fell through to
+    :data:`FALLBACK_PRICE` (~$10/$30 per 1M × markup), so a user who
+    picked a "$0.00 / $0.00" model from the picker would actually be
+    charged the most expensive rate. The picker shows whatever the
+    catalog reports, and OpenRouter is the source of truth — pricing
+    must agree.
+
+    The static :data:`MODEL_PRICES` and :data:`FALLBACK_PRICE` only
+    come into play when the model id is not in the catalog at all
+    (catalog fetch failed and the static table is being used as a
+    fallback list, or the user is somehow on a model id the catalog
+    has since dropped).
+    """
     catalog = await get_catalog()
     entry = catalog.get(model_id)
-    if entry is not None and (
-        entry.price.input_per_1m_usd > 0 or entry.price.output_per_1m_usd > 0
-    ):
+    if entry is not None:
         return entry.price
     if model_id in MODEL_PRICES:
         return MODEL_PRICES[model_id]
