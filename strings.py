@@ -161,7 +161,8 @@ _STRINGS: dict[str, dict[str, str]] = {
             "مبلغ قابل پرداخت (با احتساب کارمزد شبکه و درگاه):\n"
             "**`{pay_amount}`**\n\n"
             "آدرس واریز:\n`{pay_address}`\n\n"
-            "⚠️ لطفاً دقیقاً همین مبلغ را واریز کنید. ربات منتظر تایید شبکه است."
+            "⚠️ لطفاً دقیقاً همین مبلغ را واریز کنید.\n"
+            "🕒 برای دریافت با نرخ بالا تا ۶۰ دقیقه فرصت دارید. پس از آن پرداخت تا ۷ روز با نرخ لحظه‌ای دنبال می‌شود. بعد از ۷ روز باید فاکتور جدید بسازید."
         ),
         "charge_gateway_unreachable": "❌ درگاه پاسخگو نیست.",
         "charge_gateway_unreachable_long": (
@@ -399,7 +400,8 @@ _STRINGS: dict[str, dict[str, str]] = {
             "Total payable (network + gateway fees included):\n"
             "**`{pay_amount}`**\n\n"
             "Send to:\n`{pay_address}`\n\n"
-            "⚠️ Send EXACTLY this amount. The bot is waiting for network confirmation."
+            "⚠️ Send EXACTLY this amount.\n"
+            "🕒 The quoted rate is locked for ~60 minutes. After that the payment is still tracked at the live rate for up to 7 days. If you haven't paid by then, just create a new invoice."
         ),
         "charge_gateway_unreachable": "❌ Gateway is not responding.",
         "charge_gateway_unreachable_long": (
