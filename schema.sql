@@ -68,3 +68,52 @@ CREATE TABLE system_settings (
 
 -- Insert default exchange rate for Rial to USD conversions
 INSERT INTO system_settings (setting_key, setting_value) VALUES ('usd_to_toman_rate', '60000');
+
+-- 5. PROMO CODES TABLE
+-- Discount codes the user can apply during the wallet top-up flow. Each
+-- successful redemption credits a bonus on top of the paid invoice
+-- amount (does NOT reduce the amount the user pays NowPayments).
+--
+-- Discount semantics: exactly one of discount_percent / discount_amount
+-- is non-NULL. Bonus on a $20 top-up:
+--   * 10 % code -> $2.00 bonus  (discount_percent = 10)
+--   * $5 code   -> $5.00 bonus  (discount_amount  = 5)
+-- Redemption is gated on (is_active, NOT expired, used_count < max_uses,
+-- and the user hasn't already used this code) — see
+-- database.validate_promo_code / redeem_promo_code.
+CREATE TABLE promo_codes (
+    code VARCHAR(64) PRIMARY KEY,
+    discount_percent INT, -- 1-100, or NULL if discount_amount is set
+    discount_amount DECIMAL(10, 4), -- USD, or NULL if discount_percent is set
+    max_uses INT, -- NULL means unlimited
+    used_count INT NOT NULL DEFAULT 0,
+    expires_at TIMESTAMP WITH TIME ZONE, -- NULL means no expiry
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    -- Enforce mutual exclusivity at the DB layer.
+    CONSTRAINT promo_codes_discount_xor CHECK (
+        (discount_percent IS NOT NULL AND discount_amount IS NULL)
+        OR (discount_percent IS NULL AND discount_amount IS NOT NULL)
+    )
+);
+
+-- 6. PROMO USAGE TABLE
+-- One row per successful redemption. Composite primary key prevents the
+-- same user from redeeming the same code twice. Inserted atomically
+-- alongside the bonus credit in finalize_payment.
+CREATE TABLE promo_usage (
+    promo_code VARCHAR(64) REFERENCES promo_codes(code),
+    telegram_id BIGINT REFERENCES users(telegram_id),
+    transaction_id INT REFERENCES transactions(transaction_id),
+    bonus_usd DECIMAL(10, 4) NOT NULL,
+    used_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (promo_code, telegram_id)
+);
+
+-- Promo fields on the transactions row. Set when the user enters a
+-- promo before invoice creation; the bonus is applied to the wallet
+-- credit on the SUCCESS transition (only — partials don't unlock the
+-- bonus, the user has to pay the full invoice).
+ALTER TABLE transactions
+    ADD COLUMN promo_code_used VARCHAR(64) REFERENCES promo_codes(code),
+    ADD COLUMN promo_bonus_usd DECIMAL(10, 4) NOT NULL DEFAULT 0;

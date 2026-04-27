@@ -126,19 +126,29 @@ class Database:
         amount_crypto: float,
         amount_usd: float,
         gateway_invoice_id: str,
+        promo_code: str | None = None,
+        promo_bonus_usd: float = 0.0,
     ) -> bool:
         """Records a payment as PENDING. Returns True iff a new row was inserted.
 
         ON CONFLICT on the unique gateway_invoice_id makes this safe to retry;
         a duplicate invoice id will not create a second row.
+
+        ``promo_code`` / ``promo_bonus_usd`` attach an already-validated
+        promo redemption to the transaction. The bonus is only credited
+        on the SUCCESS transition (see :meth:`finalize_payment`); if the
+        invoice ends up EXPIRED / FAILED / REFUNDED, the promo is not
+        consumed (its used_count is incremented in the same DB tx as
+        the SUCCESS credit, not here).
         """
         query = """
             INSERT INTO transactions (
                 telegram_id, gateway, currency_used,
                 amount_crypto_or_rial, amount_usd_credited,
-                status, gateway_invoice_id
+                status, gateway_invoice_id,
+                promo_code_used, promo_bonus_usd
             )
-            VALUES ($1, $2, $3, $4, $5, 'PENDING', $6)
+            VALUES ($1, $2, $3, $4, $5, 'PENDING', $6, $7, $8)
             ON CONFLICT (gateway_invoice_id) DO NOTHING
             RETURNING transaction_id
         """
@@ -147,6 +157,7 @@ class Database:
                 query,
                 telegram_id, gateway, currency_used,
                 amount_crypto, amount_usd, gateway_invoice_id,
+                promo_code, promo_bonus_usd,
             )
         return row is not None
 
@@ -326,7 +337,9 @@ class Database:
             async with connection.transaction():
                 row = await connection.fetchrow(
                     """
-                    SELECT telegram_id, status, amount_usd_credited
+                    SELECT transaction_id, telegram_id, status,
+                           amount_usd_credited,
+                           promo_code_used, promo_bonus_usd
                     FROM transactions
                     WHERE gateway_invoice_id = $1
                     FOR UPDATE
@@ -366,21 +379,262 @@ class Database:
                     gateway_invoice_id,
                     new_credited,
                 )
-                if delta > 0:
+
+                # Promo bonus is unlocked only on the SUCCESS transition.
+                # We record the redemption (promo_usage row +
+                # promo_codes.used_count++) in the SAME DB transaction so
+                # a crash between credit and bookkeeping leaves nothing
+                # half-done. We also re-check max_uses under the FOR
+                # UPDATE lock on promo_codes so two parallel finishing
+                # invoices can't each take the last seat of a 1-use code.
+                promo_code = row["promo_code_used"]
+                bonus_usd = float(row["promo_bonus_usd"] or 0.0)
+                bonus_credited = 0.0
+                if promo_code and bonus_usd > 0:
+                    bonus_credited = await self._consume_promo_in_tx(
+                        connection,
+                        promo_code=promo_code,
+                        telegram_id=row["telegram_id"],
+                        transaction_id=row["transaction_id"],
+                        bonus_usd=bonus_usd,
+                    )
+
+                total_credit = delta + bonus_credited
+                if total_credit > 0:
                     await connection.execute(
                         """
                         UPDATE users
                         SET balance_usd = balance_usd + $1
                         WHERE telegram_id = $2
                         """,
-                        delta,
+                        total_credit,
                         row["telegram_id"],
                     )
                 return {
                     "telegram_id": row["telegram_id"],
                     "amount_usd_credited": new_credited,
                     "delta_credited": delta,
+                    "promo_bonus_credited": bonus_credited,
                 }
+
+    # ----------------------------------------------------------------- #
+    # Promo codes (P2-5)
+    # ----------------------------------------------------------------- #
+
+    async def validate_promo_code(
+        self, code: str, telegram_id: int
+    ):
+        """Look up a promo code and check eligibility for *telegram_id*.
+
+        Returns a dict ``{code, discount_percent, discount_amount}`` if
+        the code can be applied, else a string error key (one of
+        ``"unknown"``, ``"inactive"``, ``"expired"``, ``"exhausted"``,
+        ``"already_used"``) the caller can pass to :func:`strings.t`.
+
+        This is an *advisory* check at UI time — the authoritative gate
+        runs again under FOR UPDATE inside the SUCCESS transaction
+        (see :meth:`_consume_promo_in_tx`) so two parallel invoices
+        can't both take the last seat of a single-use code.
+        """
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT code, discount_percent, discount_amount,
+                       max_uses, used_count, expires_at, is_active
+                FROM promo_codes
+                WHERE code = $1
+                """,
+                code,
+            )
+            if row is None:
+                return "unknown"
+            if not row["is_active"]:
+                return "inactive"
+            expires_at = row["expires_at"]
+            if expires_at is not None:
+                # asyncpg returns timezone-aware datetimes for
+                # TIMESTAMP WITH TIME ZONE columns; compare with NOW().
+                now = await connection.fetchval("SELECT NOW()")
+                if expires_at <= now:
+                    return "expired"
+            if row["max_uses"] is not None and row["used_count"] >= row["max_uses"]:
+                return "exhausted"
+            already_used = await connection.fetchval(
+                """
+                SELECT 1 FROM promo_usage
+                WHERE promo_code = $1 AND telegram_id = $2
+                """,
+                code,
+                telegram_id,
+            )
+            if already_used:
+                return "already_used"
+        return {
+            "code": row["code"],
+            "discount_percent": row["discount_percent"],
+            "discount_amount": float(row["discount_amount"])
+            if row["discount_amount"] is not None
+            else None,
+        }
+
+    @staticmethod
+    def compute_promo_bonus(
+        amount_usd: float,
+        *,
+        discount_percent: int | None,
+        discount_amount: float | None,
+    ) -> float:
+        """USD bonus to credit on top of *amount_usd* for the given promo.
+
+        Exactly one of ``discount_percent`` / ``discount_amount`` must be
+        non-None (enforced at the DB layer, but defensive here too).
+        Bonuses are clamped to *amount_usd* — a $5 fixed-discount code
+        on a $2 top-up only credits $2 of bonus, never more than the
+        invoice itself.
+        """
+        if discount_percent is not None:
+            bonus = amount_usd * (discount_percent / 100.0)
+        elif discount_amount is not None:
+            bonus = float(discount_amount)
+        else:
+            return 0.0
+        # Round to 4 decimals (matches DECIMAL(10,4)) and clamp.
+        bonus = max(0.0, min(bonus, amount_usd))
+        return round(bonus, 4)
+
+    async def _consume_promo_in_tx(
+        self,
+        connection,
+        *,
+        promo_code: str,
+        telegram_id: int,
+        transaction_id: int,
+        bonus_usd: float,
+    ) -> float:
+        """Atomically consume one redemption of *promo_code*.
+
+        Called from inside :meth:`finalize_payment`'s open transaction.
+        Locks the promo_codes row, re-validates is_active / expires_at /
+        max_uses, then bumps used_count and inserts a promo_usage row.
+        On any failure (already used, exhausted, expired, deactivated
+        between picker and webhook), returns 0.0 — the SUCCESS still
+        commits, just without the bonus. We do **not** raise here:
+        a stale promo state is a UX issue, not a payment failure, and
+        we don't want webhook retries to compound.
+
+        Returns the bonus actually credited.
+        """
+        promo = await connection.fetchrow(
+            """
+            SELECT max_uses, used_count, expires_at, is_active
+            FROM promo_codes
+            WHERE code = $1
+            FOR UPDATE
+            """,
+            promo_code,
+        )
+        if promo is None:
+            log.warning(
+                "Promo code %r vanished between invoice creation and SUCCESS "
+                "(transaction_id=%d, telegram_id=%d). Crediting without bonus.",
+                promo_code, transaction_id, telegram_id,
+            )
+            return 0.0
+        if not promo["is_active"]:
+            log.warning(
+                "Promo code %r deactivated before SUCCESS for txn %d.",
+                promo_code, transaction_id,
+            )
+            return 0.0
+        if promo["expires_at"] is not None:
+            now = await connection.fetchval("SELECT NOW()")
+            if promo["expires_at"] <= now:
+                log.warning(
+                    "Promo code %r expired before SUCCESS for txn %d.",
+                    promo_code, transaction_id,
+                )
+                return 0.0
+        if (
+            promo["max_uses"] is not None
+            and promo["used_count"] >= promo["max_uses"]
+        ):
+            log.warning(
+                "Promo code %r exhausted before SUCCESS for txn %d.",
+                promo_code, transaction_id,
+            )
+            return 0.0
+
+        # ON CONFLICT DO NOTHING handles webhook replay: a second
+        # 'finished' IPN for the same invoice would otherwise try to
+        # insert a duplicate (promo_code, telegram_id) and re-credit.
+        # The composite PK refuses, so we silently no-op and return 0.
+        inserted = await connection.fetchval(
+            """
+            INSERT INTO promo_usage (
+                promo_code, telegram_id, transaction_id, bonus_usd
+            )
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (promo_code, telegram_id) DO NOTHING
+            RETURNING 1
+            """,
+            promo_code, telegram_id, transaction_id, bonus_usd,
+        )
+        if inserted is None:
+            log.warning(
+                "Promo redemption already recorded for code=%r telegram_id=%d "
+                "(replayed IPN for txn %d). Skipping double-credit.",
+                promo_code, telegram_id, transaction_id,
+            )
+            return 0.0
+        await connection.execute(
+            """
+            UPDATE promo_codes
+            SET used_count = used_count + 1
+            WHERE code = $1
+            """,
+            promo_code,
+        )
+        return bonus_usd
+
+    async def create_promo_code(
+        self,
+        code: str,
+        *,
+        discount_percent: int | None = None,
+        discount_amount: float | None = None,
+        max_uses: int | None = None,
+        expires_at=None,
+    ) -> bool:
+        """Insert a new promo code. Returns False on conflict.
+
+        Mainly intended for admin use (P2-6 will add a Telegram-side
+        admin command). Validates the percent/amount XOR client-side
+        for a friendlier error than the DB CHECK constraint.
+        """
+        if (discount_percent is None) == (discount_amount is None):
+            raise ValueError(
+                "Exactly one of discount_percent / discount_amount must be set"
+            )
+        if discount_percent is not None and not (1 <= discount_percent <= 100):
+            raise ValueError("discount_percent must be between 1 and 100")
+        if discount_amount is not None and discount_amount <= 0:
+            raise ValueError("discount_amount must be positive")
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchval(
+                """
+                INSERT INTO promo_codes (
+                    code, discount_percent, discount_amount,
+                    max_uses, expires_at
+                )
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (code) DO NOTHING
+                RETURNING code
+                """,
+                code, discount_percent, discount_amount,
+                max_uses, expires_at,
+            )
+        return row is not None
+
 
 # Export a single instance to be used across the app
 db = Database()

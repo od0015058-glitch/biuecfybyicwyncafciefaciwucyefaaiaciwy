@@ -60,6 +60,8 @@ async def create_crypto_invoice(
     amount_usd: float,
     currency: str,
     max_retries: int = 3,
+    promo_code: str | None = None,
+    promo_bonus_usd: float = 0.0,
 ):
     url = "https://api.nowpayments.io/v1/payment"
     headers = {
@@ -115,6 +117,8 @@ async def create_crypto_invoice(
                                 amount_crypto=float(data.get("pay_amount")),
                                 amount_usd=float(amount_usd),
                                 gateway_invoice_id=str(payment_id),
+                                promo_code=promo_code,
+                                promo_bonus_usd=float(promo_bonus_usd),
                             )
                         except Exception:
                             log.exception(
@@ -270,6 +274,7 @@ async def payment_webhook(request: web.Request):
             telegram_id = row["telegram_id"]
             delta_credited = float(row["delta_credited"])
             total_credited = float(row["amount_usd_credited"])
+            bonus_credited = float(row.get("promo_bonus_credited") or 0.0)
 
             # Best-effort user notification. The wallet has already been
             # credited in finalize_payment; a Telegram error must not cause us
@@ -285,15 +290,20 @@ async def payment_webhook(request: web.Request):
                 # partially_paid covered the full price). Just close the
                 # loop with the user.
                 msg = t(lang, "pay_credited_total_only", total=total_credited)
+            if bonus_credited > 0:
+                msg = msg + "\n\n" + t(
+                    lang, "pay_promo_bonus", bonus=bonus_credited
+                )
             try:
                 await bot.send_message(chat_id=telegram_id, text=msg)
             except Exception:
                 log.exception(
                     "Failed to notify user %d about credit of $%s "
-                    "(delta=$%.4f)",
+                    "(delta=$%.4f, promo_bonus=$%.4f)",
                     telegram_id,
                     total_credited,
                     delta_credited,
+                    bonus_credited,
                 )
 
         elif status in _TERMINAL_FAILURE_STATUSES:
