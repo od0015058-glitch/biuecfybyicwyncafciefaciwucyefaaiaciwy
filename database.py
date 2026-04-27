@@ -142,77 +142,152 @@ class Database:
     async def finalize_partial_payment(
         self, gateway_invoice_id: str, actually_paid_usd: float
     ):
-        """Atomically finalize an under-paid (partially_paid) transaction.
+        """Atomically finalize / top-up an under-paid (partially_paid) transaction.
 
-        Updates the ledger row's amount_usd_credited to the actually-paid USD
-        value (which is less than the originally requested price_amount),
-        flips status to 'PARTIAL', and credits the user's wallet by that
-        same amount — all in one DB transaction so a crash between the two
-        cannot leave us with an inconsistent ledger.
+        Accepts both PENDING (first partially_paid IPN) and PARTIAL
+        (a follow-up partially_paid IPN where the user paid more but
+        still less than the full invoice). NowPayments reports the
+        cumulative actually_paid in each IPN, so on a follow-up we credit
+        only the delta between the new total and what we've already
+        credited.
 
-        Returns the updated row (telegram_id, currency_used,
-        amount_usd_credited) if the flip happened, or None if the
-        transaction was unknown or already in a non-PENDING state.
-        Idempotent against retries.
-        """
-        flip_query = """
-            UPDATE transactions
-            SET status = 'PARTIAL',
-                amount_usd_credited = $2,
-                completed_at = CURRENT_TIMESTAMP
-            WHERE gateway_invoice_id = $1 AND status = 'PENDING'
-            RETURNING telegram_id, currency_used, amount_usd_credited
-        """
-        credit_query = """
-            UPDATE users
-            SET balance_usd = balance_usd + $1
-            WHERE telegram_id = $2
+        Either way the row ends up with status='PARTIAL' and
+        amount_usd_credited equal to the new cumulative credited total.
+        The status flip, the row update and the wallet credit all happen
+        in one DB transaction, so a crash anywhere in the middle leaves
+        the row recoverable on retry.
+
+        Returns a row dict (telegram_id, currency_used, amount_usd_credited,
+        delta_credited) on success, or None if the transaction is unknown
+        or already in a non-PENDING/non-PARTIAL terminal state. Idempotent:
+        a replayed IPN with the same actually_paid_usd will return the row
+        with delta_credited == 0.
         """
         async with self.pool.acquire() as connection:
             async with connection.transaction():
                 row = await connection.fetchrow(
-                    flip_query, gateway_invoice_id, actually_paid_usd
+                    """
+                    SELECT telegram_id, status, currency_used, amount_usd_credited
+                    FROM transactions
+                    WHERE gateway_invoice_id = $1
+                    FOR UPDATE
+                    """,
+                    gateway_invoice_id,
                 )
-                if row is None:
+                if row is None or row["status"] not in ("PENDING", "PARTIAL"):
                     return None
-                await connection.execute(
-                    credit_query, row["amount_usd_credited"], row["telegram_id"]
+
+                already_credited = (
+                    float(row["amount_usd_credited"])
+                    if row["status"] == "PARTIAL"
+                    else 0.0
                 )
-                return row
+                # max(0, ...) so a replay with a smaller actually_paid_usd
+                # cannot debit the user.
+                delta = max(0.0, actually_paid_usd - already_credited)
 
-    async def finalize_payment(self, gateway_invoice_id: str):
-        """Atomically mark a PENDING transaction SUCCESS *and* credit the user's
-        wallet, in a single DB transaction.
+                await connection.execute(
+                    """
+                    UPDATE transactions
+                    SET status = 'PARTIAL',
+                        amount_usd_credited = $2,
+                        completed_at = CURRENT_TIMESTAMP
+                    WHERE gateway_invoice_id = $1
+                    """,
+                    gateway_invoice_id,
+                    actually_paid_usd,
+                )
+                if delta > 0:
+                    await connection.execute(
+                        """
+                        UPDATE users
+                        SET balance_usd = balance_usd + $1
+                        WHERE telegram_id = $2
+                        """,
+                        delta,
+                        row["telegram_id"],
+                    )
+                return {
+                    "telegram_id": row["telegram_id"],
+                    "currency_used": row["currency_used"],
+                    "amount_usd_credited": actually_paid_usd,
+                    "delta_credited": delta,
+                }
 
-        Returns the (telegram_id, amount_usd_credited) row if the update
-        happened, or None if the transaction was already finalized, not found,
-        or in a non-PENDING state.
+    async def finalize_payment(
+        self, gateway_invoice_id: str, full_price_usd: float
+    ):
+        """Atomically mark a PENDING / PARTIAL transaction SUCCESS *and* credit
+        any remaining USD owed to the user's wallet, in one DB transaction.
+
+        Accepts:
+          - PENDING: first delivery of a 'finished' IPN. Credits the full
+            invoice amount.
+          - PARTIAL: follow-up 'finished' IPN that arrives after a
+            partially_paid IPN already credited some of the funds. Credits
+            only the delta between the full invoice and what was already
+            credited, so the user is made whole without double-crediting.
+
+        Returns a row dict (telegram_id, amount_usd_credited, delta_credited)
+        on success, or None if the transaction is unknown or already in a
+        terminal non-PENDING/non-PARTIAL state. Idempotent against replays
+        via the FOR UPDATE lock + status check.
 
         The status flip and the wallet credit must happen in the same DB
-        transaction: otherwise a crash or DB error between them would mark the
-        ledger SUCCESS but leave the user uncredited, and webhook retries
-        would forever skip crediting (status is no longer PENDING).
-        """
-        flip_query = """
-            UPDATE transactions
-            SET status = 'SUCCESS', completed_at = CURRENT_TIMESTAMP
-            WHERE gateway_invoice_id = $1 AND status = 'PENDING'
-            RETURNING telegram_id, amount_usd_credited
-        """
-        credit_query = """
-            UPDATE users
-            SET balance_usd = balance_usd + $1
-            WHERE telegram_id = $2
+        transaction: otherwise a crash or DB error between them would mark
+        the ledger SUCCESS but leave the user uncredited, and webhook
+        retries would forever skip crediting (status is no longer PENDING).
         """
         async with self.pool.acquire() as connection:
             async with connection.transaction():
-                row = await connection.fetchrow(flip_query, gateway_invoice_id)
-                if row is None:
-                    return None
-                await connection.execute(
-                    credit_query, row["amount_usd_credited"], row["telegram_id"]
+                row = await connection.fetchrow(
+                    """
+                    SELECT telegram_id, status, amount_usd_credited
+                    FROM transactions
+                    WHERE gateway_invoice_id = $1
+                    FOR UPDATE
+                    """,
+                    gateway_invoice_id,
                 )
-                return row
+                if row is None or row["status"] not in ("PENDING", "PARTIAL"):
+                    return None
+
+                already_credited = (
+                    float(row["amount_usd_credited"])
+                    if row["status"] == "PARTIAL"
+                    else 0.0
+                )
+                # max(0, ...) is defense in depth: if a buggy IPN reports
+                # full_price_usd below the already-credited amount, we must
+                # not debit the user.
+                delta = max(0.0, full_price_usd - already_credited)
+
+                await connection.execute(
+                    """
+                    UPDATE transactions
+                    SET status = 'SUCCESS',
+                        amount_usd_credited = $2,
+                        completed_at = CURRENT_TIMESTAMP
+                    WHERE gateway_invoice_id = $1
+                    """,
+                    gateway_invoice_id,
+                    full_price_usd,
+                )
+                if delta > 0:
+                    await connection.execute(
+                        """
+                        UPDATE users
+                        SET balance_usd = balance_usd + $1
+                        WHERE telegram_id = $2
+                        """,
+                        delta,
+                        row["telegram_id"],
+                    )
+                return {
+                    "telegram_id": row["telegram_id"],
+                    "amount_usd_credited": full_price_usd,
+                    "delta_credited": delta,
+                }
 
 # Export a single instance to be used across the app
 db = Database()
