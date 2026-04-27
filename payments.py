@@ -84,34 +84,21 @@ def _verify_ipn_signature(raw_body: bytes, signature_header: str | None) -> bool
     return hmac.compare_digest(expected, signature_header.lower())
 
 
-async def get_min_amount_usd(pay_currency: str) -> float | None:
-    """Fetch (and cache) the USD minimum NowPayments will accept for *pay_currency*.
+async def _query_min_amount(
+    currency_from: str, currency_to: str
+) -> float | None:
+    """Single ``GET /v1/min-amount`` call returning ``fiat_equivalent`` (USD).
 
-    Calls ``GET /v1/min-amount?currency_from=<pay_currency>&currency_to=usd&fiat_equivalent=usd``
-    and returns the ``fiat_equivalent`` field — the USD value that the
-    minimum payable crypto amount converts to. We hit this only on the
-    error path (after a "amountTo is too small" rejection) so users on
-    the happy path never wait on it.
-
-    Cached per-currency for ``_MIN_AMOUNT_CACHE_TTL_SECONDS`` so a
-    second user picking the same too-small currency doesn't re-roundtrip.
-    Returns ``None`` on any network error, non-2xx, or malformed JSON.
+    Returns ``None`` on any failure (network error, non-2xx, malformed
+    JSON, missing field). The caller decides what to do with that.
     """
-    pay_currency = pay_currency.lower()
-    cached = _min_amount_cache.get(pay_currency)
-    if cached is not None:
-        value, ts = cached
-        if (asyncio.get_event_loop().time() - ts) < _MIN_AMOUNT_CACHE_TTL_SECONDS:
-            return value
-
     url = "https://api.nowpayments.io/v1/min-amount"
     params = {
-        "currency_from": pay_currency,
-        "currency_to": "usd",
+        "currency_from": currency_from,
+        "currency_to": currency_to,
         "fiat_equivalent": "usd",
     }
     headers = {"x-api-key": NOWPAYMENTS_API_KEY} if NOWPAYMENTS_API_KEY else {}
-
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -123,23 +110,82 @@ async def get_min_amount_usd(pay_currency: str) -> float | None:
                 if response.status != 200:
                     body = await response.text()
                     log.warning(
-                        "min-amount lookup for %s returned %d: %s",
-                        pay_currency, response.status, body,
+                        "min-amount lookup %s->%s returned %d: %s",
+                        currency_from, currency_to, response.status, body,
                     )
                     return None
                 data = await response.json()
     except (asyncio.TimeoutError, aiohttp.ClientError):
-        log.warning("min-amount lookup for %s timed out / network error", pay_currency)
+        log.warning(
+            "min-amount lookup %s->%s timed out / network error",
+            currency_from, currency_to,
+        )
         return None
     except Exception:
-        log.exception("Unexpected error in min-amount lookup for %s", pay_currency)
+        log.exception(
+            "Unexpected error in min-amount lookup %s->%s",
+            currency_from, currency_to,
+        )
         return None
 
     fiat = data.get("fiat_equivalent")
     try:
-        value = float(fiat) if fiat is not None else None
+        return float(fiat) if fiat is not None else None
     except (TypeError, ValueError):
+        return None
+
+
+async def get_min_amount_usd(
+    pay_currency: str, *, attempted_usd: float | None = None
+) -> float | None:
+    """Best-effort USD floor for an invoice paid in *pay_currency*.
+
+    NowPayments' ``/v1/min-amount`` is asymmetric and a bit
+    misleading: ``<crypto> -> usd`` typically reflects the *conversion*
+    floor (~tens of cents — "smallest crypto amount we'll convert to
+    USD") and NOT the floor that ``POST /v1/payment`` enforces on the
+    merchant settlement side. Asking the merchant-side question
+    (``usd -> <crypto>``) gives us a more honest "smallest invoice
+    this provider will accept" value.
+
+    We try both directions and return the *larger* of the two as the
+    user-facing minimum. If the API returns a value that's clearly
+    inconsistent with the rejection we just saw — i.e. the floor is
+    *less than* the amount the user actually attempted — we treat
+    the lookup as untrustworthy and return ``None`` so the handler
+    falls back to the generic "min not met for <currency>" message
+    instead of misleading the user with e.g. "$0.16".
+
+    The combined result is cached per pay_currency for
+    ``_MIN_AMOUNT_CACHE_TTL_SECONDS`` so re-prompts after a rejection
+    don't fan out two more HTTP calls.
+    """
+    pay_currency = pay_currency.lower()
+    cached = _min_amount_cache.get(pay_currency)
+    if cached is not None:
+        value, ts = cached
+        if (asyncio.get_event_loop().time() - ts) < _MIN_AMOUNT_CACHE_TTL_SECONDS:
+            return value
+
+    pay_side = await _query_min_amount(pay_currency, "usd")
+    merchant_side = await _query_min_amount("usd", pay_currency)
+    candidates = [v for v in (pay_side, merchant_side) if v is not None]
+    value = max(candidates) if candidates else None
+
+    # If the user's attempted amount was already above the value we
+    # got back, then by definition this isn't the floor that
+    # actually triggered the rejection — surfacing it would tell the
+    # user e.g. "min $0.16" when their $5 invoice was rejected.
+    # Suppress the number so the "unknown min" branch of the UI fires
+    # (clear language, no false precision).
+    if value is not None and attempted_usd is not None and value < attempted_usd:
+        log.warning(
+            "min-amount lookup for %s gave $%.2f which is below the rejected "
+            "invoice amount $%.2f; suppressing as untrustworthy",
+            pay_currency, value, attempted_usd,
+        )
         value = None
+
     _min_amount_cache[pay_currency] = (value, asyncio.get_event_loop().time())
     return value
 
@@ -235,7 +281,9 @@ async def create_crypto_invoice(
                         response.status == 400
                         and "amountTo is too small" in error_text
                     ):
-                        min_usd = await get_min_amount_usd(currency)
+                        min_usd = await get_min_amount_usd(
+                            currency, attempted_usd=float(amount_usd)
+                        )
                         raise MinAmountError(currency=currency, min_usd=min_usd)
 
         except MinAmountError:

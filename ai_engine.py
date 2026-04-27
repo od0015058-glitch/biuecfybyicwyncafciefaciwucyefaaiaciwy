@@ -62,6 +62,17 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
                         "OpenRouter HTTP %d for user %d model=%s: %s",
                         response.status, telegram_id, active_model, body,
                     )
+                    # 429 from OpenRouter most often comes from a free
+                    # model whose upstream provider (Google AI Studio,
+                    # Cerebras, etc.) is rate-limiting that specific
+                    # slug — usually the ":free" tier. Generic
+                    # "provider unavailable" obscures the actionable
+                    # advice ("pick a paid model or wait"). Detect the
+                    # ":free" suffix to give a more honest message.
+                    if response.status == 429:
+                        if active_model.endswith(":free"):
+                            return t(lang, "ai_rate_limited_free")
+                        return t(lang, "ai_rate_limited")
                     return t(lang, "ai_provider_unavailable")
                 
                 data = await response.json()

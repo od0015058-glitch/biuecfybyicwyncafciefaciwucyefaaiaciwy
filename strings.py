@@ -112,9 +112,16 @@ _STRINGS: dict[str, dict[str, str]] = {
         "btn_models_prev_page": "◀️ قبلی",
         "btn_models_next_page": "بعدی ▶️",
         "btn_models_others": "🌐 سایر شرکت‌ها",
+        "btn_models_free": "🆓 مدل‌های رایگان",
         "models_others_title": (
             "🌐 **سایر شرکت‌ها**\n\n"
             "ارائه‌دهندگان دیگر مدل‌های متنی را انتخاب کنید.\n"
+            "صفحه {page} از {total_pages}"
+        ),
+        "models_free_title": (
+            "🆓 **مدل‌های رایگان**\n\n"
+            "این مدل‌ها بدون هزینه پاسخ می‌دهند ولی ارائه‌دهنده بالادستی ممکن است درخواست‌ها را محدود کند.\n"
+            "مدل فعلی: `{active_model}`\n"
             "صفحه {page} از {total_pages}"
         ),
         # ---- Wallet ----
@@ -167,12 +174,20 @@ _STRINGS: dict[str, dict[str, str]] = {
         ),
         "charge_min_amount_unknown": (
             "❌ مبلغ شما برای {currency} کمتر از حداقل قابل پرداخت است.\n"
-            "لطفاً ارز دیگری انتخاب کنید یا مبلغ بیشتری وارد کنید."
+            "لطفاً مبلغ ۱۰ دلار یا بیشتر را امتحان کنید یا ارز دیگری انتخاب کنید."
         ),
         # ---- AI engine error replies ----
         "ai_no_account": "❌ حساب کاربری شما یافت نشد. لطفا ابتدا ربات را /start کنید.",
         "ai_insufficient_balance": "⚠️ اعتبار شما کافی نیست. لطفا از منوی کیف پول، حساب خود را شارژ کنید.",
         "ai_provider_unavailable": "❌ سرور هوش مصنوعی موقتاً در دسترس نیست. لطفاً دوباره تلاش کنید.",
+        "ai_rate_limited": (
+            "⏳ این مدل در حال حاضر در سمت سرور با محدودیت نرخ مواجه شده است.\n"
+            "لطفاً چند ثانیه صبر کنید یا مدل دیگری انتخاب کنید."
+        ),
+        "ai_rate_limited_free": (
+            "⏳ این مدل *رایگان* الآن بیش از حد در حال استفاده است و توسط ارائه‌دهنده بالادستی محدود شده است.\n"
+            "برای داشتن پاسخ بدون انتظار، یک مدل پولی را انتخاب کنید یا یک-دو دقیقه دیگر صبر کنید."
+        ),
         "ai_transient_error": "❌ خطای ارتباطی موقت رخ داد. لطفاً چند لحظه دیگر دوباره تلاش کنید.",
         # ---- Payment notifications ----
         "pay_credited_full": "✅ پرداخت تایید شد! مبلغ ${delta:.4f} به حساب شما اضافه شد.",
@@ -334,6 +349,13 @@ _STRINGS: dict[str, dict[str, str]] = {
         "btn_models_prev_page": "◀️ Prev",
         "btn_models_next_page": "Next ▶️",
         "btn_models_others": "🌐 Others",
+        "btn_models_free": "🆓 Free models",
+        "models_free_title": (
+            "🆓 **Free models**\n\n"
+            "These models reply at no cost, but the upstream provider may rate-limit requests.\n"
+            "Active model: `{active_model}`\n"
+            "Page {page} of {total_pages}"
+        ),
         "models_others_title": (
             "🌐 **Other providers**\n\n"
             "Pick a provider to see its text models.\n"
@@ -389,12 +411,20 @@ _STRINGS: dict[str, dict[str, str]] = {
         ),
         "charge_min_amount_unknown": (
             "❌ Your amount is below the minimum payable for {currency}.\n"
-            "Please pick a different currency or a higher amount."
+            "Please try $10 or more, or pick a different currency."
         ),
         # ---- AI engine error replies ----
         "ai_no_account": "❌ Your account was not found. Please /start the bot first.",
         "ai_insufficient_balance": "⚠️ Insufficient balance. Please top up from the wallet menu.",
         "ai_provider_unavailable": "❌ AI provider is temporarily unavailable. Please try again.",
+        "ai_rate_limited": (
+            "⏳ This model is currently rate-limited upstream.\n"
+            "Please wait a few seconds or pick a different model."
+        ),
+        "ai_rate_limited_free": (
+            "⏳ This *free* model is being heavily used and the upstream provider is rate-limiting it.\n"
+            "For an immediate reply, pick a paid model — or try again in a minute."
+        ),
         "ai_transient_error": "❌ A temporary connectivity error occurred. Please try again in a moment.",
         # ---- Payment notifications ----
         "pay_credited_full": "✅ Payment confirmed! ${delta:.4f} has been added to your wallet.",
