@@ -15,7 +15,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from ai_engine import chat_with_model
 from database import db
 from models_catalog import CatalogModel, get_catalog
-from payments import create_crypto_invoice
+from payments import MinAmountError, create_crypto_invoice
 from strings import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, all_button_labels, t
 
 log = logging.getLogger("bot.handlers")
@@ -685,6 +685,24 @@ async def process_custom_currency_selection(callback: CallbackQuery, state: FSMC
             promo_code=promo_code,
             promo_bonus_usd=promo_bonus_usd,
         )
+    except MinAmountError as e:
+        builder = InlineKeyboardBuilder()
+        builder.button(text=t(lang, "btn_retry"), callback_data="add_crypto")
+        builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+        builder.adjust(2)
+        if e.min_usd is not None:
+            text = t(
+                lang, "charge_min_amount_with_min",
+                currency=e.currency.upper(), min_usd=e.min_usd,
+            )
+        else:
+            text = t(
+                lang, "charge_min_amount_unknown",
+                currency=e.currency.upper(),
+            )
+        await callback.message.edit_text(text, reply_markup=builder.as_markup())
+        await callback.answer()
+        return
     except Exception:
         log.exception(
             "Failed to create custom-amount invoice for user %d", callback.from_user.id
@@ -761,6 +779,24 @@ async def process_final_invoice(callback: CallbackQuery, state: FSMContext):
             promo_code=promo_code,
             promo_bonus_usd=promo_bonus_usd,
         )
+    except MinAmountError as e:
+        builder = InlineKeyboardBuilder()
+        builder.button(text=t(lang, "btn_back_to_wallet"), callback_data="back_to_wallet")
+        builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+        builder.adjust(2)
+        if e.min_usd is not None:
+            text = t(
+                lang, "charge_min_amount_with_min",
+                currency=e.currency.upper(), min_usd=e.min_usd,
+            )
+        else:
+            text = t(
+                lang, "charge_min_amount_unknown",
+                currency=e.currency.upper(),
+            )
+        await callback.message.edit_text(text, reply_markup=builder.as_markup())
+        await callback.answer()
+        return
     except Exception:
         log.exception("Failed to create invoice for user %d", callback.from_user.id)
         builder = InlineKeyboardBuilder()

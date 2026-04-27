@@ -117,6 +117,14 @@ _STRINGS: dict[str, dict[str, str]] = {
             "تنظیمات پنل ناوپیمنتس را چک کنید."
         ),
         "charge_invoice_error": "❌ ایجاد فاکتور با خطا مواجه شد. لطفاً دوباره تلاش کنید.",
+        "charge_min_amount_with_min": (
+            "❌ حداقل مبلغ قابل پرداخت برای {currency} برابر است با ${min_usd:.2f}.\n"
+            "لطفاً مبلغ بیشتری وارد کنید یا ارز دیگری انتخاب کنید."
+        ),
+        "charge_min_amount_unknown": (
+            "❌ مبلغ شما برای {currency} کمتر از حداقل قابل پرداخت است.\n"
+            "لطفاً ارز دیگری انتخاب کنید یا مبلغ بیشتری وارد کنید."
+        ),
         # ---- AI engine error replies ----
         "ai_no_account": "❌ حساب کاربری شما یافت نشد. لطفا ابتدا ربات را /start کنید.",
         "ai_insufficient_balance": "⚠️ اعتبار شما کافی نیست. لطفا از منوی کیف پول، حساب خود را شارژ کنید.",
@@ -286,6 +294,14 @@ _STRINGS: dict[str, dict[str, str]] = {
             "Check your NowPayments dashboard configuration."
         ),
         "charge_invoice_error": "❌ Invoice creation failed. Please try again.",
+        "charge_min_amount_with_min": (
+            "❌ The minimum payable amount for {currency} is ${min_usd:.2f}.\n"
+            "Please pick a higher amount or a different currency."
+        ),
+        "charge_min_amount_unknown": (
+            "❌ Your amount is below the minimum payable for {currency}.\n"
+            "Please pick a different currency or a higher amount."
+        ),
         # ---- AI engine error replies ----
         "ai_no_account": "❌ Your account was not found. Please /start the bot first.",
         "ai_insufficient_balance": "⚠️ Insufficient balance. Please top up from the wallet menu.",
