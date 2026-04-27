@@ -1016,9 +1016,9 @@ async def _render_charge_pick_amount(message, lang: str, state: FSMContext) -> N
     banner = _promo_banner(lang, data)
 
     builder = InlineKeyboardBuilder()
+    builder.button(text=t(lang, "btn_amt_5"), callback_data="amt_5")
     builder.button(text=t(lang, "btn_amt_10"), callback_data="amt_10")
     builder.button(text=t(lang, "btn_amt_25"), callback_data="amt_25")
-    builder.button(text=t(lang, "btn_amt_50"), callback_data="amt_50")
     builder.button(text=t(lang, "btn_amt_custom"), callback_data="amt_custom")
     if banner:
         # Promo applied → offer removal in place of add.
@@ -1190,7 +1190,7 @@ async def process_custom_amount_input(message: Message, state: FSMContext):
         await message.answer(t(lang, "charge_custom_invalid"))
         return
 
-    if amount < 10:
+    if amount < 5:
         await message.answer(t(lang, "charge_custom_min_error"))
         return
 

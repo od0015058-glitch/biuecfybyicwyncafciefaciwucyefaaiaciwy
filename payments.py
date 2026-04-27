@@ -210,7 +210,16 @@ async def create_crypto_invoice(
         "order_id": str(telegram_id),
         "order_description": "شارژ کیف پول",
         "ipn_callback_url": CALLBACK_URL,
+        # is_fee_paid_by_user pushes the gateway service fee onto
+        # the payer; without it, NowPayments adds the fee to the
+        # merchant-side floor and lower-value invoices get rejected.
         "is_fee_paid_by_user": True,
+        # is_fixed_rate locks the conversion rate at invoice time,
+        # which lets NowPayments skip the slippage buffer they
+        # otherwise add to the per-currency minimum. Combined with
+        # is_fee_paid_by_user, this is the standard low-minimum
+        # invoice config used by other Telegram crypto bots.
+        "is_fixed_rate": True,
     }
 
     for attempt in range(max_retries):
