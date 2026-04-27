@@ -436,6 +436,48 @@ _MODELS_PER_PAGE = 8
 _OTHERS_PER_PAGE = 8
 _CB_MAX_BYTES = 60  # leave 4 bytes of headroom under Telegram's 64-byte cap
 
+# Telegram caps each ``sendMessage`` body at 4096 characters; longer
+# payloads come back as ``TelegramBadRequest: message is too long``.
+# We sit a touch below that (4000) so we never have to worry about
+# multi-byte UTF-8 inflating the wire size past the limit.
+_TELEGRAM_MAX_MSG_CHARS = 4000
+
+
+def _split_for_telegram(text: str, limit: int) -> list[str]:
+    """Split *text* into chunks no longer than *limit* characters.
+
+    Tries paragraph boundaries (``\\n\\n``) first, then line breaks,
+    then word boundaries, then a hard cut. The goal is to never cut
+    mid-word and to keep semantic units (code blocks, paragraphs)
+    intact when there's room. Empty inputs return a single empty
+    string so the calling code still emits one message.
+    """
+    if not text:
+        return [""]
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        # Prefer paragraph break, then newline, then space.
+        for sep in ("\n\n", "\n", " "):
+            cut = window.rfind(sep)
+            if cut > limit // 2:
+                # Drop the separator from the head of the next chunk
+                # to avoid leading whitespace lines.
+                chunks.append(remaining[:cut])
+                remaining = remaining[cut + len(sep):]
+                break
+        else:
+            # No good break point in the window — hard cut.
+            chunks.append(window)
+            remaining = remaining[limit:]
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
 # P3-4: prominent providers get their own top-level button on the
 # provider list. Everything else funnels into "🌐 Others" — a paginated
 # secondary screen. The user explicitly asked for this curation
@@ -974,9 +1016,9 @@ async def _render_charge_pick_amount(message, lang: str, state: FSMContext) -> N
     banner = _promo_banner(lang, data)
 
     builder = InlineKeyboardBuilder()
-    builder.button(text=t(lang, "btn_amt_5"), callback_data="amt_5")
     builder.button(text=t(lang, "btn_amt_10"), callback_data="amt_10")
-    builder.button(text=t(lang, "btn_amt_20"), callback_data="amt_20")
+    builder.button(text=t(lang, "btn_amt_25"), callback_data="amt_25")
+    builder.button(text=t(lang, "btn_amt_50"), callback_data="amt_50")
     builder.button(text=t(lang, "btn_amt_custom"), callback_data="amt_custom")
     if banner:
         # Promo applied → offer removal in place of add.
@@ -1148,7 +1190,7 @@ async def process_custom_amount_input(message: Message, state: FSMContext):
         await message.answer(t(lang, "charge_custom_invalid"))
         return
 
-    if amount < 5:
+    if amount < 10:
         await message.answer(t(lang, "charge_custom_min_error"))
         return
 
@@ -1378,4 +1420,11 @@ async def process_chat(message: Message):
 
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     reply = await chat_with_model(message.from_user.id, message.text)
-    await message.answer(reply)
+    # Telegram caps a single message at 4096 characters. Long-form
+    # AI replies (essay-style answers, code blocks, etc.) routinely
+    # exceed that and were crashing the send with
+    # ``TelegramBadRequest: message is too long``. Chunk on a
+    # paragraph / line / hard boundary, in that order, so the split
+    # falls on a natural break when possible.
+    for chunk in _split_for_telegram(reply, _TELEGRAM_MAX_MSG_CHARS):
+        await message.answer(chunk)

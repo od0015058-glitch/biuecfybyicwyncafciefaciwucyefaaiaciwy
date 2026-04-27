@@ -134,18 +134,18 @@ _STRINGS: dict[str, dict[str, str]] = {
         # ---- Charge wallet flow ----
         "charge_pick_amount": (
             "💰 مبلغ شارژ را انتخاب کنید:\n\n"
-            "💡 حداقل مبلغ: $5"
+            "💡 حداقل مبلغ: $10"
         ),
-        "btn_amt_5": "💵 $5",
         "btn_amt_10": "💵 $10",
-        "btn_amt_20": "💵 $20",
+        "btn_amt_25": "💵 $25",
+        "btn_amt_50": "💵 $50",
         "btn_amt_custom": "✏️ مبلغ دلخواه",
         "charge_custom_prompt": (
             "✏️ مبلغ دلخواه خود را وارد کنید:\n\n"
-            "💡 حداقل: $5\n"
+            "💡 حداقل: $10\n"
             "💡 مثال: 15 یا 25.5"
         ),
-        "charge_custom_min_error": "❌ حداقل مبلغ $5 است.",
+        "charge_custom_min_error": "❌ حداقل مبلغ $10 است.",
         "charge_custom_invalid": "❌ لطفاً یک عدد معتبر وارد کنید (مثال: 15 یا 20.5)",
         "charge_custom_amount_saved": (
             "💵 مبلغ ${amount:.2f} ثبت شد.\n\n🪙 ارز مورد نظر را انتخاب کنید:"
@@ -371,18 +371,18 @@ _STRINGS: dict[str, dict[str, str]] = {
         # ---- Charge wallet flow ----
         "charge_pick_amount": (
             "💰 Choose a top-up amount:\n\n"
-            "💡 Minimum: $5"
+            "💡 Minimum: $10"
         ),
-        "btn_amt_5": "💵 $5",
         "btn_amt_10": "💵 $10",
-        "btn_amt_20": "💵 $20",
+        "btn_amt_25": "💵 $25",
+        "btn_amt_50": "💵 $50",
         "btn_amt_custom": "✏️ Custom amount",
         "charge_custom_prompt": (
             "✏️ Enter your custom amount:\n\n"
-            "💡 Minimum: $5\n"
+            "💡 Minimum: $10\n"
             "💡 Examples: 15 or 25.5"
         ),
-        "charge_custom_min_error": "❌ Minimum amount is $5.",
+        "charge_custom_min_error": "❌ Minimum amount is $10.",
         "charge_custom_invalid": "❌ Please enter a valid number (example: 15 or 20.5).",
         "charge_custom_amount_saved": (
             "💵 ${amount:.2f} saved.\n\n🪙 Pick your currency:"
