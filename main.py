@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 
 from database import db
 from handlers import router
+from middlewares import UserUpsertMiddleware
 from payments import payment_webhook
 
 load_dotenv()
@@ -38,6 +39,15 @@ async def start_webhook_server(bot: Bot) -> web.AppRunner:
 async def main():
     bot = Bot(token=os.getenv("BOT_TOKEN"))
     dp = Dispatcher()
+
+    # Upsert ``users`` row before every handler runs so anything that
+    # FK-references ``users.telegram_id`` (e.g. ``transactions``) never
+    # hits ``transactions_telegram_id_fkey`` for a Telegram client that
+    # tapped a button without re-sending /start.
+    upsert = UserUpsertMiddleware()
+    dp.message.outer_middleware(upsert)
+    dp.callback_query.outer_middleware(upsert)
+
     dp.include_router(router)
 
     await db.connect()
