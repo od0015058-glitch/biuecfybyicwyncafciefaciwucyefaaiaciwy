@@ -47,6 +47,36 @@ class CatalogModel:
     price: ModelPrice
 
 
+# Substrings in model ids that flag the model as one we never want to
+# show in the picker even if its OpenRouter ``output_modalities`` is
+# pure text. The user explicitly asked us not to surface ``codex``
+# variants — they exist alongside chat models and are expensive
+# specialised checkpoints. We deliberately do NOT filter ``coder`` /
+# ``code-fast`` because the user listed Qwen3 Coder and Grok Code Fast
+# in their model whitelist; only the literal ``codex`` slug is excluded.
+_EXCLUDED_ID_KEYWORDS: tuple[str, ...] = ("codex",)
+
+
+def _is_text_only_chat(entry: dict) -> bool:
+    """True if this OpenRouter entry is a text-in-text-out chat model.
+
+    OpenRouter's ``architecture.output_modalities`` is a list with one
+    or more of ``"text"``, ``"image"``, ``"audio"``. We require the
+    output to be *exactly* ``["text"]`` — anything that produces an
+    image or audio payload is unsupported by our Telegram bot today
+    (we'd have to download + forward the artefact, which is its own
+    feature). Multi-modal *input* (``["text", "image"]``) is fine —
+    the user can still send text and the model still replies with text.
+    """
+    arch = entry.get("architecture") or {}
+    out = arch.get("output_modalities") or []
+    if not isinstance(out, list):
+        return False
+    # Tuple set comparison is the simplest way to spell "is exactly
+    # the singleton ['text']" without caring about ordering.
+    return tuple(sorted(out)) == ("text",)
+
+
 @dataclass
 class Catalog:
     """Snapshot of the OpenRouter catalog."""
@@ -133,10 +163,25 @@ async def _fetch_from_openrouter() -> Catalog:
     raw_models = payload.get("data") or []
     models: list[CatalogModel] = []
     skipped_no_pricing = 0
+    skipped_modality = 0
+    skipped_excluded_keyword = 0
     for entry in raw_models:
         model_id = entry.get("id")
         if not isinstance(model_id, str) or "/" not in model_id:
             continue
+
+        # P3-4 filter: drop models that don't fit our Telegram chat UX.
+        # We only render text-in-text-out chat models; image/audio
+        # output models would require artefact upload which we don't
+        # support yet, and the user explicitly asked us not to surface
+        # codex variants in the picker.
+        if not _is_text_only_chat(entry):
+            skipped_modality += 1
+            continue
+        if any(kw in model_id.lower() for kw in _EXCLUDED_ID_KEYWORDS):
+            skipped_excluded_keyword += 1
+            continue
+
         provider = model_id.split("/", 1)[0]
         name = entry.get("name") or model_id
         pricing_dict = entry.get("pricing") or {}
@@ -166,6 +211,17 @@ async def _fetch_from_openrouter() -> Catalog:
         log.info(
             "Dropped %d OpenRouter model(s) from catalog due to missing/malformed pricing",
             skipped_no_pricing,
+        )
+    if skipped_modality:
+        log.info(
+            "Dropped %d OpenRouter model(s) with non-text output (image/audio)",
+            skipped_modality,
+        )
+    if skipped_excluded_keyword:
+        log.info(
+            "Dropped %d OpenRouter model(s) by excluded keyword (%s)",
+            skipped_excluded_keyword,
+            ", ".join(_EXCLUDED_ID_KEYWORDS),
         )
 
     if not models:

@@ -99,6 +99,12 @@ _STRINGS: dict[str, dict[str, str]] = {
         ),
         "btn_models_prev_page": "◀️ قبلی",
         "btn_models_next_page": "بعدی ▶️",
+        "btn_models_others": "🌐 سایر شرکت‌ها",
+        "models_others_title": (
+            "🌐 **سایر شرکت‌ها**\n\n"
+            "ارائه‌دهندگان دیگر مدل‌های متنی را انتخاب کنید.\n"
+            "صفحه {page} از {total_pages}"
+        ),
         # ---- Wallet ----
         "wallet_text": (
             "👛 **کیف پول شما**\n\n"
@@ -302,6 +308,12 @@ _STRINGS: dict[str, dict[str, str]] = {
         ),
         "btn_models_prev_page": "◀️ Prev",
         "btn_models_next_page": "Next ▶️",
+        "btn_models_others": "🌐 Others",
+        "models_others_title": (
+            "🌐 **Other providers**\n\n"
+            "Pick a provider to see its text models.\n"
+            "Page {page} of {total_pages}"
+        ),
         # ---- Wallet ----
         "wallet_text": (
             "👛 **Your wallet**\n\n"

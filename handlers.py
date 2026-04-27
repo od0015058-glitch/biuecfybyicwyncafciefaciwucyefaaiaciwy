@@ -357,11 +357,38 @@ async def set_language_handler(callback: CallbackQuery, state: FSMContext):
 # typically <50 chars, so `sm:<id>` is well under the limit. Any
 # pathologically long id (>62 bytes after prefix) is filtered out.
 _MODELS_PER_PAGE = 8
+_OTHERS_PER_PAGE = 8
 _CB_MAX_BYTES = 60  # leave 4 bytes of headroom under Telegram's 64-byte cap
+
+# P3-4: prominent providers get their own top-level button on the
+# provider list. Everything else funnels into "🌐 Others" — a paginated
+# secondary screen. The user explicitly asked for this curation
+# ("only 5 company providers: OpenAI, Anthropic, DeepSeek, Google, xAI;
+# put others in others tab"). Identifiers below match OpenRouter's
+# slugs — note ``x-ai`` (with hyphen) for xAI, not ``xai``.
+_PROMINENT_PROVIDERS: tuple[str, ...] = (
+    "openai",
+    "anthropic",
+    "google",
+    "x-ai",
+    "deepseek",
+)
+
+# Per-provider icon for the picker buttons. Keys are OpenRouter slugs.
+# Anything missing falls back to the generic 🤖 emoji prefix.
+_PROVIDER_DISPLAY_OVERRIDE: dict[str, str] = {
+    "openai": "🟢 OpenAI",
+    "anthropic": "🟣 Anthropic",
+    "google": "🔵 Google",
+    "x-ai": "⚫ xAI",
+    "deepseek": "🐋 DeepSeek",
+}
 
 
 def _provider_display(provider: str) -> str:
     """Pretty-print a provider id: 'meta-llama' -> 'Meta-Llama'."""
+    if provider in _PROVIDER_DISPLAY_OVERRIDE:
+        return _PROVIDER_DISPLAY_OVERRIDE[provider]
     return "-".join(part.capitalize() for part in provider.split("-")) if provider else provider
 
 
@@ -390,22 +417,33 @@ async def _send_provider_list(
             await message_or_callback.answer(text, reply_markup=builder.as_markup())
         return
 
-    # Sort providers by descending eligible-model count, then by name.
-    # OpenRouter exposes ~50+ providers, most of them niche. Bubbling
-    # the high-count ones (openai, anthropic, google, meta-llama, ...)
-    # to the top puts the popular models within one keypress.
-    provider_counts: list[tuple[str, int]] = []
+    # P3-4: render only the prominent providers as top-level buttons.
+    # Everything else funnels through "🌐 Others" → a paginated screen
+    # of less-popular providers. We still pre-compute eligibility so a
+    # prominent provider with zero eligible chat models (post-modality
+    # filter) doesn't render an empty bucket.
+    eligible_count_by_provider: dict[str, int] = {}
     for provider, ms in catalog.by_provider.items():
         eligible = sum(1 for m in ms if _eligible_model(m))
         if eligible:
-            provider_counts.append((provider, eligible))
-    provider_counts.sort(key=lambda pc: (-pc[1], pc[0]))
+            eligible_count_by_provider[provider] = eligible
 
     builder = InlineKeyboardBuilder()
-    for provider, _count in provider_counts:
+    for provider in _PROMINENT_PROVIDERS:
+        if provider in eligible_count_by_provider:
+            builder.button(
+                text=_provider_display(provider),
+                callback_data=f"mp:{provider}:0",
+            )
+    # Anything that isn't a prominent provider goes under the Others
+    # bucket. We only render the entry button if there's at least one
+    # eligible non-prominent provider — otherwise it's a dead-end click.
+    others_count = sum(
+        1 for p in eligible_count_by_provider if p not in _PROMINENT_PROVIDERS
+    )
+    if others_count:
         builder.button(
-            text=_provider_display(provider),
-            callback_data=f"mp:{provider}:0",
+            text=t(lang, "btn_models_others"), callback_data="op:0"
         )
     _back_to_menu_button(builder, lang)
     builder.adjust(2)  # 2-wide grid for providers, footer auto-wraps
@@ -506,6 +544,78 @@ async def models_back_to_providers(callback: CallbackQuery):
     user = await db.get_user(callback.from_user.id)
     active_model = user["active_model"] if user else "—"
     await _send_provider_list(callback, edit=True, lang=lang, active_model=active_model)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("op:"))
+async def show_others_providers(callback: CallbackQuery):
+    """Paginated list of "non-prominent" providers under the Others bucket.
+
+    P3-4: the main provider list shows only the 5 curated companies
+    (OpenAI, Anthropic, Google, xAI, DeepSeek). Everything else lives
+    here. Each row is one provider; tapping it drops into the existing
+    per-provider model list (``mp:<provider>:0``).
+    """
+    try:
+        page = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Bad data", show_alert=True)
+        return
+
+    lang = await _get_user_language(callback.from_user.id)
+    catalog = await get_catalog()
+
+    # Same eligibility criterion as _send_provider_list — keep behaviour
+    # consistent so a provider showing here actually has tappable
+    # models when the user clicks it.
+    others: list[tuple[str, int]] = []
+    for provider, ms in catalog.by_provider.items():
+        if provider in _PROMINENT_PROVIDERS:
+            continue
+        eligible = sum(1 for m in ms if _eligible_model(m))
+        if eligible:
+            others.append((provider, eligible))
+    others.sort(key=lambda pc: (-pc[1], pc[0]))
+
+    total_pages = max(1, (len(others) + _OTHERS_PER_PAGE - 1) // _OTHERS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * _OTHERS_PER_PAGE
+    page_slice = others[start : start + _OTHERS_PER_PAGE]
+
+    builder = InlineKeyboardBuilder()
+    for provider, count in page_slice:
+        builder.button(
+            text=f"{_provider_display(provider)} ({count})",
+            callback_data=f"mp:{provider}:0",
+        )
+    builder.adjust(1)  # one provider per row in the Others list
+
+    nav = InlineKeyboardBuilder()
+    if page > 0:
+        nav.button(
+            text=t(lang, "btn_models_prev_page"),
+            callback_data=f"op:{page - 1}",
+        )
+    if page < total_pages - 1:
+        nav.button(
+            text=t(lang, "btn_models_next_page"),
+            callback_data=f"op:{page + 1}",
+        )
+    nav.button(text=t(lang, "btn_back"), callback_data="mp_back")
+    nav.button(text=t(lang, "btn_back_to_menu"), callback_data="back_to_hub")
+    nav.adjust(2, 2)
+    for row in nav.export():
+        builder.row(*row)
+
+    title = t(
+        lang,
+        "models_others_title",
+        page=page + 1,
+        total_pages=total_pages,
+    )
+    await callback.message.edit_text(
+        title, reply_markup=builder.as_markup(), parse_mode="Markdown"
+    )
     await callback.answer()
 
 
