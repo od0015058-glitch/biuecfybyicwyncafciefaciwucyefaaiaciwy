@@ -200,18 +200,46 @@ def _compute_actually_paid_usd(data: dict) -> float | None:
     return min(usd, price_amount)
 
 # User-facing notification text per terminal failure status.
+# Two variants per status:
+#   "from_pending": the user paid nothing
+#   "from_partial": the user paid some crypto already and we credited the
+#                   proportional USD when partially_paid arrived; we keep
+#                   that credit and just close the row.
 _TERMINAL_FAILURE_MESSAGES = {
-    "expired": (
-        "⏰ مهلت پرداخت فاکتور شما به پایان رسید و وجهی دریافت نشد. "
-        "اگر می‌خواهید شارژ کنید، لطفاً یک فاکتور جدید ایجاد کنید."
-    ),
-    "failed": (
-        "❌ پرداخت شما ناموفق بود. "
-        "اگر مبلغی از حساب شما کسر شده است، با پشتیبانی تماس بگیرید."
-    ),
-    "refunded": (
-        "↩️ پرداخت شما بازگشت داده شد و به حساب شما اضافه نشد."
-    ),
+    "expired": {
+        "from_pending": (
+            "⏰ مهلت پرداخت فاکتور شما به پایان رسید و وجهی دریافت نشد. "
+            "اگر می‌خواهید شارژ کنید، لطفاً یک فاکتور جدید ایجاد کنید."
+        ),
+        "from_partial": (
+            "⏰ مهلت پرداخت فاکتور شما به پایان رسید. "
+            "مبلغ ${credited:.4f} که قبلاً پرداخت کرده بودید "
+            "به حساب شما اضافه شده است. برای پرداخت مابقی، "
+            "لطفاً یک فاکتور جدید ایجاد کنید."
+        ),
+    },
+    "failed": {
+        "from_pending": (
+            "❌ پرداخت شما ناموفق بود. "
+            "اگر مبلغی از حساب شما کسر شده است، با پشتیبانی تماس بگیرید."
+        ),
+        "from_partial": (
+            "❌ پرداخت شما ناموفق اعلام شد. "
+            "مبلغ ${credited:.4f} که قبلاً موفق پرداخت شده بود "
+            "همچنان در حساب شما باقی می‌ماند. "
+            "اگر مبلغ بیشتری از حساب شما کسر شده، با پشتیبانی تماس بگیرید."
+        ),
+    },
+    "refunded": {
+        "from_pending": (
+            "↩️ پرداخت شما بازگشت داده شد و به حساب شما اضافه نشد."
+        ),
+        "from_partial": (
+            "↩️ پرداخت شما بازگشت داده شد. "
+            "مبلغ ${credited:.4f} که قبلاً به حساب شما اضافه شده بود "
+            "همچنان قابل استفاده است. اگر این طور نیست با پشتیبانی تماس بگیرید."
+        ),
+    },
 }
 
 
@@ -307,30 +335,40 @@ async def payment_webhook(request: web.Request):
                 )
 
         elif status in _TERMINAL_FAILURE_STATUSES:
-            # Mark the ledger and notify. No balance change.
+            # Close the ledger row (works for both PENDING and PARTIAL —
+            # see mark_transaction_terminal docstring) and notify the user.
+            # No balance change: PARTIAL rows keep the partial credit they
+            # already received.
             target_status = _TERMINAL_FAILURE_STATUSES[status]
             row = await db.mark_transaction_terminal(str(payment_id), target_status)
             if row is None:
                 log.info(
                     "Webhook %s for payment_id=%s ignored "
-                    "(unknown or already finalized)",
+                    "(unknown or already in a different terminal state)",
                     status,
                     payment_id,
                 )
                 return web.Response(status=200, text="OK")
 
             telegram_id = row["telegram_id"]
+            previous_status = row["previous_status"]
+            credited_so_far = float(row["amount_usd_credited"])
             log.info(
-                "Marked payment_id=%s as %s for user %d",
+                "Marked payment_id=%s as %s for user %d (was %s, credited so far $%.4f)",
                 payment_id,
                 target_status,
                 telegram_id,
+                previous_status,
+                credited_so_far,
+            )
+            variant = (
+                "from_partial" if previous_status == "PARTIAL" else "from_pending"
+            )
+            text = _TERMINAL_FAILURE_MESSAGES[status][variant].format(
+                credited=credited_so_far
             )
             try:
-                await bot.send_message(
-                    chat_id=telegram_id,
-                    text=_TERMINAL_FAILURE_MESSAGES[status],
-                )
+                await bot.send_message(chat_id=telegram_id, text=text)
             except Exception:
                 log.exception(
                     "Failed to notify user %d about %s payment %s",
