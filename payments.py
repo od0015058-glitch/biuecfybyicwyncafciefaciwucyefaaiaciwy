@@ -275,9 +275,12 @@ async def create_crypto_invoice(
 
                     error_text = await response.text()
                     log.error(
-                        "NowPayments error (attempt %d/%d): status=%d body=%s",
+                        "NowPayments error (attempt %d/%d) for "
+                        "pay_currency=%s amount_usd=$%.2f: status=%d body=%s",
                         attempt + 1,
                         max_retries,
+                        currency,
+                        float(amount_usd),
                         response.status,
                         error_text,
                     )
