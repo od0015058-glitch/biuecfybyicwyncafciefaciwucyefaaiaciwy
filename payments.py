@@ -70,10 +70,12 @@ def _verify_ipn_signature(raw_body: bytes, signature_header: str | None) -> bool
         log.error("NOWPAYMENTS_IPN_SECRET is not set; refusing to process IPN.")
         return False
     if not signature_header:
+        log.warning("IPN request had no x-nowpayments-sig header.")
         return False
     try:
         payload = json.loads(raw_body)
     except (ValueError, TypeError):
+        log.warning("IPN body was not valid JSON; cannot verify signature.")
         return False
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     expected = hmac.new(
@@ -81,7 +83,25 @@ def _verify_ipn_signature(raw_body: bytes, signature_header: str | None) -> bool
         canonical.encode("utf-8"),
         hashlib.sha512,
     ).hexdigest()
-    return hmac.compare_digest(expected, signature_header.lower())
+    received = signature_header.lower()
+    ok = hmac.compare_digest(expected, received)
+    if not ok:
+        # Diagnostic logging only — first/last 8 chars of each digest plus
+        # canonical-body length. Not enough to forge a signature, but
+        # enough to tell whether we're computing a wildly-different sig
+        # (secret mismatch) vs. a close one (canonicalization drift).
+        log.warning(
+            "IPN sig mismatch: expected=%s..%s received=%s..%s "
+            "secret_len=%d body_len=%d canonical_len=%d",
+            expected[:8],
+            expected[-8:],
+            received[:8],
+            received[-8:],
+            len(NOWPAYMENTS_IPN_SECRET),
+            len(raw_body),
+            len(canonical),
+        )
+    return ok
 
 
 async def _query_min_amount(
