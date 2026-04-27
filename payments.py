@@ -352,7 +352,14 @@ async def payment_webhook(request: web.Request):
 
             telegram_id = row["telegram_id"]
             previous_status = row["previous_status"]
-            credited_so_far = float(row["amount_usd_credited"])
+            # `amount_usd_credited` semantics differ by row state: for PENDING
+            # rows it's the *intended* credit (set at invoice creation), for
+            # PARTIAL rows it's the cumulative amount already credited. Treat
+            # PENDING as $0 actually credited so the log line and the
+            # `{credited}` template var both reflect reality.
+            credited_so_far = (
+                float(row["amount_usd_credited"]) if previous_status == "PARTIAL" else 0.0
+            )
             log.info(
                 "Marked payment_id=%s as %s for user %d (was %s, credited so far $%.4f)",
                 payment_id,
