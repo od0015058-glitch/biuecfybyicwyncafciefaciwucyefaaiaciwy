@@ -59,18 +59,51 @@ def get_markup() -> float:
 
 
 def get_price(model: str) -> ModelPrice:
-    """Look up a model's price, returning the fallback if unknown."""
+    """Look up a model's price from the static table.
+
+    Returns :data:`FALLBACK_PRICE` for anything not in :data:`MODEL_PRICES`.
+    Used as a synchronous fallback when the live OpenRouter catalog
+    isn't reachable (or when the caller can't await).
+    """
     return MODEL_PRICES.get(model, FALLBACK_PRICE)
 
 
-def calculate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-    """Compute the USD cost to charge the user for one request.
+async def get_price_async(model: str) -> ModelPrice:
+    """Resolve a model's price preferring the live OpenRouter catalog.
 
-    Includes the configured markup. Result is always non-negative.
+    Async because the live lookup can trigger a network refresh on the
+    first call / past the 24h TTL. Falls back to the static table and
+    then :data:`FALLBACK_PRICE`. Imported lazily to avoid a circular
+    import (``models_catalog`` imports from this module).
     """
-    price = get_price(model)
+    from models_catalog import get_model_price
+
+    return await get_model_price(model)
+
+
+def _apply_markup(price: ModelPrice, prompt_tokens: int, completion_tokens: int) -> float:
     raw = (
         prompt_tokens * price.input_per_1m_usd
         + completion_tokens * price.output_per_1m_usd
     ) / 1_000_000.0
     return max(raw * get_markup(), 0.0)
+
+
+def calculate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    """Synchronous cost using the static table. Kept for tests / callers
+    that genuinely can't await. Production code should prefer
+    :func:`calculate_cost_async`.
+    """
+    return _apply_markup(get_price(model), prompt_tokens, completion_tokens)
+
+
+async def calculate_cost_async(
+    model: str, prompt_tokens: int, completion_tokens: int
+) -> float:
+    """Compute the USD cost to charge the user, using the live catalog.
+
+    Falls back to the static table when the catalog can't be reached.
+    Result includes the configured markup and is always non-negative.
+    """
+    price = await get_price_async(model)
+    return _apply_markup(price, prompt_tokens, completion_tokens)

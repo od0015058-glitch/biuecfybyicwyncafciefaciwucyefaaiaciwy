@@ -65,6 +65,22 @@ class Database:
         async with self.pool.acquire() as connection:
             return await connection.fetchval(query, telegram_id)
 
+    async def set_active_model(self, telegram_id: int, model_id: str) -> bool:
+        """Updates the user's active OpenRouter model id.
+
+        Returns True iff a row was updated. The caller is responsible for
+        validating that the model exists in the catalog before calling.
+        """
+        query = """
+            UPDATE users
+            SET active_model = $1
+            WHERE telegram_id = $2
+            RETURNING telegram_id
+        """
+        async with self.pool.acquire() as connection:
+            result = await connection.fetchval(query, model_id, telegram_id)
+        return result is not None
+
     async def decrement_free_message(self, telegram_id: int):
         """Safely deducts 1 free message using an atomic update."""
         query = """
