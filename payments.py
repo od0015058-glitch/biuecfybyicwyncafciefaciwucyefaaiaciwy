@@ -236,17 +236,36 @@ async def payment_webhook(request: web.Request):
         bot: Bot = request.app["bot"]
 
         if status == "finished":
-            # Atomic: flip the PENDING transaction to SUCCESS and credit the
-            # user's wallet in a single DB transaction. If either the status
-            # flip or the credit fails, the whole thing rolls back and the
-            # row stays PENDING so a webhook retry can finalize it.
-            row = await db.finalize_payment(str(payment_id))
+            # We need the full invoice price from the IPN (not the row's
+            # amount_usd_credited, which is overwritten with the partial
+            # already-credited amount when this payment first came in as
+            # partially_paid). Without it we can't compute the remaining
+            # delta to credit on a PARTIAL -> SUCCESS upgrade.
+            try:
+                full_price_usd = float(data["price_amount"])
+            except (KeyError, TypeError, ValueError):
+                full_price_usd = 0.0
+            if full_price_usd <= 0:
+                log.error(
+                    "finished IPN for payment_id=%s missing/invalid "
+                    "price_amount; refusing to credit (data=%r)",
+                    payment_id,
+                    data,
+                )
+                return web.Response(status=200, text="OK")
+
+            # Atomic in one DB transaction: flip the row (PENDING or
+            # PARTIAL) to SUCCESS, and credit the wallet by however much
+            # of the full invoice price hasn't been credited yet. If
+            # anything fails the row stays in its previous state so a
+            # webhook retry can finalize it.
+            row = await db.finalize_payment(str(payment_id), full_price_usd)
             if row is None:
                 # Either we've never seen this payment_id (no PENDING row
-                # was created on our side) or it was already SUCCESS.
-                # Either way: do NOT credit. The whole point of the
-                # transactions ledger is that a replayed or unknown IPN
-                # cannot mint money.
+                # was created on our side) or it was already in a terminal
+                # state (SUCCESS / EXPIRED / FAILED / REFUNDED). Either
+                # way: do NOT credit. The whole point of the transactions
+                # ledger is that a replayed or unknown IPN cannot mint money.
                 log.info(
                     "Webhook for payment_id=%s ignored (unknown or already finalized)",
                     payment_id,
@@ -254,25 +273,37 @@ async def payment_webhook(request: web.Request):
                 return web.Response(status=200, text="OK")
 
             telegram_id = row["telegram_id"]
-            amount_usd = float(row["amount_usd_credited"])
+            delta_credited = float(row["delta_credited"])
+            total_credited = float(row["amount_usd_credited"])
 
             # Best-effort user notification. The wallet has already been
             # credited in finalize_payment; a Telegram error must not cause us
             # to return 500 and trigger a NowPayments retry (the retry would
-            # be a no-op because the row is no longer PENDING).
-            try:
-                await bot.send_message(
-                    chat_id=telegram_id,
-                    text=(
-                        f"✅ پرداخت تایید شد! مبلغ ${amount_usd} "
-                        "به حساب شما اضافه شد."
-                    ),
+            # be a no-op because the row is no longer PENDING/PARTIAL).
+            if delta_credited > 0:
+                # Either a fresh full payment, or the remainder after a
+                # partially_paid earlier credited some.
+                msg = (
+                    f"✅ پرداخت تایید شد! مبلغ ${delta_credited:.4f} "
+                    "به حساب شما اضافه شد."
                 )
+            else:
+                # We've already credited the full amount earlier (e.g.
+                # partially_paid covered the full price). Just close the
+                # loop with the user.
+                msg = (
+                    "✅ پرداخت شما تکمیل شد. "
+                    f"در مجموع مبلغ ${total_credited:.4f} به حساب شما اضافه شده است."
+                )
+            try:
+                await bot.send_message(chat_id=telegram_id, text=msg)
             except Exception:
                 log.exception(
-                    "Failed to notify user %d about credit of $%s",
+                    "Failed to notify user %d about credit of $%s "
+                    "(delta=$%.4f)",
                     telegram_id,
-                    amount_usd,
+                    total_credited,
+                    delta_credited,
                 )
 
         elif status in _TERMINAL_FAILURE_STATUSES:
@@ -334,34 +365,42 @@ async def payment_webhook(request: web.Request):
             if row is None:
                 log.info(
                     "Webhook partially_paid for payment_id=%s ignored "
-                    "(unknown or already finalized)",
+                    "(unknown or already in a non-PENDING/non-PARTIAL state)",
                     payment_id,
                 )
                 return web.Response(status=200, text="OK")
 
             telegram_id = row["telegram_id"]
-            credited_usd = float(row["amount_usd_credited"])
+            total_credited = float(row["amount_usd_credited"])
+            delta = float(row["delta_credited"])
             log.info(
-                "Credited partial payment for payment_id=%s user=%d $%.4f",
+                "partially_paid for payment_id=%s user=%d: "
+                "delta_credited=$%.4f total_credited=$%.4f",
                 payment_id,
                 telegram_id,
-                credited_usd,
+                delta,
+                total_credited,
             )
-            try:
-                await bot.send_message(
-                    chat_id=telegram_id,
-                    text=(
-                        f"⚠️ پرداخت شما کمتر از مبلغ فاکتور بود. "
-                        f"مبلغ ${credited_usd:.4f} به حساب شما اضافه شد. "
-                        "اگر می‌خواهید مابقی را پرداخت کنید، یک فاکتور جدید ایجاد کنید."
-                    ),
-                )
-            except Exception:
-                log.exception(
-                    "Failed to notify user %d about partial credit of $%s",
-                    telegram_id,
-                    credited_usd,
-                )
+            # Only notify when there was actually new money to credit, so a
+            # replayed IPN with the same actually_paid doesn't re-spam the user.
+            if delta > 0:
+                try:
+                    await bot.send_message(
+                        chat_id=telegram_id,
+                        text=(
+                            f"⚠️ پرداخت شما کمتر از مبلغ فاکتور بود. "
+                            f"مبلغ ${delta:.4f} به حساب شما اضافه شد "
+                            f"(مجموع شارژ این فاکتور: ${total_credited:.4f}). "
+                            "اگر می‌خواهید مابقی را پرداخت کنید، می‌توانید "
+                            "همچنان به همان آدرس واریز کنید."
+                        ),
+                    )
+                except Exception:
+                    log.exception(
+                        "Failed to notify user %d about partial credit of $%s",
+                        telegram_id,
+                        delta,
+                    )
 
         elif status in _IN_FLIGHT_STATUSES:
             log.info(
