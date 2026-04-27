@@ -152,6 +152,37 @@ async def create_crypto_invoice(
     return None
 
 
+# IPN statuses we consider "in flight": the payment is still progressing,
+# nothing to do but log. NowPayments may emit several of these per invoice.
+_IN_FLIGHT_STATUSES = frozenset(
+    {"waiting", "confirming", "confirmed", "sending"}
+)
+
+# IPN statuses that mean the payment will NOT settle. We mark the ledger
+# with a terminal status (so retries are no-ops) and notify the user.
+# Mapping: incoming IPN status -> ledger status we record.
+_TERMINAL_FAILURE_STATUSES = {
+    "expired": "EXPIRED",
+    "failed": "FAILED",
+    "refunded": "REFUNDED",
+}
+
+# User-facing notification text per terminal failure status.
+_TERMINAL_FAILURE_MESSAGES = {
+    "expired": (
+        "⏰ مهلت پرداخت فاکتور شما به پایان رسید و وجهی دریافت نشد. "
+        "اگر می‌خواهید شارژ کنید، لطفاً یک فاکتور جدید ایجاد کنید."
+    ),
+    "failed": (
+        "❌ پرداخت شما ناموفق بود. "
+        "اگر مبلغی از حساب شما کسر شده است، با پشتیبانی تماس بگیرید."
+    ),
+    "refunded": (
+        "↩️ پرداخت شما بازگشت داده شد و به حساب شما اضافه نشد."
+    ),
+}
+
+
 async def payment_webhook(request: web.Request):
     try:
         raw_body = await request.read()
@@ -164,12 +195,15 @@ async def payment_webhook(request: web.Request):
             return web.Response(status=401, text="Invalid signature")
 
         data = json.loads(raw_body)
-        if data.get("payment_status") == "finished":
-            payment_id = data.get("payment_id")
-            if payment_id is None:
-                log.warning("Webhook missing payment_id; ignoring")
-                return web.Response(status=200, text="OK")
+        status = data.get("payment_status")
+        payment_id = data.get("payment_id")
+        if payment_id is None:
+            log.warning("Webhook missing payment_id; ignoring (status=%s)", status)
+            return web.Response(status=200, text="OK")
 
+        bot: Bot = request.app["bot"]
+
+        if status == "finished":
             # Atomic: flip the PENDING transaction to SUCCESS and credit the
             # user's wallet in a single DB transaction. If either the status
             # flip or the credit fails, the whole thing rolls back and the
@@ -194,7 +228,6 @@ async def payment_webhook(request: web.Request):
             # credited in finalize_payment; a Telegram error must not cause us
             # to return 500 and trigger a NowPayments retry (the retry would
             # be a no-op because the row is no longer PENDING).
-            bot: Bot = request.app["bot"]
             try:
                 await bot.send_message(
                     chat_id=telegram_id,
@@ -209,6 +242,63 @@ async def payment_webhook(request: web.Request):
                     telegram_id,
                     amount_usd,
                 )
+
+        elif status in _TERMINAL_FAILURE_STATUSES:
+            # Mark the ledger and notify. No balance change.
+            target_status = _TERMINAL_FAILURE_STATUSES[status]
+            row = await db.mark_transaction_terminal(str(payment_id), target_status)
+            if row is None:
+                log.info(
+                    "Webhook %s for payment_id=%s ignored "
+                    "(unknown or already finalized)",
+                    status,
+                    payment_id,
+                )
+                return web.Response(status=200, text="OK")
+
+            telegram_id = row["telegram_id"]
+            log.info(
+                "Marked payment_id=%s as %s for user %d",
+                payment_id,
+                target_status,
+                telegram_id,
+            )
+            try:
+                await bot.send_message(
+                    chat_id=telegram_id,
+                    text=_TERMINAL_FAILURE_MESSAGES[status],
+                )
+            except Exception:
+                log.exception(
+                    "Failed to notify user %d about %s payment %s",
+                    telegram_id,
+                    target_status,
+                    payment_id,
+                )
+
+        elif status == "partially_paid":
+            # Under-payment: NowPayments accepted some funds but less than the
+            # requested price_amount. Crediting the actually_paid USD value is
+            # P1-C; for now leave the row PENDING and log so we can audit.
+            log.warning(
+                "partially_paid IPN for payment_id=%s; deferring to P1-C "
+                "(no balance change, ledger row left PENDING)",
+                payment_id,
+            )
+
+        elif status in _IN_FLIGHT_STATUSES:
+            log.info(
+                "In-flight IPN status=%s for payment_id=%s; no-op",
+                status,
+                payment_id,
+            )
+
+        else:
+            log.info(
+                "Unhandled IPN status=%s for payment_id=%s; no-op",
+                status,
+                payment_id,
+            )
 
         return web.Response(status=200, text="OK")
     except Exception:

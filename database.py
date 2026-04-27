@@ -118,6 +118,27 @@ class Database:
             )
         return row is not None
 
+    async def mark_transaction_terminal(
+        self, gateway_invoice_id: str, new_status: str
+    ):
+        """Atomically flip a PENDING transaction to a terminal failure status.
+
+        Used for IPN statuses that mean the user will NOT be credited
+        (EXPIRED / FAILED / REFUNDED). The user's balance is not touched.
+
+        Returns the row (with telegram_id, currency_used, amount_usd_credited)
+        if the flip happened, or None if the transaction was unknown or
+        already in a non-PENDING state. Idempotent against retries.
+        """
+        query = """
+            UPDATE transactions
+            SET status = $2, completed_at = CURRENT_TIMESTAMP
+            WHERE gateway_invoice_id = $1 AND status = 'PENDING'
+            RETURNING telegram_id, currency_used, amount_usd_credited
+        """
+        async with self.pool.acquire() as connection:
+            return await connection.fetchrow(query, gateway_invoice_id, new_status)
+
     async def finalize_payment(self, gateway_invoice_id: str):
         """Atomically mark a PENDING transaction SUCCESS *and* credit the user's
         wallet, in a single DB transaction.
