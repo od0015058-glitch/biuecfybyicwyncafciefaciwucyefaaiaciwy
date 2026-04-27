@@ -77,7 +77,15 @@ def _verify_ipn_signature(raw_body: bytes, signature_header: str | None) -> bool
     except (ValueError, TypeError):
         log.warning("IPN body was not valid JSON; cannot verify signature.")
         return False
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    # ensure_ascii=False is critical: NowPayments signs the raw UTF-8
+    # bytes they put on the wire. Python's json.dumps defaults to
+    # ensure_ascii=True, which escapes any non-ASCII char (e.g. our
+    # Persian order_description "شارژ کیف پول") into \uXXXX form,
+    # turning the canonical body 40+ chars longer than what NowPayments
+    # actually signed and breaking the HMAC compare.
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
     expected = hmac.new(
         NOWPAYMENTS_IPN_SECRET.encode("utf-8"),
         canonical.encode("utf-8"),
