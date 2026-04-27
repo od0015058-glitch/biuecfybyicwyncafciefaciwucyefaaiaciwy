@@ -40,6 +40,28 @@ _SUPPORT_LABELS = all_button_labels("kbd_support")
 _LANGUAGE_LABELS = all_button_labels("kbd_language")
 
 
+# Currencies offered for crypto top-ups. The first element is what the
+# user sees on the inline button, the second is the NowPayments ticker
+# we send as `pay_currency` when creating the invoice.
+#
+# When adding a row here, also confirm the ticker is enabled in the
+# NowPayments dashboard (Store Settings → Currencies). NowPayments
+# rejects invoice creation for a disabled currency with HTTP 400.
+SUPPORTED_PAY_CURRENCIES: tuple[tuple[str, str], ...] = (
+    ("₿ Bitcoin", "btc"),
+    ("Ξ Ethereum", "eth"),
+    ("🔷 Litecoin", "ltc"),
+    ("💎 TON", "ton"),
+    ("⚡ TRON (TRX)", "trx"),
+    ("💵 USDT (TRC20)", "usdttrc20"),
+    ("💵 USDT (ERC20)", "usdterc20"),
+    ("💵 USDT (BEP20)", "usdtbsc"),
+    ("💵 USDT (TON)", "usdtton"),
+)
+# Layout: 3-wide grid for the 9 currencies above.
+_CURRENCY_ROWS_LAYOUT = (3, 3, 3)
+
+
 async def _get_user_language(telegram_id: int) -> str:
     """Look up the user's preferred language, falling back to the default.
 
@@ -250,15 +272,12 @@ async def process_add_crypto_currency(callback: CallbackQuery):
     amount = callback.data.split("_")[1]
     lang = await _get_user_language(callback.from_user.id)
     builder = InlineKeyboardBuilder()
-    builder.button(text="₿ Bitcoin", callback_data=f"pay_btc_{amount}")
-    builder.button(text="Ξ Ethereum", callback_data=f"pay_eth_{amount}")
-    builder.button(text="💎 TON", callback_data=f"pay_ton_{amount}")
-    builder.button(text="💵 USDT (TRC20)", callback_data=f"pay_usdttrc20_{amount}")
-    builder.button(text="💵 USDT (ERC20)", callback_data=f"pay_usdterc20_{amount}")
-    builder.button(text="🔷 Litecoin", callback_data=f"pay_ltc_{amount}")
+    for label, ticker in SUPPORTED_PAY_CURRENCIES:
+        builder.button(text=label, callback_data=f"pay_{ticker}_{amount}")
     builder.button(text=t(lang, "btn_back"), callback_data="add_crypto")
     builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
-    builder.adjust(2, 2, 2, 2)
+    # Currency grid first, then the back / home footer on its own row.
+    builder.adjust(*_CURRENCY_ROWS_LAYOUT, 2)
     await callback.message.edit_text(
         t(lang, "charge_pick_currency", amount=amount),
         parse_mode="Markdown",
@@ -280,25 +299,22 @@ async def process_custom_amount_input(message: Message, state: FSMContext):
         await message.answer(t(lang, "charge_custom_min_error"))
         return
 
+    # Drop the waiting_custom_amount state so the user can chat freely
+    # while the currency picker is on screen, but stash the amount in
+    # FSM data so process_custom_currency_selection can read it back
+    # when they tap a currency. (state.clear() wipes both the state
+    # name and the data, so update_data() must come after.)
     await state.clear()
 
     builder = InlineKeyboardBuilder()
-    currencies = [
-        ("Bitcoin (BTC)", "cur_btc"),
-        ("Ethereum (ETH)", "cur_eth"),
-        ("TON", "cur_ton"),
-        ("USDT-TRC20", "cur_usdttrc20"),
-        ("USDT-ERC20", "cur_usdterc20"),
-        ("Litecoin (LTC)", "cur_ltc"),
-    ]
-    for name, callback_data in currencies:
-        builder.button(text=name, callback_data=callback_data)
+    for label, ticker in SUPPORTED_PAY_CURRENCIES:
+        builder.button(text=label, callback_data=f"cur_{ticker}")
     # Footer: back to amount entry + home. Going back to amt_custom
     # re-prompts for the amount (clearing state) so the user can pick a
     # different value without restarting from the wallet.
     builder.button(text=t(lang, "btn_back"), callback_data="amt_custom")
     builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
-    builder.adjust(2, 2, 2, 2)
+    builder.adjust(*_CURRENCY_ROWS_LAYOUT, 2)
 
     await state.update_data(custom_amount=amount)
 
