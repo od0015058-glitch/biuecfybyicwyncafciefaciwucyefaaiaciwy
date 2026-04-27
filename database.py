@@ -236,26 +236,35 @@ class Database:
                 # cannot debit the user.
                 delta = max(0.0, actually_paid_usd - already_credited)
 
-                # GREATEST(...) keeps amount_usd_credited monotonic: an
-                # out-of-order replay carrying a smaller actually_paid must
-                # NOT downgrade the ledger value, otherwise a subsequent
-                # `finished` IPN would compute the remainder against the
-                # downgraded base and over-credit the user. Pair with the
-                # `delta = max(0, ...)` clamp above which protects the
-                # wallet balance on the same path.
-                new_credited_row = await connection.fetchrow(
+                # The new cumulative-credited value is the larger of what
+                # we previously credited and what's just landed.
+                # `already_credited` is already the right base on both
+                # paths (0 for PENDING, the row's stored cumulative for
+                # PARTIAL), so this max() correctly:
+                #   - PENDING → PARTIAL: stamps the actually_paid_usd we
+                #     just credited (NOT the stale "intended" amount the
+                #     PENDING row was holding).
+                #   - PARTIAL → PARTIAL upgrade: writes the higher number.
+                #   - PARTIAL → PARTIAL out-of-order replay: keeps the
+                #     stored higher value, so a subsequent `finished` IPN
+                #     can correctly compute its remainder.
+                # An equivalent SQL expression (CASE on status, GREATEST
+                # only on PARTIAL rows) was rejected because the row's
+                # PRE-update status is gone the moment the SET runs;
+                # computing in Python where we still have the previous
+                # status is clearer and equally atomic under FOR UPDATE.
+                new_credited = max(already_credited, actually_paid_usd)
+                await connection.execute(
                     """
                     UPDATE transactions
                     SET status = 'PARTIAL',
-                        amount_usd_credited = GREATEST(amount_usd_credited, $2),
+                        amount_usd_credited = $2,
                         completed_at = CURRENT_TIMESTAMP
                     WHERE gateway_invoice_id = $1
-                    RETURNING amount_usd_credited
                     """,
                     gateway_invoice_id,
-                    actually_paid_usd,
+                    new_credited,
                 )
-                new_credited = float(new_credited_row["amount_usd_credited"])
                 if delta > 0:
                     await connection.execute(
                         """
@@ -321,24 +330,26 @@ class Database:
                 # not debit the user.
                 delta = max(0.0, full_price_usd - already_credited)
 
-                # GREATEST keeps amount_usd_credited monotonic; matches the
-                # symmetric guard in finalize_partial_payment. Defends
-                # against an unlikely `finished` IPN whose price_amount is
-                # below what was already credited from earlier
-                # partially_paid IPNs.
-                new_credited_row = await connection.fetchrow(
+                # New cumulative-credited value, computed in Python with
+                # the pre-update status still in scope. See the parallel
+                # comment in finalize_partial_payment for why this is
+                # safer than `GREATEST(amount_usd_credited, $2)` in SQL —
+                # the PENDING row's amount_usd_credited carries the
+                # *intended* amount, not what's been credited, so a
+                # blind GREATEST would lock the row at the intended value
+                # and starve subsequent finalize calls of any delta.
+                new_credited = max(already_credited, full_price_usd)
+                await connection.execute(
                     """
                     UPDATE transactions
                     SET status = 'SUCCESS',
-                        amount_usd_credited = GREATEST(amount_usd_credited, $2),
+                        amount_usd_credited = $2,
                         completed_at = CURRENT_TIMESTAMP
                     WHERE gateway_invoice_id = $1
-                    RETURNING amount_usd_credited
                     """,
                     gateway_invoice_id,
-                    full_price_usd,
+                    new_credited,
                 )
-                new_credited = float(new_credited_row["amount_usd_credited"])
                 if delta > 0:
                     await connection.execute(
                         """
