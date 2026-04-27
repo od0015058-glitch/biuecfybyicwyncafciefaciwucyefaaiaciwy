@@ -121,23 +121,57 @@ class Database:
     async def mark_transaction_terminal(
         self, gateway_invoice_id: str, new_status: str
     ):
-        """Atomically flip a PENDING transaction to a terminal failure status.
+        """Atomically close a PENDING or PARTIAL transaction with a terminal
+        failure status (EXPIRED / FAILED / REFUNDED).
 
-        Used for IPN statuses that mean the user will NOT be credited
-        (EXPIRED / FAILED / REFUNDED). The user's balance is not touched.
+        The user's balance is **not** modified — even when transitioning from
+        PARTIAL. The semantics are:
+          - PENDING -> terminal: user paid nothing, nothing to do but log.
+          - PARTIAL -> terminal: user paid less than the invoice required and
+            we already credited that partial amount when partially_paid first
+            arrived. They keep the partial credit; we just close the ledger
+            row. (We do NOT debit them — NowPayments did receive the
+            underpayment, and reversing would require a counter-payment we
+            cannot orchestrate.)
 
-        Returns the row (with telegram_id, currency_used, amount_usd_credited)
-        if the flip happened, or None if the transaction was unknown or
-        already in a non-PENDING state. Idempotent against retries.
+        Returns a row dict (telegram_id, currency_used, amount_usd_credited,
+        previous_status) if the close happened, or None if the row was
+        unknown or already in a different terminal state. Idempotent against
+        retries via the WHERE-status guard.
         """
-        query = """
-            UPDATE transactions
-            SET status = $2, completed_at = CURRENT_TIMESTAMP
-            WHERE gateway_invoice_id = $1 AND status = 'PENDING'
-            RETURNING telegram_id, currency_used, amount_usd_credited
-        """
+        # We need the *previous* status to let the caller choose the right
+        # user notification text (a PARTIAL -> terminal close means the user
+        # already received some credit). Wrap the read-then-update in one DB
+        # transaction with FOR UPDATE so concurrent webhooks serialize.
         async with self.pool.acquire() as connection:
-            return await connection.fetchrow(query, gateway_invoice_id, new_status)
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    """
+                    SELECT telegram_id, status, currency_used, amount_usd_credited
+                    FROM transactions
+                    WHERE gateway_invoice_id = $1
+                    FOR UPDATE
+                    """,
+                    gateway_invoice_id,
+                )
+                if row is None or row["status"] not in ("PENDING", "PARTIAL"):
+                    return None
+                previous_status = row["status"]
+                await connection.execute(
+                    """
+                    UPDATE transactions
+                    SET status = $2, completed_at = CURRENT_TIMESTAMP
+                    WHERE gateway_invoice_id = $1
+                    """,
+                    gateway_invoice_id,
+                    new_status,
+                )
+                return {
+                    "telegram_id": row["telegram_id"],
+                    "currency_used": row["currency_used"],
+                    "amount_usd_credited": row["amount_usd_credited"],
+                    "previous_status": previous_status,
+                }
 
     async def finalize_partial_payment(
         self, gateway_invoice_id: str, actually_paid_usd: float
