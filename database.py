@@ -139,6 +139,47 @@ class Database:
         async with self.pool.acquire() as connection:
             return await connection.fetchrow(query, gateway_invoice_id, new_status)
 
+    async def finalize_partial_payment(
+        self, gateway_invoice_id: str, actually_paid_usd: float
+    ):
+        """Atomically finalize an under-paid (partially_paid) transaction.
+
+        Updates the ledger row's amount_usd_credited to the actually-paid USD
+        value (which is less than the originally requested price_amount),
+        flips status to 'PARTIAL', and credits the user's wallet by that
+        same amount — all in one DB transaction so a crash between the two
+        cannot leave us with an inconsistent ledger.
+
+        Returns the updated row (telegram_id, currency_used,
+        amount_usd_credited) if the flip happened, or None if the
+        transaction was unknown or already in a non-PENDING state.
+        Idempotent against retries.
+        """
+        flip_query = """
+            UPDATE transactions
+            SET status = 'PARTIAL',
+                amount_usd_credited = $2,
+                completed_at = CURRENT_TIMESTAMP
+            WHERE gateway_invoice_id = $1 AND status = 'PENDING'
+            RETURNING telegram_id, currency_used, amount_usd_credited
+        """
+        credit_query = """
+            UPDATE users
+            SET balance_usd = balance_usd + $1
+            WHERE telegram_id = $2
+        """
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    flip_query, gateway_invoice_id, actually_paid_usd
+                )
+                if row is None:
+                    return None
+                await connection.execute(
+                    credit_query, row["amount_usd_credited"], row["telegram_id"]
+                )
+                return row
+
     async def finalize_payment(self, gateway_invoice_id: str):
         """Atomically mark a PENDING transaction SUCCESS *and* credit the user's
         wallet, in a single DB transaction.
