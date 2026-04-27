@@ -51,7 +51,11 @@ async def cmd_start(message: Message):
 # ==========================================
 @router.message(F.text == "🎧 پشتیبانی")
 async def support_text_handler(message: Message):
-    await message.answer("🎧 **پشتیبانی فنی**\n\nبرای ارتباط با ادمین به آیدی @Mahan_Admin پیام دهید.")
+    await message.answer(
+        "🎧 **پشتیبانی فنی**\n\n"
+        "برای ارتباط با ادمین به آیدی @Mahan\\_Admin پیام دهید.",
+        parse_mode="Markdown",
+    )
 
 @router.message(F.text == "🌍 تغییر زبان")
 async def language_text_handler(message: Message):
@@ -68,7 +72,7 @@ async def models_text_handler(message: Message):
         "⏳ Claude 3.5 (بزودی...)\n"
         "⏳ Gemini Pro (بزودی...)"
     )
-    await message.answer(text, reply_markup=builder.as_markup())
+    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
 
 @router.message(F.text == "💰 کیف پول")
 async def wallet_text_handler(message: Message):
@@ -83,7 +87,7 @@ async def wallet_text_handler(message: Message):
     builder.adjust(1, 1)
     
     text = f"👛 **کیف پول شما**\n\nموجودی فعلی: ${balance:.2f}\n\nبرای شارژ حساب کلیک کنید:"
-    await message.answer(text, reply_markup=builder.as_markup())
+    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
 
 # ==========================================
 # هندلرهای دکمه‌های شیشه‌ای (ناوبری و بازگشت)
@@ -105,7 +109,7 @@ async def back_to_wallet_handler(callback: CallbackQuery):
     builder.adjust(1, 1)
     
     text = f"👛 **کیف پول شما**\n\nموجودی فعلی: ${balance:.2f}\n\nبرای شارژ حساب کلیک کنید:"
-    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
     await callback.answer()
 
 # ==========================================
