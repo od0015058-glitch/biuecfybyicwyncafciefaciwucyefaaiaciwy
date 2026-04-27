@@ -102,12 +102,24 @@ def _finalize_catalog(
     )
 
 
-def _parse_price(raw: object) -> float:
-    """OpenRouter returns prices as strings of USD-per-token. Parse safely."""
+def _parse_price(raw: object) -> float | None:
+    """OpenRouter returns prices as strings of USD-per-token. Parse safely.
+
+    Returns ``None`` when the field is missing (``raw is None``) or
+    malformed (non-numeric). The caller uses ``None`` as a signal that
+    we don't actually know this model's price, distinct from
+    legitimately free models whose price is the explicit value
+    ``0`` / ``"0"``. Conflating the two leads to silently charging
+    paid models at $0 (when OpenRouter returns malformed pricing) or
+    silently charging free models at FALLBACK_PRICE (when we treat
+    explicit zero as missing).
+    """
+    if raw is None:
+        return None
     try:
         return float(raw)  # type: ignore[arg-type]
     except (TypeError, ValueError):
-        return 0.0
+        return None
 
 
 async def _fetch_from_openrouter() -> Catalog:
@@ -120,6 +132,7 @@ async def _fetch_from_openrouter() -> Catalog:
 
     raw_models = payload.get("data") or []
     models: list[CatalogModel] = []
+    skipped_no_pricing = 0
     for entry in raw_models:
         model_id = entry.get("id")
         if not isinstance(model_id, str) or "/" not in model_id:
@@ -131,12 +144,28 @@ async def _fetch_from_openrouter() -> Catalog:
         # to match our internal ModelPrice format.
         prompt_per_token = _parse_price(pricing_dict.get("prompt"))
         completion_per_token = _parse_price(pricing_dict.get("completion"))
+        if prompt_per_token is None or completion_per_token is None:
+            # Pricing data missing or malformed for this model. Drop it
+            # from the catalog so the picker doesn't display it (we'd
+            # have nothing trustworthy to show as the price), and so
+            # get_model_price falls through to MODEL_PRICES /
+            # FALLBACK_PRICE for any user already on this id. Silently
+            # charging $0 here would let the platform pay OpenRouter
+            # for an API call the user never paid for.
+            skipped_no_pricing += 1
+            continue
         price = ModelPrice(
             input_per_1m_usd=prompt_per_token * 1_000_000.0,
             output_per_1m_usd=completion_per_token * 1_000_000.0,
         )
         models.append(
             CatalogModel(id=model_id, name=str(name), provider=provider, price=price)
+        )
+
+    if skipped_no_pricing:
+        log.info(
+            "Dropped %d OpenRouter model(s) from catalog due to missing/malformed pricing",
+            skipped_no_pricing,
         )
 
     if not models:
