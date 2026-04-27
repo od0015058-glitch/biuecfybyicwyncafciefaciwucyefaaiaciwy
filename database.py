@@ -431,11 +431,17 @@ class Database:
         ``"unknown"``, ``"inactive"``, ``"expired"``, ``"exhausted"``,
         ``"already_used"``) the caller can pass to :func:`strings.t`.
 
+        Codes are uppercased before lookup so the UI promise of
+        case-insensitivity holds even for codes inserted by raw SQL
+        in mixed case (defense in depth — :meth:`create_promo_code`
+        also uppercases on insert).
+
         This is an *advisory* check at UI time — the authoritative gate
         runs again under FOR UPDATE inside the SUCCESS transaction
         (see :meth:`_consume_promo_in_tx`) so two parallel invoices
         can't both take the last seat of a single-use code.
         """
+        code = code.upper()
         async with self.pool.acquire() as connection:
             row = await connection.fetchrow(
                 """
@@ -522,8 +528,15 @@ class Database:
         a stale promo state is a UX issue, not a payment failure, and
         we don't want webhook retries to compound.
 
+        Codes are uppercased on entry to match :meth:`create_promo_code`
+        and :meth:`validate_promo_code`. This shouldn't matter in
+        practice because the code on the transactions row was stamped
+        from the validate result (already uppercase), but defending
+        the boundary is cheaper than chasing a mismatch later.
+
         Returns the bonus actually credited.
         """
+        promo_code = promo_code.upper()
         promo = await connection.fetchrow(
             """
             SELECT max_uses, used_count, expires_at, is_active
@@ -610,7 +623,15 @@ class Database:
         Mainly intended for admin use (P2-6 will add a Telegram-side
         admin command). Validates the percent/amount XOR client-side
         for a friendlier error than the DB CHECK constraint.
+
+        The code is uppercased before insert so the user-facing case-
+        insensitive promise (the UI uppercases what users type, see
+        :func:`handlers.process_promo_input`) holds for codes created
+        through this method. Admins can pass ``"summer20"`` and users
+        can type ``"summer20"`` / ``"Summer20"`` / ``"SUMMER20"`` and
+        all three resolve to the same row.
         """
+        code = code.upper()
         if (discount_percent is None) == (discount_amount is None):
             raise ValueError(
                 "Exactly one of discount_percent / discount_amount must be set"
