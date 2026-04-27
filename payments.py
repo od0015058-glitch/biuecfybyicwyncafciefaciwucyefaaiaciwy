@@ -17,6 +17,35 @@ log = logging.getLogger("bot.payments")
 NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY")
 NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET")
 
+# How long we trust a cached min-amount lookup before re-querying the
+# NowPayments API. The minimums move with the underlying network
+# fee + spot price, so a stale value can falsely accept an invoice
+# that NowPayments will then reject. 1h is conservative.
+_MIN_AMOUNT_CACHE_TTL_SECONDS = 3600
+_min_amount_cache: dict[str, tuple[float | None, float]] = {}
+
+
+class MinAmountError(Exception):
+    """NowPayments rejected the invoice as below the per-currency minimum.
+
+    Raised from :func:`create_crypto_invoice` when the API returns a
+    400 with ``"amountTo is too small"`` (the only currency-specific
+    BAD_REQUEST we can recover from cleanly).
+
+    Carries the offending pay-currency symbol and, when we can fetch
+    it, the current minimum in USD so the handler can render a precise
+    user-facing message. ``min_usd`` is ``None`` when the min-amount
+    lookup itself failed (network error, malformed response, etc.).
+    """
+
+    def __init__(self, currency: str, min_usd: float | None):
+        self.currency = currency
+        self.min_usd = min_usd
+        msg = f"NowPayments min-amount not met for {currency!s}"
+        if min_usd is not None:
+            msg += f" (min ${min_usd:.2f})"
+        super().__init__(msg)
+
 # Public base URL where this bot is reachable (HTTPS in production).
 # Example: https://bot.example.com  -> IPN posts to /nowpayments-webhook there.
 WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
@@ -53,6 +82,66 @@ def _verify_ipn_signature(raw_body: bytes, signature_header: str | None) -> bool
         hashlib.sha512,
     ).hexdigest()
     return hmac.compare_digest(expected, signature_header.lower())
+
+
+async def get_min_amount_usd(pay_currency: str) -> float | None:
+    """Fetch (and cache) the USD minimum NowPayments will accept for *pay_currency*.
+
+    Calls ``GET /v1/min-amount?currency_from=<pay_currency>&currency_to=usd&fiat_equivalent=usd``
+    and returns the ``fiat_equivalent`` field — the USD value that the
+    minimum payable crypto amount converts to. We hit this only on the
+    error path (after a "amountTo is too small" rejection) so users on
+    the happy path never wait on it.
+
+    Cached per-currency for ``_MIN_AMOUNT_CACHE_TTL_SECONDS`` so a
+    second user picking the same too-small currency doesn't re-roundtrip.
+    Returns ``None`` on any network error, non-2xx, or malformed JSON.
+    """
+    pay_currency = pay_currency.lower()
+    cached = _min_amount_cache.get(pay_currency)
+    if cached is not None:
+        value, ts = cached
+        if (asyncio.get_event_loop().time() - ts) < _MIN_AMOUNT_CACHE_TTL_SECONDS:
+            return value
+
+    url = "https://api.nowpayments.io/v1/min-amount"
+    params = {
+        "currency_from": pay_currency,
+        "currency_to": "usd",
+        "fiat_equivalent": "usd",
+    }
+    headers = {"x-api-key": NOWPAYMENTS_API_KEY} if NOWPAYMENTS_API_KEY else {}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    log.warning(
+                        "min-amount lookup for %s returned %d: %s",
+                        pay_currency, response.status, body,
+                    )
+                    return None
+                data = await response.json()
+    except (asyncio.TimeoutError, aiohttp.ClientError):
+        log.warning("min-amount lookup for %s timed out / network error", pay_currency)
+        return None
+    except Exception:
+        log.exception("Unexpected error in min-amount lookup for %s", pay_currency)
+        return None
+
+    fiat = data.get("fiat_equivalent")
+    try:
+        value = float(fiat) if fiat is not None else None
+    except (TypeError, ValueError):
+        value = None
+    _min_amount_cache[pay_currency] = (value, asyncio.get_event_loop().time())
+    return value
 
 
 async def create_crypto_invoice(
@@ -138,6 +227,19 @@ async def create_crypto_invoice(
                         error_text,
                     )
 
+                    # Currency-specific minimum: don't waste retries on a
+                    # 400 that's deterministic. Surface a structured
+                    # error so the handler can show the user the actual
+                    # minimum and suggest a different currency.
+                    if (
+                        response.status == 400
+                        and "amountTo is too small" in error_text
+                    ):
+                        min_usd = await get_min_amount_usd(currency)
+                        raise MinAmountError(currency=currency, min_usd=min_usd)
+
+        except MinAmountError:
+            raise
         except asyncio.TimeoutError:
             log.warning(
                 "Timeout talking to NowPayments (attempt %d/%d)",
