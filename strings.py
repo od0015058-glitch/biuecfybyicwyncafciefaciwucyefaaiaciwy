@@ -51,13 +51,28 @@ _STRINGS: dict[str, dict[str, str]] = {
         "language_changed": "✅ زبان به فارسی تغییر یافت.",
         "btn_lang_fa": "🇮🇷 فارسی",
         "btn_lang_en": "🇬🇧 English",
-        # ---- Models menu (placeholder until P2-4) ----
-        "models_text": (
-            "🤖 **مدل‌های هوش مصنوعی**\n\n"
-            "✅ GPT-4o (فعال)\n"
-            "⏳ Claude 3.5 (بزودی...)\n"
-            "⏳ Gemini Pro (بزودی...)"
+        # ---- Model picker ----
+        "models_picker_title": (
+            "🤖 **انتخاب مدل هوش مصنوعی**\n\n"
+            "مدل فعلی: `{active_model}`\n\n"
+            "ابتدا یک ارائه‌دهنده را انتخاب کنید:"
         ),
+        "models_picker_empty": "❌ لیست مدل‌ها در دسترس نیست. لطفاً بعداً تلاش کنید.",
+        "models_provider_title": (
+            "🤖 ارائه‌دهنده: **{provider}**\n\n"
+            "مدل فعلی: `{active_model}`\n\n"
+            "صفحه {page} از {total_pages}"
+        ),
+        "models_price_format": "${input:.2f} / ${output:.2f} per 1M",
+        "models_set_success": (
+            "✅ مدل فعال شما به `{model_id}` تغییر یافت."
+        ),
+        "models_set_unknown": "❌ این مدل در فهرست یافت نشد.",
+        "models_offline_warning": (
+            "⚠️ ارتباط با OpenRouter برقرار نشد؛ از فهرست محلی استفاده می‌شود."
+        ),
+        "btn_models_prev_page": "◀️ قبلی",
+        "btn_models_next_page": "بعدی ▶️",
         # ---- Wallet ----
         "wallet_text": (
             "👛 **کیف پول شما**\n\n"
@@ -175,13 +190,28 @@ _STRINGS: dict[str, dict[str, str]] = {
         "language_changed": "✅ Language switched to English.",
         "btn_lang_fa": "🇮🇷 فارسی",
         "btn_lang_en": "🇬🇧 English",
-        # ---- Models menu (placeholder until P2-4) ----
-        "models_text": (
-            "🤖 **AI models**\n\n"
-            "✅ GPT-4o (active)\n"
-            "⏳ Claude 3.5 (coming soon...)\n"
-            "⏳ Gemini Pro (coming soon...)"
+        # ---- Model picker ----
+        "models_picker_title": (
+            "🤖 **Pick an AI model**\n\n"
+            "Currently active: `{active_model}`\n\n"
+            "First, choose a provider:"
         ),
+        "models_picker_empty": "❌ Model list unavailable. Please try again later.",
+        "models_provider_title": (
+            "🤖 Provider: **{provider}**\n\n"
+            "Currently active: `{active_model}`\n\n"
+            "Page {page} of {total_pages}"
+        ),
+        "models_price_format": "${input:.2f} / ${output:.2f} per 1M",
+        "models_set_success": (
+            "✅ Active model switched to `{model_id}`."
+        ),
+        "models_set_unknown": "❌ This model is not in the catalog.",
+        "models_offline_warning": (
+            "⚠️ Couldn't reach OpenRouter; showing the cached fallback list."
+        ),
+        "btn_models_prev_page": "◀️ Prev",
+        "btn_models_next_page": "Next ▶️",
         # ---- Wallet ----
         "wallet_text": (
             "👛 **Your wallet**\n\n"

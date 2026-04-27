@@ -4,7 +4,7 @@ import os
 import aiohttp
 
 from database import db
-from pricing import calculate_cost
+from pricing import calculate_cost_async
 from strings import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, t
 
 log = logging.getLogger("bot.ai_engine")
@@ -58,7 +58,9 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
                 if free_msgs > 0:
                     await db.decrement_free_message(telegram_id)
                 else:
-                    cost = calculate_cost(active_model, prompt_tokens, completion_tokens)
+                    cost = await calculate_cost_async(
+                        active_model, prompt_tokens, completion_tokens
+                    )
                     deducted = await db.deduct_balance(telegram_id, cost)
                     if not deducted:
                         # Balance was sufficient at the pre-check but a

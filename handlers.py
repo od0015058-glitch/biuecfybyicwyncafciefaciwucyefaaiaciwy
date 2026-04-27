@@ -14,6 +14,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from ai_engine import chat_with_model
 from database import db
+from models_catalog import CatalogModel, get_catalog
 from payments import create_crypto_invoice
 from strings import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, all_button_labels, t
 
@@ -161,15 +162,201 @@ async def set_language_handler(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+# ==========================================
+# Model picker (P2-4)
+# ==========================================
+# Two-step UI: provider list -> paginated model list -> "set active".
+#
+# Callback data fits Telegram's 64-byte cap by using short prefixes:
+#   mp:<provider>:<page>   -> open provider's page (page is 0-indexed)
+#   sm:<full_model_id>     -> set the model active
+# Provider names are at most ~20 chars; OpenRouter model ids are
+# typically <50 chars, so `sm:<id>` is well under the limit. Any
+# pathologically long id (>62 bytes after prefix) is filtered out.
+_MODELS_PER_PAGE = 8
+_CB_MAX_BYTES = 60  # leave 4 bytes of headroom under Telegram's 64-byte cap
+
+
+def _provider_display(provider: str) -> str:
+    """Pretty-print a provider id: 'meta-llama' -> 'Meta-Llama'."""
+    return "-".join(part.capitalize() for part in provider.split("-")) if provider else provider
+
+
+def _eligible_model(model: CatalogModel) -> bool:
+    """Filter out models whose callback data wouldn't fit in 64 bytes."""
+    return len(f"sm:{model.id}".encode("utf-8")) <= _CB_MAX_BYTES
+
+
+async def _send_provider_list(
+    message_or_callback,
+    *,
+    edit: bool,
+    lang: str,
+    active_model: str,
+):
+    """Render the provider-list screen, either as a fresh message or by
+    editing the calling callback's message."""
+    catalog = await get_catalog()
+    if not catalog.by_provider:
+        text = t(lang, "models_picker_empty")
+        builder = InlineKeyboardBuilder()
+        builder.button(text=t(lang, "btn_close_menu"), callback_data="close_menu")
+        if edit:
+            await message_or_callback.message.edit_text(text, reply_markup=builder.as_markup())
+        else:
+            await message_or_callback.answer(text, reply_markup=builder.as_markup())
+        return
+
+    # Sort providers by descending eligible-model count, then by name.
+    # OpenRouter exposes ~50+ providers, most of them niche. Bubbling
+    # the high-count ones (openai, anthropic, google, meta-llama, ...)
+    # to the top puts the popular models within one keypress.
+    provider_counts: list[tuple[str, int]] = []
+    for provider, ms in catalog.by_provider.items():
+        eligible = sum(1 for m in ms if _eligible_model(m))
+        if eligible:
+            provider_counts.append((provider, eligible))
+    provider_counts.sort(key=lambda pc: (-pc[1], pc[0]))
+
+    builder = InlineKeyboardBuilder()
+    for provider, _count in provider_counts:
+        builder.button(
+            text=_provider_display(provider),
+            callback_data=f"mp:{provider}:0",
+        )
+    builder.button(text=t(lang, "btn_close_menu"), callback_data="close_menu")
+    builder.adjust(2)  # 2-wide grid for providers, footer auto-wraps
+
+    title = t(lang, "models_picker_title", active_model=active_model)
+    if catalog.is_fallback:
+        title = title + "\n\n" + t(lang, "models_offline_warning")
+
+    if edit:
+        await message_or_callback.message.edit_text(
+            title, reply_markup=builder.as_markup(), parse_mode="Markdown"
+        )
+    else:
+        await message_or_callback.answer(
+            title, reply_markup=builder.as_markup(), parse_mode="Markdown"
+        )
+
+
 @router.message(F.text.in_(_MODEL_LABELS))
 async def models_text_handler(message: Message, state: FSMContext):
     await state.clear()
     lang = await _get_user_language(message.from_user.id)
+    user = await db.get_user(message.from_user.id)
+    active_model = user["active_model"] if user else "—"
+    await _send_provider_list(message, edit=False, lang=lang, active_model=active_model)
+
+
+@router.callback_query(F.data.startswith("mp:"))
+async def show_provider_models(callback: CallbackQuery):
+    """Show the paginated model list for the chosen provider."""
+    try:
+        _, provider, page_str = callback.data.split(":", 2)
+        page = int(page_str)
+    except (ValueError, IndexError):
+        await callback.answer("Bad data", show_alert=True)
+        return
+
+    lang = await _get_user_language(callback.from_user.id)
+    user = await db.get_user(callback.from_user.id)
+    active_model = user["active_model"] if user else "—"
+
+    catalog = await get_catalog()
+    models = [m for m in catalog.by_provider.get(provider, ()) if _eligible_model(m)]
+    if not models:
+        await callback.answer(t(lang, "models_picker_empty"), show_alert=True)
+        return
+
+    total_pages = max(1, (len(models) + _MODELS_PER_PAGE - 1) // _MODELS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    page_slice = models[page * _MODELS_PER_PAGE : (page + 1) * _MODELS_PER_PAGE]
+
     builder = InlineKeyboardBuilder()
-    builder.button(text=t(lang, "btn_close_menu"), callback_data="close_menu")
-    await message.answer(
-        t(lang, "models_text"), reply_markup=builder.as_markup(), parse_mode="Markdown"
+    for model in page_slice:
+        marker = "✅ " if model.id == active_model else ""
+        price_label = t(
+            lang,
+            "models_price_format",
+            input=model.price.input_per_1m_usd,
+            output=model.price.output_per_1m_usd,
+        )
+        # Telegram inline button labels can be ~64 chars, so squeeze the
+        # name + price onto one line. Truncate the name first if needed.
+        label = f"{marker}{model.name} • {price_label}"
+        if len(label) > 60:
+            label = label[:57] + "…"
+        builder.button(text=label, callback_data=f"sm:{model.id}")
+    # One model per row keeps the long labels readable.
+    builder.adjust(*([1] * len(page_slice)))
+
+    # Pagination row.
+    nav = InlineKeyboardBuilder()
+    if page > 0:
+        nav.button(
+            text=t(lang, "btn_models_prev_page"),
+            callback_data=f"mp:{provider}:{page - 1}",
+        )
+    if page < total_pages - 1:
+        nav.button(
+            text=t(lang, "btn_models_next_page"),
+            callback_data=f"mp:{provider}:{page + 1}",
+        )
+    nav.button(text=t(lang, "btn_back"), callback_data="mp_back")
+    nav.button(text=t(lang, "btn_home"), callback_data="close_menu")
+    nav.adjust(2, 2)
+    # Append the nav rows after the model rows.
+    for row in nav.export():
+        builder.row(*row)
+
+    title = t(
+        lang,
+        "models_provider_title",
+        provider=_provider_display(provider),
+        active_model=active_model,
+        page=page + 1,
+        total_pages=total_pages,
     )
+    await callback.message.edit_text(
+        title, reply_markup=builder.as_markup(), parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "mp_back")
+async def models_back_to_providers(callback: CallbackQuery):
+    """Go back from the per-provider page to the provider list."""
+    lang = await _get_user_language(callback.from_user.id)
+    user = await db.get_user(callback.from_user.id)
+    active_model = user["active_model"] if user else "—"
+    await _send_provider_list(callback, edit=True, lang=lang, active_model=active_model)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("sm:"))
+async def set_active_model_handler(callback: CallbackQuery):
+    """Set the user's active_model to the chosen catalog entry."""
+    model_id = callback.data.removeprefix("sm:")
+    lang = await _get_user_language(callback.from_user.id)
+
+    catalog = await get_catalog()
+    if catalog.get(model_id) is None:
+        await callback.answer(t(lang, "models_set_unknown"), show_alert=True)
+        return
+
+    updated = await db.set_active_model(callback.from_user.id, model_id)
+    if not updated:
+        # User row missing — they need to /start. Surface as alert so we
+        # don't strip the keyboard out from under them.
+        await callback.answer(t(lang, "ai_no_account"), show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        t(lang, "models_set_success", model_id=model_id), parse_mode="Markdown"
+    )
+    await callback.answer()
 
 
 def _build_wallet_keyboard(lang: str) -> InlineKeyboardBuilder:
