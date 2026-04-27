@@ -9,6 +9,7 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -79,7 +80,9 @@ async def _get_user_language(telegram_id: int) -> str:
 
 
 # ==========================================
-# Bottom reply keyboard (always visible at the top level)
+# Legacy bottom reply keyboard (P3-3 deprecated this; kept only as a
+# rendering helper so the legacy text handlers can still construct one
+# if absolutely needed. The hub UI is now inline-only.)
 # ==========================================
 def get_main_keyboard(lang: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -99,44 +102,228 @@ def get_main_keyboard(lang: str) -> ReplyKeyboardMarkup:
 
 
 # ==========================================
+# Inline hub — single-message UI (P3-3)
+# ==========================================
+# The bot renders ONE persistent message — the "hub" — that the user
+# navigates by tapping inline buttons attached to it. Every action
+# (wallet, models, language, support, …) edits the same message in
+# place, so the chat history stays clean: one bot bubble, the user's
+# free-text messages, and the bot's AI replies. Subflows that take
+# free-text input from the user (custom amount, promo code) inherently
+# create extra bubbles — that's unavoidable, but they end with a fresh
+# inline-keyboard message that becomes the local hub for that flow.
+async def _hub_text_and_kb(
+    telegram_id: int, lang: str
+) -> tuple[str, InlineKeyboardBuilder]:
+    """Render the hub: title text + 5-button inline keyboard.
+
+    Pulls live state (active model, balance, current language) from
+    the DB so the user always sees their settings without digging.
+    """
+    user = await db.get_user(telegram_id)
+    active_model = (
+        user["active_model"]
+        if user and user.get("active_model")
+        else t(lang, "hub_no_active_model")
+    )
+    balance = float(user["balance_usd"]) if user else 0.0
+    lang_label = t(lang, f"hub_lang_label_{lang}")
+
+    text = t(
+        lang,
+        "hub_title",
+        active_model=active_model,
+        balance=balance,
+        lang_label=lang_label,
+    )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text=t(lang, "hub_btn_wallet"), callback_data="hub_wallet")
+    kb.button(text=t(lang, "hub_btn_models"), callback_data="hub_models")
+    kb.button(text=t(lang, "hub_btn_new_chat"), callback_data="hub_newchat")
+    kb.button(text=t(lang, "hub_btn_support"), callback_data="hub_support")
+    kb.button(text=t(lang, "hub_btn_language"), callback_data="hub_language")
+    kb.adjust(2, 2, 1)
+    return text, kb
+
+
+async def _send_hub(message: Message, lang: str, *, remove_kb: bool = False) -> None:
+    """Send a fresh hub message. ``remove_kb=True`` strips the legacy
+    bottom reply-keyboard from the user's client (one-shot — once the
+    user has seen a ``ReplyKeyboardRemove`` they won't see the bottom
+    keyboard again unless we explicitly send a new ReplyKeyboardMarkup).
+    """
+    text, kb = await _hub_text_and_kb(message.chat.id, lang)
+    if remove_kb:
+        # Strip the legacy bottom keyboard first as its own message —
+        # ``answer`` with reply_markup=ReplyKeyboardRemove on the same
+        # call would also strip the inline keyboard we want to attach.
+        await message.answer("…", reply_markup=ReplyKeyboardRemove())
+    await message.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+async def _edit_to_hub(callback: CallbackQuery, lang: str) -> None:
+    """Edit the calling callback's message back into the hub view.
+
+    All "🏠 Back to menu" buttons funnel here. Idempotent: if the
+    message text + keyboard are already the hub, Telegram's
+    ``edit_text`` raises a "message is not modified" error which we
+    swallow.
+    """
+    text, kb = await _hub_text_and_kb(callback.from_user.id, lang)
+    try:
+        await callback.message.edit_text(
+            text, reply_markup=kb.as_markup(), parse_mode="Markdown"
+        )
+    except Exception:
+        # Telegram may raise TelegramBadRequest when the message is
+        # already exactly the hub. Not user-facing.
+        log.debug("edit_to_hub: edit_text was a no-op", exc_info=True)
+
+
+def _back_to_menu_button(kb: InlineKeyboardBuilder, lang: str) -> None:
+    """Append the standard '🏠 Back to menu' button to a screen's keyboard."""
+    kb.button(text=t(lang, "btn_back_to_menu"), callback_data="back_to_hub")
+
+
+# ==========================================
 # COMMAND: /start
 # ==========================================
 @router.message(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    # Drop any in-flight FSM (custom-amount / promo input) — /start is
+    # always a hard reset.
+    await state.clear()
     await db.create_user(message.from_user.id, message.from_user.username or "Unknown")
     lang = await _get_user_language(message.from_user.id)
-    text = t(lang, "start_greeting", first_name=message.from_user.first_name or "")
-    await message.answer(text, reply_markup=get_main_keyboard(lang))
+    # Quick greeting first (one-shot bubble), then the hub. Greeting is
+    # short and addressable so users feel acknowledged before the menu
+    # appears. Also strips the legacy bottom keyboard from old clients.
+    greeting = t(lang, "start_greeting", first_name=message.from_user.first_name or "")
+    await message.answer(greeting, reply_markup=ReplyKeyboardRemove())
+    await _send_hub(message, lang, remove_kb=False)
 
 
 # ==========================================
 # Top-level reply-keyboard handlers (matched across all languages)
 # ==========================================
-# Top-level reply-keyboard handlers all defensively clear the FSM. The
-# user can reach these by tapping the bottom keyboard from inside any
-# screen, including FSM-active flows like the custom-amount entry. If we
-# left the FSM set, the user's next free-text message would be
-# intercepted by `process_custom_amount_input` instead of `process_chat`.
-# `state.clear()` on a session with no state is a no-op so this is safe
-# to apply unconditionally. Same class of trap as #15 fixed for the home
-# button; this generalizes the fix.
-@router.message(F.text.in_(_SUPPORT_LABELS))
-async def support_text_handler(message: Message, state: FSMContext):
+# Legacy reply-keyboard handlers. P3-3 replaced the bottom keyboard
+# with an inline hub, but old Telegram clients may still have a cached
+# ReplyKeyboardMarkup from before the deploy. Until the user sends
+# /start (which clears it via ReplyKeyboardRemove), tapping a legacy
+# button still hits these handlers — we route them to the hub +
+# strip the legacy keyboard.
+#
+# Defensive FSM clear: same reason as before — these are reachable
+# from inside flows like waiting_custom_amount or waiting_promo_code,
+# and we don't want stale FSM state intercepting the user's next text
+# message after they bounce back to the hub. `state.clear()` is a no-op
+# when no state is set so it's always safe.
+async def _route_legacy_text_to_hub(message: Message, state: FSMContext):
     await state.clear()
     lang = await _get_user_language(message.from_user.id)
-    await message.answer(t(lang, "support_text"), parse_mode="Markdown")
+    await _send_hub(message, lang, remove_kb=True)
+
+
+@router.message(F.text.in_(_SUPPORT_LABELS))
+async def support_text_handler(message: Message, state: FSMContext):
+    await _route_legacy_text_to_hub(message, state)
 
 
 @router.message(F.text.in_(_LANGUAGE_LABELS))
 async def language_text_handler(message: Message, state: FSMContext):
+    await _route_legacy_text_to_hub(message, state)
+
+
+# ==========================================
+# Hub callbacks — each top-level button on the hub edits the message
+# in place into the chosen screen. Every screen has a "🏠 Back to menu"
+# button that routes back via ``back_to_hub``.
+# ==========================================
+@router.callback_query(F.data == "back_to_hub")
+async def back_to_hub_handler(callback: CallbackQuery, state: FSMContext):
+    # Defensive FSM clear — reachable from inside the charge flows.
     await state.clear()
-    lang = await _get_user_language(message.from_user.id)
+    lang = await _get_user_language(callback.from_user.id)
+    await _edit_to_hub(callback, lang)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "hub_wallet")
+async def hub_wallet_handler(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    user_id = callback.from_user.id
+    lang = await _get_user_language(user_id)
+    user_data = await db.get_user(user_id)
+    balance = float(user_data["balance_usd"]) if user_data else 0.0
+    builder = _build_wallet_keyboard(lang)
+    await callback.message.edit_text(
+        t(lang, "wallet_text", balance=balance),
+        reply_markup=builder.as_markup(),
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "hub_models")
+async def hub_models_handler(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    lang = await _get_user_language(callback.from_user.id)
+    user = await db.get_user(callback.from_user.id)
+    active_model = user["active_model"] if user else "—"
+    await _send_provider_list(callback, edit=True, lang=lang, active_model=active_model)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "hub_support")
+async def hub_support_handler(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    lang = await _get_user_language(callback.from_user.id)
+    builder = InlineKeyboardBuilder()
+    _back_to_menu_button(builder, lang)
+    await callback.message.edit_text(
+        t(lang, "support_text"),
+        parse_mode="Markdown",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "hub_language")
+async def hub_language_handler(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    lang = await _get_user_language(callback.from_user.id)
     builder = InlineKeyboardBuilder()
     builder.button(text=t(lang, "btn_lang_fa"), callback_data="set_lang_fa")
     builder.button(text=t(lang, "btn_lang_en"), callback_data="set_lang_en")
-    builder.button(text=t(lang, "btn_close_menu"), callback_data="close_menu")
+    _back_to_menu_button(builder, lang)
     builder.adjust(2, 1)
-    await message.answer(t(lang, "language_picker_title"), reply_markup=builder.as_markup())
+    await callback.message.edit_text(
+        t(lang, "language_picker_title"), reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "hub_newchat")
+async def hub_newchat_handler(callback: CallbackQuery, state: FSMContext):
+    """Placeholder for the conversation-memory feature (P3-4 / P3-6).
+
+    Today the bot has no memory: every message is independent. This
+    button currently shows a notice explaining what's coming and
+    offers a back-to-menu button. Once memory + the per-user toggle
+    land, this handler will clear the user's conversation buffer and
+    return to the hub with a fresh-chat indicator.
+    """
+    await state.clear()
+    lang = await _get_user_language(callback.from_user.id)
+    builder = InlineKeyboardBuilder()
+    _back_to_menu_button(builder, lang)
+    await callback.message.edit_text(
+        t(lang, "hub_new_chat_pending"),
+        parse_mode="Markdown",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("set_lang_"))
@@ -149,18 +336,13 @@ async def set_language_handler(callback: CallbackQuery, state: FSMContext):
     # picker is reachable while in waiting_custom_amount.
     await state.clear()
     await db.set_language(callback.from_user.id, new_lang)
-    # Show the confirmation in the *new* language so the user immediately
-    # sees the switch took effect.
-    await callback.message.edit_text(t(new_lang, "language_changed"))
-    # The bottom reply keyboard was rendered before the user changed
-    # language; re-render it so the four top-level buttons are localized.
-    # Send as a fresh message because edit_text can't change reply_markup
-    # to a ReplyKeyboardMarkup (only inline markups are editable).
-    await callback.message.answer(
-        t(new_lang, "start_greeting", first_name=callback.from_user.first_name or ""),
-        reply_markup=get_main_keyboard(new_lang),
-    )
-    await callback.answer()
+    # Telegram alert (the small toast at the top of the chat) confirms
+    # the switch took effect, then we edit the message back to the hub
+    # rendered in the new language. No fresh chat bubble needed — the
+    # hub message carries every label, including the "Language: 🇮🇷 …"
+    # row, so the user sees the change reflected everywhere.
+    await callback.answer(t(new_lang, "language_changed"))
+    await _edit_to_hub(callback, new_lang)
 
 
 # ==========================================
@@ -201,7 +383,7 @@ async def _send_provider_list(
     if not catalog.by_provider:
         text = t(lang, "models_picker_empty")
         builder = InlineKeyboardBuilder()
-        builder.button(text=t(lang, "btn_close_menu"), callback_data="close_menu")
+        _back_to_menu_button(builder, lang)
         if edit:
             await message_or_callback.message.edit_text(text, reply_markup=builder.as_markup())
         else:
@@ -225,7 +407,7 @@ async def _send_provider_list(
             text=_provider_display(provider),
             callback_data=f"mp:{provider}:0",
         )
-    builder.button(text=t(lang, "btn_close_menu"), callback_data="close_menu")
+    _back_to_menu_button(builder, lang)
     builder.adjust(2)  # 2-wide grid for providers, footer auto-wraps
 
     title = t(lang, "models_picker_title", active_model=active_model)
@@ -240,15 +422,6 @@ async def _send_provider_list(
         await message_or_callback.answer(
             title, reply_markup=builder.as_markup(), parse_mode="Markdown"
         )
-
-
-@router.message(F.text.in_(_MODEL_LABELS))
-async def models_text_handler(message: Message, state: FSMContext):
-    await state.clear()
-    lang = await _get_user_language(message.from_user.id)
-    user = await db.get_user(message.from_user.id)
-    active_model = user["active_model"] if user else "—"
-    await _send_provider_list(message, edit=False, lang=lang, active_model=active_model)
 
 
 @router.callback_query(F.data.startswith("mp:"))
@@ -306,7 +479,7 @@ async def show_provider_models(callback: CallbackQuery):
             callback_data=f"mp:{provider}:{page + 1}",
         )
     nav.button(text=t(lang, "btn_back"), callback_data="mp_back")
-    nav.button(text=t(lang, "btn_home"), callback_data="close_menu")
+    nav.button(text=t(lang, "btn_back_to_menu"), callback_data="back_to_hub")
     nav.adjust(2, 2)
     # Append the nav rows after the model rows.
     for row in nav.export():
@@ -354,8 +527,12 @@ async def set_active_model_handler(callback: CallbackQuery):
         await callback.answer(t(lang, "ai_no_account"), show_alert=True)
         return
 
+    builder = InlineKeyboardBuilder()
+    _back_to_menu_button(builder, lang)
     await callback.message.edit_text(
-        t(lang, "models_set_success", model_id=model_id), parse_mode="Markdown"
+        t(lang, "models_set_success", model_id=model_id),
+        parse_mode="Markdown",
+        reply_markup=builder.as_markup(),
     )
     await callback.answer()
 
@@ -363,21 +540,21 @@ async def set_active_model_handler(callback: CallbackQuery):
 def _build_wallet_keyboard(lang: str) -> InlineKeyboardBuilder:
     builder = InlineKeyboardBuilder()
     builder.button(text=t(lang, "btn_add_crypto"), callback_data="add_crypto")
-    builder.button(text=t(lang, "btn_close_menu"), callback_data="close_menu")
+    _back_to_menu_button(builder, lang)
     builder.adjust(1, 1)
     return builder
 
 
 @router.message(F.text.in_(_WALLET_LABELS))
 async def wallet_text_handler(message: Message, state: FSMContext):
-    await state.clear()
-    user_id = message.from_user.id
-    lang = await _get_user_language(user_id)
-    user_data = await db.get_user(user_id)
-    balance = float(user_data["balance_usd"]) if user_data else 0.0
-    text = t(lang, "wallet_text", balance=balance)
-    builder = _build_wallet_keyboard(lang)
-    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+    # Legacy reply-keyboard handler — see _route_legacy_text_to_hub.
+    await _route_legacy_text_to_hub(message, state)
+
+
+@router.message(F.text.in_(_MODEL_LABELS))
+async def models_text_handler_legacy(message: Message, state: FSMContext):
+    # Legacy reply-keyboard handler — see _route_legacy_text_to_hub.
+    await _route_legacy_text_to_hub(message, state)
 
 
 # ==========================================
@@ -385,14 +562,18 @@ async def wallet_text_handler(message: Message, state: FSMContext):
 # ==========================================
 @router.callback_query(F.data == "close_menu")
 async def close_menu_handler(callback: CallbackQuery, state: FSMContext):
-    # The 🏠 home button is reachable from the custom-amount entry screen,
-    # which sets the FSM to UserStates.waiting_custom_amount. Without
-    # clearing here, the user's next free-text message is intercepted by
-    # process_custom_amount_input (it expects an amount) instead of
-    # process_chat — so AI chat would silently break until the user
-    # restarts the charge flow.
+    # P3-3: legacy alias. Pre-hub, this used to *delete* the inline
+    # message; with the single-message hub UI we instead edit back to
+    # the hub so the user always has the menu in front of them. Any
+    # button that still emits ``callback_data="close_menu"`` from
+    # older buttons effectively becomes "back to menu".
+    #
+    # FSM clear: same reason as before — this is reachable from inside
+    # waiting_custom_amount / waiting_promo_code, so the user's next
+    # free-text message must not be intercepted by those FSM handlers.
     await state.clear()
-    await callback.message.delete()
+    lang = await _get_user_language(callback.from_user.id)
+    await _edit_to_hub(callback, lang)
     await callback.answer()
 
 
