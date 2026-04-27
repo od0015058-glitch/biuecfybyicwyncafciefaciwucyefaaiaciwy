@@ -102,7 +102,14 @@ async def wallet_text_handler(message: Message):
 # هندلرهای دکمه‌های شیشه‌ای (ناوبری و بازگشت)
 # ==========================================
 @router.callback_query(F.data == "close_menu")
-async def close_menu_handler(callback: CallbackQuery):
+async def close_menu_handler(callback: CallbackQuery, state: FSMContext):
+    # The 🏠 home button is reachable from the custom-amount entry screen,
+    # which sets the FSM to UserStates.waiting_custom_amount. Without
+    # clearing here, the user's next free-text message is intercepted by
+    # process_custom_amount_input (it expects an amount) instead of
+    # process_chat — so AI chat would silently break until the user
+    # restarts the charge flow.
+    await state.clear()
     await callback.message.delete()
     await callback.answer()
 
