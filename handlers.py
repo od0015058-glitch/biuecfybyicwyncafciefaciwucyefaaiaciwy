@@ -808,11 +808,16 @@ async def show_free_models(callback: CallbackQuery):
     for model in page_slice:
         marker = "✅ " if model.id == active_model else ""
         # Inside the Free list we need the provider hint back on the
-        # row (the user is browsing across providers here).
-        pretty_provider = _provider_display(model.provider).split(" ", 1)
-        provider_label = (
-            pretty_provider[1] if len(pretty_provider) == 2 else model.provider
-        )
+        # row (the user is browsing across providers here). For
+        # prominent providers with an emoji override
+        # ("🟢 OpenAI") we strip the leading emoji + space so the
+        # row reads "OpenAI • <model>" without doubling the emoji.
+        # For non-prominent providers (e.g. "Meta-Llama"), there's
+        # nothing to strip — use the full pretty-printed display
+        # string instead of falling back to the raw slug.
+        full_display = _provider_display(model.provider)
+        parts = full_display.split(" ", 1)
+        provider_label = parts[1] if len(parts) == 2 else full_display
         clean_name = _strip_provider_prefix(model.name, model.provider)
         label = f"{marker}{provider_label} • {clean_name}"
         if len(label) > 60:
