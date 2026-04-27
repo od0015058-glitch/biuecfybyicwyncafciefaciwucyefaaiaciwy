@@ -44,7 +44,8 @@ _STRINGS: dict[str, dict[str, str]] = {
             "🐱 **Meowassist**\n\n"
             "🤖 مدل فعال: `{active_model}`\n"
             "💰 موجودی: `${balance:.2f}`\n"
-            "🌍 زبان: `{lang_label}`\n\n"
+            "🌍 زبان: `{lang_label}`\n"
+            "🧠 حافظه: {memory_label}\n\n"
             "از دکمه‌های زیر برای ادامه استفاده کنید:"
         ),
         "hub_btn_wallet": "💰 کیف پول",
@@ -55,13 +56,24 @@ _STRINGS: dict[str, dict[str, str]] = {
         "hub_no_active_model": "—",
         "hub_lang_label_fa": "🇮🇷 فارسی",
         "hub_lang_label_en": "🇬🇧 English",
-        "hub_new_chat_pending": (
-            "🆕 **گفتگوی جدید**\n\n"
-            "این قابلیت در حال توسعه است. "
-            "در نسخه بعد، دکمه‌ای برای فعال‌سازی حافظه و یک دکمه برای پاک کردن "
-            "گفتگوی فعلی اضافه می‌شود.\n\n"
-            "فعلاً ربات هر پیام را مستقل پاسخ می‌دهد."
+        # ---- Memory toggle / new-chat screen (P3-5) ----
+        "memory_state_on": "🟢 روشن",
+        "memory_state_off": "⚪ خاموش",
+        "memory_screen": (
+            "🧠 **حافظه گفتگو**\n\n"
+            "وضعیت فعلی: {state}\n\n"
+            "وقتی حافظه روشن باشد، ربات پیام‌های قبلی شما را به‌خاطر می‌سپارد "
+            "و می‌توانید گفتگوی چندمرحله‌ای داشته باشید. هزینه با طول گفتگو افزایش می‌یابد:\n"
+            "• ۱۰ پیام ≈ ۵ برابر یک پیام مستقل\n"
+            "• ۳۰ پیام ≈ ۱۵ برابر یک پیام مستقل\n\n"
+            "هر زمان دکمه «گفتگوی جدید» را بزنید، حافظه پاک می‌شود (رایگان)."
         ),
+        "btn_memory_enable": "🟢 فعال کردن حافظه",
+        "btn_memory_disable": "⚪ خاموش کردن حافظه",
+        "btn_memory_reset": "🆕 شروع گفتگوی جدید",
+        "memory_toggled_on": "✅ حافظه فعال شد",
+        "memory_toggled_off": "⚪ حافظه خاموش شد",
+        "memory_reset_done": "🆕 گفتگو پاک شد ({count} پیام)",
         # ---- /start ----
         "start_greeting": (
             "سلام {first_name}!\n\n"
@@ -253,7 +265,8 @@ _STRINGS: dict[str, dict[str, str]] = {
             "🐱 **Meowassist**\n\n"
             "🤖 Active model: `{active_model}`\n"
             "💰 Balance: `${balance:.2f}`\n"
-            "🌍 Language: `{lang_label}`\n\n"
+            "🌍 Language: `{lang_label}`\n"
+            "🧠 Memory: {memory_label}\n\n"
             "Tap a button to continue:"
         ),
         "hub_btn_wallet": "💰 Wallet",
@@ -264,13 +277,25 @@ _STRINGS: dict[str, dict[str, str]] = {
         "hub_no_active_model": "—",
         "hub_lang_label_fa": "🇮🇷 فارسی",
         "hub_lang_label_en": "🇬🇧 English",
-        "hub_new_chat_pending": (
-            "🆕 **New Chat**\n\n"
-            "This feature is being built. The next release will add a memory "
-            "toggle so the bot can remember your last messages, plus a button "
-            "to clear that memory and start fresh.\n\n"
-            "For now every message is independent."
+        # ---- Memory toggle / new-chat screen (P3-5) ----
+        "memory_state_on": "🟢 ON",
+        "memory_state_off": "⚪ OFF",
+        "memory_screen": (
+            "🧠 **Conversation memory**\n\n"
+            "Current state: {state}\n\n"
+            "When memory is ON the bot remembers your previous messages so "
+            "you can have a real multi-turn conversation. Cost grows with "
+            "conversation length:\n"
+            "• 10 turns ≈ 5× one independent message\n"
+            "• 30 turns ≈ 15× one independent message\n\n"
+            "Tap '🆕 New chat' any time to wipe memory and start fresh (free)."
         ),
+        "btn_memory_enable": "🟢 Enable memory",
+        "btn_memory_disable": "⚪ Disable memory",
+        "btn_memory_reset": "🆕 Start new chat",
+        "memory_toggled_on": "✅ Memory enabled",
+        "memory_toggled_off": "⚪ Memory disabled",
+        "memory_reset_done": "🆕 Conversation cleared ({count} messages)",
         # ---- /start ----
         "start_greeting": (
             "Hi {first_name}!\n\n"

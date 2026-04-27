@@ -8,6 +8,10 @@ CREATE TABLE users (
     balance_usd DECIMAL(10, 4) DEFAULT 0.0000, -- Precise to 4 decimal places for micro-cent API costs
     free_messages_left INT DEFAULT 5, -- The Freemium Funnel
     active_model VARCHAR(255) DEFAULT 'openai/gpt-3.5-turbo',
+    -- P3-5 conversation memory opt-in. OFF by default; enabling
+    -- causes ai_engine to prepend the user's recent conversation_messages
+    -- as context to every prompt — costs scale with conversation length.
+    memory_enabled BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -117,3 +121,23 @@ CREATE TABLE promo_usage (
 ALTER TABLE transactions
     ADD COLUMN promo_code_used VARCHAR(64) REFERENCES promo_codes(code),
     ADD COLUMN promo_bonus_usd DECIMAL(10, 4) NOT NULL DEFAULT 0;
+
+-- 7. CONVERSATION MESSAGES TABLE
+-- Per-user multi-turn conversation memory (P3-5). Only written to when
+-- ``users.memory_enabled = TRUE``. ai_engine reads the most recent N
+-- rows (chronological) and feeds them as the OpenAI Chat-Completions
+-- ``messages`` array on each request.
+--
+-- "🆕 New chat" deletes every row for the user so they can reset
+-- context without flipping the toggle. ON DELETE CASCADE handles a
+-- future delete-account flow safely.
+CREATE TABLE conversation_messages (
+    id BIGSERIAL PRIMARY KEY,
+    telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+    role VARCHAR(16) NOT NULL CHECK (role IN ('user', 'assistant')),
+    content TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX conversation_messages_user_created_idx
+    ON conversation_messages (telegram_id, created_at DESC);

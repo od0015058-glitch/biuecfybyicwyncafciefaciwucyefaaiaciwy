@@ -22,20 +22,35 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
     balance = float(user['balance_usd'])
     active_model = user['active_model']
     lang = user['language_code'] if user['language_code'] in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
+    # P3-5: pull the toggle from the same row so we don't fire a second
+    # SELECT for what's effectively a one-byte flag. Defaults to False
+    # if the column is missing (pre-migration DB), keeping the bot
+    # operational while the DBA applies the migration.
+    memory_enabled = bool(user["memory_enabled"]) if "memory_enabled" in user else False
 
     # 2. Hard block if they are out of free messages and out of money
     if free_msgs <= 0 and balance < 0.05:
         return t(lang, "ai_insufficient_balance")
 
-    # 3. Call OpenRouter API
+    # 3. Build the messages payload. With memory disabled this is just
+    #    [user_prompt]; with memory enabled we prepend the user's last
+    #    N turns so the model can carry context across messages. The
+    #    cost grows roughly linearly with conversation length — the
+    #    hub UI explains this and offers a "🆕 New chat" reset.
+    messages: list[dict] = []
+    if memory_enabled:
+        messages.extend(await db.get_recent_messages(telegram_id))
+    messages.append({"role": "user", "content": user_prompt})
+
+    # 4. Call OpenRouter API
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json"
     }
-    
+
     payload = {
         "model": active_model,
-        "messages": [{"role": "user", "content": user_prompt}]
+        "messages": messages,
     }
 
     try:
@@ -75,7 +90,18 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
                         )
                     charged = cost if deducted else 0.0
                     await db.log_usage(telegram_id, active_model, prompt_tokens, completion_tokens, charged)
-                    
+
+                # 5. Persist the turn for memory-enabled users. We do
+                #    this AFTER the settlement so a free / paid call
+                #    that already deducted balance doesn't get recorded
+                #    twice if the response parse fails. Persisting both
+                #    sides of the turn keeps the buffer balanced (so
+                #    each fetch returns alternating user/assistant
+                #    pairs in chronological order).
+                if memory_enabled:
+                    await db.append_conversation_message(telegram_id, "user", user_prompt)
+                    await db.append_conversation_message(telegram_id, "assistant", reply_text)
+
                 return reply_text
                 
     except Exception:
