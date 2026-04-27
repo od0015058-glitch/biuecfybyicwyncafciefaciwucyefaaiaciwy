@@ -413,7 +413,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         ),
         "charge_min_amount_unknown": (
             "❌ Your amount is below the minimum payable for {currency}.\n"
-            "Please try $10 or more, or pick a different currency."
+            "Please try a higher amount, or pick a cheaper currency (e.g. USDT-TRC20)."
         ),
         # ---- AI engine error replies ----
         "ai_no_account": "❌ Your account was not found. Please /start the bot first.",
