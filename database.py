@@ -1,9 +1,13 @@
-import asyncpg
+import logging
 import os
+
+import asyncpg
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+log = logging.getLogger("bot.database")
 
 class Database:
     def __init__(self):
@@ -20,7 +24,7 @@ class Database:
             min_size=1,  # Minimum concurrent connections
             max_size=10  # Maximum concurrent connections to prevent RAM overload
         )
-        print("✅ Database connection pool established.")
+        log.info("Database connection pool established")
 
     async def close(self):
         """Closes the connection pool securely."""
@@ -79,12 +83,6 @@ class Database:
         """
         async with self.pool.acquire() as connection:
             await connection.execute(query, telegram_id, model, prompt_tokens, completion_tokens, cost)
-
-    async def add_balance(self, telegram_id: int, amount_usd: float):
-        """Safely adds USD to the user's wallet after a successful crypto payment."""
-        query = "UPDATE users SET balance_usd = balance_usd + $1 WHERE telegram_id = $2"
-        async with self.pool.acquire() as connection:
-            await connection.execute(query, amount_usd, telegram_id)
 
     async def create_pending_transaction(
         self,

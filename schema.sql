@@ -12,16 +12,34 @@ CREATE TABLE users (
 );
 
 -- 2. TRANSACTIONS TABLE
--- This is your ledger. Every time someone clicks "Add Credit", a row is created here as PENDING. 
--- When NowPayments or ZarinPal sends the success webhook, it updates to SUCCESS.
+-- This is your ledger. Every time someone clicks "Add Credit", a row is created
+-- here as PENDING. The IPN webhook from NowPayments transitions it through
+-- the lifecycle below.
+--
+-- Status state machine (see database.finalize_payment / finalize_partial_payment
+-- / mark_transaction_terminal for the corresponding code paths):
+--
+--   PENDING  ──finished──→ SUCCESS
+--   PENDING  ──partially_paid──→ PARTIAL
+--   PENDING  ──expired/failed/refunded──→ EXPIRED / FAILED / REFUNDED
+--   PARTIAL  ──finished──→ SUCCESS                  (credits remainder delta)
+--   PARTIAL  ──partially_paid──→ PARTIAL            (credits new delta only)
+--   PARTIAL  ──expired/failed/refunded──→ EXPIRED / FAILED / REFUNDED
+--                                                   (no debit; user keeps the partial credit)
+--
+-- amount_usd_credited semantics:
+--   * For PENDING rows:     the USD amount we *intend* to credit on success.
+--   * For non-PENDING rows: the cumulative USD already credited to the wallet
+--                            from this invoice. Updated atomically alongside
+--                            the wallet credit.
 CREATE TABLE transactions (
     transaction_id SERIAL PRIMARY KEY,
     telegram_id BIGINT REFERENCES users(telegram_id),
-    gateway VARCHAR(50) NOT NULL, -- e.g., 'NowPayments', 'ZarinPal'
-    currency_used VARCHAR(10) NOT NULL, -- e.g., 'TON', 'IRR'
-    amount_crypto_or_rial DECIMAL(20, 8), -- The exact amount they sent in TON or Tomans
-    amount_usd_credited DECIMAL(10, 4) NOT NULL, -- The USD equivalent added to their wallet
-    status VARCHAR(20) DEFAULT 'PENDING', -- PENDING, SUCCESS, FAILED
+    gateway VARCHAR(50) NOT NULL, -- e.g., 'NowPayments'
+    currency_used VARCHAR(10) NOT NULL, -- e.g., 'TON', 'btc', 'usdttrc20'
+    amount_crypto_or_rial DECIMAL(20, 8), -- The exact amount they sent in the chosen currency
+    amount_usd_credited DECIMAL(10, 4) NOT NULL, -- See semantics note above
+    status VARCHAR(20) DEFAULT 'PENDING', -- PENDING, SUCCESS, PARTIAL, EXPIRED, FAILED, REFUNDED
     gateway_invoice_id VARCHAR(255) UNIQUE, -- The ID provided by the payment gateway to prevent duplicate processing
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     completed_at TIMESTAMP WITH TIME ZONE
