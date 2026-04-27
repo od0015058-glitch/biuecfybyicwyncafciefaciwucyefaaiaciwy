@@ -236,17 +236,26 @@ class Database:
                 # cannot debit the user.
                 delta = max(0.0, actually_paid_usd - already_credited)
 
-                await connection.execute(
+                # GREATEST(...) keeps amount_usd_credited monotonic: an
+                # out-of-order replay carrying a smaller actually_paid must
+                # NOT downgrade the ledger value, otherwise a subsequent
+                # `finished` IPN would compute the remainder against the
+                # downgraded base and over-credit the user. Pair with the
+                # `delta = max(0, ...)` clamp above which protects the
+                # wallet balance on the same path.
+                new_credited_row = await connection.fetchrow(
                     """
                     UPDATE transactions
                     SET status = 'PARTIAL',
-                        amount_usd_credited = $2,
+                        amount_usd_credited = GREATEST(amount_usd_credited, $2),
                         completed_at = CURRENT_TIMESTAMP
                     WHERE gateway_invoice_id = $1
+                    RETURNING amount_usd_credited
                     """,
                     gateway_invoice_id,
                     actually_paid_usd,
                 )
+                new_credited = float(new_credited_row["amount_usd_credited"])
                 if delta > 0:
                     await connection.execute(
                         """
@@ -260,7 +269,7 @@ class Database:
                 return {
                     "telegram_id": row["telegram_id"],
                     "currency_used": row["currency_used"],
-                    "amount_usd_credited": actually_paid_usd,
+                    "amount_usd_credited": new_credited,
                     "delta_credited": delta,
                 }
 
@@ -312,17 +321,24 @@ class Database:
                 # not debit the user.
                 delta = max(0.0, full_price_usd - already_credited)
 
-                await connection.execute(
+                # GREATEST keeps amount_usd_credited monotonic; matches the
+                # symmetric guard in finalize_partial_payment. Defends
+                # against an unlikely `finished` IPN whose price_amount is
+                # below what was already credited from earlier
+                # partially_paid IPNs.
+                new_credited_row = await connection.fetchrow(
                     """
                     UPDATE transactions
                     SET status = 'SUCCESS',
-                        amount_usd_credited = $2,
+                        amount_usd_credited = GREATEST(amount_usd_credited, $2),
                         completed_at = CURRENT_TIMESTAMP
                     WHERE gateway_invoice_id = $1
+                    RETURNING amount_usd_credited
                     """,
                     gateway_invoice_id,
                     full_price_usd,
                 )
+                new_credited = float(new_credited_row["amount_usd_credited"])
                 if delta > 0:
                     await connection.execute(
                         """
@@ -335,7 +351,7 @@ class Database:
                     )
                 return {
                     "telegram_id": row["telegram_id"],
-                    "amount_usd_credited": full_price_usd,
+                    "amount_usd_credited": new_credited,
                     "delta_credited": delta,
                 }
 

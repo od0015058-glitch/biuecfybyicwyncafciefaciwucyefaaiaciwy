@@ -88,14 +88,24 @@ async def cmd_start(message: Message):
 # ==========================================
 # Top-level reply-keyboard handlers (matched across all languages)
 # ==========================================
+# Top-level reply-keyboard handlers all defensively clear the FSM. The
+# user can reach these by tapping the bottom keyboard from inside any
+# screen, including FSM-active flows like the custom-amount entry. If we
+# left the FSM set, the user's next free-text message would be
+# intercepted by `process_custom_amount_input` instead of `process_chat`.
+# `state.clear()` on a session with no state is a no-op so this is safe
+# to apply unconditionally. Same class of trap as #15 fixed for the home
+# button; this generalizes the fix.
 @router.message(F.text.in_(_SUPPORT_LABELS))
-async def support_text_handler(message: Message):
+async def support_text_handler(message: Message, state: FSMContext):
+    await state.clear()
     lang = await _get_user_language(message.from_user.id)
     await message.answer(t(lang, "support_text"), parse_mode="Markdown")
 
 
 @router.message(F.text.in_(_LANGUAGE_LABELS))
-async def language_text_handler(message: Message):
+async def language_text_handler(message: Message, state: FSMContext):
+    await state.clear()
     lang = await _get_user_language(message.from_user.id)
     builder = InlineKeyboardBuilder()
     builder.button(text=t(lang, "btn_lang_fa"), callback_data="set_lang_fa")
@@ -106,11 +116,14 @@ async def language_text_handler(message: Message):
 
 
 @router.callback_query(F.data.startswith("set_lang_"))
-async def set_language_handler(callback: CallbackQuery):
+async def set_language_handler(callback: CallbackQuery, state: FSMContext):
     new_lang = callback.data.removeprefix("set_lang_")
     if new_lang not in SUPPORTED_LANGUAGES:
         await callback.answer("Unknown language", show_alert=True)
         return
+    # Clear FSM defensively (see top-level handlers comment); the language
+    # picker is reachable while in waiting_custom_amount.
+    await state.clear()
     await db.set_language(callback.from_user.id, new_lang)
     # Show the confirmation in the *new* language so the user immediately
     # sees the switch took effect.
@@ -127,7 +140,8 @@ async def set_language_handler(callback: CallbackQuery):
 
 
 @router.message(F.text.in_(_MODEL_LABELS))
-async def models_text_handler(message: Message):
+async def models_text_handler(message: Message, state: FSMContext):
+    await state.clear()
     lang = await _get_user_language(message.from_user.id)
     builder = InlineKeyboardBuilder()
     builder.button(text=t(lang, "btn_close_menu"), callback_data="close_menu")
@@ -145,7 +159,8 @@ def _build_wallet_keyboard(lang: str) -> InlineKeyboardBuilder:
 
 
 @router.message(F.text.in_(_WALLET_LABELS))
-async def wallet_text_handler(message: Message):
+async def wallet_text_handler(message: Message, state: FSMContext):
+    await state.clear()
     user_id = message.from_user.id
     lang = await _get_user_language(user_id)
     user_data = await db.get_user(user_id)
