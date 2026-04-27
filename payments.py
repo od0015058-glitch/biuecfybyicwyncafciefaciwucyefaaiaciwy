@@ -152,6 +152,69 @@ async def create_crypto_invoice(
     return None
 
 
+# IPN statuses we consider "in flight": the payment is still progressing,
+# nothing to do but log. NowPayments may emit several of these per invoice.
+_IN_FLIGHT_STATUSES = frozenset(
+    {"waiting", "confirming", "confirmed", "sending"}
+)
+
+# IPN statuses that mean the payment will NOT settle. We mark the ledger
+# with a terminal status (so retries are no-ops) and notify the user.
+# Mapping: incoming IPN status -> ledger status we record.
+_TERMINAL_FAILURE_STATUSES = {
+    "expired": "EXPIRED",
+    "failed": "FAILED",
+    "refunded": "REFUNDED",
+}
+
+
+def _compute_actually_paid_usd(data: dict) -> float | None:
+    """Convert the IPN's `actually_paid` (in pay_currency) to USD.
+
+    NowPayments quotes the conversion rate at invoice time:
+        pay_amount  <crypto>  ==  price_amount  USD
+    so the proportional USD value of `actually_paid` is:
+        actually_paid_usd = actually_paid / pay_amount * price_amount
+
+    Using the quoted rate (rather than fetching a fresh spot price) is
+    the right defensive choice: it's the rate the user agreed to when
+    they generated the invoice, so they cannot game us by paying when
+    the spot price has moved against us.
+
+    Returns None if any required field is missing or non-positive,
+    in which case the caller should refuse to credit and surface for
+    manual reconciliation.
+    """
+    try:
+        actually_paid = float(data["actually_paid"])
+        pay_amount = float(data["pay_amount"])
+        price_amount = float(data["price_amount"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if pay_amount <= 0 or price_amount <= 0 or actually_paid <= 0:
+        return None
+    # Cap at price_amount as a defense-in-depth: NowPayments shouldn't fire
+    # `partially_paid` for an over-payment, but if it ever did we don't want
+    # to credit more than the user requested.
+    usd = actually_paid / pay_amount * price_amount
+    return min(usd, price_amount)
+
+# User-facing notification text per terminal failure status.
+_TERMINAL_FAILURE_MESSAGES = {
+    "expired": (
+        "⏰ مهلت پرداخت فاکتور شما به پایان رسید و وجهی دریافت نشد. "
+        "اگر می‌خواهید شارژ کنید، لطفاً یک فاکتور جدید ایجاد کنید."
+    ),
+    "failed": (
+        "❌ پرداخت شما ناموفق بود. "
+        "اگر مبلغی از حساب شما کسر شده است، با پشتیبانی تماس بگیرید."
+    ),
+    "refunded": (
+        "↩️ پرداخت شما بازگشت داده شد و به حساب شما اضافه نشد."
+    ),
+}
+
+
 async def payment_webhook(request: web.Request):
     try:
         raw_body = await request.read()
@@ -164,12 +227,15 @@ async def payment_webhook(request: web.Request):
             return web.Response(status=401, text="Invalid signature")
 
         data = json.loads(raw_body)
-        if data.get("payment_status") == "finished":
-            payment_id = data.get("payment_id")
-            if payment_id is None:
-                log.warning("Webhook missing payment_id; ignoring")
-                return web.Response(status=200, text="OK")
+        status = data.get("payment_status")
+        payment_id = data.get("payment_id")
+        if payment_id is None:
+            log.warning("Webhook missing payment_id; ignoring (status=%s)", status)
+            return web.Response(status=200, text="OK")
 
+        bot: Bot = request.app["bot"]
+
+        if status == "finished":
             # Atomic: flip the PENDING transaction to SUCCESS and credit the
             # user's wallet in a single DB transaction. If either the status
             # flip or the credit fails, the whole thing rolls back and the
@@ -194,7 +260,6 @@ async def payment_webhook(request: web.Request):
             # credited in finalize_payment; a Telegram error must not cause us
             # to return 500 and trigger a NowPayments retry (the retry would
             # be a no-op because the row is no longer PENDING).
-            bot: Bot = request.app["bot"]
             try:
                 await bot.send_message(
                     chat_id=telegram_id,
@@ -209,6 +274,108 @@ async def payment_webhook(request: web.Request):
                     telegram_id,
                     amount_usd,
                 )
+
+        elif status in _TERMINAL_FAILURE_STATUSES:
+            # Mark the ledger and notify. No balance change.
+            target_status = _TERMINAL_FAILURE_STATUSES[status]
+            row = await db.mark_transaction_terminal(str(payment_id), target_status)
+            if row is None:
+                log.info(
+                    "Webhook %s for payment_id=%s ignored "
+                    "(unknown or already finalized)",
+                    status,
+                    payment_id,
+                )
+                return web.Response(status=200, text="OK")
+
+            telegram_id = row["telegram_id"]
+            log.info(
+                "Marked payment_id=%s as %s for user %d",
+                payment_id,
+                target_status,
+                telegram_id,
+            )
+            try:
+                await bot.send_message(
+                    chat_id=telegram_id,
+                    text=_TERMINAL_FAILURE_MESSAGES[status],
+                )
+            except Exception:
+                log.exception(
+                    "Failed to notify user %d about %s payment %s",
+                    telegram_id,
+                    target_status,
+                    payment_id,
+                )
+
+        elif status == "partially_paid":
+            # Under-payment: the user paid some crypto, but less than the
+            # invoice required. Credit the proportional USD value derived
+            # from `actually_paid` (NOT the originally requested
+            # price_amount, which would over-credit and let users
+            # intentionally underpay to drain margin).
+            actually_paid_usd = _compute_actually_paid_usd(data)
+            if actually_paid_usd is None:
+                # Couldn't derive a credit amount from the IPN payload.
+                # Refuse to credit and log loudly so the operator can
+                # reconcile by hand. The row stays PENDING.
+                log.error(
+                    "partially_paid IPN for payment_id=%s missing/invalid "
+                    "fields needed to convert actually_paid -> USD; leaving "
+                    "row PENDING for manual review (data=%r)",
+                    payment_id,
+                    data,
+                )
+                return web.Response(status=200, text="OK")
+
+            row = await db.finalize_partial_payment(
+                str(payment_id), actually_paid_usd
+            )
+            if row is None:
+                log.info(
+                    "Webhook partially_paid for payment_id=%s ignored "
+                    "(unknown or already finalized)",
+                    payment_id,
+                )
+                return web.Response(status=200, text="OK")
+
+            telegram_id = row["telegram_id"]
+            credited_usd = float(row["amount_usd_credited"])
+            log.info(
+                "Credited partial payment for payment_id=%s user=%d $%.4f",
+                payment_id,
+                telegram_id,
+                credited_usd,
+            )
+            try:
+                await bot.send_message(
+                    chat_id=telegram_id,
+                    text=(
+                        f"⚠️ پرداخت شما کمتر از مبلغ فاکتور بود. "
+                        f"مبلغ ${credited_usd:.4f} به حساب شما اضافه شد. "
+                        "اگر می‌خواهید مابقی را پرداخت کنید، یک فاکتور جدید ایجاد کنید."
+                    ),
+                )
+            except Exception:
+                log.exception(
+                    "Failed to notify user %d about partial credit of $%s",
+                    telegram_id,
+                    credited_usd,
+                )
+
+        elif status in _IN_FLIGHT_STATUSES:
+            log.info(
+                "In-flight IPN status=%s for payment_id=%s; no-op",
+                status,
+                payment_id,
+            )
+
+        else:
+            log.info(
+                "Unhandled IPN status=%s for payment_id=%s; no-op",
+                status,
+                payment_id,
+            )
 
         return web.Response(status=200, text="OK")
     except Exception:
