@@ -115,6 +115,11 @@ async def back_to_wallet_handler(callback: CallbackQuery):
 # مرحله ۱: انتخاب مبلغ
 @router.callback_query(F.data == "add_crypto")
 async def process_add_crypto_amount(callback: CallbackQuery, state: FSMContext):
+    # This callback is also the "cancel" target of the custom-amount screen
+    # (which puts the FSM in waiting_custom_amount). Clear any lingering state
+    # so the user isn't stuck — otherwise their next free-text message would
+    # be intercepted by process_custom_amount_input instead of process_chat.
+    await state.clear()
     builder = InlineKeyboardBuilder()
     builder.button(text="💵 $5", callback_data="amt_5")
     builder.button(text="💵 $10", callback_data="amt_10")
