@@ -19,6 +19,15 @@ class UserStates(StatesGroup):
     waiting_custom_amount = State()
 
 
+# Footer-row label constants for nested inline menus. Keeping these in one
+# place lets us swap the wording or i18n-ify them later (P2-2) without
+# touching every screen.
+BTN_BACK = "🔙 بازگشت"
+BTN_HOME = "🏠 منوی اصلی"
+BTN_BACK_TO_WALLET = "🔙 کیف پول"
+BTN_CANCEL = "❌ انصراف"
+
+
 # ==========================================
 # کیبورد اصلی (همیشه پایین صفحه)
 # ==========================================
@@ -129,8 +138,11 @@ async def process_add_crypto_amount(callback: CallbackQuery, state: FSMContext):
     builder.button(text="💵 $10", callback_data="amt_10")
     builder.button(text="💵 $20", callback_data="amt_20")
     builder.button(text="✏️ مبلغ دلخواه", callback_data="amt_custom")
-    builder.button(text="🔙 بازگشت به کیف پول", callback_data="back_to_wallet")
-    builder.adjust(3, 1, 1)
+    # Footer: back to wallet + home (close inline menu, the bottom reply
+    # keyboard remains visible so the user is back at the top level).
+    builder.button(text=BTN_BACK_TO_WALLET, callback_data="back_to_wallet")
+    builder.button(text=BTN_HOME, callback_data="close_menu")
+    builder.adjust(3, 1, 2)
     
     await callback.message.edit_text(
         "💰 مبلغ شارژ را انتخاب کنید:\n\n"
@@ -150,8 +162,10 @@ async def process_custom_amount_request(callback: CallbackQuery, state: FSMConte
     # بقیه کد...
     
     builder = InlineKeyboardBuilder()
-    builder.button(text="🔙 انصراف", callback_data="add_crypto")
-    
+    builder.button(text=BTN_CANCEL, callback_data="add_crypto")
+    builder.button(text=BTN_HOME, callback_data="close_menu")
+    builder.adjust(2)
+
     await callback.message.edit_text(
         "✏️ مبلغ دلخواه خود را وارد کنید:\n\n"
         "💡 حداقل: $5\n"
@@ -173,8 +187,9 @@ async def process_add_crypto_currency(callback: CallbackQuery):
     builder.button(text="💵 USDT (TRC20)", callback_data=f"pay_usdttrc20_{amount}")
     builder.button(text="💵 USDT (ERC20)", callback_data=f"pay_usdterc20_{amount}")
     builder.button(text="🔷 Litecoin", callback_data=f"pay_ltc_{amount}")
-    builder.button(text="🔙 بازگشت", callback_data="add_crypto")
-    builder.adjust(2, 2, 2, 1)
+    builder.button(text=BTN_BACK, callback_data="add_crypto")
+    builder.button(text=BTN_HOME, callback_data="close_menu")
+    builder.adjust(2, 2, 2, 2)
 
     await callback.message.edit_text(
         f"💰 مبلغ: **${amount}**\n\n🪙 ارز خود را انتخاب کنید:",
@@ -204,16 +219,20 @@ async def process_custom_amount_input(message: Message, state: FSMContext):
             ("TON", "cur_ton"),
             ("USDT-TRC20", "cur_usdttrc20"),
             ("USDT-ERC20", "cur_usdterc20"),
-            ("Litecoin (LTC)", "cur_ltc")
+            ("Litecoin (LTC)", "cur_ltc"),
         ]
-        
         for name, callback_data in currencies:
             builder.button(text=name, callback_data=callback_data)
-        builder.adjust(2)
-        
+        # Footer: back to amount entry + home. Going back to amt_custom
+        # re-prompts for the amount (clearing state) so the user can pick a
+        # different value without restarting from the wallet.
+        builder.button(text=BTN_BACK, callback_data="amt_custom")
+        builder.button(text=BTN_HOME, callback_data="close_menu")
+        builder.adjust(2, 2, 2, 2)
+
         # ذخیره مبلغ در state برای استفاده بعدی
         await state.update_data(custom_amount=amount)
-        
+
         await message.answer(
             f"💵 مبلغ ${amount:.2f} ثبت شد.\n\n🪙 ارز مورد نظر را انتخاب کنید:",
             reply_markup=builder.as_markup()
@@ -246,8 +265,10 @@ async def process_custom_currency_selection(callback: CallbackQuery, state: FSMC
             pay_amount = invoice.get('pay_amount')
             
             builder = InlineKeyboardBuilder()
-            builder.button(text="🔙 بازگشت به کیف پول", callback_data="back_to_wallet")
-            
+            builder.button(text=BTN_BACK_TO_WALLET, callback_data="back_to_wallet")
+            builder.button(text=BTN_HOME, callback_data="close_menu")
+            builder.adjust(2)
+
             text = (
                 f"🧾 **فاکتور شارژ حساب**\n\n"
                 f"مبلغ شارژ خالص: `${amount}`\n"
@@ -257,11 +278,13 @@ async def process_custom_currency_selection(callback: CallbackQuery, state: FSMC
                 f"آدرس واریز:\n`{pay_address}`\n\n"
                 "⚠️ دقیقاً همین مبلغ را واریز کنید."
             )
-            
+
             await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=builder.as_markup())
         else:
             builder = InlineKeyboardBuilder()
-            builder.button(text="🔙 تلاش مجدد", callback_data="back_to_wallet")
+            builder.button(text="🔄 تلاش مجدد", callback_data="add_crypto")
+            builder.button(text=BTN_HOME, callback_data="close_menu")
+            builder.adjust(2)
             await callback.message.edit_text("❌ درگاه پاسخگو نیست.", reply_markup=builder.as_markup())
     except Exception:
         log.exception(
@@ -269,7 +292,9 @@ async def process_custom_currency_selection(callback: CallbackQuery, state: FSMC
             callback.from_user.id,
         )
         builder = InlineKeyboardBuilder()
-        builder.button(text="🔙 بازگشت", callback_data="back_to_wallet")
+        builder.button(text="🔄 تلاش مجدد", callback_data="add_crypto")
+        builder.button(text=BTN_HOME, callback_data="close_menu")
+        builder.adjust(2)
         await callback.message.edit_text(
             "❌ ایجاد فاکتور با خطا مواجه شد. لطفاً دوباره تلاش کنید.",
             reply_markup=builder.as_markup(),
@@ -297,8 +322,10 @@ async def process_final_invoice(callback: CallbackQuery):
             pay_amount = invoice.get('pay_amount')
             
             builder = InlineKeyboardBuilder()
-            builder.button(text="🔙 بازگشت به کیف پول", callback_data="back_to_wallet")
-            
+            builder.button(text=BTN_BACK_TO_WALLET, callback_data="back_to_wallet")
+            builder.button(text=BTN_HOME, callback_data="close_menu")
+            builder.adjust(2)
+
             text = (
                 f"🧾 **فاکتور شارژ حساب**\n\n"
                 f"مبلغ شارژ خالص: `${amount}`\n"
@@ -308,11 +335,13 @@ async def process_final_invoice(callback: CallbackQuery):
                 f"آدرس واریز:\n`{pay_address}`\n\n"
                 "⚠️ لطفاً دقیقاً همین مبلغ را واریز کنید. ربات منتظر تایید شبکه است."
             )
-            
+
             await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=builder.as_markup())
         else:
             builder = InlineKeyboardBuilder()
-            builder.button(text="🔙 تلاش مجدد", callback_data="back_to_wallet")
+            builder.button(text="🔄 تلاش مجدد", callback_data="add_crypto")
+            builder.button(text=BTN_HOME, callback_data="close_menu")
+            builder.adjust(2)
             await callback.message.edit_text("❌ درگاه در حال حاضر پاسخگو نیست. تنظیمات پنل ناوپیمنتس را چک کنید.", reply_markup=builder.as_markup())
     except Exception:
         log.exception(
@@ -320,7 +349,9 @@ async def process_final_invoice(callback: CallbackQuery):
             callback.from_user.id,
         )
         builder = InlineKeyboardBuilder()
-        builder.button(text="🔙 بازگشت به کیف پول", callback_data="back_to_wallet")
+        builder.button(text=BTN_BACK_TO_WALLET, callback_data="back_to_wallet")
+        builder.button(text=BTN_HOME, callback_data="close_menu")
+        builder.adjust(2)
         await callback.message.edit_text(
             "❌ ایجاد فاکتور با خطا مواجه شد. لطفاً دوباره تلاش کنید.",
             reply_markup=builder.as_markup(),
