@@ -160,6 +160,36 @@ _STRINGS: dict[str, dict[str, str]] = {
             "مبلغ ${credited:.4f} که قبلاً به حساب شما اضافه شده بود "
             "همچنان قابل استفاده است. اگر این طور نیست با پشتیبانی تماس بگیرید."
         ),
+        "pay_promo_bonus": (
+            "🎁 کد تخفیف اعمال شد و مبلغ ${bonus:.4f} به‌عنوان هدیه به حساب شما اضافه شد."
+        ),
+        # ---- Promo codes ----
+        "btn_promo_enter": "🎁 کد تخفیف",
+        "btn_promo_remove": "❌ حذف کد تخفیف",
+        "promo_prompt": (
+            "🎁 کد تخفیف خود را وارد کنید:\n\n"
+            "💡 کد به حروف کوچک/بزرگ حساس نیست."
+        ),
+        "promo_applied_percent": (
+            "✅ کد تخفیف `{code}` ثبت شد ({percent}٪ هدیه روی شارژ).\n\n"
+            "اکنون مبلغ شارژ را انتخاب کنید — مبلغ هدیه روی هر شارژ موفق محاسبه و به حساب شما اضافه می‌شود."
+        ),
+        "promo_applied_amount": (
+            "✅ کد تخفیف `{code}` ثبت شد (${amount:.2f} هدیه روی شارژ).\n\n"
+            "اکنون مبلغ شارژ را انتخاب کنید — مبلغ هدیه پس از تایید پرداخت به حساب شما اضافه می‌شود."
+        ),
+        "promo_active_banner_percent": (
+            "🎁 کد فعلی: `{code}` ({percent}٪ هدیه)"
+        ),
+        "promo_active_banner_amount": (
+            "🎁 کد فعلی: `{code}` (${amount:.2f} هدیه)"
+        ),
+        "promo_removed": "❌ کد تخفیف از این پرداخت برداشته شد.",
+        "promo_invalid_unknown": "❌ این کد تخفیف پیدا نشد.",
+        "promo_invalid_inactive": "❌ این کد تخفیف غیرفعال است.",
+        "promo_invalid_expired": "❌ مهلت استفاده از این کد تخفیف به پایان رسیده.",
+        "promo_invalid_exhausted": "❌ ظرفیت استفاده از این کد تخفیف تکمیل شده.",
+        "promo_invalid_already_used": "❌ شما قبلاً از این کد تخفیف استفاده کرده‌اید.",
     },
     "en": {
         # ---- Top-level reply keyboard ----
@@ -297,6 +327,36 @@ _STRINGS: dict[str, dict[str, str]] = {
             "The ${credited:.4f} previously credited to your wallet is still usable. "
             "If that's not the case, please contact support."
         ),
+        "pay_promo_bonus": (
+            "🎁 Promo applied: ${bonus:.4f} bonus credited to your wallet."
+        ),
+        # ---- Promo codes ----
+        "btn_promo_enter": "🎁 Promo code",
+        "btn_promo_remove": "❌ Remove promo",
+        "promo_prompt": (
+            "🎁 Enter your promo code:\n\n"
+            "💡 Codes are not case-sensitive."
+        ),
+        "promo_applied_percent": (
+            "✅ Promo `{code}` applied ({percent}% bonus).\n\n"
+            "Now pick the top-up amount — the bonus is credited on top of every successful payment."
+        ),
+        "promo_applied_amount": (
+            "✅ Promo `{code}` applied (${amount:.2f} bonus).\n\n"
+            "Now pick the top-up amount — the bonus is credited once payment confirms."
+        ),
+        "promo_active_banner_percent": (
+            "🎁 Promo: `{code}` ({percent}% bonus)"
+        ),
+        "promo_active_banner_amount": (
+            "🎁 Promo: `{code}` (${amount:.2f} bonus)"
+        ),
+        "promo_removed": "❌ Promo code removed from this top-up.",
+        "promo_invalid_unknown": "❌ Unknown promo code.",
+        "promo_invalid_inactive": "❌ This promo code is inactive.",
+        "promo_invalid_expired": "❌ This promo code has expired.",
+        "promo_invalid_exhausted": "❌ This promo code has been fully used up.",
+        "promo_invalid_already_used": "❌ You've already used this promo code.",
     },
 }
 

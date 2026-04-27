@@ -25,6 +25,7 @@ router = Router()
 
 class UserStates(StatesGroup):
     waiting_custom_amount = State()
+    waiting_promo_code = State()
 
 
 # Pre-compute the set of all main-keyboard button labels (across every
@@ -396,7 +397,11 @@ async def close_menu_handler(callback: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data == "back_to_wallet")
-async def back_to_wallet_handler(callback: CallbackQuery):
+async def back_to_wallet_handler(callback: CallbackQuery, state: FSMContext):
+    # Leaving the charge flow back to the wallet view: drop any
+    # in-flight promo / custom_amount so they don't carry over to the
+    # next charge. (Re-entering charge starts fresh.)
+    await state.clear()
     user_id = callback.from_user.id
     lang = await _get_user_language(user_id)
     user_data = await db.get_user(user_id)
@@ -411,27 +416,161 @@ async def back_to_wallet_handler(callback: CallbackQuery):
 # Charge wallet flow (3 steps)
 # ==========================================
 
-# Step 1: pick an amount
-@router.callback_query(F.data == "add_crypto")
-async def process_add_crypto_amount(callback: CallbackQuery, state: FSMContext):
-    # This callback is also the "cancel" target of the custom-amount screen
-    # (which puts the FSM in waiting_custom_amount). Clear any lingering state
-    # so the user isn't stuck — otherwise their next free-text message would
-    # be intercepted by process_custom_amount_input instead of process_chat.
-    await state.clear()
-    lang = await _get_user_language(callback.from_user.id)
+def _promo_banner(lang: str, data: dict) -> str | None:
+    """Banner text describing the active promo, or None if none is set.
+
+    Read from FSM data set by ``process_promo_input``. The banner is
+    appended to the amount-picker title so the user always sees the
+    promo they currently have applied.
+    """
+    code = data.get("promo_code")
+    if not code:
+        return None
+    pct = data.get("promo_discount_percent")
+    amt = data.get("promo_discount_amount")
+    if pct is not None:
+        return t(lang, "promo_active_banner_percent", code=code, percent=pct)
+    if amt is not None:
+        return t(lang, "promo_active_banner_amount", code=code, amount=float(amt))
+    return None
+
+
+async def _render_charge_pick_amount(message, lang: str, state: FSMContext) -> None:
+    """Render (or re-render) the top-up amount picker.
+
+    Keeps any in-flight promo state visible: the banner + a "remove
+    promo" button replace the "add promo" button when an active promo
+    is in FSM data. We always edit_text the message in place so the
+    user sees the promo applied / removed without a fresh chat bubble.
+    """
+    data = await state.get_data()
+    banner = _promo_banner(lang, data)
+
     builder = InlineKeyboardBuilder()
     builder.button(text=t(lang, "btn_amt_5"), callback_data="amt_5")
     builder.button(text=t(lang, "btn_amt_10"), callback_data="amt_10")
     builder.button(text=t(lang, "btn_amt_20"), callback_data="amt_20")
     builder.button(text=t(lang, "btn_amt_custom"), callback_data="amt_custom")
+    if banner:
+        # Promo applied → offer removal in place of add.
+        builder.button(text=t(lang, "btn_promo_remove"), callback_data="remove_promo")
+    else:
+        builder.button(text=t(lang, "btn_promo_enter"), callback_data="enter_promo")
     builder.button(text=t(lang, "btn_back_to_wallet"), callback_data="back_to_wallet")
     builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
-    builder.adjust(3, 1, 2)
+    # Layout: 3 amount buttons | custom row | promo row | back+home.
+    builder.adjust(3, 1, 1, 2)
+
+    text = t(lang, "charge_pick_amount")
+    if banner:
+        text = text + "\n\n" + banner
+
+    await message.edit_text(
+        text, parse_mode="Markdown", reply_markup=builder.as_markup()
+    )
+
+
+# Step 1: pick an amount
+@router.callback_query(F.data == "add_crypto")
+async def process_add_crypto_amount(callback: CallbackQuery, state: FSMContext):
+    # This callback is also the "cancel" target of the custom-amount screen
+    # (which puts the FSM in waiting_custom_amount) and the back path from
+    # the promo-input screen (waiting_promo_code). Drop the FSM *state*
+    # but keep FSM data so an already-applied promo or a typed-in custom
+    # amount survives back-and-forth nav. (state.clear() would wipe both.)
+    await state.set_state(None)
+    lang = await _get_user_language(callback.from_user.id)
+    await _render_charge_pick_amount(callback.message, lang, state)
+    await callback.answer()
+
+
+# ---- Promo code flow (sub-flow inside the charge wallet flow) ----
+
+@router.callback_query(F.data == "enter_promo")
+async def enter_promo_handler(callback: CallbackQuery, state: FSMContext):
+    """Open the promo-input screen. The next free-text message is
+    consumed by process_promo_input below."""
+    await state.set_state(UserStates.waiting_promo_code)
+    lang = await _get_user_language(callback.from_user.id)
+    builder = InlineKeyboardBuilder()
+    # Cancel returns to the amount picker (which clears the FSM state
+    # without dropping the rest of the charge data).
+    builder.button(text=t(lang, "btn_cancel"), callback_data="add_crypto")
+    builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+    builder.adjust(2)
     await callback.message.edit_text(
-        t(lang, "charge_pick_amount"), reply_markup=builder.as_markup()
+        t(lang, "promo_prompt"), reply_markup=builder.as_markup()
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "remove_promo")
+async def remove_promo_handler(callback: CallbackQuery, state: FSMContext):
+    """Drop the promo fields from FSM data and re-render the picker.
+
+    Keeps any other in-flight charge data (e.g. ``custom_amount``)
+    intact. The user gets a one-shot Telegram alert confirming the
+    removal so they don't think the screen redraw is silent.
+    """
+    data = await state.get_data()
+    for key in ("promo_code", "promo_discount_percent", "promo_discount_amount"):
+        data.pop(key, None)
+    await state.set_data(data)
+    lang = await _get_user_language(callback.from_user.id)
+    await _render_charge_pick_amount(callback.message, lang, state)
+    await callback.answer(t(lang, "promo_removed"), show_alert=False)
+
+
+@router.message(UserStates.waiting_promo_code)
+async def process_promo_input(message: Message, state: FSMContext):
+    """Validate the typed promo code; on success stash it in FSM data
+    and bounce the user back to the amount picker. Errors keep the
+    user in waiting_promo_code so they can retype without restarting.
+    """
+    lang = await _get_user_language(message.from_user.id)
+    code = (message.text or "").strip().upper()
+    if not code:
+        await message.answer(t(lang, "promo_invalid_unknown"))
+        return
+
+    result = await db.validate_promo_code(code, message.from_user.id)
+    if isinstance(result, str):
+        # Validation error key → render the matching i18n string and
+        # leave the user in waiting_promo_code so they can retype.
+        await message.answer(t(lang, f"promo_invalid_{result}"))
+        return
+
+    # Persist into FSM data alongside any custom_amount the user already
+    # entered. Drop the waiting_promo_code state so process_chat can
+    # take over for free-text again, but keep data.
+    data = await state.get_data()
+    data["promo_code"] = result["code"]
+    data["promo_discount_percent"] = result["discount_percent"]
+    data["promo_discount_amount"] = result["discount_amount"]
+    await state.set_data(data)
+    await state.set_state(None)
+
+    # Confirmation message (sent fresh — we can't edit_text on a
+    # message the user just typed). Then re-render the picker as a new
+    # message so the inline keyboard is reachable again.
+    if result["discount_percent"] is not None:
+        confirm = t(
+            lang,
+            "promo_applied_percent",
+            code=result["code"],
+            percent=result["discount_percent"],
+        )
+    else:
+        confirm = t(
+            lang,
+            "promo_applied_amount",
+            code=result["code"],
+            amount=float(result["discount_amount"]),
+        )
+    sent = await message.answer(confirm, parse_mode="Markdown")
+    # Render the picker on the just-sent message (so its inline keyboard
+    # carries the promo banner + remove button).
+    await _render_charge_pick_amount(sent, lang, state)
 
 
 # Step 2 (custom-amount path): prompt for free-text input
@@ -487,23 +626,25 @@ async def process_custom_amount_input(message: Message, state: FSMContext):
         return
 
     # Drop the waiting_custom_amount state so the user can chat freely
-    # while the currency picker is on screen, but stash the amount in
-    # FSM data so process_custom_currency_selection can read it back
-    # when they tap a currency. (state.clear() wipes both the state
-    # name and the data, so update_data() must come after.)
-    await state.clear()
+    # while the currency picker is on screen, but keep FSM data so:
+    #   * the custom_amount we stash here survives until the user taps
+    #     a currency (process_custom_currency_selection reads it back),
+    #   * any active promo also survives (it's separate FSM data set by
+    #     process_promo_input).
+    # state.clear() would wipe both name and data — set_state(None)
+    # only drops the name.
+    await state.set_state(None)
+    await state.update_data(custom_amount=amount)
 
     builder = InlineKeyboardBuilder()
     for label, ticker in SUPPORTED_PAY_CURRENCIES:
         builder.button(text=label, callback_data=f"cur_{ticker}")
     # Footer: back to amount entry + home. Going back to amt_custom
-    # re-prompts for the amount (clearing state) so the user can pick a
-    # different value without restarting from the wallet.
+    # re-prompts for the amount (without dropping promo state) so the
+    # user can pick a different value without restarting from the wallet.
     builder.button(text=t(lang, "btn_back"), callback_data="amt_custom")
     builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
     builder.adjust(*_CURRENCY_ROWS_LAYOUT, 2)
-
-    await state.update_data(custom_amount=amount)
 
     await message.answer(
         t(lang, "charge_custom_amount_saved", amount=amount),
@@ -522,12 +663,27 @@ async def process_custom_currency_selection(callback: CallbackQuery, state: FSMC
         await callback.answer(t(lang, "charge_amount_lost"), show_alert=True)
         return
 
+    # Pull any active promo from FSM data and compute the bonus
+    # *before* we wipe state. The bonus rides along on the PENDING
+    # transaction row and is only credited on SUCCESS (see
+    # database.finalize_payment).
+    promo_code = data.get("promo_code")
+    promo_bonus_usd = db.compute_promo_bonus(
+        float(amount),
+        discount_percent=data.get("promo_discount_percent"),
+        discount_amount=data.get("promo_discount_amount"),
+    ) if promo_code else 0.0
+
     await state.clear()
     await callback.message.edit_text(t(lang, "charge_creating_invoice"))
 
     try:
         invoice = await create_crypto_invoice(
-            callback.from_user.id, amount_usd=float(amount), currency=currency
+            callback.from_user.id,
+            amount_usd=float(amount),
+            currency=currency,
+            promo_code=promo_code,
+            promo_bonus_usd=promo_bonus_usd,
         )
     except Exception:
         log.exception(
@@ -573,7 +729,7 @@ async def process_custom_currency_selection(callback: CallbackQuery, state: FSMC
 
 # Step 3: emit the final invoice (fixed-amount path)
 @router.callback_query(F.data.startswith("pay_"))
-async def process_final_invoice(callback: CallbackQuery):
+async def process_final_invoice(callback: CallbackQuery, state: FSMContext):
     parts = callback.data.split("_")
     lang = await _get_user_language(callback.from_user.id)
     if len(parts) != 3:
@@ -583,11 +739,27 @@ async def process_final_invoice(callback: CallbackQuery):
     currency = parts[1]
     amount = parts[2]
 
+    # Pull any active promo from FSM data and compute the bonus before
+    # invoice creation (see process_custom_currency_selection for the
+    # parallel path).
+    data = await state.get_data()
+    promo_code = data.get("promo_code")
+    promo_bonus_usd = db.compute_promo_bonus(
+        float(amount),
+        discount_percent=data.get("promo_discount_percent"),
+        discount_amount=data.get("promo_discount_amount"),
+    ) if promo_code else 0.0
+
+    await state.clear()
     await callback.message.edit_text(t(lang, "charge_creating_invoice"))
 
     try:
         invoice = await create_crypto_invoice(
-            callback.from_user.id, amount_usd=float(amount), currency=currency
+            callback.from_user.id,
+            amount_usd=float(amount),
+            currency=currency,
+            promo_code=promo_code,
+            promo_bonus_usd=promo_bonus_usd,
         )
     except Exception:
         log.exception("Failed to create invoice for user %d", callback.from_user.id)
