@@ -12,7 +12,8 @@ NowPayments crypto invoices.
   purchase required). Users redeem with `/redeem CODE`; admin manages
   them at `${WEBHOOK_BASE_URL}/admin/gifts`.
 - Web admin panel at `${WEBHOOK_BASE_URL}/admin/` (login, dashboard,
-  promos, gifts).
+  promos, gifts, users — search by id/username and credit/debit from
+  the browser).
 - Telegram-side admin commands (`/admin`, `/admin_metrics`,
   `/admin_credit`, `/admin_broadcast`, …) for ops via DMs.
 
