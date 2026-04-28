@@ -14,6 +14,7 @@ MARKUP is read from the ``COST_MARKUP`` env var (default 1.5x).
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 
@@ -48,11 +49,25 @@ MODEL_PRICES: dict[str, ModelPrice] = {
 
 
 def get_markup() -> float:
-    """Return the cost markup multiplier from env, default 1.5x."""
+    """Return the cost markup multiplier from env, default 1.5x.
+
+    Rejects ``NaN`` / ``±Infinity`` explicitly. ``float()`` accepts the
+    strings ``"nan"`` and ``"inf"`` (case-insensitive) so a typo or a
+    deliberately malicious ``COST_MARKUP=nan`` would otherwise slip
+    past the parse step. A NaN markup propagates through
+    :func:`_apply_markup` (every IEEE-754 op against NaN returns NaN)
+    and ultimately reaches ``database.deduct_balance``; the
+    ``_is_finite_amount`` guard there refuses the SQL but the user
+    still gets a free OpenRouter reply because ``log_usage`` records
+    ``cost=0``. Reject upstream so paid models stay paid even with a
+    deploy-time misconfiguration.
+    """
     raw = os.getenv("COST_MARKUP", "1.5")
     try:
         markup = float(raw)
     except ValueError:
+        return 1.5
+    if not math.isfinite(markup):
         return 1.5
     # A markup below 1.0 would mean charging less than cost; guard against typos.
     return max(markup, 1.0)
@@ -82,6 +97,26 @@ async def get_price_async(model: str) -> ModelPrice:
 
 
 def _apply_markup(price: ModelPrice, prompt_tokens: int, completion_tokens: int) -> float:
+    # Defense-in-depth against ``NaN`` / ``±Infinity`` (or negative)
+    # values slipping into the ModelPrice via the live catalog.
+    # ``models_catalog._parse_price`` rejects them at ingest, but a
+    # legacy cached row, a unit-test caller stubbing in a hand-built
+    # ModelPrice, or future plumbing could route a non-finite value
+    # here. NaN propagates through every downstream IEEE-754 op
+    # (``raw * markup`` is NaN, ``max(NaN, 0)`` is NaN) and ultimately
+    # reaches ``database.deduct_balance`` whose finite guard refuses
+    # the SQL — but the user still gets a free OpenRouter reply
+    # because ``log_usage`` records ``cost=0``. A negative price
+    # likewise rounds to zero through ``max(raw * markup, 0.0)``,
+    # silently turning a paid model into a free one. Substitute the
+    # conservative fallback so paid models stay paid.
+    if not (
+        math.isfinite(price.input_per_1m_usd)
+        and math.isfinite(price.output_per_1m_usd)
+        and price.input_per_1m_usd >= 0.0
+        and price.output_per_1m_usd >= 0.0
+    ):
+        price = FALLBACK_PRICE
     raw = (
         prompt_tokens * price.input_per_1m_usd
         + completion_tokens * price.output_per_1m_usd
