@@ -1599,6 +1599,123 @@ class Database:
             "total_pages": total_pages,
         }
 
+    USAGE_LOGS_MAX_PER_PAGE: int = 200
+
+    async def list_user_usage_logs(
+        self,
+        *,
+        telegram_id: int,
+        page: int = 1,
+        per_page: int = 50,
+    ) -> dict:
+        """Stage-9-Step-8: paginated read of ``usage_logs`` for one user.
+
+        Backs ``GET /admin/users/{id}/usage`` — last N AI calls with
+        model, token counts, and per-call cost. Indexed by
+        ``idx_usage_logs_telegram_created`` (added in migration
+        ``0006_usage_logs_indexes``); without that index this query
+        was a sequential scan.
+
+        ``per_page`` is clamped to ``[1, USAGE_LOGS_MAX_PER_PAGE]``;
+        ``page`` to ``>= 1``. Sort is ``log_id DESC`` which on a
+        ``SERIAL`` column is functionally identical to
+        ``created_at DESC`` and avoids a tie-break for rows with the
+        same second-resolution ``created_at``.
+
+        Returns a dict shaped::
+
+            {
+              "rows": [
+                {"id": int, "model": str,
+                 "prompt_tokens": int, "completion_tokens": int,
+                 "total_tokens": int, "cost_usd": float,
+                 "created_at": iso str | None},
+                ...
+              ],
+              "total": int, "page": int, "per_page": int,
+              "total_pages": int,
+            }
+        """
+        per_page = max(1, min(int(per_page), self.USAGE_LOGS_MAX_PER_PAGE))
+        page = max(1, int(page))
+        tid = int(telegram_id)
+
+        async with self.pool.acquire() as connection:
+            total = await connection.fetchval(
+                "SELECT COUNT(*) FROM usage_logs WHERE telegram_id = $1",
+                tid,
+            )
+            rows = await connection.fetch(
+                """
+                SELECT log_id, model_used,
+                       prompt_tokens, completion_tokens,
+                       cost_deducted_usd, created_at
+                FROM usage_logs
+                WHERE telegram_id = $1
+                ORDER BY log_id DESC
+                LIMIT $2 OFFSET $3
+                """,
+                tid,
+                per_page,
+                (page - 1) * per_page,
+            )
+
+        total = int(total or 0)
+        total_pages = (total + per_page - 1) // per_page
+        return {
+            "rows": [
+                {
+                    "id": int(r["log_id"]),
+                    "model": r["model_used"],
+                    "prompt_tokens": int(r["prompt_tokens"]),
+                    "completion_tokens": int(r["completion_tokens"]),
+                    "total_tokens": (
+                        int(r["prompt_tokens"]) + int(r["completion_tokens"])
+                    ),
+                    "cost_usd": float(r["cost_deducted_usd"]),
+                    "created_at": (
+                        r["created_at"].isoformat()
+                        if r["created_at"] is not None else None
+                    ),
+                }
+                for r in rows
+            ],
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages,
+        }
+
+    async def get_user_usage_aggregates(self, telegram_id: int) -> dict:
+        """Stage-9-Step-8: lightweight aggregates rendered above the
+        per-user usage log table.
+
+        Returns ``{"total_calls": int, "total_tokens": int,
+        "total_cost_usd": float}`` — the user's lifetime AI usage at a
+        glance. Cheap on the new index (range over a single
+        ``telegram_id`` partition).
+        """
+        tid = int(telegram_id)
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT COUNT(*) AS calls,
+                       COALESCE(SUM(prompt_tokens + completion_tokens), 0)
+                           AS tokens,
+                       COALESCE(SUM(cost_deducted_usd), 0) AS cost
+                FROM usage_logs
+                WHERE telegram_id = $1
+                """,
+                tid,
+            )
+        if row is None:
+            return {"total_calls": 0, "total_tokens": 0, "total_cost_usd": 0.0}
+        return {
+            "total_calls": int(row["calls"] or 0),
+            "total_tokens": int(row["tokens"] or 0),
+            "total_cost_usd": float(row["cost"] or 0),
+        }
+
     async def get_system_metrics(self) -> dict:
         """Aggregate counters for the admin metrics panel.
 

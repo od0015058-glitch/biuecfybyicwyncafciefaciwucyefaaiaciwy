@@ -673,3 +673,108 @@ async def test_admin_adjust_balance_populates_admin_telegram_id_column():
     )
     # Last positional arg should be the admin id (42).
     assert insert_args[-1] == 42
+
+
+# ---------------------------------------------------------------------
+# Stage-9-Step-8: list_user_usage_logs + get_user_usage_aggregates
+# ---------------------------------------------------------------------
+
+
+async def test_list_user_usage_logs_filters_by_telegram_id():
+    """The WHERE clause MUST scope to the requested user — leakage
+    here would expose another user's usage history."""
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=0)
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.list_user_usage_logs(telegram_id=42, page=1, per_page=50)
+
+    count_sql, count_bind = conn.fetchval.await_args.args
+    assert "WHERE telegram_id = $1" in count_sql
+    assert count_bind == 42
+
+    list_sql, *list_binds = conn.fetch.await_args.args
+    assert "WHERE telegram_id = $1" in list_sql
+    assert "ORDER BY log_id DESC" in list_sql
+    assert tuple(list_binds) == (42, 50, 0)
+
+
+async def test_list_user_usage_logs_clamps_per_page():
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=0)
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    # Above max → clamps to USAGE_LOGS_MAX_PER_PAGE.
+    await db.list_user_usage_logs(telegram_id=1, per_page=9999)
+    binds = conn.fetch.await_args.args[1:]
+    assert binds[1] == db.USAGE_LOGS_MAX_PER_PAGE
+
+    # Below 1 → clamps to 1.
+    conn.fetch.reset_mock()
+    await db.list_user_usage_logs(telegram_id=1, per_page=0)
+    binds = conn.fetch.await_args.args[1:]
+    assert binds[1] == 1
+
+
+async def test_list_user_usage_logs_maps_rows_with_total_tokens():
+    """The mapper must compute ``total_tokens`` (prompt + completion)
+    server-side so the template can render it without needing the
+    raw cols."""
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=1)
+    conn.fetch = AsyncMock(
+        return_value=[
+            {
+                "log_id": 99,
+                "model_used": "openai/gpt-4o",
+                "prompt_tokens": 10,
+                "completion_tokens": 20,
+                "cost_deducted_usd": 0.0042,
+                "created_at": None,
+            }
+        ]
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    out = await db.list_user_usage_logs(telegram_id=7)
+    row = out["rows"][0]
+    assert row["id"] == 99
+    assert row["model"] == "openai/gpt-4o"
+    assert row["total_tokens"] == 30
+    assert row["cost_usd"] == pytest.approx(0.0042)
+    assert row["created_at"] is None
+
+
+async def test_get_user_usage_aggregates_returns_zeros_when_no_rows():
+    """``COALESCE(..., 0)`` must absorb the empty-result case."""
+    conn = _make_conn()
+    conn.fetchrow = AsyncMock(
+        return_value={"calls": 0, "tokens": 0, "cost": 0}
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    out = await db.get_user_usage_aggregates(telegram_id=999)
+    assert out == {
+        "total_calls": 0, "total_tokens": 0, "total_cost_usd": 0.0,
+    }
+    sql, bind = conn.fetchrow.await_args.args
+    assert "WHERE telegram_id = $1" in sql
+    assert bind == 999
+
+
+async def test_get_user_usage_aggregates_handles_none_row():
+    """Defensive: if ``fetchrow`` returns ``None`` (shouldn't with
+    SUM/COUNT but belt-and-suspenders) we still return the zero
+    shape rather than a TypeError on ``row[...]`` indexing."""
+    conn = _make_conn()
+    conn.fetchrow = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    out = await db.get_user_usage_aggregates(telegram_id=1)
+    assert out == {
+        "total_calls": 0, "total_tokens": 0, "total_cost_usd": 0.0,
+    }
