@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 
 import aiohttp
@@ -424,6 +425,41 @@ _TERMINAL_FAILURE_STATUSES = {
 }
 
 
+def _finite_positive_float(value) -> float | None:
+    """Return ``float(value)`` iff it parses, is finite, and > 0.
+
+    Why not just ``float(v) > 0``? ``float("NaN")`` returns ``nan``,
+    and **every** comparison against ``nan`` returns ``False`` —
+    including ``nan <= 0``. So a pre-fix check of the form::
+
+        x = float(data["actually_paid"])
+        if x <= 0:
+            return None
+        ...credit x to the wallet...
+
+    silently passed ``NaN`` straight through to ``finalize_payment`` /
+    ``finalize_partial_payment``, which then INSERTed ``NaN`` into the
+    ``transactions.amount_usd_credited`` ``DECIMAL`` column. PostgreSQL
+    accepts ``'NaN'::numeric`` (it's a defined IEEE-754 value), but
+    every subsequent balance comparison against the wallet — including
+    ``deduct_balance``'s ``WHERE balance_usd >= $1 RETURNING ...`` —
+    becomes a silent no-op (``NaN >= x`` is always false), effectively
+    bricking the user's wallet without an obvious error.
+
+    ``math.isfinite`` returns ``False`` for ``nan``, ``+inf``, and
+    ``-inf``, so the single check below is equivalent to the
+    ``not (v == v) or v in (inf, -inf) or v <= 0`` pattern used
+    elsewhere in the codebase but a lot easier to read.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v) or v <= 0:
+        return None
+    return v
+
+
 def _compute_actually_paid_usd(data: dict) -> float | None:
     """Convert the IPN's `actually_paid` (in pay_currency) to USD.
 
@@ -437,22 +473,29 @@ def _compute_actually_paid_usd(data: dict) -> float | None:
     they generated the invoice, so they cannot game us by paying when
     the spot price has moved against us.
 
-    Returns None if any required field is missing or non-positive,
-    in which case the caller should refuse to credit and surface for
-    manual reconciliation.
+    Returns None if any required field is missing, non-finite (NaN /
+    Infinity), or non-positive, in which case the caller should refuse
+    to credit and surface for manual reconciliation.
     """
     try:
-        actually_paid = float(data["actually_paid"])
-        pay_amount = float(data["pay_amount"])
-        price_amount = float(data["price_amount"])
-    except (KeyError, TypeError, ValueError):
+        actually_paid_raw = data["actually_paid"]
+        pay_amount_raw = data["pay_amount"]
+        price_amount_raw = data["price_amount"]
+    except KeyError:
         return None
-    if pay_amount <= 0 or price_amount <= 0 or actually_paid <= 0:
+    actually_paid = _finite_positive_float(actually_paid_raw)
+    pay_amount = _finite_positive_float(pay_amount_raw)
+    price_amount = _finite_positive_float(price_amount_raw)
+    if actually_paid is None or pay_amount is None or price_amount is None:
         return None
     # Cap at price_amount as a defense-in-depth: NowPayments shouldn't fire
     # `partially_paid` for an over-payment, but if it ever did we don't want
     # to credit more than the user requested.
     usd = actually_paid / pay_amount * price_amount
+    # Even with finite inputs, FP arithmetic on extreme magnitudes
+    # could in principle overflow to inf — guard the output too.
+    if not math.isfinite(usd) or usd <= 0:
+        return None
     return min(usd, price_amount)
 
 # Maps an IPN failure status -> (strings.py key for PENDING-row variant,
@@ -630,11 +673,16 @@ async def payment_webhook(request: web.Request):
             # already-credited amount when this payment first came in as
             # partially_paid). Without it we can't compute the remaining
             # delta to credit on a PARTIAL -> SUCCESS upgrade.
-            try:
-                full_price_usd = float(data["price_amount"])
-            except (KeyError, TypeError, ValueError):
-                full_price_usd = 0.0
-            if full_price_usd <= 0:
+            #
+            # ``_finite_positive_float`` rejects NaN / Inf in addition to
+            # the obvious missing / non-numeric / non-positive cases.
+            # Pre-fix a NaN ``price_amount`` slipped past
+            # ``full_price_usd <= 0`` (every comparison against NaN is
+            # False) and got passed to ``finalize_payment`` as the
+            # credit amount — see ``_finite_positive_float`` docstring
+            # for the wallet-bricking implications.
+            full_price_usd = _finite_positive_float(data.get("price_amount"))
+            if full_price_usd is None:
                 log.error(
                     "finished IPN for payment_id=%s missing/invalid "
                     "price_amount; refusing to credit (data=%r)",
