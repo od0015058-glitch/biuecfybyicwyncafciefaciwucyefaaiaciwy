@@ -618,3 +618,69 @@ def test_admin_broadcast_router_decorator_present():
     import inspect
     src = inspect.getsource(admin)
     assert '@router.message(Command("admin_broadcast"))' in src
+
+
+# ---------------------------------------------------------------------
+# Bug-fix sweep: ``max_uses`` / ``[days]`` overflow on
+# ``/admin_promo_create``.
+#
+# Mirrors the equivalent fix on the web admin's ``parse_promo_form``.
+# Pre-fix the parser had no upper bound on either ``max_uses`` or the
+# ``[days]`` argument. PG INTEGER overflows at 2_147_483_647, and PG
+# ``interval`` arithmetic overflows somewhere below that depending on
+# the unit. Both crashes surfaced as the generic
+# ``"DB write failed — see logs."`` reply — the admin couldn't tell
+# the cause was a fat-finger.
+# ---------------------------------------------------------------------
+def test_parse_promo_create_args_max_uses_at_cap_accepted():
+    from admin import _PROMO_MAX_USES_CAP
+    out = parse_promo_create_args(
+        f"/admin_promo_create FOO 10% {_PROMO_MAX_USES_CAP}"
+    )
+    assert isinstance(out, dict)
+    assert out["max_uses"] == _PROMO_MAX_USES_CAP
+
+
+def test_parse_promo_create_args_max_uses_above_cap_rejected():
+    from admin import _PROMO_MAX_USES_CAP
+    out = parse_promo_create_args(
+        f"/admin_promo_create FOO 10% {_PROMO_MAX_USES_CAP + 1}"
+    )
+    assert out == "max_uses_too_large"
+
+
+def test_parse_promo_create_args_max_uses_pg_int_overflow_rejected():
+    """Direct repro of the original crash: 2_147_483_648 would
+    overflow PG INTEGER on insert."""
+    out = parse_promo_create_args(
+        "/admin_promo_create FOO 10% 2147483648"
+    )
+    assert out == "max_uses_too_large"
+
+
+def test_parse_promo_create_args_days_at_cap_accepted():
+    from admin import _PROMO_EXPIRES_IN_DAYS_CAP
+    out = parse_promo_create_args(
+        f"/admin_promo_create FOO 10% 100 {_PROMO_EXPIRES_IN_DAYS_CAP}"
+    )
+    assert isinstance(out, dict)
+    assert out["expires_in_days"] == _PROMO_EXPIRES_IN_DAYS_CAP
+
+
+def test_parse_promo_create_args_days_above_cap_rejected():
+    from admin import _PROMO_EXPIRES_IN_DAYS_CAP
+    out = parse_promo_create_args(
+        f"/admin_promo_create FOO 10% 100 {_PROMO_EXPIRES_IN_DAYS_CAP + 1}"
+    )
+    assert out == "days_too_large"
+
+
+def test_promo_create_err_text_has_new_keys():
+    """The dispatcher uses the error key as a dict lookup; a missing
+    key would silently render an unrouted error. Pin both new keys
+    have hand-written messages."""
+    from admin import _PROMO_CREATE_ERR_TEXT
+    assert "max_uses_too_large" in _PROMO_CREATE_ERR_TEXT
+    assert "days_too_large" in _PROMO_CREATE_ERR_TEXT
+    assert "1,000,000" in _PROMO_CREATE_ERR_TEXT["max_uses_too_large"]
+    assert "36,500" in _PROMO_CREATE_ERR_TEXT["days_too_large"]

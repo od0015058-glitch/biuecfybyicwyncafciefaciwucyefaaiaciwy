@@ -402,6 +402,25 @@ async def admin_debit(message: Message) -> None:
 # ---------------------------------------------------------------------
 
 
+# Upper bound on the ``max_uses`` argument of ``/admin_promo_create``.
+# Pre-fix this was unbounded — typing
+# ``/admin_promo_create FOO 10% 2147483648`` would overflow PostgreSQL's
+# INTEGER column on insert and the asyncpg driver would raise
+# ``NumericValueOutOfRangeError``, surfacing as the generic
+# ``"DB write failed — see logs."`` reply with no hint at the cause.
+# The web admin already has the equivalent cap; this mirrors it on
+# the Telegram-side parser. 1M is well clear of the 2.1B PG INT max
+# and already implausibly large for any real promo.
+_PROMO_MAX_USES_CAP = 1_000_000
+# Upper bound on ``[days]`` for the same reason — PostgreSQL's
+# ``interval`` arithmetic (``NOW() + ($N || ' days')::interval``) tops
+# out at ≈68 years before the underlying ``int32`` for the days
+# component overflows. 36_500 days (≈100 years) matches the cap the
+# web admin and broadcast filter already use; anything beyond that
+# is almost certainly a typo.
+_PROMO_EXPIRES_IN_DAYS_CAP = 36_500
+
+
 def parse_promo_create_args(text: str) -> dict | str:
     """Parse ``/admin_promo_create <CODE> <pct%|$amt> [max_uses] [days]``.
 
@@ -417,7 +436,7 @@ def parse_promo_create_args(text: str) -> dict | str:
 
     Returns a string error key on failure: ``"missing"``,
     ``"bad_code"``, ``"bad_discount"``, ``"bad_max_uses"``,
-    ``"bad_days"``.
+    ``"max_uses_too_large"``, ``"bad_days"``, ``"days_too_large"``.
 
     Discount syntax:
       * ``20%``       → percent
@@ -463,6 +482,8 @@ def parse_promo_create_args(text: str) -> dict | str:
             return "bad_max_uses"
         if max_uses <= 0:
             return "bad_max_uses"
+        if max_uses > _PROMO_MAX_USES_CAP:
+            return "max_uses_too_large"
 
     expires_in_days: int | None = None
     if len(parts) >= 5:
@@ -472,6 +493,8 @@ def parse_promo_create_args(text: str) -> dict | str:
             return "bad_days"
         if expires_in_days <= 0:
             return "bad_days"
+        if expires_in_days > _PROMO_EXPIRES_IN_DAYS_CAP:
+            return "days_too_large"
 
     return {
         "code": code,
@@ -502,9 +525,17 @@ _PROMO_CREATE_ERR_TEXT = {
         "❌ max_uses must be a positive integer (or omit it for "
         "unlimited)."
     ),
+    "max_uses_too_large": (
+        f"❌ max_uses must be at most {_PROMO_MAX_USES_CAP:,} "
+        f"(DB INTEGER limit)."
+    ),
     "bad_days": (
         "❌ days-until-expiry must be a positive integer (or omit "
         "it for no expiry)."
+    ),
+    "days_too_large": (
+        f"❌ days-until-expiry must be at most {_PROMO_EXPIRES_IN_DAYS_CAP:,} "
+        f"(≈100 years)."
     ),
 }
 

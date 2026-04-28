@@ -768,6 +768,17 @@ DISCOUNT_AMOUNT_MAX = 999_999.0
 # crashed the create handler with an uncaught OverflowError → 500
 # (instead of a friendly red banner).
 EXPIRES_IN_DAYS_MAX = 36_500
+# Upper bound on the ``max_uses`` field of promo / gift codes.
+# Pre-fix this was unbounded — an admin typing ``max_uses=2147483648``
+# (or larger) would overflow PostgreSQL's INTEGER column on insert and
+# the asyncpg driver would raise ``NumericValueOutOfRangeError``,
+# which the route handler caught with the generic ``"DB write failed
+# — see logs."`` flash. The admin had no way to know the real cause
+# was that they fat-fingered an extra digit. Now we reject anything
+# above this cap up-front with a clear validation message. 1M
+# distinct uses is already implausibly large for any single
+# promo/gift code; anything beyond that is almost certainly a typo.
+MAX_USES_CAP = 1_000_000
 
 
 def parse_promo_form(form) -> dict | str:
@@ -841,6 +852,8 @@ def parse_promo_form(form) -> dict | str:
             return "bad_max_uses"
         if max_uses <= 0:
             return "bad_max_uses"
+        if max_uses > MAX_USES_CAP:
+            return "max_uses_too_large"
 
     raw_days = (form.get("expires_in_days") or "").strip()
     expires_in_days: int | None = None
@@ -874,6 +887,9 @@ _PROMO_FORM_ERR_TEXT = {
         f"Amount must be at most ${DISCOUNT_AMOUNT_MAX:,.2f} (DB limit)."
     ),
     "bad_max_uses": "Max uses must be a positive integer (or leave blank).",
+    "max_uses_too_large": (
+        f"Max uses must be at most {MAX_USES_CAP:,} (DB INTEGER limit)."
+    ),
     "bad_days": "Days-until-expiry must be a positive integer (or leave blank).",
     "days_too_large": (
         f"Days-until-expiry must be at most {EXPIRES_IN_DAYS_MAX:,} (≈100 years)."
@@ -1205,6 +1221,8 @@ def parse_gift_form(form) -> dict | str:
             return "bad_max_uses"
         if max_uses <= 0:
             return "bad_max_uses"
+        if max_uses > MAX_USES_CAP:
+            return "max_uses_too_large"
 
     raw_days = (form.get("expires_in_days") or "").strip()
     expires_in_days: int | None = None
@@ -1235,6 +1253,9 @@ _GIFT_FORM_ERR_TEXT = {
         f"Amount must be at most ${GIFT_AMOUNT_MAX:,.2f} (DB limit)."
     ),
     "bad_max_uses": "Max redemptions must be a positive integer (or leave blank).",
+    "max_uses_too_large": (
+        f"Max redemptions must be at most {MAX_USES_CAP:,} (DB INTEGER limit)."
+    ),
     "bad_days": "Days-until-expiry must be a positive integer (or leave blank).",
     "days_too_large": (
         f"Days-until-expiry must be at most {EXPIRES_IN_DAYS_MAX:,} (≈100 years)."
