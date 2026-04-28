@@ -3324,6 +3324,18 @@ def parse_user_edit_form(form, *, current: dict) -> dict | str:
             # Telegram usernames are alphanumeric + underscore. We
             # accept the canonical form without the leading "@".
             cleaned = raw_username.lstrip("@")
+            # Pre-fix bug: a raw value of ``"@"`` / ``"@@@"`` / etc.
+            # collapsed to ``""`` after ``lstrip("@")`` and slipped
+            # past the ``all(...)`` check (``all(empty_iterable)`` is
+            # ``True``) — the empty string then got written to
+            # ``users.username``, which is distinct from ``NULL`` at
+            # the SQL level and breaks downstream ``WHERE username IS
+            # NULL`` / display-name fallback logic. Reject explicitly;
+            # admins who actually want to clear the field can submit
+            # an empty string via the regular ``raw_username`` falsy
+            # branch below.
+            if not cleaned:
+                return "bad_username"
             if not all(c.isalnum() or c == "_" for c in cleaned):
                 return "bad_username"
             new_username: str | None = cleaned
