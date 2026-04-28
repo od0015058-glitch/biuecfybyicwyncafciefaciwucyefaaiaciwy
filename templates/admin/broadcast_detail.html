@@ -61,6 +61,25 @@
   .state-running   { background: rgba(79,140,255,0.15);  color: var(--accent); }
   .state-completed { background: rgba(74,222,128,0.15);  color: var(--success); }
   .state-failed    { background: rgba(244,93,93,0.18);   color: var(--danger, #f45d5d); }
+  .state-cancelled { background: rgba(214,158,46,0.15);  color: #d69e2e; }
+  form.cancel-form {
+    display: inline;
+    margin-left: 12px;
+  }
+  form.cancel-form button {
+    background: rgba(244,93,93,0.1);
+    color: var(--danger, #f45d5d);
+    border: 1px solid var(--danger, #f45d5d);
+    border-radius: 4px;
+    padding: 4px 12px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  form.cancel-form button:hover { background: rgba(244,93,93,0.2); }
+  form.cancel-form button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
   pre.body {
     white-space: pre-wrap;
     word-wrap: break-word;
@@ -96,6 +115,18 @@
 <h2 style="margin-top:0">
   Broadcast <code>{{ job.id }}</code>
   <span id="state-pill" class="state-pill state-{{ job.state }}">{{ job.state }}</span>
+  {% if job.state in ("queued", "running") %}
+    <form class="cancel-form" id="cancel-form"
+          method="post"
+          action="/admin/broadcast/{{ job.id }}/cancel"
+          onsubmit="return confirm('Cancel this broadcast? Recipients already messaged will not be unsent.');">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit"
+              {% if job.cancel_requested %}disabled{% endif %}>
+        {% if job.cancel_requested %}Cancelling…{% else %}Cancel{% endif %}
+      </button>
+    </form>
+  {% endif %}
 </h2>
 
 <div class="meta">
@@ -139,11 +170,13 @@
 <script>
 (function () {
   var jobId = {{ job.id | tojson }};
-  var terminal = new Set(["completed", "failed"]);
+  var terminal = new Set(["completed", "failed", "cancelled"]);
   var pill = document.getElementById("state-pill");
   var bar = document.getElementById("progress-bar");
   var errBox = document.getElementById("err-box");
   var errMsg = document.getElementById("err-msg");
+  var cancelForm = document.getElementById("cancel-form");
+  var cancelBtn = cancelForm ? cancelForm.querySelector("button") : null;
 
   function paint(j) {
     document.getElementById("progress-i").textContent = j.i;
@@ -158,6 +191,14 @@
     if (j.error) {
       errMsg.textContent = j.error;
       errBox.style.display = "";
+    }
+    if (cancelForm) {
+      if (terminal.has(j.state)) {
+        cancelForm.style.display = "none";
+      } else if (cancelBtn) {
+        cancelBtn.disabled = !!j.cancel_requested;
+        cancelBtn.textContent = j.cancel_requested ? "Cancelling…" : "Cancel";
+      }
     }
   }
 

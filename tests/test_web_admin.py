@@ -14,8 +14,9 @@ Two flavours of tests:
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -4512,3 +4513,381 @@ async def test_promos_create_records_audit(
     assert resp.status == 302
     actions = [c.kwargs["action"] for c in db.record_admin_audit.await_args_list]
     assert "promo_create" in actions
+
+
+# =========================================================================
+# Stage-9-Step-6: soft-cancel running broadcasts + retry_after cap
+# =========================================================================
+
+
+async def test_do_broadcast_returns_cancelled_false_by_default():
+    """Backwards compat — pre-Step-6 callers without ``should_cancel``
+    must still see a stats dict; the new ``cancelled`` key defaults to
+    False."""
+    import admin
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(return_value=None)
+    orig_delay = admin._BROADCAST_DELAY_S
+    admin._BROADCAST_DELAY_S = 0.0
+    try:
+        stats = await admin._do_broadcast(
+            bot, recipients=[1, 2, 3], text="hi", admin_id=0
+        )
+    finally:
+        admin._BROADCAST_DELAY_S = orig_delay
+    assert stats == {
+        "sent": 3, "blocked": 0, "failed": 0,
+        "total": 3, "cancelled": False,
+    }
+
+
+async def test_do_broadcast_honours_should_cancel_after_first_send():
+    """A flag flip after the first successful send must short-circuit
+    the loop; remaining recipients must NOT receive the message."""
+    import admin
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(return_value=None)
+    flag = {"cancel": False}
+
+    def cancel_after_first():
+        # The cancel-check fires at the *top* of every iteration; flip
+        # the flag after the first send so iteration 2 sees it.
+        if bot.send_message.await_count >= 1:
+            flag["cancel"] = True
+        return flag["cancel"]
+
+    orig_delay = admin._BROADCAST_DELAY_S
+    admin._BROADCAST_DELAY_S = 0.0
+    try:
+        stats = await admin._do_broadcast(
+            bot,
+            recipients=[1, 2, 3, 4, 5],
+            text="hi",
+            admin_id=0,
+            should_cancel=cancel_after_first,
+        )
+    finally:
+        admin._BROADCAST_DELAY_S = orig_delay
+    assert stats["cancelled"] is True
+    assert stats["sent"] == 1
+    assert bot.send_message.await_count == 1
+
+
+async def test_do_broadcast_cancel_predicate_exception_is_swallowed():
+    """A buggy ``should_cancel`` predicate must not abort the
+    broadcast — a raised exception is treated as 'not cancelled'."""
+    import admin
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(return_value=None)
+
+    def explode():
+        raise RuntimeError("predicate broken")
+
+    orig_delay = admin._BROADCAST_DELAY_S
+    admin._BROADCAST_DELAY_S = 0.0
+    try:
+        stats = await admin._do_broadcast(
+            bot, recipients=[1, 2, 3], text="hi", admin_id=0,
+            should_cancel=explode,
+        )
+    finally:
+        admin._BROADCAST_DELAY_S = orig_delay
+    assert stats["cancelled"] is False
+    assert stats["sent"] == 3
+
+
+async def test_do_broadcast_cancel_check_at_top_of_loop():
+    """Cancel set BEFORE the first send must result in zero sends."""
+    import admin
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(return_value=None)
+
+    orig_delay = admin._BROADCAST_DELAY_S
+    admin._BROADCAST_DELAY_S = 0.0
+    try:
+        stats = await admin._do_broadcast(
+            bot, recipients=[1, 2, 3], text="hi", admin_id=0,
+            should_cancel=lambda: True,
+        )
+    finally:
+        admin._BROADCAST_DELAY_S = orig_delay
+    assert stats["cancelled"] is True
+    assert stats["sent"] == 0
+    bot.send_message.assert_not_awaited()
+
+
+async def test_do_broadcast_caps_retry_after():
+    """Pre-fix, ``await asyncio.sleep(exc.retry_after)`` was uncapped.
+    A misbehaving Telegram returning ``retry_after=3600`` would pin
+    the worker for an hour. Now capped at
+    ``_BROADCAST_RETRY_AFTER_MAX_S``."""
+    import admin
+    from aiogram.exceptions import TelegramRetryAfter
+    bot = AsyncMock()
+    # First call raises 429 with retry_after=600 (10 min); retry succeeds.
+    bot.send_message = AsyncMock(
+        side_effect=[
+            TelegramRetryAfter(method=MagicMock(), message="flood", retry_after=600),
+            None,
+        ]
+    )
+    sleeps: list[float] = []
+    orig_sleep = asyncio.sleep
+    orig_delay = admin._BROADCAST_DELAY_S
+    admin._BROADCAST_DELAY_S = 0.0
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        # Keep coroutine semantics but don't actually wait.
+        await orig_sleep(0)
+
+    try:
+        with patch.object(admin.asyncio, "sleep", fake_sleep):
+            stats = await admin._do_broadcast(
+                bot, recipients=[1], text="hi", admin_id=0
+            )
+    finally:
+        admin._BROADCAST_DELAY_S = orig_delay
+    # The retry sleep must have been capped at the configured maximum.
+    assert any(
+        s == admin._BROADCAST_RETRY_AFTER_MAX_S for s in sleeps
+    ), f"expected one sleep at the cap, got {sleeps}"
+    # Ensure no sleep call ever exceeded the cap.
+    assert all(
+        s <= admin._BROADCAST_RETRY_AFTER_MAX_S for s in sleeps
+    ), f"unexpected uncapped sleep in {sleeps}"
+    assert stats["sent"] == 1
+
+
+async def test_do_broadcast_retry_after_within_cap_unchanged():
+    """A normal retry_after (well under the cap) must be honoured
+    verbatim — the cap only kicks in for outliers."""
+    import admin
+    from aiogram.exceptions import TelegramRetryAfter
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(
+        side_effect=[
+            TelegramRetryAfter(method=MagicMock(), message="flood", retry_after=5),
+            None,
+        ]
+    )
+    sleeps: list[float] = []
+    orig_sleep = asyncio.sleep
+    orig_delay = admin._BROADCAST_DELAY_S
+    admin._BROADCAST_DELAY_S = 0.0
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        await orig_sleep(0)
+
+    try:
+        with patch.object(admin.asyncio, "sleep", fake_sleep):
+            stats = await admin._do_broadcast(
+                bot, recipients=[1], text="hi", admin_id=0
+            )
+    finally:
+        admin._BROADCAST_DELAY_S = orig_delay
+    assert 5 in sleeps or 5.0 in sleeps
+    assert stats["sent"] == 1
+
+
+async def test_run_broadcast_job_marks_cancelled_state(make_admin_app):
+    """``_run_broadcast_job`` must read ``job['cancel_requested']``
+    and surface the resulting state as ``cancelled`` (not
+    ``completed``)."""
+    import admin
+    recipients = [10, 20, 30, 40, 50]
+    db = _stub_db(broadcast_recipients=recipients)
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(return_value=None)
+    app = make_admin_app(db=db, bot=bot)
+    job = _new_broadcast_job(text="hi", only_active_days=None)
+    _store_broadcast_job(app, job)
+
+    # Flip the cancel flag after the first send.
+    async def cancel_after_first(chat_id, text):
+        if bot.send_message.await_count == 1:
+            job["cancel_requested"] = True
+
+    bot.send_message.side_effect = cancel_after_first
+
+    orig_delay = admin._BROADCAST_DELAY_S
+    admin._BROADCAST_DELAY_S = 0.0
+    try:
+        await _run_broadcast_job(app=app, job=job, text="hi")
+    finally:
+        admin._BROADCAST_DELAY_S = orig_delay
+
+    assert job["state"] == "cancelled"
+    assert job["sent"] == 1
+    # ``i`` reflects only the recipients we actually attempted, NOT
+    # the full recipient list size.
+    assert job["i"] == 1
+    # ``total`` still records the recipient list length (so the UI
+    # can render "stopped at 1/5").
+    assert job["total"] == 5
+
+
+def test_store_broadcast_job_evicts_cancelled_entries():
+    """Cancelled jobs must be eligible for eviction once the
+    registry hits its cap, not pile up forever."""
+    app = web.Application()
+    app[APP_KEY_BROADCAST_JOBS] = {}
+    ordered_ids: list[str] = []
+    for _ in range(BROADCAST_MAX_HISTORY):
+        j = _new_broadcast_job(text="cancelled", only_active_days=None)
+        j["state"] = "cancelled"
+        _store_broadcast_job(app, j)
+        ordered_ids.append(j["id"])
+    newest = _new_broadcast_job(text="next", only_active_days=None)
+    newest["state"] = "completed"
+    _store_broadcast_job(app, newest)
+    assert ordered_ids[0] not in app[APP_KEY_BROADCAST_JOBS]
+    assert newest["id"] in app[APP_KEY_BROADCAST_JOBS]
+    assert len(app[APP_KEY_BROADCAST_JOBS]) == BROADCAST_MAX_HISTORY
+
+
+# ---- /admin/broadcast/{id}/cancel endpoint integration ------------------
+
+
+async def test_broadcast_cancel_requires_auth(aiohttp_client, make_admin_app):
+    client = await aiohttp_client(make_admin_app())
+    resp = await client.post(
+        "/admin/broadcast/abc/cancel", allow_redirects=False
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/login"
+
+
+async def test_broadcast_cancel_csrf_required(aiohttp_client, make_admin_app):
+    db = _stub_db()
+    app = make_admin_app(password="pw", db=db, bot=AsyncMock())
+    job = _new_broadcast_job(text="hi", only_active_days=None)
+    job["state"] = "running"
+    _store_broadcast_job(app, job)
+    client = await aiohttp_client(app)
+    await _login(client, "pw")
+    resp = await client.post(
+        f"/admin/broadcast/{job['id']}/cancel",
+        data={},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert job.get("cancel_requested", False) is False
+
+
+async def test_broadcast_cancel_unknown_job_redirects_to_index(
+    aiohttp_client, make_admin_app
+):
+    app = make_admin_app(password="pw", bot=AsyncMock())
+    client = await aiohttp_client(app)
+    await _login(client, "pw")
+    resp = await client.get("/admin/broadcast")
+    body = await resp.text()
+    import re
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', body).group(1)
+    resp = await client.post(
+        "/admin/broadcast/does-not-exist/cancel",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/broadcast"
+
+
+async def test_broadcast_cancel_on_running_job_sets_flag_and_audits(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    app = make_admin_app(password="pw", db=db, bot=AsyncMock())
+    job = _new_broadcast_job(text="hi", only_active_days=None)
+    job["state"] = "running"
+    _store_broadcast_job(app, job)
+    client = await aiohttp_client(app)
+    csrf = await _login_and_get_broadcast_csrf(client, "pw")
+    resp = await client.post(
+        f"/admin/broadcast/{job['id']}/cancel",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == f"/admin/broadcast/{job['id']}"
+    assert job["cancel_requested"] is True
+    actions = [c.kwargs["action"] for c in db.record_admin_audit.await_args_list]
+    assert "broadcast_cancel" in actions
+
+
+async def test_broadcast_cancel_on_terminal_job_rejected(
+    aiohttp_client, make_admin_app
+):
+    """Cancelling a job that already completed is a flash-error,
+    NOT a state mutation."""
+    db = _stub_db()
+    app = make_admin_app(password="pw", db=db, bot=AsyncMock())
+    job = _new_broadcast_job(text="hi", only_active_days=None)
+    job["state"] = "completed"
+    _store_broadcast_job(app, job)
+    client = await aiohttp_client(app)
+    csrf = await _login_and_get_broadcast_csrf(client, "pw")
+    resp = await client.post(
+        f"/admin/broadcast/{job['id']}/cancel",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert job.get("cancel_requested", False) is False
+    # No audit row written for a rejected cancel.
+    audit_actions = [
+        c.kwargs.get("action") for c in db.record_admin_audit.await_args_list
+    ]
+    assert "broadcast_cancel" not in audit_actions
+
+
+async def test_broadcast_cancel_idempotent(aiohttp_client, make_admin_app):
+    """A second cancel on an already-cancelling job must NOT write a
+    second audit row."""
+    db = _stub_db()
+    app = make_admin_app(password="pw", db=db, bot=AsyncMock())
+    job = _new_broadcast_job(text="hi", only_active_days=None)
+    job["state"] = "running"
+    _store_broadcast_job(app, job)
+    client = await aiohttp_client(app)
+    csrf = await _login_and_get_broadcast_csrf(client, "pw")
+    for _ in range(2):
+        resp = await client.post(
+            f"/admin/broadcast/{job['id']}/cancel",
+            data={"csrf_token": csrf},
+            allow_redirects=False,
+        )
+        assert resp.status == 302
+    cancel_audits = [
+        c for c in db.record_admin_audit.await_args_list
+        if c.kwargs.get("action") == "broadcast_cancel"
+    ]
+    assert len(cancel_audits) == 1
+
+
+async def test_broadcast_detail_renders_cancel_button_for_running(
+    aiohttp_client, make_admin_app
+):
+    """Verify the live-progress page renders the cancel form when the
+    job is ``running`` and hides it when terminal."""
+    db = _stub_db()
+    app = make_admin_app(password="pw", db=db, bot=AsyncMock())
+    job_running = _new_broadcast_job(text="hi", only_active_days=None)
+    job_running["state"] = "running"
+    _store_broadcast_job(app, job_running)
+    job_done = _new_broadcast_job(text="hi", only_active_days=None)
+    job_done["state"] = "completed"
+    _store_broadcast_job(app, job_done)
+    client = await aiohttp_client(app)
+    await _login(client, "pw")
+
+    resp = await client.get(f"/admin/broadcast/{job_running['id']}")
+    body = await resp.text()
+    assert f"/admin/broadcast/{job_running['id']}/cancel" in body
+    assert "Cancel" in body
+
+    resp = await client.get(f"/admin/broadcast/{job_done['id']}")
+    body = await resp.text()
+    assert f"/admin/broadcast/{job_done['id']}/cancel" not in body
