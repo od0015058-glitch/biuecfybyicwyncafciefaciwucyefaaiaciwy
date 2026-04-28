@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+
+{% block body %}
+<div class="layout">
+  <aside class="sidebar">
+    <h1>Meowassist Admin</h1>
+    <nav>
+      <a href="/admin/" class="{% if active_page == 'dashboard' %}active{% endif %}">📊 Dashboard</a>
+      <a class="disabled" title="Coming in Stage-8-Part-2">🎟️ Promo codes</a>
+      <a class="disabled" title="Coming in Stage-8-Part-3">🎁 Gift codes</a>
+      <a class="disabled" title="Coming in Stage-8-Part-4">👥 Users</a>
+      <a class="disabled" title="Coming in Stage-8-Part-5">📣 Broadcast</a>
+      <a class="disabled" title="Coming in Stage-8-Part-5">💸 Transactions</a>
+    </nav>
+    <div class="footer">
+      <a href="/admin/logout">Sign out</a>
+    </div>
+  </aside>
+  <main>
+    {% block main %}{% endblock %}
+  </main>
+</div>
+{% endblock %}

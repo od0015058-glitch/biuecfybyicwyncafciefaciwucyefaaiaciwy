@@ -201,6 +201,16 @@ async def cmd_start(message: Message, state: FSMContext):
     # Drop any in-flight FSM (custom-amount / promo input) — /start is
     # always a hard reset.
     await state.clear()
+    # ``message.from_user`` is None for anonymous group admins and
+    # channel-bot edge cases. ``UserUpsertMiddleware`` guards None
+    # for the DB upsert but the handler itself was still touching
+    # ``.id`` / ``.username`` / ``.first_name`` directly — pre-fix
+    # this AttributeError'd and bubbled up as a poller-level crash.
+    # Same defensive guard pattern that PR #51 added to ``process_chat``
+    # and the cleanup PR added to ``process_promo_input`` /
+    # ``process_custom_amount_input``.
+    if message.from_user is None:
+        return
     await db.create_user(message.from_user.id, message.from_user.username or "Unknown")
     lang = await _get_user_language(message.from_user.id)
     # Quick greeting first (one-shot bubble), then the hub. Greeting is
@@ -228,6 +238,13 @@ async def cmd_start(message: Message, state: FSMContext):
 # when no state is set so it's always safe.
 async def _route_legacy_text_to_hub(message: Message, state: FSMContext):
     await state.clear()
+    # ``message.from_user`` is None for anonymous-group / channel-bot
+    # edge cases. The legacy reply-keyboard buttons are matched by
+    # text equality so a group admin posting (e.g.) "👛 کیف پول" as
+    # an anonymous admin would route here without ``from_user``.
+    # Same guard pattern as cmd_start / process_chat.
+    if message.from_user is None:
+        return
     lang = await _get_user_language(message.from_user.id)
     await _send_hub(message, lang, remove_kb=True)
 

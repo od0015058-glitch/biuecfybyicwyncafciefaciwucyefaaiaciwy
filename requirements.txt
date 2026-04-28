@@ -14,3 +14,9 @@ psycopg2-binary>=2.9.9
 # falls back to in-memory storage (with a WARNING log) when REDIS_URL
 # is unset, so this dependency is "always installed, sometimes used".
 redis>=5.0.0
+
+# Web admin panel (Stage-8). Mounted on the existing aiohttp server
+# under /admin/. jinja2 + aiohttp_jinja2 for templating. No build step,
+# no Node, no separate frontend.
+jinja2>=3.1.2
+aiohttp-jinja2>=1.5.1
