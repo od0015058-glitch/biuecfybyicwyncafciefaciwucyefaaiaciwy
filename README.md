@@ -6,7 +6,25 @@ NowPayments crypto invoices.
 
 For the full project history, file map, and roadmap **read [HANDOFF.md](./HANDOFF.md)**.
 
-## Quick start
+## Quick start (Docker — recommended)
+
+```bash
+git clone <repo>
+cd <repo>
+cp .env.example .env       # fill in BOT_TOKEN / OPENROUTER_API_KEY / NOWPAYMENTS_* / DB_PASSWORD / WEBHOOK_BASE_URL
+docker compose up -d --build
+docker compose logs -f bot
+```
+
+Compose boots Postgres + the bot together. Schema and `migrations/*.sql`
+auto-apply on first boot of an empty Postgres volume. The bot's webhook
+listener is published to `127.0.0.1:8080` only — put nginx/Caddy/Cloudflare
+Tunnel in front for TLS so NowPayments can reach
+`${WEBHOOK_BASE_URL}/nowpayments-webhook` over HTTPS.
+
+To roll back: `docker compose down && git checkout <previous-sha> && docker compose up -d --build`.
+
+## Quick start (manual)
 
 1. **Clone + install**
    ```bash
@@ -42,6 +60,13 @@ For the full project history, file map, and roadmap **read [HANDOFF.md](./HANDOF
    `WEBHOOK_PORT` (default `8080`). Put it behind nginx/Caddy + certbot or a
    Cloudflare tunnel so NowPayments can reach `${WEBHOOK_BASE_URL}/nowpayments-webhook`
    over HTTPS.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests/
+```
 
 ## Source map
 
