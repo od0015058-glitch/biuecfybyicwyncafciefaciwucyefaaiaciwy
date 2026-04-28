@@ -978,7 +978,7 @@ class Database:
             rows = await connection.fetch(
                 """
                 SELECT r.telegram_id, r.redeemed_at, r.transaction_id,
-                       u.first_name, u.username
+                       u.username
                 FROM gift_redemptions r
                 LEFT JOIN users u ON u.telegram_id = r.telegram_id
                 WHERE r.code = $1
@@ -998,7 +998,6 @@ class Database:
                     int(r["transaction_id"])
                     if r["transaction_id"] is not None else None
                 ),
-                "first_name": r["first_name"],
                 "username": r["username"],
             }
             for r in rows
