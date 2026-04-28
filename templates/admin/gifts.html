@@ -124,7 +124,7 @@
         {% for r in rows %}
         <tr>
           <td><code class="code">{{ r.code }}</code></td>
-          <td>${{ "{:,.2f}".format(r.amount_usd) }}</td>
+          <td>{{ r.amount_usd | format_usd(2) }}</td>
           <td>
             {{ r.used_count }} /
             {% if r.max_uses is not none %}{{ r.max_uses }}{% else %}∞{% endif %}

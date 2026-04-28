@@ -2808,9 +2808,11 @@ async def test_user_detail_renders_summary(
     assert "@alice" in body
     assert "$42.5000" in body
     assert "openai/gpt-4o" in body
-    # Positive and negative sign rendering with abs magnitude.
+    # Stage-9-Step-7 unified format_usd: minus is the ASCII ``-``
+    # placed BEFORE the dollar sign; positive numbers get a leading
+    # ``+`` sign-marker.
     assert "+$10.0000" in body
-    assert "−$5.0000" in body
+    assert "-$5.0000" in body
     assert "[web] overcharge fix" in body
     # CSRF token is injected into the adjust form.
     assert 'name="csrf_token"' in body
