@@ -300,15 +300,15 @@ These are the items the original roadmap had under "P3 — operational
 hardening (~3h)" that the recent P3-* product PRs did **not** address.
 Each is a separate PR, in this order:
 
-| # | Title | Why now |
-| --- | --- | --- |
-| **P3-Op-1** | Robust IPN verifier — sign raw body first, fall back to canonicalized | Defense-in-depth on the bug we just spent a session debugging. Add a unit test that loads a sample IPN body + signature and asserts `_verify_ipn_signature` returns True. |
-| **P3-Op-2** | `Dockerfile` + `docker-compose.yml` (postgres + bot) | The user is currently `mv`-ing the app dir to back up. A reproducible build/deploy story replaces "if it explodes, mv the bak directory back". |
-| **P3-Op-3** | pytest skeleton + tests for IPN verify, pricing, balance accounting | Nothing in this repo has automated tests. The webhook + pricing + balance code paths are exactly where untested = loses money. |
-| **P3-Op-4** | Alembic migrations | We're at `migrations/003_*.sql`. Switching now is cheap; later it's painful. |
-| **P3-Op-5** | Redis-backed FSM storage | Right now if the bot restarts mid-checkout the user is stuck in `waiting_custom_amount`. |
-| **P3-Op-6** | Rate limiting on `/chat` and on `/nowpayments-webhook` | Cheap insurance against runaway costs and webhook DoS. |
-| **P3-Op-7** | Bug A + Bug B fixes (see §5) | Bundle the two latent bugs in one tidy PR. |
+| # | Title | Status | PR |
+| --- | --- | --- | --- |
+| **P3-Op-1** | Robust IPN verifier — sign raw body first, fall back to canonicalized | ✅ Shipped | [#41](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/41) |
+| **P3-Op-2** | `Dockerfile` + `docker-compose.yml` (postgres + bot) | ✅ Shipped | [#42](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/42) |
+| **P3-Op-3** | pytest skeleton + GitHub Actions CI + pricing tests | ✅ Shipped | [#43](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/43) |
+| **P3-Op-4** | Alembic migrations + entrypoint runs `upgrade head` | ✅ Shipped | [#44](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/44) |
+| **P3-Op-4-Hotfix** | URL-encode DB credentials in `alembic/env.py` (Devin Review catch) | ✅ Shipped | this PR |
+| **P3-Op-5** | Redis-backed FSM storage **+ Bug B (FSMContext on top-level handlers)** | ⏳ Next | — |
+| **P3-Op-6** | Rate limiting on `/chat` and `/nowpayments-webhook` **+ Bug A (`finalize_partial_payment` GREATEST guard)** | ⏳ Queued | — |
 
 ### P2 product items still queued (lower priority than P3-Op)
 

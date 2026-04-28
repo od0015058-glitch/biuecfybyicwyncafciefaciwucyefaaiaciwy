@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 from logging.config import fileConfig
+from urllib.parse import quote_plus
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
@@ -27,9 +28,17 @@ if config.config_file_name is not None:
 
 
 def _build_url() -> str:
-    """Assemble the connection URL from the bot's DB_* env vars."""
-    user = os.getenv("DB_USER", "botuser")
-    password = os.getenv("DB_PASSWORD", "")
+    """Assemble the connection URL from the bot's DB_* env vars.
+
+    User and password are URL-encoded with ``quote_plus`` so values
+    containing characters that are meaningful in a URL (``@``, ``/``,
+    ``:``, ``%``, ``#``, ``?``, …) don't corrupt the connection string
+    and crash-loop the bot container at startup. Anything in DB_HOST /
+    DB_PORT / DB_NAME stays raw — those are operator-supplied
+    hostnames and identifiers.
+    """
+    user = quote_plus(os.getenv("DB_USER", "botuser"))
+    password = quote_plus(os.getenv("DB_PASSWORD", ""))
     host = os.getenv("DB_HOST", "localhost")
     port = os.getenv("DB_PORT", "5432")
     name = os.getenv("DB_NAME", "aibot_db")
