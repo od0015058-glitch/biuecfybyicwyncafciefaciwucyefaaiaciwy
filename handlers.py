@@ -1097,6 +1097,13 @@ async def process_promo_input(message: Message, state: FSMContext):
     and bounce the user back to the amount picker. Errors keep the
     user in waiting_promo_code so they can retype without restarting.
     """
+    # Anonymous-group-admin / channel-bot messages have ``from_user is
+    # None``. Touching ``.id`` would crash with AttributeError and
+    # bubble up as a poller-level error. Same defensive guard as
+    # ``process_chat`` (PR #51): silently no-op so the user can retry
+    # from a private chat or after re-anonymising.
+    if message.from_user is None:
+        return
     lang = await _get_user_language(message.from_user.id)
     code = (message.text or "").strip().upper()
     if not code:
@@ -1184,6 +1191,11 @@ async def process_add_crypto_currency(callback: CallbackQuery):
 
 @router.message(UserStates.waiting_custom_amount)
 async def process_custom_amount_input(message: Message, state: FSMContext):
+    # Same defensive guard as ``process_promo_input`` /
+    # ``process_chat``: anonymous-group-admin messages set
+    # ``from_user`` to None, and ``.id`` access would AttributeError.
+    if message.from_user is None:
+        return
     lang = await _get_user_language(message.from_user.id)
     # ``message.text`` is None for stickers / photos / voice / video
     # notes / etc. The previous ``message.text.strip()`` raised

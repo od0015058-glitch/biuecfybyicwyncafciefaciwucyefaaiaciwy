@@ -1,230 +1,228 @@
 # Project Handoff — Meowassist AI bot
 
 **Audience:** the next AI (or human) picking this codebase up.
-**Goal:** you can read this single file and have full context — what the
-project is, what's been shipped, what's currently broken (or recently fixed),
-and what to do next without asking the user to re-explain anything.
+**Goal:** read this single file and have full context — what the project is,
+what's been shipped, what direction the user pivoted to, what to do next.
+
+> **If you are the next AI:** read §11 ("Working agreement") first — the user
+> wants you to ship PRs autonomously without blocking on per-PR approval.
 
 ---
 
 ## 1. What the bot is
 
-Telegram bot (`@Meowassist_Ai_bot`) that:
+Telegram bot (`@Meowassist_Ai_bot`, id `8761211112`) that:
 
 1. Lets a user pick an LLM from OpenRouter (free or paid).
 2. Charges them per request — free messages while their `free_messages_left > 0`,
    then deducts USD from a wallet stored in PostgreSQL.
 3. Tops the wallet up via NowPayments crypto invoices (BTC / ETH / LTC / TON /
-   TRX / USDT on TRC20·ERC20·BEP20·TON).
+   TRX / USDT on TRC20·ERC20·BEP20·TON — 9 supported tickers).
 4. Speaks Persian by default, English on demand.
 
-**Stack:** Python 3.11+, aiogram 3, asyncpg, aiohttp, PostgreSQL.
-**Process model:** one Python process. `aiogram` long-polls Telegram, a
+**Stack:** Python 3.11+, aiogram 3, asyncpg, aiohttp, PostgreSQL, Redis.
+**Process model:** one Python process. `aiogram` long-polls Telegram; a
 side-by-side `aiohttp` web server listens for NowPayments IPN POSTs on
 `${WEBHOOK_BASE_URL}/nowpayments-webhook`.
+**Deployment:** docker-compose (`postgres` + `redis` + `bot`). Live deploy
+sits at `/root/bot_project` on the user's VPS. **Do not modify that path.**
 
 ---
 
 ## 2. File map
 
 ```
-main.py             entrypoint                             67 LoC
-database.py         asyncpg pool, all SQL                 758 LoC
-payments.py         NowPayments invoice + IPN verify       628 LoC
-handlers.py         every aiogram handler                 1430 LoC
-ai_engine.py        OpenRouter call + cost settlement     119 LoC
-pricing.py          per-model price + markup              109 LoC
-models_catalog.py   live OpenRouter /v1/models cache      289 LoC
-middlewares.py      user-upsert middleware                 61 LoC
-strings.py          fa/en string table                    539 LoC
-schema.sql          initial schema                        142 LoC
-migrations/*.sql    numbered, append-only migrations
+main.py             entrypoint                            ~70 LoC
+database.py         asyncpg pool, all SQL                ~1100 LoC
+payments.py         NowPayments invoice + IPN verify      ~630 LoC
+handlers.py         every aiogram handler                ~1490 LoC
+ai_engine.py        OpenRouter call + cost settlement     ~140 LoC
+pricing.py          per-model price + markup              ~110 LoC
+models_catalog.py   live OpenRouter /v1/models cache      ~290 LoC
+middlewares.py      user-upsert middleware                 ~60 LoC
+strings.py          fa/en string table                    ~540 LoC
+admin.py            Telegram-side admin commands          ~870 LoC
+rate_limit.py       chat + webhook rate limiters          ~270 LoC
+alembic/            schema migrations (owns schema)
+  env.py
+  versions/0001_baseline.py
+  versions/0002_transactions_notes.py
+entrypoint.sh       runs `alembic upgrade head` then exec's main.py
+Dockerfile          python:3.12-slim + requirements
+docker-compose.yml  postgres + redis + bot
 .env.example        every required env var
-.gitignore          secrets, venvs, *.save backups
+tests/              pytest, ~160 cases
+.github/workflows/ci.yml   3.11/3.12 matrix + alembic roundtrip + docker build
 ```
 
-Total: ~4.2k LoC, no test suite yet (P3 todo).
+Total: ~4.6k LoC, 161 tests, full CI on every push.
 
 ---
 
-## 3. The priority framework we follow
+## 3. Priority framework
 
-A previous AI's roadmap put payment-security at "stage 8 / low priority"; the
-user pushed back on that and we adopted **money-and-security-first** as the
-prioritization rule:
+The user's rule (overriding the original "Stage 1–8" Persian roadmap):
+**money/security first, product surface last.**
 
 - **P0** — security & money correctness. Anything that can drain the account
   or let users mint balance.
-- **P1** — correctness bugs (custom amount, partial-payment crediting, etc).
-- **P2** — product surface (back buttons, i18n, model picker UI).
-- **P3** — operational hardening (Dockerfile, README, tests, Redis FSM, etc).
+- **P1** — correctness bugs (custom amount, partial-payment crediting).
+- **P2** — product surface (back buttons, i18n, model picker, promo, admin).
+- **P3** — operational hardening (Dockerfile, README, tests, Redis FSM,
+  Alembic, rate limiting).
 
-Every PR labels itself P0/P1/P2/P3 in the title and updates this doc when a
-phase is complete.
+The new **Stage-8** (web admin panel) belongs to P2 conceptually but is
+big enough to track separately.
 
 ---
 
-## 4. What's been shipped (in merge order)
+## 4. What's shipped (in merge order)
 
 ### P0 — security & money correctness
-| # | What | Why |
-| --- | --- | --- |
-| #1 | `.gitignore` + `.env.example` + drop committed `payments.py.save` | Stops the most obvious accidental-commit-of-secrets path. |
-| #2 | Per-model pricing table + `COST_MARKUP` (default 1.5×) | Original $1/1M-tokens flat fee lost money on every paid call. |
-| #3 | Atomic `deduct_balance` with `WHERE balance_usd >= $1 RETURNING …` | Pre-fix, `UPDATE balance = balance - cost` could go negative under concurrency. |
-| #4 | Env-driven `WEBHOOK_BASE_URL`, structured logging, sanitized errors | Removed hard-coded `212.87.199.41:8080`; replaced every `print` with `logging`; user replies never carry raw exception text. |
-| #5 | NowPayments IPN HMAC-SHA512 signature verification | Without this, anyone reaching the webhook could POST `payment_status=finished` and credit themselves. |
-| #6 | Idempotent payments via the `transactions` ledger | Pre-fix, the webhook would credit the same payment twice on retry. Now: PENDING row written at invoice issuance, webhook flips it to SUCCESS + credits in **one DB transaction**. Replays / unknown payment_ids cannot mint money. |
+| # | What |
+| --- | --- |
+| #1 | `.gitignore` + `.env.example` + drop committed `payments.py.save`. |
+| #2 | Per-model pricing table + `COST_MARKUP` (default 1.5×). |
+| #3 | Atomic `deduct_balance` with `WHERE balance_usd >= $1 RETURNING …`. |
+| #4 | Env-driven `WEBHOOK_BASE_URL`, structured logging, sanitized errors. |
+| #5 | NowPayments IPN HMAC-SHA512 signature verification. |
+| #6 | Idempotent payments via the `transactions` ledger (PENDING → SUCCESS in one DB tx). |
 
 ### P1 — correctness bugs
 | # | What |
 | --- | --- |
-| #7 | Make `amt_custom` callback reachable (handler-ordering fix). |
-| #8 | Handle non-`finished` IPN statuses (`expired` / `failed` / `refunded` close the ledger row + notify user). |
-| #9 | Credit `actually_paid_usd` (not `price_amount`) on `partially_paid`. New atomic `db.finalize_partial_payment`. |
-| #10 | Hotfix: `finished` after `partially_paid` now credits the **remainder delta**, not zero. Both finalize paths use `SELECT … FOR UPDATE` and accept PENDING ∪ PARTIAL. |
-| #11 | Hotfix: `mark_transaction_terminal` accepts PARTIAL (not just PENDING) so a terminal IPN after a partial actually closes the row. |
-| #13 | Hotfix: report `$0` credited (not the unpaid invoice price) when closing a PENDING row, fixing dual-semantics confusion in `amount_usd_credited`. |
+| #7  | `amt_custom` callback reachability (handler-ordering fix). |
+| #8  | Non-`finished` IPN status handling (`expired`/`failed`/`refunded`). |
+| #9  | Partial-payment crediting via `actually_paid_usd`. |
+| #10 | `finished`-after-`partially_paid` credits the **delta**, not zero. |
+| #11 | `mark_transaction_terminal` accepts PARTIAL ∪ PENDING. |
+| #13 | Report `$0` (not invoice price) when closing PENDING terminally. |
 
-### P2 — product surface
+### P2 — product surface (#12, #14–#16, #25–#37)
+Hub navigation, FSM clearing, i18n, model picker filter, conversation memory,
+free-models tab, NowPayments error log polish, rate-lock screen, etc.
+See git log; not repeating here — they're all in `main`.
+
+### IPN signature fix (the one the user was stuck on)
 | # | What |
 | --- | --- |
-| #12 | P2-0 cleanup — Markdown `parse_mode` on missing messages, default `active_model` aligned, schema docstrings. |
-| #14 | P2-1 back/home navigation across every nested inline menu. |
-| #15 | Hotfix: Home button clears FSM. |
-| #16 | P2-2 i18n via `strings.py` (Persian default + English). Language picker persists choice via `db.set_language`. |
+| #38 | Diagnostic logging on signature mismatch (`expected/received` prefixes + lengths). |
+| #39 | **`json.dumps(..., ensure_ascii=False)` in canonical re-serialization.** Persian `order_description` was being escaped to `\uXXXX` (6 bytes/char) while NowPayments signs raw UTF-8 (~2 bytes/char). 40-byte length gap → HMAC mismatch. Verified against the user's `body_len=585 canonical_len=625` log. |
 
-### P3 — partial product-side
-The recent run of P3-* PRs was mostly **product**, not the operational
-hardening from the original P3 list. Specifically:
-
-| # | What |
+### P3 — operational hardening (the original stage-2 list, completed this cycle)
+| PR | Title |
 | --- | --- |
-| #25 | P3-1 user-upsert middleware (aiogram outer middleware, fixes FK violations from button taps without `/start`). |
-| #26 | P3-2 friendly per-currency min-amount error. |
-| #27 | P3-3 single-message inline-hub UI. |
-| #28 | P3-4 model filter (provider whitelist + text-only). |
-| #29 | P3-5 per-user opt-in conversation memory toggle (with cost warning). |
-| #30 | P3-6 free-models tab, picker polish, friendly 429 message. |
-| #31 | P3-7 polish — pretty provider names. |
-| #32 | P3-7 long-reply chunking, wallet min $10, free-trial bumped 5→10. |
-| #33 | P3-8 `is_fixed_rate=true` to lower per-currency min, restore $5 button. |
-| #34 | P3-9 EN/FA copy alignment for `charge_min_amount_unknown`. |
-| #35 | P3-10 NowPayments error log includes `pay_currency` + amount. |
-| #36 | P3-11 drop `is_fee_paid_by_user` to unblock low-amount invoices. |
-| #37 | P3-12 explain rate-lock + 7-day tracking on the invoice screen. |
-| #38 | Diagnostic logging on IPN signature mismatch. |
-| #39 | **IPN canonical body uses `ensure_ascii=False`** — see §6. |
+| [#41](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/41) | **P3-Op-1**: two-pass IPN verifier — sign raw body first, fall back to canonicalized. Stripe-style. |
+| [#42](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/42) | **P3-Op-2**: Dockerfile + docker-compose. |
+| [#43](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/43) | **P3-Op-3**: pytest skeleton + GitHub Actions CI matrix. |
+| [#44](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/44) | **P3-Op-4**: Alembic migrations + entrypoint runs `alembic upgrade head`. |
+| [#45](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/45) | **P3-Op-4-Hotfix**: URL-encode DB credentials in `alembic/env.py` (Devin Review catch). |
+| [#46](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/46) | **P3-Op-5**: Redis-backed FSM + reject NaN/Inf/over-cap custom amounts. |
+| [#47](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/47) | **P3-Op-6**: per-user chat + per-IP webhook rate limits + OpenRouter `aiohttp.ClientTimeout`. |
+| [#48](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/48) | **P3-Op-6-Hotfix**: scope chat throttle to AI handler only (Devin Review catch). |
 
-The original P3 operational-hardening checklist (Dockerfile, README, tests,
-Alembic, Redis FSM, rate limiting) is still **unstarted**; that is what's
-queued next.
+### Stage-7 — Telegram-side admin commands (completed)
+The original "Stage 7 CLI panel" was reframed as Telegram commands (gated by
+`ADMIN_USER_IDS` in env). All four sub-stages shipped:
+
+| PR | Command surface |
+| --- | --- |
+| [#49](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/49) | **Stage-7-Part-1**: `is_admin` gate, `/admin` hub, `/admin_metrics`. + `message.text=None` crash fix in `process_custom_amount_input`. |
+| [#50](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/50) | **Stage-7-Part-2**: `/admin_balance`, `/admin_credit`, `/admin_debit` with `transactions.notes` audit column (alembic 0002). + defensive guard for malformed OpenRouter responses. |
+| [#51](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/51) | **Stage-7-Part-3**: `/admin_promo_create`, `/admin_promo_list`, `/admin_promo_revoke`. + `from_user is None` guard in `process_chat`. |
+| [#52](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/52) | **Stage-7-Part-4**: `/admin_broadcast [--active=N]` with paced fan-out + progress + Markdown-escape fix for free-form `reason`/`notes`. |
+
+### Cleanup PR (this PR)
+- Deleted `schema.sql` and `migrations/*.sql` — Alembic owns schema now,
+  the legacy files were stale leftovers (the docker-compose mount-list
+  maintenance burden goes with them too).
+- Same defensive `from_user is None` guard added to `process_promo_input`
+  and `process_custom_amount_input` (the FSM-state handlers PR #51 didn't
+  cover). Two new regression tests pin both guards.
 
 ---
 
-## 5. Status of every file (post-P3-Op-6)
+## 5. The user's pivot — Stage-8: Web admin panel + gift codes
 
-| File | Status |
-| --- | --- |
-| `main.py` | Clean. Env-driven port, FSM storage selection (`build_fsm_storage`), webhook rate-limiter installed via `install_webhook_rate_limit`. The chat rate limiter is **not** registered as a dispatcher middleware (intentional — see `rate_limit.py`). |
-| `database.py` | Clean. All money-touching methods use `SELECT … FOR UPDATE` inside a connection-scoped transaction. `finalize_partial_payment` already uses `max(already_credited, actually_paid_usd)` (the GREATEST guard) — see code comment at lines 360–380. The "Bug A" line that used to live here has been retired; it was already fixed in an earlier PR but the doc lagged. |
-| `payments.py` | Clean. Two-pass IPN verifier (raw bytes first, canonicalized fallback). Idempotent finalize, partial-delta crediting, terminal closure on PENDING ∪ PARTIAL. |
-| `handlers.py` | Clean. `process_custom_amount_input` rejects NaN/Inf and amounts > $10k (P3-Op-5). Legacy reply-keyboard handlers all route through `_route_legacy_text_to_hub` which `state.clear()`s — the original Bug B is fixed in main. |
-| `ai_engine.py` | Clean. Pre-check on free messages + balance, atomic deduct, log_usage with the actual amount. **OpenRouter call now has a 60s `aiohttp.ClientTimeout` (10s connect / 50s sock_read)** so a stalled upstream can't pin a coroutine forever. |
-| `pricing.py` | Clean. Conservative fallback for unmapped models, guards markup ≥ 1.0. |
-| `rate_limit.py` | `TokenBucket` + `_LRUBucketCache` primitives, `consume_chat_token(user_id)` per-user limiter (called *inside* `handlers.process_chat` only — defaults 5 tokens / 1s refill), `webhook_rate_limit_middleware` (per-IP, 30 tokens / 5s refill on the IPN endpoint). 15 unit tests. NB: chat rate-limiting must be done in-handler, not as a `dp.message` middleware, otherwise commands / FSM state inputs get throttled too. See PR #47 / #48 history. |
-| `admin.py` | `parse_admin_user_ids` (env parser), `is_admin` (gate), `_escape_md` (legacy-Markdown reserved-char escaper), `/admin` hub, `/admin_metrics`, `/admin_balance`, `/admin_credit`, `/admin_debit`, `/admin_promo_create`, `/admin_promo_list`, `/admin_promo_revoke`, `/admin_broadcast`. Non-admin callers see a silent no-op so the surface isn't leaked. Router included in `main.py` BEFORE the public router. 86 unit tests. **Free-form admin-typed `reason` (credit/debit) and persisted `notes` (wallet snapshot rows) are now run through `_escape_md` before interpolation into Markdown — without it, Telegram rejects the whole reply with 400 BadRequest *after* the DB write commits.** |
-| `alembic/versions/0002_transactions_notes.py` | Adds `transactions.notes TEXT NULL` so admin adjustments can record a human-readable reason. Forward-compat (nullable, no default). |
-| `alembic/` | Clean. `env.py` URL-encodes credentials (PR #45). Baseline = consolidated current schema. |
-| `entrypoint.sh` | Runs idempotent `alembic upgrade head` before exec'ing the bot. |
-| `docker-compose.yml` | postgres + redis + bot. Redis backs FSM. |
-| `schema.sql`, `migrations/*.sql` | Historical artifacts only — alembic owns schema. Safe to delete in a follow-up cleanup PR. |
-| `strings.py` | Clean. Every `t()` call site has a slug in both locales. |
-| `.env.example`, `.gitignore` | Clean. `.env.example` documents `REDIS_URL`. |
-| `tests/` | 6 modules, 60+ cases (signature, pricing, alembic env URL building, FSM storage selection, custom-amount validation, rate limiter). Strict-warnings pytest config + GitHub Actions CI on Python 3.11/3.12 + alembic upgrade/downgrade roundtrip + docker-build smoke. |
+> The user explicitly asked for this on 2026-04-28, replacing the original
+> "Stage 8 — webhook security" item from the Persian roadmap (already shipped
+> as P0/P1/P3-Op-1). The Telegram-side `/admin_*` commands stay (still work,
+> still gated), but they are no longer the primary UI.
 
-### Pre-existing minor issue (not blocking)
-`process_custom_amount_input` does `message.text.strip()` without first
-checking `message.text is not None`. Stickers / images / voice while in
-`waiting_custom_amount` raise `AttributeError`. Trivial: `text =
-(message.text or "").strip()`. (Mostly mooted by aiogram's `F.text` filter
-in newer registrations.)
+### Why a web panel
+The user found the Telegram-command UI hard to use ("typing slash commands is
+painful, give me buttons in a browser"). New requirement: a real web admin
+dashboard the user can open in any browser, log in, and click through.
 
-### Note on the historical "Bug A" / "Bug B" rows
-The earlier handoff document called out two latent bugs — `finalize_partial_payment` overwriting `amount_usd_credited` (Bug A) and top-level reply-keyboard handlers not clearing FSM (Bug B). On a careful re-read of the current code on `main`, **both are already fixed**:
-- `database.finalize_partial_payment` uses `new_credited = max(already_credited, actually_paid_usd)` and a CASE-on-status base for `already_credited`. Out-of-order replays can't lower the stored cumulative.
-- All five reply-keyboard handlers (`support_text_handler`, `wallet_text_handler`, `models_text_handler_legacy`, `language_text_handler`, plus `set_language_handler`) either route through `_route_legacy_text_to_hub` (which calls `state.clear()`) or call `state.clear()` directly.
+### The new gift-code concept (distinct from existing promo codes)
+| | Existing promo code | **NEW: gift code** |
+| --- | --- | --- |
+| Triggered by | User applying it during a paid invoice | User redeeming it standalone (no purchase required) |
+| Effect | Adds bonus % or $ on top of a paid top-up | Directly credits balance |
+| Cap | `max_uses` (total redemptions) | `max_uses` (total redemptions) — same shape |
+| Per-user | Single redemption (`promo_usage` table) | Single redemption (`gift_redemptions` table) |
+| Admin sets | Code + discount % or $ + max_uses + expiry | Code + **fixed $ amount** + max_uses + expiry |
+| Schema | `promo_codes` | new `gift_codes` table (alembic 0003) |
+| User flow | Apply during charge picker | New `/redeem CODE` command **or** "Redeem gift code" wallet button |
 
-The PRs in this session that were pitched as "fixing Bug A/B" instead bundled a *different* real bug each time:
-- **P3-Op-5 (#46)** — `process_custom_amount_input` silently accepting NaN/Inf and unbounded amounts.
-- **P3-Op-6 (this PR)** — `chat_with_model` had no `aiohttp.ClientTimeout`, so a stalled OpenRouter call would pin a coroutine forever.
+The user's exact wording (paraphrased): "I want to set 10 people and 10
+people use that code to increase their balance as much as I want." → that's
+a gift code with `max_uses=10`, `amount_usd=$X`, no expiry, that can be
+redeemed by any 10 distinct telegram_ids.
+
+### Stage-8 stack (decided, not asked)
+- **Server-side:** mount on the **same** aiohttp app that already serves
+  `/nowpayments-webhook`. Routes under `/admin/`. One process, one
+  Dockerfile, one deploy. No FastAPI / no Node.
+- **Templating:** `jinja2` (already a stable, well-known choice; no build
+  step required).
+- **Frontend interactivity:** vanilla HTML forms + a sprinkle of HTMX where
+  it removes 80% of the JS we'd otherwise need (e.g. live broadcast progress).
+- **Auth:** `ADMIN_PASSWORD` env var → login form sets a signed (HMAC) cookie
+  with a 24h TTL. Existing `ADMIN_USER_IDS` list is still used to attribute
+  "which admin" performed an action (recorded into `transactions.notes`
+  via `admin_adjust_balance`). No OAuth, no third-party SSO.
+- **Hosting:** the bot's aiohttp server already binds port 8080. The same
+  port serves admin routes behind `/admin/`. Expose externally via the
+  existing Cloudflare tunnel (or whatever the user uses for `WEBHOOK_BASE_URL`).
+  Admin URL becomes e.g. `https://bot.example.com/admin/login`.
+
+### Stage-8 PR queue
+Each is a separate PR with a real bundled bug fix, HANDOFF.md + README.md
+updated, full tests:
+
+| # | Title | Notes |
+| --- | --- | --- |
+| **Stage-8-Part-1** | Web admin scaffold — login page + dashboard with system metrics. Reuses `Database.get_system_metrics`. | Auth helper (`signed_cookie.py`), `web_admin.py` (routes), `templates/admin/*.html`. |
+| **Stage-8-Part-2** | Promo codes page — table view + create form + revoke action. Reuses `Database.list_promo_codes` + `create_promo_code` + `revoke_promo_code`. | |
+| **Stage-8-Part-3** | **Gift codes** — full feature: alembic 0003 (`gift_codes` + `gift_redemptions`), DB methods, `/redeem CODE` user-facing flow + wallet menu button, admin UI for create/list/revoke + redemption stats. | This is the biggest PR — split further if it gets unwieldy. |
+| **Stage-8-Part-4** | Users page — search by id/username, view balance + recent transactions, credit/debit form. Reuses `admin_adjust_balance`. | |
+| **Stage-8-Part-5** | Broadcast page (live progress via HTMX polling) + Transactions browser (paginated). | |
 
 ---
 
-## 6. The IPN signature bug we were stuck on
+## 6. The IPN signature bug we were stuck on (kept for context)
 
-### Symptom (from the user's prod log, 2026-04-27 16:12:01 UTC)
+### Symptom (from prod log 2026-04-27 16:12:01 UTC)
 ```
 WARNING bot.payments: IPN sig mismatch:
   expected=6ac370a7..f0d64f68
   received=691300cd..b1ae2324
   secret_len=32 body_len=585 canonical_len=625
-WARNING bot.payments: IPN signature verification failed (remote=51.75.77.69)
-INFO aiohttp.access: 51.75.77.69 ... "POST /nowpayments-webhook HTTP/1.1" 401 199
 ```
-
-`51.75.77.69` is NowPayments' real outbound IP. The IPN secret was set
-correctly (length 32). The signature still mismatched.
 
 ### Root cause
-The diagnostic logging gives it away: `body_len=585 canonical_len=625`. Our
-re-canonicalized body was **40 bytes longer** than the body NowPayments
-actually put on the wire.
+Persian `order_description = "شارژ کیف پول"` got escaped to `\uXXXX`
+(6 bytes/char) by `json.dumps(ensure_ascii=True)`, while NowPayments
+signs the raw UTF-8 body (~2 bytes/char). 40-byte length gap = HMAC mismatch.
 
-`json.dumps(...)` defaults to `ensure_ascii=True`, which escapes every
-non-ASCII char into `\uXXXX`. The invoice payload includes
-`order_description = "شارژ کیف پول"` (Persian, 12 chars). In raw UTF-8 each
-char is ~2 bytes; in `\uXXXX` form each char is 6 bytes. ~10 Persian chars
-× 4 extra bytes ≈ 40 bytes — exactly the gap we saw.
+### Fix (PR #39 + PR #41)
+- `ensure_ascii=False` in canonical re-serialization (#39).
+- Two-pass verifier — try the **raw body bytes first**, fall back to
+  re-canonicalization (#41). Stripe / Paddle / GitHub all sign the raw
+  body; we now do the same.
 
-NowPayments sends the IPN body as raw UTF-8 (`JSON_UNESCAPED_UNICODE`
-equivalent) and signs that same raw-UTF-8 string. Our re-canonicalization
-was producing a different string, so the HMACs disagreed.
-
-### Fix (PR #39, merged)
-```python
-# payments.py:_verify_ipn_signature
-canonical = json.dumps(
-    payload, sort_keys=True, separators=(",", ":"),
-    ensure_ascii=False,    # ← the fix
-)
-```
-
-### What the user should do now
-The user's last log is from **before** PR #39 was merged. The fix is on
-`main`. They need to redeploy:
-
-```bash
-cd /root/bot_project
-git pull origin main
-sudo systemctl restart bot      # or whatever process supervisor they use
-```
-
-If the next IPN still fails verification after the redeploy, that means
-NowPayments' actual canonical form differs from ours in a way we haven't
-diagnosed yet. The diagnostic log line gives us enough to tell which:
-- `body_len == canonical_len` → byte counts match, only key order or
-  whitespace differs.
-- `canonical_len > body_len` → we're still escaping something they aren't
-  (probably forward slashes — NowPayments uses `JSON_UNESCAPED_SLASHES`,
-  Python doesn't escape slashes either, so this should be a non-issue).
-- `canonical_len < body_len` → they're padding something we strip.
-
-A future PR (queued — see §8 P3-Op-1) will switch the verifier to **sign
-the raw body bytes first**, falling back to re-canonicalization only if
-that fails. That makes us robust to whatever canonical form NowPayments
-actually signed, and is what every mature webhook handler does (Stripe,
-Paddle, GitHub all expose the raw body for HMAC).
+User confirmed clean log on 2026-04-28 (PR was already merged & redeployed).
 
 ---
 
@@ -232,173 +230,213 @@ Paddle, GitHub all expose the raw body for HMAC).
 
 ```
 User taps "Charge wallet" → picks $5/$10/$25/custom → picks currency
-        │
-        ▼
+    │
+    ▼
 handlers.process_charge_*  →  payments.create_crypto_invoice(...)
-        │
-        ├─ POST /v1/payment to NowPayments → returns {payment_id, pay_address, pay_amount}
-        ├─ db.create_pending_transaction(payment_id, amount_usd, ...)   ← PENDING row
-        └─ Bot shows the user the invoice (address + amount + QR via Telegram link)
+    │
+    ├─ POST /v1/payment to NowPayments → returns {payment_id, pay_address, ...}
+    ├─ db.create_pending_transaction(...)              ← PENDING row
+    └─ Bot shows the user the invoice address + amount
 
-[user pays on-chain in their wallet]
+[user pays on-chain]
 
 NowPayments POSTs to /nowpayments-webhook with x-nowpayments-sig header
-        │
-        ▼
+    │
+    ▼
 payments.payment_webhook
-        │
-        ├─ _verify_ipn_signature(raw_body, header)             ← HMAC-SHA512
-        │     │
-        │     └─ 401 if bad. Stop here — no balance changes.
-        │
-        ├─ status == "finished":
-        │     └─ db.finalize_payment(payment_id, full_price_usd)
-        │            ↑ SELECT … FOR UPDATE on the row, accept PENDING or PARTIAL,
-        │              credit (full_price_usd - already_credited), set SUCCESS,
-        │              consume promo (if any), all in one DB transaction.
-        │
-        ├─ status == "partially_paid":
-        │     └─ actually_paid_usd = actually_paid / pay_amount * price_amount
-        │        db.finalize_partial_payment(payment_id, actually_paid_usd)
-        │            ↑ same FOR UPDATE pattern, credit only the new delta,
-        │              row goes PENDING/PARTIAL → PARTIAL.
-        │
-        ├─ status in {expired, failed, refunded}:
-        │     └─ db.mark_transaction_terminal(payment_id, EXPIRED|FAILED|REFUNDED)
-        │            ↑ accepts PENDING ∪ PARTIAL; user keeps any partial credit.
-        │
-        ├─ status in {waiting, confirming, confirmed, sending}:    no-op, just log
-        │
-        └─ unknown status:                                         no-op, just log
-
-        Telegram notification to the user is best-effort AFTER the DB commit.
+    ├─ _verify_ipn_signature(raw_body, header)         ← HMAC-SHA512
+    │     └─ 401 if bad. STOP. No balance changes.
+    │
+    ├─ status == "finished":
+    │     └─ db.finalize_payment(payment_id, full_price_usd)
+    │            credit (full_price_usd - already_credited), set SUCCESS,
+    │            consume promo (if any), all in ONE DB transaction.
+    │
+    ├─ status == "partially_paid":
+    │     └─ actually_paid_usd = actually_paid / pay_amount * price_amount
+    │        db.finalize_partial_payment(...)
+    │            credit only the new delta, status PENDING|PARTIAL → PARTIAL.
+    │
+    ├─ status in {expired, failed, refunded}:
+    │     └─ db.mark_transaction_terminal(...) — accepts PENDING ∪ PARTIAL.
+    │
+    ├─ status in {waiting, confirming, confirmed, sending}:    no-op.
+    └─ unknown:                                               no-op.
 ```
 
-**Invariants you must preserve:**
-1. Wallet credit and ledger row update happen in **one DB transaction**.
-2. Every credit operation is gated on `WHERE status IN ('PENDING','PARTIAL')`
-   so a replayed IPN cannot mint money.
+**Invariants:**
+1. Wallet credit + ledger row update happen in **one DB transaction**.
+2. Every credit is gated on `WHERE status IN ('PENDING','PARTIAL')` so a
+   replayed IPN cannot mint money.
 3. `_verify_ipn_signature` returns False on missing secret / missing header /
-   bad JSON / mismatched HMAC. Anything else short-circuits the request to
-   401 — **never** read the body without verifying.
+   bad JSON / mismatched HMAC → 401. **Never** read the body without
+   verifying.
 4. `actually_paid` from a `partially_paid` IPN is in the **pay-currency**
-   (e.g. TRX), NOT USD. Convert via the locked-in invoice rate
-   (`actually_paid / pay_amount * price_amount`), cap at `price_amount`.
+   (e.g. TRX), NOT USD. Convert via `actually_paid / pay_amount * price_amount`.
 
 ---
 
-## 8. What's next (priority queue)
+## 8. Schema (post-cleanup)
 
-### P0/P1 cleanup (zero outstanding — re-verified §5)
-The codebase is currently free of P0/P1 issues that I could find. Bug A and
-Bug B in §5 are both low severity. They're tracked but not blocking.
+Alembic owns the schema. Read `alembic/versions/0001_baseline.py` for the
+canonical truth. Two tables are "money tables" — touch them only with
+care:
 
-### P3 — operational hardening (the original list, still unstarted)
+- `users` — wallet, free messages remaining, language, active model.
+- `transactions` — ledger. **Every** balance change writes a row.
+  - `gateway` ∈ {`nowpayments`, `admin`} (admin set via `Database.admin_adjust_balance`).
+  - `status` ∈ {PENDING, PARTIAL, SUCCESS, EXPIRED, FAILED, REFUNDED}.
+  - `gateway_invoice_id` UNIQUE — gives a free duplicate-click guard.
+  - `notes` TEXT — human-readable reason on admin adjustments (alembic 0002).
+- `usage_logs` — append-only AI request log. Used for cost analytics.
+- `system_settings` — singleton-ish key/value store.
+- `promo_codes` + `promo_usage` — discount codes (P2-5).
+- `conversation_messages` — opt-in conversation memory buffer (P3-5).
 
-These are the items the original roadmap had under "P3 — operational
-hardening (~3h)" that the recent P3-* product PRs did **not** address.
-Each is a separate PR, in this order:
-
-| # | Title | Status | PR |
-| --- | --- | --- | --- |
-| **P3-Op-1** | Robust IPN verifier — sign raw body first, fall back to canonicalized | ✅ Shipped | [#41](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/41) |
-| **P3-Op-2** | `Dockerfile` + `docker-compose.yml` (postgres + bot) | ✅ Shipped | [#42](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/42) |
-| **P3-Op-3** | pytest skeleton + GitHub Actions CI + pricing tests | ✅ Shipped | [#43](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/43) |
-| **P3-Op-4** | Alembic migrations + entrypoint runs `upgrade head` | ✅ Shipped | [#44](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/44) |
-| **P3-Op-4-Hotfix** | URL-encode DB credentials in `alembic/env.py` (Devin Review catch) | ✅ Shipped | [#45](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/45) |
-| **P3-Op-5** | Redis-backed FSM storage **+ NaN/Inf/over-cap rejection in `process_custom_amount_input`** | ✅ Shipped | [#46](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/46) |
-| **P3-Op-6** | Rate limiting on `/chat` and `/nowpayments-webhook` **+ `aiohttp.ClientTimeout` on the OpenRouter call** | ✅ Shipped | [#47](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/47) |
-| **P3-Op-6-Hotfix** | Move chat rate limit OUT of `dp.message` middleware INTO `process_chat` so commands / FSM state inputs aren't incorrectly throttled (Devin Review catch on #47) | ✅ Shipped | [#48](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/48) |
-| **Stage-7-Part-1** | Admin scaffold: `admin.py` (`parse_admin_user_ids`, `is_admin`, hub `/admin`, `/admin_metrics`) + `Database.get_system_metrics` **+ `message.text=None` crash fix in `process_custom_amount_input`** | ✅ Shipped | [#49](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/49) |
-| **Stage-7-Part-2** | Admin balance ops: `/admin_balance`, `/admin_credit`, `/admin_debit` writing `transactions` rows with `gateway='admin'` + `notes` audit column (alembic `0002`) **+ defensive guard in `chat_with_model` for OpenRouter 200-with-error-shaped bodies** | ✅ Shipped | [#50](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/50) |
-| **Stage-7-Part-3** | Admin promo creation: `/admin_promo_create`, `/admin_promo_list`, `/admin_promo_revoke` (soft-delete via `is_active`) **+ `from_user is None` guard in `process_chat`** | ✅ Shipped | [#51](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/51) |
-| **Stage-7-Part-4** | Admin broadcast: `/admin_broadcast [--active=N] <text>` with rate-limited fan-out (~25 msg/s), per-recipient error counting, retry-after handling, progress message **+ Markdown-escape fix for free-form `reason`/`notes` (Devin Review catch on PR #50 — unescaped `_*\`[` in admin-typed text crashed the success message after the DB write committed, causing admins to retry and double-adjust)** | ✅ Shipped | this PR |
-
-Operational hardening queue is **complete**. P2 admin panel is being built next, in 4 small PRs (Stage-7-Part-1 ... Part-4).
-
-### P2 admin panel queue (next; one PR each)
-
-The previous AI's roadmap had a "Stage 7" CLI admin panel. We're shipping that as Telegram commands instead (already proposed in the original review and confirmed by the user). Breakdown:
-
-| # | Title | Status |
-| --- | --- | --- |
-| **Stage-7-Part-1** | `is_admin` gate, `/admin` hub, `/admin_metrics` (users, revenue, spend, top models) | ✅ this PR |
-| **Stage-7-Part-2** | Balance ops: `/admin_balance <user_id>`, `/admin_credit <user_id> <usd> <reason>`, `/admin_debit ...`. Writes `transactions` rows with `gateway='admin'` + `notes` audit column. | ✅ this PR |
-| **Stage-7-Part-3** | Promo creation: `/admin_promo_create`, `/admin_promo_list`, `/admin_promo_revoke`. Subsumes the original "Stage 6B" admin gap. | ✅ this PR |
-| **Stage-7-Part-4** | Broadcast: `/admin_broadcast` with rate-limited fan-out + progress message. | ✅ this PR |
-| **Cleanup** | Delete legacy `schema.sql` + `migrations/*.sql` (Alembic owns schema; they're confusing leftovers). | ⏳ next |
+Two new tables coming in **Stage-8-Part-3** (alembic 0003):
+- `gift_codes (code TEXT PK, amount_usd NUMERIC, max_uses INT NULL, used_count INT, expires_at TIMESTAMPTZ NULL, is_active BOOLEAN, created_at TIMESTAMPTZ)`
+- `gift_redemptions (gift_code TEXT REFERENCES gift_codes, telegram_id BIGINT, redeemed_at TIMESTAMPTZ, transaction_id INT REFERENCES transactions, PRIMARY KEY (gift_code, telegram_id))`
 
 ---
 
-## 9. How we work together
+## 9. Test suite
 
-The user's process for this project (which the next AI should follow):
+**161 tests across 8 modules** as of cleanup PR:
 
-1. **One PR per logical step.** Don't bundle the IPN fix with a Dockerfile.
-2. **Push the PR. Wait for the user to approve / merge.** Do not start the
-   next item until the previous merge is in.
-3. **CI:** there's no CI yet (P3-Op-3 will add it). Until then, run `python
-   -m py_compile *.py` locally and read your own diff carefully.
-4. **Tone in PR descriptions:** be specific about *what* and *why*, link
-   the failing log line or the doc, don't oversell.
-5. **Never modify tests to make them pass.** When P3-Op-3 lands and a test
-   fails, fix the code or the assumption, not the test.
-6. **`git_pr(action="fetch_template")` before `git_pr(action="create")`** —
-   the create call enforces this.
-
-### Where the user runs the bot
 ```
-/root/bot_project              the live deploy
-/root/bot_project.bak-<ts>     the rollback dir from the previous deploy
+tests/
+├── conftest.py                            # adds repo root to sys.path
+├── test_admin.py                          # 86 cases (gate, parsers, formatters, broadcast, _escape_md)
+├── test_alembic_env.py                    # 12 cases (DB_URL building w/ special chars in password)
+├── test_custom_amount_validation.py       # 21 cases (NaN/Inf/bounds)
+├── test_fsm_storage.py                    # 3 cases (build_fsm_storage selection)
+├── test_handlers_from_user_guard.py       # 2 cases (process_promo_input + process_custom_amount_input)
+├── test_ipn_signature.py                  # 11 cases (raw + canonical paths, persian descr regression)
+├── test_pricing.py                        # 11 cases (per-model lookup, markup, fallback)
+└── test_rate_limit.py                     # 15 cases (token bucket + LRU + middleware)
 ```
 
-Their rollback is literally `mv` between the two directories. P3-Op-2
-(Docker) replaces this with `docker compose up -d` + `docker compose down`.
+CI runs the full suite on Python 3.11 + 3.12, plus an alembic
+upgrade/downgrade roundtrip job and a docker-build smoke job. Every PR
+must be green before merge.
 
-### The bot's Telegram handle
-`@Meowassist_Ai_bot` (id `8761211112`).
-
-### NowPayments
-- Inbound IPN source IP: `51.75.77.69` (per the prod log). NowPayments
-  doesn't publish a stable IP allowlist, so don't gate on this — gate on the
-  HMAC.
-- API base: `https://api.nowpayments.io/v1`
-- Docs the user is using:
-  <https://documenter.getpostman.com/view/7907941/2s93JusNJt#api-documentation>
+**Rule:** never modify a test to make it pass. Fix the code or the
+assumption.
 
 ---
 
-## 10. Glossary of files / acronyms / odd things
+## 10. Status of every file (post-cleanup)
 
-- **IPN** = Instant Payment Notification, NowPayments' name for their
-  webhook callback.
-- **FSM** = aiogram's per-chat finite state machine for multi-message
-  flows like "type a custom amount". Currently in-memory; restarts wipe
-  in-flight states.
-- **`MEMORY_CONTENT_MAX_CHARS`** = 8000. Per-message cap on what we
-  persist into the conversation-memory buffer (P3-5).
-- **`MEMORY_CONTEXT_LIMIT`** = 30. How many recent turns we feed back as
-  context when memory is enabled.
-- **`COST_MARKUP`** = env var, default 1.5. Multiplier on raw OpenRouter
-  cost to cover the gateway's 0.5% fee + give us margin.
-- **`partially_paid`** = a NowPayments status: the user paid less than the
-  invoice required. We credit them the proportional USD value, not zero.
+| File | Status |
+| --- | --- |
+| `main.py` | Clean. Env-driven port, `build_fsm_storage` (Redis if `REDIS_URL` set, in-memory fallback with warning), `install_webhook_rate_limit`, admin router included BEFORE the public router. |
+| `database.py` | Clean. All money-touching methods use `SELECT … FOR UPDATE`. `finalize_partial_payment` already uses `max(already_credited, actually_paid_usd)`. `admin_adjust_balance` writes `transactions` row + updates wallet in one tx with FOR UPDATE on the user row. |
+| `payments.py` | Clean. Two-pass IPN verifier (raw → canonical fallback). Idempotent finalize, partial-delta crediting. |
+| `handlers.py` | Clean. `process_chat`, `process_promo_input`, and `process_custom_amount_input` all guard `from_user is None` and `text is None`. |
+| `ai_engine.py` | Clean. `aiohttp.ClientTimeout(total=60, connect=10, sock_read=50)` on OpenRouter. Defensive guard for malformed responses. |
+| `pricing.py` | Clean. Conservative fallback for unmapped models, markup ≥ 1.0. |
+| `rate_limit.py` | `consume_chat_token(user_id)` per-user (called *inside* `handlers.process_chat`, not as a `dp.message` middleware — see PR #47/#48 history). `webhook_rate_limit_middleware` per-IP. |
+| `admin.py` | `parse_admin_user_ids`, `is_admin`, `_escape_md`, `/admin`, `/admin_metrics`, `/admin_balance`, `/admin_credit`, `/admin_debit`, `/admin_promo_create`, `/admin_promo_list`, `/admin_promo_revoke`, `/admin_broadcast`. 86 unit tests. |
+| `alembic/` | Clean. Baseline = consolidated current schema. `env.py` URL-encodes credentials. |
+| `entrypoint.sh` | Idempotent `alembic upgrade head` then `exec python -m main`. |
+| `docker-compose.yml` | postgres + redis + bot. |
+| `strings.py` | Clean. Every `t()` slug exists in fa + en. |
+| `.env.example` | Documents every required env var including `REDIS_URL`, `ADMIN_USER_IDS`, `COST_MARKUP`. |
+| `tests/` | 161 cases. Strict-warnings pytest config + 3-job CI matrix. |
+| ~~`schema.sql`, `migrations/*.sql`~~ | **Deleted in cleanup PR.** Alembic owns schema. |
+
+---
+
+## 11. Working agreement (read this first if you're the next AI)
+
+The user's process for this project — **do not deviate**:
+
+1. **Push PRs autonomously, sequentially, without blocking on per-PR
+   approval.** The user explicitly said (2026-04-28): *"I'm going to sleep
+   so don't wait for my approval on every pull. I pull all of them when I
+   wake up. Just move forward step by step. Stick to the plan."* Take this
+   as standing instruction unless the user says otherwise.
+
+2. **One PR per logical step.** Don't bundle "scaffold web admin" with
+   "promo codes UI" with "gift codes". Small, reviewable PRs.
+
+3. **Bundle a real bug fix in every PR.** The user explicitly asked for
+   this. Find an actual latent bug in the codebase — defensive guards for
+   edge cases, off-by-ones, race-condition fixes, etc. **Do not invent
+   fake bugs.** If you genuinely cannot find one for a given PR (e.g. a
+   pure deletion PR like cleanup), pair it with a small defensive
+   refactor + test. Document the bug in the PR description.
+
+4. **Update HANDOFF.md and README.md in every PR.** The user explicitly
+   asked: *"remember change your read me file and your guide for next AI in
+   every single merge u push. I want to have a record on what we have when
+   you are finished in every step."* The HANDOFF.md you're reading right
+   now is that running record. Keep it current. Future AIs / humans will
+   pick the project up from this file alone.
+
+5. **Branch naming:** `devin/$(date +%s)-<short-description>`.
+
+6. **PR template:** call `git_pr(action="fetch_template")` then
+   `git_pr(action="create")`. The create call enforces fetch first.
+
+7. **Never modify a test to make it pass.** Fix the code or the assumption.
+
+8. **CI must be green before reporting completion.** Run
+   `git(action="pr_checks", wait_mode="all")` after creating each PR.
+   If a check fails, fix it (don't report success). The user merges manually
+   when they wake up — they expect green PRs ready to merge.
+
+9. **Devin Review feedback is real.** Treat the bot's PR-review comments
+   as if a senior engineer wrote them. PR #50's Devin Review caught a real
+   Markdown-escape bug; PR #44's caught the URL-encode-credentials bug.
+   Both became hotfix PRs. Read the review on every PR and respond to it.
+
+10. **Respect the live deploy.** `/root/bot_project` on the user's VPS is
+    sacred. Don't ssh in, don't modify it, don't reference it as anything
+    other than "the live deploy".
+
+### Branch / commit conventions
+- Branch: `devin/$(date +%s)-<description>` (timestamp + kebab-case slug).
+- Commit message: `<type>(<scope>): <subject> [<stage-ref>]`
+  e.g. `feat(admin): broadcast + Markdown-escape fix [Stage-7-Part-4]`
+- Co-author Devin on every commit (handled automatically by the tool).
+
+### Git etiquette
+- **Never** `git add .` (catches stray files). Stage explicitly.
+- **Never** `--force` push to main / master.
+- **Never** `--no-verify` to skip pre-commit hooks (we don't have any
+  configured, but if the user adds them, respect them).
+- **Never** amend a commit. Add a new commit on top.
+
+---
+
+## 12. Glossary / odd things
+
+- **IPN** = Instant Payment Notification (NowPayments' webhook).
+- **FSM** = aiogram per-chat finite state machine. Backed by Redis (PR #46).
+- **`COST_MARKUP`** env var, default 1.5×. Multiplier on raw OpenRouter cost.
+- **`MEMORY_CONTENT_MAX_CHARS`** = 8000 (per-message buffer cap).
+- **`MEMORY_CONTEXT_LIMIT`** = 30 (recent turns fed back as context).
+- **`partially_paid`** = NowPayments status. User paid less than invoice.
+  Credit proportional USD, NOT zero.
 - **`amount_usd_credited`** has dual semantics by row state:
-  - On PENDING rows: the *intended* credit (set at invoice creation).
-  - On PARTIAL/SUCCESS rows: the *cumulative* USD already credited.
-  - That difference matters in two places: terminal-status logging
-    (PR #13) and `finalize_payment`'s "credit only the delta" math
-    (PR #10). Read those PRs before touching that column.
+  - PENDING: *intended* credit at invoice creation.
+  - PARTIAL/SUCCESS: *cumulative* USD already credited.
+- **NowPayments source IP**: `51.75.77.69` (per prod log; not stable, don't
+  gate on it — gate on HMAC).
+- **NowPayments docs**: <https://documenter.getpostman.com/view/7907941/2s93JusNJt#api-documentation>
+- **Bot handle**: `@Meowassist_Ai_bot` (id `8761211112`).
+- **Live deploy**: `/root/bot_project`. Don't touch.
 
 ---
 
-## 11. TL;DR for whoever reads this next
+## 13. TL;DR
 
-1. P0 + P1 + P2-0..P2-2 are done.
-2. The IPN signature bug is fixed on `main` (PR #39, `ensure_ascii=False`).
-   The user's failing log is from before that merge — they need to pull and
-   restart.
-3. The next queue is the **operational hardening** items in §8: robust IPN
-   verifier (with unit test), Dockerfile, pytest, Alembic, Redis FSM, rate
-   limiting, then Bug A/B cleanup.
-4. One PR per item. Wait for approval before starting the next.
+1. **All P0 / P1 / P2 / P3-Op / Stage-7 work is shipped and merged.**
+2. **The IPN signature bug is fixed on `main`** (PRs #39 + #41).
+3. **The user pivoted to a web admin panel + new gift-code feature** —
+   that's **Stage-8**, queued as 5 sequential PRs (see §5).
+4. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+   update this doc + README in each, do NOT block on user approval. The
+   user merges them when they wake up.
+5. **Read the §11 working agreement before doing anything.**

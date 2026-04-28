@@ -51,9 +51,10 @@ To roll back: `docker compose down && git checkout <previous-sha> && docker comp
    alembic upgrade head                               # apply schema via alembic
    ```
 
-   For an existing prod DB that pre-dates Alembic (already has the
-   tables from the legacy `schema.sql` + `migrations/*.sql`), stamp it
-   once instead of upgrading:
+   For an existing prod DB that pre-dates Alembic (one created before
+   PR #44 — i.e. already has the bot's tables but no `alembic_version`
+   row), stamp it once instead of upgrading, otherwise the first
+   `alembic upgrade head` will fail with `relation users already exists`:
    ```bash
    alembic stamp head
    ```
@@ -102,8 +103,8 @@ pytest tests/
 | `middlewares.py` | `UserUpsertMiddleware` — ensures `users` row exists before any handler runs. |
 | `rate_limit.py` | Token-bucket primitives + `ChatRateLimitMiddleware` (per-user) and `webhook_rate_limit_middleware` (per-IP). Guards `/chat` against runaway OpenRouter spend and the `/nowpayments-webhook` endpoint against DoS bursts. |
 | `strings.py` | Two-locale (fa/en) string table + `t(lang, key, **kwargs)` helper. |
-| `schema.sql` | Initial schema. New tables/columns go in `migrations/NNN_*.sql`. |
-| `migrations/` | Numbered, append-only SQL migrations. Apply in order. |
+| `admin.py` | Telegram-side admin commands gated on `ADMIN_USER_IDS`: `/admin`, `/admin_metrics`, `/admin_balance`, `/admin_credit`, `/admin_debit`, `/admin_promo_create`, `/admin_promo_list`, `/admin_promo_revoke`, `/admin_broadcast`. |
+| `alembic/` | Schema migrations. `alembic upgrade head` runs idempotently in `entrypoint.sh` on every container start. New schema changes: `alembic revision -m "..."`. |
 
 ## License / contributing
 

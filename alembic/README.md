@@ -16,10 +16,11 @@ docker compose exec bot alembic upgrade head
 
 ## Existing production deployments
 
-If your DB was created from `schema.sql` + `migrations/*.sql` *before*
-P3-Op-4 landed, the schema is identical to the post-baseline state but
-Alembic doesn't know that yet. **Stamp the DB** at the baseline once,
-then `upgrade head` will become a no-op:
+If your DB was created before P3-Op-4 landed (one created via raw
+`psql -f schema.sql` + the numbered SQL migrations), the schema is
+identical to the post-baseline state but Alembic doesn't know that
+yet. **Stamp the DB** at the baseline once, then `upgrade head` will
+become a no-op:
 
 ```bash
 docker compose run --rm bot alembic stamp head
@@ -43,10 +44,13 @@ disabled — we write upgrades and downgrades by hand using `op.execute`,
 they touch and keep the SQL close to what the bot's raw asyncpg code
 expects.
 
-## Legacy `schema.sql` and `migrations/*.sql`
+## Removed: legacy `schema.sql` and `migrations/*.sql`
 
-`schema.sql` and `migrations/001_*.sql` ··· `003_*.sql` are kept in the
-repo as historical reference but are **no longer applied automatically**
-by `docker-compose.yml`. The Alembic baseline migration
-(`0001_baseline.py`) carries the same SQL, so a fresh DB built via
-Alembic ends up structurally identical.
+The repo previously kept `schema.sql` and three numbered SQL migration
+files (`001_promo_codes.sql`, `002_conversation_memory.sql`,
+`003_bump_free_messages_to_10.sql`) as historical reference. They were
+deleted in the post-Stage-7 cleanup PR — Alembic owns the schema now,
+and the baseline migration (`0001_baseline.py`) carries the exact SQL
+that the legacy files would have produced. If you need to inspect the
+pre-Alembic state, check out the `main` branch at the merge commit of
+PR #44 or earlier.
