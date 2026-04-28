@@ -1970,6 +1970,13 @@ def _new_broadcast_job(
         "created_at": _now_iso(),
         "started_at": None,
         "completed_at": None,
+        # Stage-9-Step-6 soft-cancel flag. Set by
+        # ``broadcast_cancel_post``; polled by ``_do_broadcast`` at
+        # the top of every send. ``False`` means the job was never
+        # cancelled; if the flag was set but the loop already drained
+        # to completion the resulting state stays ``"completed"`` —
+        # cancellation is best-effort, not retroactive.
+        "cancel_requested": False,
     }
 
 
@@ -1984,7 +1991,7 @@ def _store_broadcast_job(app: web.Application, job: dict) -> None:
     if len(jobs) > BROADCAST_MAX_HISTORY:
         terminal = [
             jid for jid, j in jobs.items()
-            if j["state"] in ("completed", "failed")
+            if j["state"] in ("completed", "failed", "cancelled")
             and jid != job["id"]
         ]
         # Evict oldest terminal jobs first. ``jobs`` is insertion-
@@ -2050,6 +2057,12 @@ async def _run_broadcast_job(
         job["blocked"] = stats["blocked"]
         job["failed"] = stats["failed"]
 
+    def _cancel_requested() -> bool:
+        # Stage-9-Step-6: ``broadcast_cancel_post`` flips this flag in
+        # the live job dict. Polled at the top of every send loop in
+        # ``admin._do_broadcast``; honoured within one pacing tick.
+        return bool(job.get("cancel_requested"))
+
     try:
         # Import locally so a test that doesn't need admin.py
         # (e.g. pure form-parser tests) doesn't pay the aiogram
@@ -2062,6 +2075,7 @@ async def _run_broadcast_job(
             text=text,
             admin_id=0,  # web-admin sentinel — see ADMIN_WEB_SENTINEL_ID
             progress_callback=_on_progress,
+            should_cancel=_cancel_requested,
         )
     except asyncio.CancelledError:
         job["state"] = "failed"
@@ -2075,11 +2089,19 @@ async def _run_broadcast_job(
         job["completed_at"] = _now_iso()
         return
 
-    job["i"] = stats["total"]
+    # ``i`` is the count of recipients we actually attempted — for a
+    # cancelled run that's ``sent + blocked + failed`` (every loop
+    # iteration that didn't bail at the cancel-check), NOT
+    # ``stats["total"]`` which is the recipient list length.
     job["sent"] = stats["sent"]
     job["blocked"] = stats["blocked"]
     job["failed"] = stats["failed"]
-    job["state"] = "completed"
+    if stats.get("cancelled"):
+        job["i"] = stats["sent"] + stats["blocked"] + stats["failed"]
+        job["state"] = "cancelled"
+    else:
+        job["i"] = stats["total"]
+        job["state"] = "completed"
     job["completed_at"] = _now_iso()
 
 
@@ -2220,6 +2242,8 @@ async def broadcast_detail_get(request: web.Request) -> web.StreamResponse:
         {
             "active_page": "broadcast",
             "job": dict(job),
+            # Stage-9-Step-6: CSRF token for the cancel-button form.
+            "csrf_token": csrf_token_for(request),
         },
     )
 
@@ -2235,6 +2259,114 @@ async def broadcast_status_get(request: web.Request) -> web.StreamResponse:
     # Snapshot before handing to json_response so a concurrent
     # writer can't mutate mid-serialize.
     return web.json_response(dict(job))
+
+
+async def broadcast_cancel_post(request: web.Request) -> web.StreamResponse:
+    """POST /admin/broadcast/{job_id}/cancel — flip the soft-cancel flag.
+
+    Stage-9-Step-6. The cancel is *cooperative* — we just set
+    ``job["cancel_requested"] = True`` in the in-memory job dict.
+    The running ``_do_broadcast`` loop polls this flag at the top of
+    each iteration and exits cleanly within one pacing tick. The
+    background task itself is NOT ``task.cancel()``-ed because
+    ``CancelledError`` mid-send would be counted as a failure for a
+    recipient who actually received the message.
+
+    Idempotent: a second cancel on an already-cancelled job is a
+    no-op redirect with no audit double-write. Refuses with a flash
+    error on terminal-state jobs (``completed`` / ``failed`` /
+    already ``cancelled``).
+    """
+    job_id = request.match_info.get("job_id", "")
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    back = web.HTTPFound(location=f"/admin/broadcast/{job_id}")
+
+    form = await request.post()
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning(
+            "broadcast_cancel_post: CSRF token mismatch from %s",
+            request.remote,
+        )
+        set_flash(
+            back,
+            kind="error",
+            message="Form submission was rejected (CSRF). Refresh and try again.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return back
+
+    job = request.app[APP_KEY_BROADCAST_JOBS].get(job_id)
+    if job is None:
+        # Don't redirect into a 404 detail page; bounce to the index.
+        response = web.HTTPFound(location="/admin/broadcast")
+        set_flash(
+            response,
+            kind="error",
+            message=(
+                f"Broadcast job '{job_id}' not found "
+                "(it may have been evicted from the in-memory registry)."
+            ),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    if job["state"] not in ("queued", "running"):
+        set_flash(
+            back,
+            kind="error",
+            message=(
+                f"Cannot cancel a {job['state']} broadcast — only "
+                "queued or running jobs can be cancelled."
+            ),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return back
+
+    if job.get("cancel_requested"):
+        # Already in the cancellation window; don't re-audit.
+        set_flash(
+            back,
+            kind="info",
+            message=(
+                "Cancel already requested — the worker will exit at the "
+                "next loop iteration."
+            ),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return back
+
+    job["cancel_requested"] = True
+    log.info(
+        "broadcast_cancel_post: cancel requested for job=%s "
+        "(state=%s, sent=%d/%d)",
+        job_id, job["state"], job.get("sent", 0), job.get("total", 0),
+    )
+    await _record_audit_safe(
+        request,
+        "broadcast_cancel",
+        target=f"broadcast:{job_id}",
+        meta={
+            "state_at_cancel": job["state"],
+            "sent_at_cancel": job.get("sent", 0),
+            "total": job.get("total", 0),
+        },
+    )
+    set_flash(
+        back,
+        kind="info",
+        message=(
+            "Cancel requested — the worker will stop at the next "
+            "recipient (within ~1 second)."
+        ),
+        secret=secret,
+        cookie_secure=cookie_secure,
+    )
+    return back
 
 
 # ---------------------------------------------------------------------
@@ -3340,6 +3472,11 @@ def setup_admin_routes(
     app.router.add_get(
         "/admin/broadcast/{job_id}/status",
         _require_auth(broadcast_status_get),
+    )
+    # Stage-9-Step-6: soft-cancel for a running/queued broadcast.
+    app.router.add_post(
+        "/admin/broadcast/{job_id}/cancel",
+        _require_auth(broadcast_cancel_post),
     )
 
     # Stage-8-Part-6: transactions browser (read-only, paginated).
