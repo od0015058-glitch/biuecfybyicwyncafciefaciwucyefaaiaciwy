@@ -57,7 +57,7 @@ tests/              pytest, ~190 cases
 .github/workflows/ci.yml   3.11/3.12 matrix + alembic roundtrip + docker build
 ```
 
-Total: ~5.0k LoC, 188 tests, full CI on every push.
+Total: ~5.0k LoC, 191 tests, full CI on every push.
 
 ---
 
@@ -308,7 +308,7 @@ Two new tables coming in **Stage-8-Part-3** (alembic 0003):
 
 ## 9. Test suite
 
-**188 tests across 9 modules** as of Stage-8-Part-1:
+**191 tests across 9 modules** as of Stage-8-Part-1:
 
 ```
 tests/
