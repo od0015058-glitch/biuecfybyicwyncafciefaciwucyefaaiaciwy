@@ -8,6 +8,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp import web
 from dotenv import load_dotenv
 
+import strings
 from admin import parse_admin_user_ids, router as admin_router
 from bot_commands import publish_bot_commands
 from database import db
@@ -122,6 +123,22 @@ async def main():
 
     await db.connect()
     log.info("Proxy bot is online.")
+
+    # Seed the in-memory string-override cache from the bot_strings
+    # table. Admin edits via /admin/strings refresh the cache after
+    # each save; this seed handles the boot case (process restart,
+    # rolling deploy, etc.). See strings.set_overrides.
+    try:
+        overrides = await db.load_all_string_overrides()
+        strings.set_overrides(overrides)
+        log.info("loaded %d bot_strings overrides from DB", len(overrides))
+    except Exception:
+        # Don't take the bot down for an override-load failure —
+        # the compiled defaults are a safe fallback. Surface loudly
+        # so ops investigates (vs. silently shipping stale text).
+        log.exception(
+            "failed to load bot_strings overrides — using compiled defaults"
+        )
 
     # Overwrite BotFather's cached slash-command list with the
     # canonical one. Without this, Telegram shows whatever was last

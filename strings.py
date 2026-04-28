@@ -13,9 +13,22 @@ is safe to ship for testing.
 
 Format strings use Python ``str.format`` placeholders. Any caller passing
 ``**kwargs`` to :func:`t` will substitute them in.
+
+**Runtime overrides (Stage-9-Step-1.6).** :func:`t` first consults an
+in-memory ``_OVERRIDES`` cache keyed by ``(lang, key)``. Admins edit
+this cache via the web admin's ``/admin/strings`` page; the
+``database.bot_strings`` table is the persistent source. The cache is
+seeded at boot from :func:`database.Database.load_all_string_overrides`
+and refreshed after every successful admin write. Compiled defaults
+in :data:`_STRINGS` are the fallback — overrides never *delete* a slug,
+they just shadow it, so reverting an override resurrects the default.
 """
 
 from __future__ import annotations
+
+import logging
+
+log = logging.getLogger("bot.strings")
 
 DEFAULT_LANGUAGE = "fa"
 SUPPORTED_LANGUAGES = ("fa", "en")
@@ -572,20 +585,99 @@ _STRINGS: dict[str, dict[str, str]] = {
 }
 
 
+# Admin-edited per-(lang, key) overrides. Replaced wholesale by
+# :func:`set_overrides` at boot and after each successful admin write
+# in ``web_admin``. Empty dict = "every slug serves the compiled
+# default", which is the behaviour pre-Stage-9-Step-1.6.
+_OVERRIDES: dict[tuple[str, str], str] = {}
+
+# Suppression set for the missing-key warning. Without this every
+# ``t()`` call for a missing slug would re-emit the warning on every
+# turn — instant log spam. We log once per (lang, key) per process and
+# then go silent for that slug. Ops only needs to see drift once to
+# act on it.
+_MISSING_KEY_WARNED: set[tuple[str, str]] = set()
+
+
+def set_overrides(overrides: dict[tuple[str, str], str]) -> None:
+    """Replace the in-memory override cache.
+
+    Called at boot from ``main.py`` once :func:`database.Database.connect`
+    has populated the pool, and again after each successful write in the
+    ``/admin/strings`` web handlers. Pass an empty dict to revert to the
+    compiled defaults (used in tests).
+    """
+    global _OVERRIDES
+    _OVERRIDES = dict(overrides)
+
+
+def get_override(lang: str, key: str) -> str | None:
+    """Return the override for *(lang, key)* or None. Used by the
+    admin UI to show "current value vs compiled default" side by side."""
+    return _OVERRIDES.get((lang, key))
+
+
+def get_compiled_default(lang: str, key: str) -> str | None:
+    """Return the compiled default text for *(lang, key)* without
+    consulting the override cache. ``None`` if the slug doesn't exist
+    in the requested locale."""
+    if lang not in _STRINGS:
+        return None
+    return _STRINGS[lang].get(key)
+
+
+def iter_compiled_strings():
+    """Yield ``(lang, key, default_value)`` for every compiled string.
+
+    Used by the admin UI to enumerate every editable slug. The order
+    is deterministic — sorted by lang then key — so the admin page is
+    reproducible across reloads.
+    """
+    for lang in SUPPORTED_LANGUAGES:
+        for key in sorted(_STRINGS[lang]):
+            yield lang, key, _STRINGS[lang][key]
+
+
 def t(lang: str | None, key: str, **kwargs: object) -> str:
     """Look up *key* in *lang* and ``str.format(**kwargs)`` it.
 
-    Falls back to :data:`DEFAULT_LANGUAGE` if *lang* is unknown or the
-    requested locale doesn't have the key. If the key is missing in both,
-    returns the key itself (so a typo surfaces visibly during development
-    rather than as a confusing ``KeyError``).
+    Resolution order:
+
+    1. ``_OVERRIDES[(lang, key)]`` — admin-set runtime override.
+    2. ``_STRINGS[lang][key]`` — compiled default for the requested locale.
+    3. ``_STRINGS[DEFAULT_LANGUAGE][key]`` — fallback to the default locale.
+    4. The bare slug itself, with a one-shot WARNING logged so dictionary
+       drift surfaces in ops logs instead of silently shipping a slug to
+       the user. Pre-Stage-9-Step-1.6 step (4) was a silent return.
     """
     if lang not in _STRINGS:
         lang = DEFAULT_LANGUAGE
-    template = _STRINGS[lang].get(key)
-    if template is None and lang != DEFAULT_LANGUAGE:
-        template = _STRINGS[DEFAULT_LANGUAGE].get(key)
+    template = _OVERRIDES.get((lang, key))
     if template is None:
+        template = _STRINGS[lang].get(key)
+        if template is None and lang != DEFAULT_LANGUAGE:
+            # Try the override cache for the default locale before
+            # falling back to its compiled default — admin overrides
+            # should win regardless of which locale we're rendering.
+            template = _OVERRIDES.get((DEFAULT_LANGUAGE, key))
+            if template is None:
+                template = _STRINGS[DEFAULT_LANGUAGE].get(key)
+    if template is None:
+        # Bug fix bundled in this PR: pre-fix this branch silently
+        # returned ``key`` so a typo'd slug or a translation gap was
+        # invisible until a user copy-pasted the literal slug back.
+        # Now we log once per (lang, key) per process so ops sees
+        # the drift on the very next deploy.
+        if (lang, key) not in _MISSING_KEY_WARNED:
+            _MISSING_KEY_WARNED.add((lang, key))
+            log.warning(
+                "strings.t(): missing key %r in lang %r and default %r — "
+                "returning the bare slug. Add the key to strings._STRINGS "
+                "or set an override at /admin/strings.",
+                key,
+                lang,
+                DEFAULT_LANGUAGE,
+            )
         return key
     if kwargs:
         return template.format(**kwargs)
@@ -607,5 +699,9 @@ __all__ = [
     "DEFAULT_LANGUAGE",
     "SUPPORTED_LANGUAGES",
     "all_button_labels",
+    "get_compiled_default",
+    "get_override",
+    "iter_compiled_strings",
+    "set_overrides",
     "t",
 ]

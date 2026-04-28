@@ -31,6 +31,13 @@ NowPayments crypto invoices.
   Memory: ON/OFF · Support · Language`. Tapping "🆕 New Chat" wipes
   the conversation buffer immediately; tapping "🧠 Memory" opens
   the memory settings screen with the cost trade-off explainer.
+- **Editable bot text** — every user-facing label (button, prompt,
+  error message) is editable at `${WEBHOOK_BASE_URL}/admin/strings`.
+  The compiled defaults in `strings.py` ship with the code; admin
+  edits write a per-`(lang, key)` row to `bot_strings` and refresh
+  an in-memory cache so the next message uses the new text. Reverting
+  resurrects the compiled default. Missing-slug typos now log a
+  WARNING instead of silently shipping the slug to the user.
 
 For the full project history, file map, and roadmap **read [HANDOFF.md](./HANDOFF.md)**.
 
@@ -144,10 +151,10 @@ pytest tests/
 | `models_catalog.py` | Live `/v1/models` fetch from OpenRouter with 24 h cache, provider whitelist, free/paid split. |
 | `middlewares.py` | `UserUpsertMiddleware` — ensures `users` row exists before any handler runs. |
 | `rate_limit.py` | Token-bucket primitives + `ChatRateLimitMiddleware` (per-user) and `webhook_rate_limit_middleware` (per-IP). Guards `/chat` against runaway OpenRouter spend and the `/nowpayments-webhook` endpoint against DoS bursts. |
-| `strings.py` | Two-locale (fa/en) string table + `t(lang, key, **kwargs)` helper. |
+| `strings.py` | Two-locale (fa/en) compiled string table + `t(lang, key, **kwargs)` helper. Layered with a runtime override cache populated from the `bot_strings` DB table — admin edits at `/admin/strings` shadow the compiled defaults until reverted. Missing-slug lookups now log a one-shot WARNING per `(lang, key)` instead of silently returning the bare slug. |
 | `admin.py` | Telegram-side admin commands gated on `ADMIN_USER_IDS`: `/admin`, `/admin_metrics`, `/admin_balance`, `/admin_credit`, `/admin_debit`, `/admin_promo_create`, `/admin_promo_list`, `/admin_promo_revoke`, `/admin_broadcast`. |
-| `web_admin.py` | aiohttp + jinja2 web admin panel mounted under `/admin/` on the same web server that serves `/nowpayments-webhook`. HMAC-cookie auth via `ADMIN_PASSWORD` / `ADMIN_SESSION_SECRET`. CSRF-protected POST forms + signed flash-cookie banners. Login + dashboard + promo codes UI + gift codes UI + users UI + **broadcast UI with live-progress polling** + **paginated transactions browser** shipped — the full Stage-8 web panel is complete. |
-| `templates/admin/` | Jinja2 templates for the web admin (login, dashboard, promos, gifts, users, user_detail, broadcast, broadcast_detail, transactions). |
+| `web_admin.py` | aiohttp + jinja2 web admin panel mounted under `/admin/` on the same web server that serves `/nowpayments-webhook`. HMAC-cookie auth via `ADMIN_PASSWORD` / `ADMIN_SESSION_SECRET`. CSRF-protected POST forms + signed flash-cookie banners. Login + dashboard + promo codes UI + gift codes UI + users UI + **broadcast UI with live-progress polling** + **paginated transactions browser** + **editable bot text** (`/admin/strings`) shipped. |
+| `templates/admin/` | Jinja2 templates for the web admin (login, dashboard, promos, gifts, users, user_detail, broadcast, broadcast_detail, transactions, strings, string_detail). |
 | `alembic/` | Schema migrations. `alembic upgrade head` runs idempotently in `entrypoint.sh` on every container start. New schema changes: `alembic revision -m "..."`. |
 
 ## License / contributing

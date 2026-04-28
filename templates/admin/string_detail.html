@@ -1,0 +1,174 @@
+{% extends "_layout.html" %}
+
+{% block title %}Edit {{ lang }}:{{ key }}{% endblock %}
+
+{% block extra_head %}
+<style>
+  .breadcrumb {
+    color: var(--text-muted);
+    font-size: 13px;
+    margin-bottom: 8px;
+  }
+  .breadcrumb a { color: var(--text-muted); }
+  .breadcrumb a:hover { color: var(--accent); }
+  .meta {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  .lang-badge {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 4px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 11px;
+    text-transform: uppercase;
+  }
+  code.slug {
+    background: var(--bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+  }
+  textarea.value-editor {
+    width: 100%;
+    min-height: 140px;
+    padding: 12px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 14px;
+    line-height: 1.5;
+    resize: vertical;
+  }
+  .default-block {
+    background: var(--bg);
+    border: 1px dashed var(--border);
+    border-radius: 6px;
+    padding: 10px 14px;
+    color: var(--text-muted);
+    font-size: 13px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .actions {
+    display: flex;
+    gap: 12px;
+    margin-top: 16px;
+    align-items: center;
+  }
+  button.primary {
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 6px;
+    padding: 9px 18px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  button.primary:hover { background: var(--accent-hover); }
+  button.danger {
+    background: transparent;
+    color: var(--danger);
+    border: 1px solid var(--danger);
+    border-radius: 6px;
+    padding: 9px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button.danger:hover { background: rgba(255, 107, 107, 0.1); }
+  button.danger:disabled { opacity: 0.4; cursor: not-allowed; }
+  .placeholders {
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  form.inline { display: inline; margin: 0; }
+  .alert-info {
+    background: rgba(79, 140, 255, 0.1);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+  }
+</style>
+{% endblock %}
+
+{% block main %}
+<div class="breadcrumb">
+  <a href="/admin/strings">Bot text</a> / <span class="lang-badge">{{ lang }}</span>
+  <code class="slug">{{ key }}</code>
+</div>
+
+<h2>Edit {{ lang }}:{{ key }}</h2>
+
+{% if flash %}
+<div class="alert alert-{{ flash.kind }}">{{ flash.message }}</div>
+{% endif %}
+
+{% if db_error %}
+<div class="alert alert-warn">{{ db_error }}</div>
+{% endif %}
+
+<div class="meta">
+  <div>
+    Status:
+    {% if override is not none %}
+      <strong style="color: var(--accent);">override active</strong>
+    {% else %}
+      <strong>compiled default (no override)</strong>
+    {% endif %}
+  </div>
+</div>
+
+<div class="panel">
+  <h3>Compiled default</h3>
+  <p style="color: var(--text-muted); font-size: 13px; margin-top: 0;">
+    Read-only. This is what the bot ships with. Reverting an override
+    restores this text.
+  </p>
+  <div class="default-block">{{ default }}</div>
+</div>
+
+<div class="panel" style="margin-top: 16px;">
+  <h3>Override</h3>
+  <form method="post" action="/admin/strings/{{ lang }}/{{ key }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label for="value" style="display: block; margin-bottom: 6px; color: var(--text-muted); font-size: 13px;">
+      Edit the text below. Saving overrides the compiled default for
+      <code class="slug">{{ key }}</code> in <strong>{{ lang }}</strong>.
+    </label>
+    <textarea id="value" name="value" class="value-editor"
+              maxlength="{{ max_chars }}"
+              placeholder="Type the new text…">{{ current }}</textarea>
+    <div class="placeholders">
+      Max {{ max_chars }} characters. <code>{placeholder}</code> tokens
+      (e.g. <code>{balance}</code>, <code>{count}</code>) are filled in
+      at render time — keep them in your text or the bot will crash on
+      a <code>KeyError</code>.
+    </div>
+
+    <div class="actions">
+      <button class="primary" type="submit">Save override</button>
+      {% if override is not none %}
+      <form class="inline" method="post"
+            action="/admin/strings/{{ lang }}/{{ key }}/revert"
+            onsubmit="return confirm('Revert {{ lang }}:{{ key }} to the compiled default?');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="danger">Revert to default</button>
+      </form>
+      {% else %}
+      <button class="danger" disabled title="No override exists yet">Revert to default</button>
+      {% endif %}
+    </div>
+  </form>
+</div>
+{% endblock %}

@@ -139,6 +139,9 @@ def _stub_db(
     adjust_balance_result: dict | None | Exception = None,
     broadcast_recipients: list | Exception | None = None,
     list_transactions_result: dict | Exception | None = None,
+    string_overrides_result: dict | Exception | None = None,
+    upsert_string_result: object | Exception = None,
+    delete_string_result: bool | Exception = True,
 ):
     """A minimal Database stub that exposes the methods web_admin uses.
 
@@ -230,6 +233,33 @@ def _stub_db(
             return_value=list_transactions_result
             if list_transactions_result is not None
             else default_list_tx
+        )
+    # Stage-9-Step-1.6: bot_strings.
+    if isinstance(string_overrides_result, Exception):
+        db.load_all_string_overrides = AsyncMock(
+            side_effect=string_overrides_result
+        )
+    else:
+        db.load_all_string_overrides = AsyncMock(
+            return_value=string_overrides_result
+            if string_overrides_result is not None
+            else {}
+        )
+    if isinstance(upsert_string_result, Exception):
+        db.upsert_string_override = AsyncMock(
+            side_effect=upsert_string_result
+        )
+    else:
+        db.upsert_string_override = AsyncMock(
+            return_value=upsert_string_result
+        )
+    if isinstance(delete_string_result, Exception):
+        db.delete_string_override = AsyncMock(
+            side_effect=delete_string_result
+        )
+    else:
+        db.delete_string_override = AsyncMock(
+            return_value=delete_string_result
         )
     return db
 
@@ -3563,3 +3593,369 @@ async def test_transactions_null_telegram_id_renders_em_dash(
     # broken link.
     assert "/admin/users/None" not in body
 
+
+
+# ---------------------------------------------------------------------
+# Stage-9-Step-1.6: /admin/strings (editable bot text)
+# ---------------------------------------------------------------------
+
+
+async def test_strings_get_renders_compiled_table(
+    aiohttp_client, make_admin_app
+):
+    """The list page renders one row per (lang, key) in the compiled
+    table. Slugs we know exist must appear; default badge is shown
+    when no override exists."""
+    db = _stub_db(string_overrides_result={})
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/strings")
+    assert resp.status == 200
+    body = await resp.text()
+    # Slug from the compiled table that ships with the bot.
+    assert "hub_btn_wallet" in body
+    # Status badge for non-overridden rows.
+    assert "default" in body
+    # Sidebar link is active on this page.
+    assert 'class="active"' in body and "Bot text" in body
+    # Sanity: lang badge appears (per row).
+    assert "lang-badge" in body
+
+
+async def test_strings_get_filters_by_lang_and_search(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(string_overrides_result={})
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/strings?lang=en&q=memory")
+    assert resp.status == 200
+    body = await resp.text()
+    # Lang filter clamps to en — so a known fa-only-display row's
+    # row-table render should not include the same slug under fa.
+    # Easier check: the filter form should round-trip the parameters.
+    assert 'value="memory"' in body
+    assert '<option value="en" selected>en</option>' in body
+
+
+async def test_strings_get_marks_overridden_rows(
+    aiohttp_client, make_admin_app
+):
+    """When an override exists, the row shows the override badge and
+    serves the override value rather than the compiled default."""
+    overrides = {("en", "hub_btn_wallet"): "💰 Custom Wallet Label"}
+    db = _stub_db(string_overrides_result=overrides)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/strings?lang=en&q=hub_btn_wallet")
+    body = await resp.text()
+    assert "Custom Wallet Label" in body
+    assert "badge-override" in body
+
+
+async def test_strings_get_handles_db_error(
+    aiohttp_client, make_admin_app
+):
+    """A DB failure on the list page must render a banner — not 500."""
+    db = _stub_db(string_overrides_result=RuntimeError("pool down"))
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/strings")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Database query failed" in body
+
+
+async def test_strings_detail_get_renders_form(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(string_overrides_result={})
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/strings/en/hub_btn_wallet")
+    assert resp.status == 200
+    body = await resp.text()
+    # Form points at the right action URL.
+    assert 'action="/admin/strings/en/hub_btn_wallet"' in body
+    # Compiled default block + textarea both rendered.
+    assert "Compiled default" in body
+    assert "<textarea" in body
+    # Revert button is disabled when no override exists.
+    assert "Revert to default" in body
+    assert "disabled" in body
+
+
+async def test_strings_detail_get_unknown_lang_404(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/strings/zh/anything")
+    assert resp.status == 404
+
+
+async def test_strings_detail_get_unknown_key_404(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/strings/en/this_slug_does_not_exist_anywhere")
+    assert resp.status == 404
+
+
+async def _login_and_get_strings_csrf(
+    client, password: str, lang: str = "en", key: str = "hub_btn_wallet"
+) -> str:
+    """Log in, fetch the per-string editor, scrape the CSRF token."""
+    await _login(client, password)
+    resp = await client.get(f"/admin/strings/{lang}/{key}")
+    body = await resp.text()
+    import re
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+    assert m, "Expected CSRF token in /admin/strings/<lang>/<key> form"
+    return m.group(1)
+
+
+async def test_strings_save_post_happy_path(
+    aiohttp_client, make_admin_app
+):
+    """A save POST upserts the (lang, key, value) row, refreshes the
+    in-memory cache, and redirects back to the editor with a success
+    flash."""
+    import strings as bot_strings_module
+
+    # Reset module-level override cache so this test's assertion is
+    # independent of any prior state.
+    bot_strings_module.set_overrides({})
+
+    db = _stub_db()
+    # On the post-write refresh the DB returns the new override.
+    db.load_all_string_overrides = AsyncMock(
+        side_effect=[
+            {},  # initial detail GET
+            {("en", "hub_btn_wallet"): "💰 Custom"},  # post-save refresh
+        ]
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_strings_csrf(client, "pw")
+
+    resp = await client.post(
+        "/admin/strings/en/hub_btn_wallet",
+        data={"csrf_token": csrf, "value": "💰 Custom"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/strings/en/hub_btn_wallet"
+    db.upsert_string_override.assert_awaited_once_with(
+        "en", "hub_btn_wallet", "💰 Custom", updated_by="web"
+    )
+    # Cache was refreshed and the in-memory override is now visible.
+    assert bot_strings_module.get_override("en", "hub_btn_wallet") == "💰 Custom"
+
+    # Reset to keep the test isolated from later tests.
+    bot_strings_module.set_overrides({})
+
+
+async def test_strings_save_post_strips_whitespace(
+    aiohttp_client, make_admin_app
+):
+    """The override is trimmed before persistence — Telegram strips
+    leading/trailing whitespace on inline-button text anyway."""
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_strings_csrf(client, "pw")
+    await client.post(
+        "/admin/strings/en/hub_btn_wallet",
+        data={"csrf_token": csrf, "value": "   padded   "},
+        allow_redirects=False,
+    )
+    db.upsert_string_override.assert_awaited_once_with(
+        "en", "hub_btn_wallet", "padded", updated_by="web"
+    )
+
+
+async def test_strings_save_post_rejects_empty_value(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_strings_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/strings/en/hub_btn_wallet",
+        data={"csrf_token": csrf, "value": "   "},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_string_override.assert_not_awaited()
+
+
+async def test_strings_save_post_rejects_oversize(
+    aiohttp_client, make_admin_app
+):
+    """Submitting a value longer than the cap is rejected with a flash —
+    not 500'd by some downstream length check in the DB layer."""
+    from web_admin import STRING_OVERRIDE_MAX_CHARS
+
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_strings_csrf(client, "pw")
+    too_big = "x" * (STRING_OVERRIDE_MAX_CHARS + 1)
+    resp = await client.post(
+        "/admin/strings/en/hub_btn_wallet",
+        data={"csrf_token": csrf, "value": too_big},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_string_override.assert_not_awaited()
+
+
+async def test_strings_save_post_rejects_missing_csrf(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.post(
+        "/admin/strings/en/hub_btn_wallet",
+        data={"value": "hello"},  # no csrf
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_string_override.assert_not_awaited()
+
+
+async def test_strings_save_post_rejects_unknown_lang(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_strings_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/strings/zh/hub_btn_wallet",
+        data={"csrf_token": csrf, "value": "x"},
+        allow_redirects=False,
+    )
+    assert resp.status == 404
+    db.upsert_string_override.assert_not_awaited()
+
+
+async def test_strings_save_post_rejects_unknown_key(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_strings_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/strings/en/this_slug_does_not_exist",
+        data={"csrf_token": csrf, "value": "x"},
+        allow_redirects=False,
+    )
+    assert resp.status == 404
+    db.upsert_string_override.assert_not_awaited()
+
+
+async def test_strings_save_post_db_error_shows_flash(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(upsert_string_result=RuntimeError("disk full"))
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_strings_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/strings/en/hub_btn_wallet",
+        data={"csrf_token": csrf, "value": "x"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    # Follow the redirect; the editor renders the error flash.
+    resp2 = await client.get("/admin/strings/en/hub_btn_wallet")
+    body = await resp2.text()
+    assert "Database write failed" in body
+
+
+async def test_strings_revert_post_happy_path(
+    aiohttp_client, make_admin_app
+):
+    import strings as bot_strings_module
+
+    # Pre-state: the override is currently set.
+    bot_strings_module.set_overrides(
+        {("en", "hub_btn_wallet"): "💰 Custom"}
+    )
+
+    db = _stub_db(delete_string_result=True)
+    # Detail GET sees the override; post-revert refresh sees nothing.
+    db.load_all_string_overrides = AsyncMock(
+        side_effect=[
+            {("en", "hub_btn_wallet"): "💰 Custom"},
+            {},
+        ]
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_strings_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/strings/en/hub_btn_wallet/revert",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.delete_string_override.assert_awaited_once_with("en", "hub_btn_wallet")
+    # Cache was refreshed — override is gone.
+    assert bot_strings_module.get_override("en", "hub_btn_wallet") is None
+
+    bot_strings_module.set_overrides({})
+
+
+async def test_strings_revert_post_rejects_missing_csrf(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.post(
+        "/admin/strings/en/hub_btn_wallet/revert",
+        data={},  # no csrf
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.delete_string_override.assert_not_awaited()
+
+
+async def test_strings_revert_post_no_override_flashes_info(
+    aiohttp_client, make_admin_app
+):
+    """Reverting when there's no override is not an error — the flash
+    just informs the operator that there was nothing to do."""
+    db = _stub_db(delete_string_result=False)
+    db.load_all_string_overrides = AsyncMock(return_value={})
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_strings_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/strings/en/hub_btn_wallet/revert",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    resp2 = await client.get("/admin/strings/en/hub_btn_wallet")
+    body = await resp2.text()
+    assert "nothing to revert" in body
+
+
+async def test_strings_routes_require_auth(
+    aiohttp_client, make_admin_app
+):
+    """All four endpoints redirect to login when unauthed."""
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    for path, method in [
+        ("/admin/strings", "get"),
+        ("/admin/strings/en/hub_btn_wallet", "get"),
+        ("/admin/strings/en/hub_btn_wallet", "post"),
+        ("/admin/strings/en/hub_btn_wallet/revert", "post"),
+    ]:
+        if method == "get":
+            resp = await client.get(path, allow_redirects=False)
+        else:
+            resp = await client.post(path, data={}, allow_redirects=False)
+        assert resp.status == 302
+        assert resp.headers["Location"] == "/admin/login"
