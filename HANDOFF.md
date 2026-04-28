@@ -133,7 +133,7 @@ queued next.
 | `ai_engine.py` | Clean. Pre-check on free messages + balance, atomic deduct, log_usage with the actual amount. **OpenRouter call now has a 60s `aiohttp.ClientTimeout` (10s connect / 50s sock_read)** so a stalled upstream can't pin a coroutine forever. |
 | `pricing.py` | Clean. Conservative fallback for unmapped models, guards markup ≥ 1.0. |
 | `rate_limit.py` | `TokenBucket` + `_LRUBucketCache` primitives, `consume_chat_token(user_id)` per-user limiter (called *inside* `handlers.process_chat` only — defaults 5 tokens / 1s refill), `webhook_rate_limit_middleware` (per-IP, 30 tokens / 5s refill on the IPN endpoint). 15 unit tests. NB: chat rate-limiting must be done in-handler, not as a `dp.message` middleware, otherwise commands / FSM state inputs get throttled too. See PR #47 / #48 history. |
-| `admin.py` | `parse_admin_user_ids` (env parser), `is_admin` (gate), `/admin` hub, `/admin_metrics`, `/admin_balance`, `/admin_credit`, `/admin_debit`, `/admin_promo_create`, `/admin_promo_list`, `/admin_promo_revoke`. Non-admin callers see a silent no-op so the surface isn't leaked. Router included in `main.py` BEFORE the public router. 65 unit tests. |
+| `admin.py` | `parse_admin_user_ids` (env parser), `is_admin` (gate), `_escape_md` (legacy-Markdown reserved-char escaper), `/admin` hub, `/admin_metrics`, `/admin_balance`, `/admin_credit`, `/admin_debit`, `/admin_promo_create`, `/admin_promo_list`, `/admin_promo_revoke`, `/admin_broadcast`. Non-admin callers see a silent no-op so the surface isn't leaked. Router included in `main.py` BEFORE the public router. 86 unit tests. **Free-form admin-typed `reason` (credit/debit) and persisted `notes` (wallet snapshot rows) are now run through `_escape_md` before interpolation into Markdown — without it, Telegram rejects the whole reply with 400 BadRequest *after* the DB write commits.** |
 | `alembic/versions/0002_transactions_notes.py` | Adds `transactions.notes TEXT NULL` so admin adjustments can record a human-readable reason. Forward-compat (nullable, no default). |
 | `alembic/` | Clean. `env.py` URL-encodes credentials (PR #45). Baseline = consolidated current schema. |
 | `entrypoint.sh` | Runs idempotent `alembic upgrade head` before exec'ing the bot. |
@@ -311,7 +311,8 @@ Each is a separate PR, in this order:
 | **P3-Op-6-Hotfix** | Move chat rate limit OUT of `dp.message` middleware INTO `process_chat` so commands / FSM state inputs aren't incorrectly throttled (Devin Review catch on #47) | ✅ Shipped | [#48](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/48) |
 | **Stage-7-Part-1** | Admin scaffold: `admin.py` (`parse_admin_user_ids`, `is_admin`, hub `/admin`, `/admin_metrics`) + `Database.get_system_metrics` **+ `message.text=None` crash fix in `process_custom_amount_input`** | ✅ Shipped | [#49](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/49) |
 | **Stage-7-Part-2** | Admin balance ops: `/admin_balance`, `/admin_credit`, `/admin_debit` writing `transactions` rows with `gateway='admin'` + `notes` audit column (alembic `0002`) **+ defensive guard in `chat_with_model` for OpenRouter 200-with-error-shaped bodies** | ✅ Shipped | [#50](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/50) |
-| **Stage-7-Part-3** | Admin promo creation: `/admin_promo_create`, `/admin_promo_list`, `/admin_promo_revoke` (soft-delete via `is_active`) **+ `from_user is None` guard in `process_chat`** | ✅ Shipped | this PR |
+| **Stage-7-Part-3** | Admin promo creation: `/admin_promo_create`, `/admin_promo_list`, `/admin_promo_revoke` (soft-delete via `is_active`) **+ `from_user is None` guard in `process_chat`** | ✅ Shipped | [#51](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/51) |
+| **Stage-7-Part-4** | Admin broadcast: `/admin_broadcast [--active=N] <text>` with rate-limited fan-out (~25 msg/s), per-recipient error counting, retry-after handling, progress message **+ Markdown-escape fix for free-form `reason`/`notes` (Devin Review catch on PR #50 — unescaped `_*\`[` in admin-typed text crashed the success message after the DB write committed, causing admins to retry and double-adjust)** | ✅ Shipped | this PR |
 
 Operational hardening queue is **complete**. P2 admin panel is being built next, in 4 small PRs (Stage-7-Part-1 ... Part-4).
 
@@ -324,8 +325,8 @@ The previous AI's roadmap had a "Stage 7" CLI admin panel. We're shipping that a
 | **Stage-7-Part-1** | `is_admin` gate, `/admin` hub, `/admin_metrics` (users, revenue, spend, top models) | ✅ this PR |
 | **Stage-7-Part-2** | Balance ops: `/admin_balance <user_id>`, `/admin_credit <user_id> <usd> <reason>`, `/admin_debit ...`. Writes `transactions` rows with `gateway='admin'` + `notes` audit column. | ✅ this PR |
 | **Stage-7-Part-3** | Promo creation: `/admin_promo_create`, `/admin_promo_list`, `/admin_promo_revoke`. Subsumes the original "Stage 6B" admin gap. | ✅ this PR |
-| **Stage-7-Part-4** | Broadcast: `/admin_broadcast` with rate-limited fan-out + progress message. | ⏳ next |
-| **Cleanup** | Delete legacy `schema.sql` + `migrations/*.sql` (Alembic owns schema; they're confusing leftovers). | ⏳ |
+| **Stage-7-Part-4** | Broadcast: `/admin_broadcast` with rate-limited fan-out + progress message. | ✅ this PR |
+| **Cleanup** | Delete legacy `schema.sql` + `migrations/*.sql` (Alembic owns schema; they're confusing leftovers). | ⏳ next |
 
 ---
 

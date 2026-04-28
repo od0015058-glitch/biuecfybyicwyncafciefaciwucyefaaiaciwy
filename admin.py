@@ -38,6 +38,42 @@ log = logging.getLogger("bot.admin")
 router = Router()
 
 
+# ---------------------------------------------------------------------
+# Markdown-escape helper.
+#
+# Telegram's legacy ``parse_mode="Markdown"`` treats ``_`` ``*`` `` ` ``
+# ``[`` as formatting markers and rejects the *entire message* with
+# 400 BadRequest if they're unbalanced. Free-form admin-typed text
+# (``reason`` on credit/debit, persisted ``notes`` on the wallet
+# snapshot) used to land in those messages unescaped — Devin Review
+# caught this on PR #50: a reason like ``stuck_invoice`` would crash
+# the success confirmation **after** the DB write had already
+# committed, so the admin would retry and double-adjust the balance.
+#
+# Escape, don't strip — admins should see exactly what they typed,
+# not a sanitized variant. Escape via prefix-backslash, which legacy
+# Markdown honours for these characters.
+# ---------------------------------------------------------------------
+
+_MD_RESERVED = "_*`["
+
+
+def _escape_md(s: str | None) -> str:
+    r"""Escape Telegram legacy-Markdown reserved characters in *s*.
+
+    ``None`` or empty input returns ``""``. The four characters
+    ``_ * ` [`` are prefixed with a backslash so the parser treats
+    them as literals. We don't escape ``\`` itself: the only way one
+    would land in admin-typed text is if the admin literally typed
+    a backslash, in which case rendering it as-is is the obvious
+    behaviour. (Telegram's legacy Markdown has no escape for ``\\``
+    anyway — it just renders as ``\``.)
+    """
+    if not s:
+        return ""
+    return "".join("\\" + c if c in _MD_RESERVED else c for c in s)
+
+
 def parse_admin_user_ids(raw: str | None) -> frozenset[int]:
     """Parse the ``ADMIN_USER_IDS`` env value into a frozenset of ints.
 
@@ -94,8 +130,8 @@ _ADMIN_HUB_TEXT = (
     "• `/admin_promo_create <CODE> <pct%|$amt> [max_uses] [days]` — new promo\n"
     "• `/admin_promo_list` — list promo codes (newest 20)\n"
     "• `/admin_promo_revoke <CODE>` — soft-delete a promo code\n"
-    "\n"
-    "_More commands will be added in subsequent PRs (broadcast)._"
+    "• `/admin_broadcast [--active=N] <text>` — send `<text>` to every "
+    "user (or only users active in the last `N` days)"
 )
 
 
@@ -246,7 +282,11 @@ def _format_balance_summary(summary: dict) -> str:
             sign = "+" if r["amount_usd"] >= 0 else "−"
             amount_abs = abs(r["amount_usd"])
             note = r.get("notes")
-            note_suffix = f" — _{note}_" if note else ""
+            # Escape free-form note text — Markdown-special chars
+            # in a stored note (`_`, `*`, `` ` ``, `[`) would
+            # otherwise crash the whole admin reply with 400 Bad
+            # Request, hiding the wallet snapshot from the admin.
+            note_suffix = f" — _{_escape_md(note)}_" if note else ""
             lines.append(
                 f"  • #{r['id']} `{r['gateway']}` "
                 f"{sign}${amount_abs:.4f} ({r['status']}){note_suffix}"
@@ -332,7 +372,13 @@ async def _handle_balance_op(
         f"✅ {sign_label} `{user_id}` ${amount:.4f}.\n"
         f"New balance: *${result['new_balance']:.4f}*\n"
         f"Tx id: `{result['transaction_id']}`\n"
-        f"Reason: _{reason}_",
+        # Escape free-form reason — without this, a reason like
+        # ``stuck_invoice`` (admin's natural shorthand) would crash
+        # this confirmation with 400 BadRequest **after** the DB
+        # write had already committed. The admin would retry and
+        # double-adjust the user's balance. Reported by Devin Review
+        # on PR #50.
+        f"Reason: _{_escape_md(reason)}_",
         parse_mode="Markdown",
     )
 
@@ -596,3 +642,232 @@ async def admin_promo_revoke(message: Message) -> None:
             f"❌ `{code}` does not exist or is already revoked.",
             parse_mode="Markdown",
         )
+
+
+# ---------------------------------------------------------------------
+# /admin_broadcast — fan-out a text message to every (or recently
+# active) user, throttled below Telegram's documented per-bot send
+# rate (30 msg/s to *different* chats; we sit at ~25/s for headroom).
+#
+# Block-list / blocked-bot / dead-chat sends are caught and counted
+# rather than aborting the broadcast. We also catch ``TelegramRetryAfter``
+# (HTTP 429) and honour the server's ``retry_after`` window before
+# resuming, so a transient surge doesn't kill the whole broadcast.
+#
+# Progress is reported by editing a single status message every
+# ``_BROADCAST_PROGRESS_EVERY`` deliveries — chat-flooding the admin
+# with one update per recipient would itself trip rate limits.
+# ---------------------------------------------------------------------
+
+import asyncio
+import re
+
+# Telegram doc: "30 messages per second to different users". Sit at
+# 25/s = 0.04s between sends so we never crowd the limit. A burst
+# allowance of 30 is documented but we'd rather pace conservatively.
+_BROADCAST_DELAY_S = 0.04
+_BROADCAST_PROGRESS_EVERY = 25
+# Cap to avoid letting an admin DoS Telegram via a broadcast text
+# longer than a single Telegram message can carry.
+_BROADCAST_MAX_TEXT_LEN = 3500
+
+
+def parse_broadcast_args(text: str) -> dict | str:
+    """Parse ``/admin_broadcast [--active=N] <text>``.
+
+    Returns either::
+
+        {"only_active_days": int | None, "text": str}
+
+    on success, or a string error key on failure: ``"missing"``
+    (no body), ``"bad_active"`` (``--active`` parse failed),
+    ``"too_long"`` (body > _BROADCAST_MAX_TEXT_LEN).
+
+    The body is everything after the command (and after the optional
+    ``--active=N`` flag). Newlines are preserved so the admin can
+    send formatted multi-line announcements. Leading/trailing
+    whitespace is stripped.
+    """
+    # Drop the leading slash-command token.
+    after = text.split(None, 1)
+    if len(after) < 2 or not after[1].strip():
+        return "missing"
+    body = after[1]
+
+    only_active_days: int | None = None
+    m = re.match(r"\s*--active=(\S+)\s*", body)
+    if m:
+        try:
+            only_active_days = int(m.group(1))
+        except ValueError:
+            return "bad_active"
+        if only_active_days <= 0:
+            return "bad_active"
+        body = body[m.end():]
+
+    body = body.strip()
+    if not body:
+        return "missing"
+    if len(body) > _BROADCAST_MAX_TEXT_LEN:
+        return "too_long"
+
+    return {"only_active_days": only_active_days, "text": body}
+
+
+_BROADCAST_ERR_TEXT = {
+    "missing": (
+        "❌ Usage: `/admin_broadcast [--active=N] <text>`\n"
+        "Examples:\n"
+        "  `/admin_broadcast Hello everyone! New feature shipped.`\n"
+        "  `/admin_broadcast --active=30 Heads-up: scheduled maintenance...`"
+    ),
+    "bad_active": (
+        "❌ `--active=N` must be a positive integer (days)."
+    ),
+    "too_long": (
+        f"❌ Broadcast body too long (limit "
+        f"{_BROADCAST_MAX_TEXT_LEN} chars)."
+    ),
+}
+
+
+async def _do_broadcast(
+    bot,
+    *,
+    recipients: list[int],
+    text: str,
+    progress_message,
+    admin_id: int,
+) -> dict:
+    """Send *text* to each id in *recipients*, paced + error-counted.
+
+    Returns a stats dict ``{sent, blocked, failed, total}``. Logs
+    every failure for forensics. Edits *progress_message* every
+    ``_BROADCAST_PROGRESS_EVERY`` recipients.
+    """
+    # Lazy import so the ``aiogram.exceptions`` symbol load doesn't
+    # happen at module import time (and so test code that patches
+    # ``aiogram`` doesn't get tangled in admin.py's import order).
+    from aiogram.exceptions import (
+        TelegramBadRequest,
+        TelegramForbiddenError,
+        TelegramRetryAfter,
+    )
+
+    sent = 0
+    blocked = 0
+    failed = 0
+    total = len(recipients)
+
+    for i, chat_id in enumerate(recipients, 1):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text)
+            sent += 1
+        except TelegramForbiddenError:
+            # User blocked the bot OR deleted their account. Expected
+            # at scale; just count and move on.
+            blocked += 1
+        except TelegramRetryAfter as exc:
+            # Honour the server's back-off window. After sleeping,
+            # retry *this* recipient (don't lose them).
+            log.warning(
+                "broadcast: 429 from Telegram, retry_after=%ss "
+                "(recipient %d of %d)",
+                exc.retry_after, i, total,
+            )
+            await asyncio.sleep(exc.retry_after)
+            try:
+                await bot.send_message(chat_id=chat_id, text=text)
+                sent += 1
+            except Exception:
+                failed += 1
+                log.exception(
+                    "broadcast: post-429 retry failed for chat_id=%d",
+                    chat_id,
+                )
+        except TelegramBadRequest:
+            # Chat not found, deactivated user, etc.
+            failed += 1
+            log.exception(
+                "broadcast: bad_request for chat_id=%d", chat_id
+            )
+        except Exception:
+            failed += 1
+            log.exception(
+                "broadcast: unexpected error for chat_id=%d", chat_id
+            )
+
+        if i % _BROADCAST_PROGRESS_EVERY == 0 or i == total:
+            try:
+                await progress_message.edit_text(
+                    f"📣 Broadcasting…\n"
+                    f"Progress: {i}/{total}\n"
+                    f"Sent: {sent}  Blocked: {blocked}  Failed: {failed}"
+                )
+            except Exception:
+                # Progress edits are best-effort; never let one
+                # failure abort the whole broadcast.
+                log.debug(
+                    "broadcast: progress edit failed (i=%d)", i,
+                    exc_info=True,
+                )
+
+        # Pace below Telegram's per-bot rate cap. Skip the delay
+        # on the very last recipient to shorten the visible duration.
+        if i < total:
+            await asyncio.sleep(_BROADCAST_DELAY_S)
+
+    log.info(
+        "broadcast: admin=%s sent=%d blocked=%d failed=%d total=%d",
+        admin_id, sent, blocked, failed, total,
+    )
+    return {"sent": sent, "blocked": blocked, "failed": failed,
+            "total": total}
+
+
+@router.message(Command("admin_broadcast"))
+async def admin_broadcast(message: Message) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return  # silent no-op
+    parsed = parse_broadcast_args(message.text or "")
+    if isinstance(parsed, str):
+        await message.answer(_BROADCAST_ERR_TEXT[parsed])
+        return
+
+    try:
+        recipients = await db.iter_broadcast_recipients(
+            only_active_days=parsed["only_active_days"]
+        )
+    except Exception:
+        log.exception("admin_broadcast: recipient query failed")
+        await message.answer("❌ DB query failed — see logs.")
+        return
+
+    if not recipients:
+        await message.answer(
+            "❌ No recipients matched. "
+            "(Try without `--active=N` to include everyone.)"
+        )
+        return
+
+    eta_seconds = int(len(recipients) * _BROADCAST_DELAY_S) + 1
+    progress = await message.answer(
+        f"📣 Broadcasting to {len(recipients)} user(s) "
+        f"(ETA ~{eta_seconds}s)…\n"
+        f"Progress: 0/{len(recipients)}"
+    )
+    stats = await _do_broadcast(
+        message.bot,
+        recipients=recipients,
+        text=parsed["text"],
+        progress_message=progress,
+        admin_id=message.from_user.id,
+    )
+    await message.answer(
+        "✅ Broadcast complete.\n"
+        f"Sent: *{stats['sent']}*  "
+        f"Blocked: *{stats['blocked']}*  "
+        f"Failed: *{stats['failed']}*  "
+        f"Total: *{stats['total']}*",
+        parse_mode="Markdown",
+    )
