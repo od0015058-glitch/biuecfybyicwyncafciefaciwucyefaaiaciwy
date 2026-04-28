@@ -32,6 +32,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from database import db
+from formatting import format_usd
 
 log = logging.getLogger("bot.admin")
 
@@ -267,20 +268,19 @@ def _format_balance_summary(summary: dict) -> str:
     lines = [
         f"💼 *Wallet for {user_label}* (`{summary['telegram_id']}`)",
         "",
-        f"• Balance: *${summary['balance_usd']:.4f}*",
+        f"• Balance: *{format_usd(summary['balance_usd'])}*",
         f"• Free messages left: {summary['free_messages_left']}",
         f"• Active model: `{summary['active_model']}`",
         f"• Language: `{summary['language_code']}`",
-        f"• Total credited (lifetime): ${summary['total_credited_usd']:.4f}",
-        f"• Total spent (lifetime): ${summary['total_spent_usd']:.4f}",
+        f"• Total credited (lifetime): {format_usd(summary['total_credited_usd'])}",
+        f"• Total spent (lifetime): {format_usd(summary['total_spent_usd'])}",
     ]
     txs = summary.get("recent_transactions") or []
     if txs:
         lines.append("")
         lines.append("📜 *Last 5 transactions*")
         for r in txs:
-            sign = "+" if r["amount_usd"] >= 0 else "−"
-            amount_abs = abs(r["amount_usd"])
+            sign = "+" if r["amount_usd"] >= 0 else ""
             note = r.get("notes")
             # Escape free-form note text — Markdown-special chars
             # in a stored note (`_`, `*`, `` ` ``, `[`) would
@@ -289,7 +289,7 @@ def _format_balance_summary(summary: dict) -> str:
             note_suffix = f" — _{_escape_md(note)}_" if note else ""
             lines.append(
                 f"  • #{r['id']} `{r['gateway']}` "
-                f"{sign}${amount_abs:.4f} ({r['status']}){note_suffix}"
+                f"{sign}{format_usd(r['amount_usd'])} ({r['status']}){note_suffix}"
             )
     return "\n".join(lines)
 
@@ -356,9 +356,9 @@ async def _handle_balance_op(
             await message.answer(f"❌ No user with id `{user_id}`.")
         else:
             await message.answer(
-                f"❌ Refused — debit of ${amount:.4f} would take user "
+                f"❌ Refused — debit of {format_usd(amount)} would take user "
                 f"`{user_id}` below zero "
-                f"(current balance: ${summary['balance_usd']:.4f})."
+                f"(current balance: {format_usd(summary['balance_usd'])})."
             )
         return
 
@@ -369,8 +369,8 @@ async def _handle_balance_op(
         result["transaction_id"], reason,
     )
     await message.answer(
-        f"✅ {sign_label} `{user_id}` ${amount:.4f}.\n"
-        f"New balance: *${result['new_balance']:.4f}*\n"
+        f"✅ {sign_label} `{user_id}` {format_usd(amount)}.\n"
+        f"New balance: *{format_usd(result['new_balance'])}*\n"
         f"Tx id: `{result['transaction_id']}`\n"
         # Escape free-form reason — without this, a reason like
         # ``stuck_invoice`` (admin's natural shorthand) would crash
@@ -670,6 +670,16 @@ _BROADCAST_PROGRESS_EVERY = 25
 # Cap to avoid letting an admin DoS Telegram via a broadcast text
 # longer than a single Telegram message can carry.
 _BROADCAST_MAX_TEXT_LEN = 3500
+# Stage-9-Step-6 bug-fix bundle: cap the ``TelegramRetryAfter``
+# back-off so a misbehaving Telegram response (or an outage spike
+# returning ``retry_after=3600``) can't pin the broadcast worker
+# for an hour per affected recipient. Pre-fix, ``await
+# asyncio.sleep(exc.retry_after)`` was uncapped — the operator
+# would see an apparently-stuck broadcast and no log line
+# explaining why. Now we sleep at most this many seconds and log
+# a WARNING when the server-supplied window exceeds the cap so
+# ops can spot prolonged degradation.
+_BROADCAST_RETRY_AFTER_MAX_S = 60.0
 # Upper bound on ``--active=N`` / ``only_active_days=``. PostgreSQL's
 # ``interval`` stores days in a 32-bit int; an admin typing
 # ``--active=9999999999`` (ten digits) would overflow the
@@ -757,17 +767,28 @@ async def _do_broadcast(
     text: str,
     admin_id: int,
     progress_callback=None,
+    should_cancel=None,
 ) -> dict:
     """Send *text* to each id in *recipients*, paced + error-counted.
 
-    Returns a stats dict ``{sent, blocked, failed, total}``. Logs
-    every failure for forensics. Calls *progress_callback* — an
-    ``async (stats: dict) -> None`` — every
+    Returns a stats dict ``{sent, blocked, failed, total, cancelled}``.
+    Logs every failure for forensics. Calls *progress_callback* —
+    an ``async (stats: dict) -> None`` — every
     ``_BROADCAST_PROGRESS_EVERY`` recipients (and once at the end)
     with a snapshot dict ``{i, total, sent, blocked, failed}`` so
     the caller can surface progress however it wants (Telegram
     ``edit_text``, web-panel in-memory job dict, structured log,
     …). Passing ``None`` disables progress reporting entirely.
+
+    *should_cancel* is an optional zero-arg callable (``() -> bool``)
+    polled at the top of every loop iteration. The callable is
+    intentionally synchronous so an in-memory flag flip from the
+    web admin's cancel endpoint takes effect within one tick of
+    the pacing sleep, even if the underlying flag-store has no
+    asyncio integration. When it returns truthy the loop exits
+    cleanly; the returned stats dict carries ``cancelled=True``
+    so the caller can mark the job ``cancelled`` rather than
+    ``completed``.
     """
     # Lazy import so the ``aiogram.exceptions`` symbol load doesn't
     # happen at module import time (and so test code that patches
@@ -781,9 +802,32 @@ async def _do_broadcast(
     sent = 0
     blocked = 0
     failed = 0
+    cancelled = False
     total = len(recipients)
 
     for i, chat_id in enumerate(recipients, 1):
+        # Stage-9-Step-6: soft-cancel check at the *top* of the loop
+        # so a cancel arriving during the previous iteration's pacing
+        # sleep is honoured before we hit Telegram one more time.
+        # Swallow any exception from the predicate — it's a flag
+        # read; nothing it raises is worth aborting a broadcast for.
+        if should_cancel is not None:
+            try:
+                if should_cancel():
+                    cancelled = True
+                    log.info(
+                        "broadcast: cancel requested at recipient %d "
+                        "of %d (sent=%d blocked=%d failed=%d)",
+                        i, total, sent, blocked, failed,
+                    )
+                    break
+            except Exception:
+                log.debug(
+                    "broadcast: should_cancel predicate raised "
+                    "(treating as not-cancelled)",
+                    exc_info=True,
+                )
+
         try:
             await bot.send_message(chat_id=chat_id, text=text)
             sent += 1
@@ -792,14 +836,23 @@ async def _do_broadcast(
             # at scale; just count and move on.
             blocked += 1
         except TelegramRetryAfter as exc:
-            # Honour the server's back-off window. After sleeping,
-            # retry *this* recipient (don't lose them).
-            log.warning(
-                "broadcast: 429 from Telegram, retry_after=%ss "
-                "(recipient %d of %d)",
-                exc.retry_after, i, total,
-            )
-            await asyncio.sleep(exc.retry_after)
+            # Honour the server's back-off window — but cap it so a
+            # misbehaving response can't pin the worker for an hour.
+            raw_retry = float(exc.retry_after) if exc.retry_after else 0.0
+            sleep_for = max(0.0, min(raw_retry, _BROADCAST_RETRY_AFTER_MAX_S))
+            if raw_retry > _BROADCAST_RETRY_AFTER_MAX_S:
+                log.warning(
+                    "broadcast: 429 from Telegram, retry_after=%ss "
+                    "(capped to %ss; recipient %d of %d)",
+                    raw_retry, sleep_for, i, total,
+                )
+            else:
+                log.warning(
+                    "broadcast: 429 from Telegram, retry_after=%ss "
+                    "(recipient %d of %d)",
+                    raw_retry, i, total,
+                )
+            await asyncio.sleep(sleep_for)
             try:
                 await bot.send_message(chat_id=chat_id, text=text)
                 sent += 1
@@ -843,11 +896,12 @@ async def _do_broadcast(
             await asyncio.sleep(_BROADCAST_DELAY_S)
 
     log.info(
-        "broadcast: admin=%s sent=%d blocked=%d failed=%d total=%d",
-        admin_id, sent, blocked, failed, total,
+        "broadcast: admin=%s sent=%d blocked=%d failed=%d total=%d "
+        "cancelled=%s",
+        admin_id, sent, blocked, failed, total, cancelled,
     )
     return {"sent": sent, "blocked": blocked, "failed": failed,
-            "total": total}
+            "total": total, "cancelled": cancelled}
 
 
 @router.message(Command("admin_broadcast"))

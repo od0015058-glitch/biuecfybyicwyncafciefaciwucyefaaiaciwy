@@ -1,0 +1,63 @@
+{% extends "_layout.html" %}
+
+{% block title %}2FA setup{% endblock %}
+
+{% block main %}
+<h2>Two-factor authentication</h2>
+
+{% if is_suggestion %}
+<div class="alert alert-warn">
+  <strong>2FA is currently disabled.</strong>
+  Below is a freshly-generated secret you can copy into
+  <code>ADMIN_2FA_SECRET</code> in your <code>.env</code> file. Restart
+  the bot to activate. Each page reload generates a new suggestion —
+  copy the value before navigating away.
+</div>
+{% else %}
+<div class="alert" style="background: rgba(74, 222, 128, 0.08); border: 1px solid var(--success); color: var(--success);">
+  <strong>2FA is currently enabled.</strong>
+  The QR / secret below matches the value in
+  <code>ADMIN_2FA_SECRET</code>. Re-scan to add another device.
+</div>
+{% endif %}
+
+<div class="panel">
+  <h3>1. Scan the QR with your authenticator app</h3>
+  <div style="background: white; display: inline-block; padding: 12px; border-radius: 6px;">
+    {{ qr_svg|safe }}
+  </div>
+  <p class="muted" style="margin-top: 12px;">
+    Issuer: <code>{{ issuer }}</code> &middot; Account: <code>admin</code>
+  </p>
+</div>
+
+<div class="panel">
+  <h3>2. Or enter the secret manually</h3>
+  <p>Most authenticators let you type the secret instead of scanning
+  the QR. Group of four characters for readability:</p>
+  <pre style="background: var(--bg); padding: 12px; border-radius: 6px; font-size: 16px; letter-spacing: 0.05em;"><code>{% for chunk in secret|batch(4) %}{{ chunk|join('') }}{% if not loop.last %} {% endif %}{% endfor %}</code></pre>
+  <p class="muted">
+    Algorithm: SHA-1 &middot; Digits: 6 &middot; Period: 30 s
+  </p>
+</div>
+
+<div class="panel">
+  <h3>3. Or use the otpauth:// URI</h3>
+  <p>If your authenticator imports URIs directly (e.g. 1Password,
+  Bitwarden), copy this:</p>
+  <pre style="background: var(--bg); padding: 12px; border-radius: 6px; word-break: break-all; white-space: pre-wrap;"><code>{{ uri }}</code></pre>
+</div>
+
+{% if is_suggestion %}
+<div class="panel">
+  <h3>4. Activate it</h3>
+  <ol>
+    <li>Copy the secret above.</li>
+    <li>Set <code>ADMIN_2FA_SECRET</code> in your <code>.env</code>:
+      <pre style="background: var(--bg); padding: 8px; border-radius: 4px;"><code>ADMIN_2FA_SECRET={{ secret }}</code></pre>
+    </li>
+    <li>Restart the bot — the next login will require a TOTP code.</li>
+  </ol>
+</div>
+{% endif %}
+{% endblock %}

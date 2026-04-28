@@ -156,6 +156,15 @@
     </div>
     <button type="submit" class="primary">Apply</button>
     <a class="reset" href="/admin/transactions">Reset</a>
+    {# Stage-9-Step-7: CSV export. Honours the same filters by
+       carrying them in the query string. ``download`` hint nudges
+       browsers that ignore Content-Disposition. #}
+    <a class="reset"
+       href="/admin/transactions?{{ csv_query }}"
+       download
+       title="Export the filtered ledger as a CSV file (full result, not just this page)">
+      ⬇ Export CSV
+    </a>
   </form>
 
   {% if result.rows %}
@@ -190,9 +199,9 @@
         <td><code class="mono">{{ r.currency }}</code></td>
         <td class="amount">
           {% if r.amount_usd < 0 %}
-          <span style="color:#f87171">-${{ "{:,.4f}".format(-r.amount_usd) }}</span>
+          <span style="color:#f87171">{{ r.amount_usd | format_usd }}</span>
           {% else %}
-          ${{ "{:,.4f}".format(r.amount_usd) }}
+          {{ r.amount_usd | format_usd }}
           {% endif %}
         </td>
         <td><span class="status-pill status-{{ r.status }}">{{ r.status }}</span></td>

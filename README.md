@@ -47,6 +47,15 @@ NowPayments crypto invoices.
   table. View the feed at `${WEBHOOK_BASE_URL}/admin/audit` with
   optional action/actor filters. Audit writes are best-effort — a
   failed audit insert never blocks the underlying admin operation.
+- **TOTP / 2FA on admin login** — set `ADMIN_2FA_SECRET` to a base32
+  string and `/admin/login` will require a 6-digit code from your
+  authenticator app (Google Authenticator, Authy, 1Password,
+  Bitwarden) in addition to `ADMIN_PASSWORD`. The check runs *after*
+  the password compare so an attacker without the password can't use
+  the form to brute-force the TOTP code. Provision a fresh secret at
+  `${WEBHOOK_BASE_URL}/admin/enroll_2fa` (renders an inline-SVG QR
+  + the manual key + an `otpauth://` URI). Leave `ADMIN_2FA_SECRET`
+  unset to keep the existing password-only login flow.
 
 For the full project history, file map, and roadmap **read [HANDOFF.md](./HANDOFF.md)**.
 
@@ -121,6 +130,12 @@ To roll back: `docker compose down && git checkout <previous-sha> && docker comp
      `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
      Set `ADMIN_COOKIE_SECURE=0` ONLY when running over plain HTTP
      locally — the default is HTTPS-only.
+   - `ADMIN_2FA_SECRET` (optional) — base32 TOTP secret. When set,
+     `/admin/login` requires a 6-digit code from your authenticator
+     app in addition to `ADMIN_PASSWORD`. Provision via
+     `${WEBHOOK_BASE_URL}/admin/enroll_2fa` after first login.
+     `ADMIN_2FA_ISSUER` (default `Meowassist Admin`) labels the entry
+     in the authenticator app.
    - `TRUST_PROXY_HEADERS=1` if the bot runs behind a reverse proxy
      (Cloudflare Tunnel, nginx, Caddy). When set, the per-IP rate
      limiters (webhook + `/admin/login`) key on the leftmost
@@ -153,7 +168,9 @@ pytest tests/
 | `main.py` | Entrypoint. Boots aiogram dispatcher, registers middleware, calls `bot_commands.publish_bot_commands` to overwrite BotFather's slash-command list, starts the IPN HTTP listener. |
 | `bot_commands.py` | Canonical Telegram slash-command publisher. `PUBLIC_COMMANDS` (everyone sees) + `ADMIN_COMMANDS` (per-admin via `BotCommandScopeChat`). Idempotent; errors are logged and swallowed so a transient network blip during startup doesn't take the bot down. |
 | `database.py` | asyncpg pool + every SQL query. Money methods use `SELECT … FOR UPDATE` inside connection-scoped transactions. |
+| `payments.py` | NowPayments invoice creation, IPN verification (HMAC-SHA512), idempotent finalize, partial-payment crediting. IPN replay-dedupe via `payment_status_transitions` (`UNIQUE(gateway_invoice_id, payment_status)`) — duplicate `(invoice, status)` deliveries drop with a 200 before any state mutation. Per-process drop counters (`bad_signature`, `bad_json`, `missing_payment_id`, `replay`) exposed via `get_ipn_drop_counters()` for ops dashboards. |
 | `payments.py` | NowPayments invoice creation, IPN verification (HMAC-SHA512), idempotent finalize, partial-payment crediting. |
+| `pending_expiration.py` | Background reaper task. Wakes every `PENDING_EXPIRATION_INTERVAL_MIN` (default 15) minutes, calls `Database.expire_stale_pending` to flip stuck `PENDING` rows older than `PENDING_EXPIRATION_HOURS` (default 24) to `EXPIRED`, drops a `payment_expired` audit row (`actor="reaper"`), and pings the affected user. `TelegramForbiddenError` / `TelegramBadRequest` are swallowed. Spawned by `main.main` after the webhook server, cancelled cleanly on shutdown. |
 | `handlers.py` | All aiogram handlers — `/start`, hub UI, charge flow, model picker, language picker, support. |
 | `ai_engine.py` | OpenRouter call, cost calc, balance deduct, optional conversation memory. |
 | `pricing.py` | Per-model price table + `COST_MARKUP` env var (default 1.5×). |
@@ -164,6 +181,11 @@ pytest tests/
 | `admin.py` | Telegram-side admin commands gated on `ADMIN_USER_IDS`: `/admin`, `/admin_metrics`, `/admin_balance`, `/admin_credit`, `/admin_debit`, `/admin_promo_create`, `/admin_promo_list`, `/admin_promo_revoke`, `/admin_broadcast`. |
 | `web_admin.py` | aiohttp + jinja2 web admin panel mounted under `/admin/` on the same web server that serves `/nowpayments-webhook`. HMAC-cookie auth via `ADMIN_PASSWORD` / `ADMIN_SESSION_SECRET`. CSRF-protected POST forms + signed flash-cookie banners. Login + dashboard + promo codes UI + gift codes UI + users UI + **per-user AI usage log browser** (`/admin/users/{id}/usage` with lifetime aggregates + paginated last-N calls) + **broadcast UI with live-progress polling** + **paginated transactions browser** + **editable bot text** (`/admin/strings`) shipped. |
 | `templates/admin/` | Jinja2 templates for the web admin (login, dashboard, promos, gifts, users, user_detail, user_usage, broadcast, broadcast_detail, transactions, strings, string_detail). |
+| `web_admin.py` | aiohttp + jinja2 web admin panel mounted under `/admin/` on the same web server that serves `/nowpayments-webhook`. HMAC-cookie auth via `ADMIN_PASSWORD` / `ADMIN_SESSION_SECRET`. CSRF-protected POST forms + signed flash-cookie banners. Login + dashboard + promo codes UI + gift codes UI + users UI + **broadcast UI with live-progress polling** + **paginated transactions browser with streamed CSV export** (`/admin/transactions?format=csv` honours all filters, RFC 4180 quoted, audited as `transactions_export_csv`) + **editable bot text** (`/admin/strings`) shipped. |
+| `formatting.py` | Single canonical USD formatter — `format_usd(value, places=4)` returns `"$1,234.5678"` (4 decimal places, comma-grouped, leading-minus for negatives). Wired as a Jinja2 filter (`{{ value \| format_usd }}` / `{{ value \| format_usd(2) }}`) so every admin template uses the same precision, replacing the ad-hoc `:,.4f` / `:,.2f` / `:.4f` mix that pre-Step-7 made cross-page auditing painful. |
+| `templates/admin/` | Jinja2 templates for the web admin (login, dashboard, promos, gifts, users, user_detail, broadcast, broadcast_detail, transactions, strings, string_detail). |
+| `web_admin.py` | aiohttp + jinja2 web admin panel mounted under `/admin/` on the same web server that serves `/nowpayments-webhook`. HMAC-cookie auth via `ADMIN_PASSWORD` / `ADMIN_SESSION_SECRET`, optional TOTP / 2FA via `ADMIN_2FA_SECRET` (Stage-9-Step-3). CSRF-protected POST forms + signed flash-cookie banners. Login + dashboard + promo codes UI + gift codes UI + users UI + **broadcast UI with live-progress polling** + **paginated transactions browser** + **editable bot text** (`/admin/strings`) + **audit log** + **2FA enrolment helper** (`/admin/enroll_2fa`) shipped. |
+| `templates/admin/` | Jinja2 templates for the web admin (login, dashboard, promos, gifts, users, user_detail, broadcast, broadcast_detail, transactions, strings, string_detail, audit, enroll_2fa). |
 | `alembic/` | Schema migrations. `alembic upgrade head` runs idempotently in `entrypoint.sh` on every container start. New schema changes: `alembic revision -m "..."`. |
 
 ## License / contributing

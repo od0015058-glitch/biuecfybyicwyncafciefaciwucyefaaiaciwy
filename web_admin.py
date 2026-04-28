@@ -58,6 +58,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import io
 import logging
 import os
 import secrets
@@ -67,6 +68,9 @@ from typing import Awaitable, Callable
 
 import aiohttp_jinja2
 import jinja2
+import pyotp
+import qrcode
+import qrcode.image.svg as qrsvg
 from aiohttp import web
 
 # Imported for the class-level ``TRANSACTIONS_GATEWAY_VALUES`` /
@@ -76,6 +80,7 @@ from aiohttp import web
 # still works against the injected DB in tests.
 import strings as bot_strings_module
 from database import Database
+from formatting import format_usd
 from rate_limit import (
     client_ip_for_rate_limit,
     consume_login_token,
@@ -101,6 +106,14 @@ APP_KEY_TTL_HOURS: web.AppKey = web.AppKey("admin_ttl_hours", int)
 APP_KEY_COOKIE_SECURE: web.AppKey = web.AppKey("admin_cookie_secure", bool)
 APP_KEY_DB: web.AppKey = web.AppKey("admin_db", object)
 APP_KEY_INSTALLED: web.AppKey = web.AppKey("admin_routes_installed", bool)
+# Stage-9-Step-3: optional TOTP / 2FA. ``APP_KEY_TOTP_SECRET`` carries
+# the configured base32 secret (empty = 2FA disabled, login is
+# password-only and backwards-compatible). ``APP_KEY_TOTP_ISSUER`` is
+# the human label baked into the otpauth:// URI so the entry shows up
+# in authenticator apps as "Meowassist Admin: admin" rather than a
+# bare hostname.
+APP_KEY_TOTP_SECRET: web.AppKey = web.AppKey("admin_totp_secret", str)
+APP_KEY_TOTP_ISSUER: web.AppKey = web.AppKey("admin_totp_issuer", str)
 # Stage-8-Part-5: the aiogram ``Bot`` used by the broadcast page's
 # background task to send Telegram messages. Optional — handlers
 # render a friendly banner and refuse to start jobs when it's absent
@@ -216,6 +229,111 @@ def verify_cookie(
 
 
 # ---------------------------------------------------------------------
+# TOTP / 2FA helpers (Stage-9-Step-3)
+# ---------------------------------------------------------------------
+
+
+# RFC-6238 advises a one-step (±30 s) tolerance window so an honest
+# code that ticks over while the form is in flight still verifies.
+# Anything wider hands free codes to a brute-forcer; pyotp's default
+# is 0 (exact match). We pin the value explicitly so a future pyotp
+# release can't widen it on us.
+TOTP_VALID_WINDOW = 1
+
+
+def _normalize_totp_secret(secret: str) -> str:
+    """Return *secret* uppercased + de-spaced (authenticator-app friendly).
+
+    Authenticators format secrets as space-separated 4-char chunks for
+    readability; operators paste those raw into ``ADMIN_2FA_SECRET``
+    and end up with verification failures. Strip whitespace + uppercase
+    so a copy-pasted ``"abcd efgh ijkl mnop"`` still works.
+    """
+    return "".join(secret.split()).upper()
+
+
+def validate_totp_secret(secret: str) -> str:
+    """Return the normalized base32 secret or raise ``ValueError``.
+
+    Empty / whitespace-only input means "2FA disabled" — return ``""``
+    so the caller can short-circuit. Any non-empty value must base32-
+    decode cleanly with at least 80 bits of entropy (16 base32 chars =
+    80 bits, the RFC-4226 floor). We deliberately reject shorter
+    strings even though pyotp would accept them, because a 6-char
+    "secret" is brute-forceable in seconds.
+    """
+    if not secret or not secret.strip():
+        return ""
+    norm = _normalize_totp_secret(secret)
+    if len(norm) < 16:
+        raise ValueError(
+            "ADMIN_2FA_SECRET must be at least 16 base32 characters "
+            "(≥ 80 bits of entropy). Generate a fresh one with "
+            "pyotp.random_base32() or copy the value from "
+            "/admin/enroll_2fa."
+        )
+    try:
+        # ``casefold=True`` lets lowercase secrets decode; we already
+        # uppercased above but keep the flag for defence in depth.
+        base64.b32decode(norm, casefold=True)
+    except (ValueError, TypeError, base64.binascii.Error) as exc:
+        raise ValueError(
+            "ADMIN_2FA_SECRET is not a valid base32 string. Use only "
+            "the characters A-Z and 2-7 (padding optional) — generate "
+            "a fresh one at /admin/enroll_2fa."
+        ) from exc
+    return norm
+
+
+def verify_totp_code(secret: str, submitted: str) -> bool:
+    """Return True iff *submitted* is the current TOTP for *secret*.
+
+    Wraps ``pyotp.TOTP.verify`` so the rest of the module never has
+    to think about pyotp directly. ``submitted`` is normalized
+    (whitespace stripped, but case preserved — TOTP codes are
+    digits only) before dispatch so a stray space copied with the
+    code still verifies.
+    """
+    if not secret or not submitted:
+        return False
+    cleaned = "".join(submitted.split())
+    if not cleaned.isdigit() or len(cleaned) != 6:
+        return False
+    try:
+        return bool(
+            pyotp.TOTP(secret).verify(cleaned, valid_window=TOTP_VALID_WINDOW)
+        )
+    except Exception:
+        # Defence in depth: a malformed secret should never crash the
+        # request — the startup guard already validates the secret,
+        # but if a future code path mutates it we'd rather refuse the
+        # login than 500.
+        log.exception("verify_totp_code: pyotp raised on submitted code")
+        return False
+
+
+def build_otpauth_uri(secret: str, *, issuer: str, account: str = "admin") -> str:
+    """Render a standard ``otpauth://totp/...`` provisioning URI."""
+    return pyotp.TOTP(secret).provisioning_uri(name=account, issuer_name=issuer)
+
+
+def render_qr_svg(uri: str) -> str:
+    """Render a self-contained inline SVG QR for *uri*.
+
+    Uses ``qrcode.image.svg.SvgPathImage`` so we don't pull in Pillow
+    just to ship one image. The returned string is safe to drop into
+    a Jinja template via the ``|safe`` filter.
+    """
+    qr = qrcode.QRCode(box_size=8, border=2)
+    qr.add_data(uri)
+    qr.make(fit=True)
+    img = qr.make_image(image_factory=qrsvg.SvgPathImage)
+    buf = io.BytesIO()
+    img.save(buf)
+    return buf.getvalue().decode("utf-8")
+
+
+# ---------------------------------------------------------------------
 # Auth middleware / decorator
 # ---------------------------------------------------------------------
 
@@ -261,13 +379,20 @@ async def login_get(request: web.Request) -> web.StreamResponse:
     if request.get(REQUEST_KEY_AUTHED, False):
         return web.HTTPFound(location="/admin/")
     return aiohttp_jinja2.render_template(
-        "login.html", request, {"error": None}
+        "login.html",
+        request,
+        {
+            "error": None,
+            "show_2fa_field": bool(request.app.get(APP_KEY_TOTP_SECRET, "")),
+        },
     )
 
 
 async def login_post(request: web.Request) -> web.StreamResponse:
     expected = request.app.get(APP_KEY_PASSWORD, "")
     secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    totp_secret = request.app.get(APP_KEY_TOTP_SECRET, "")
+    show_2fa = bool(totp_secret)
     ttl_hours = request.app.get(APP_KEY_TTL_HOURS, DEFAULT_TTL_HOURS)
     secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
 
@@ -282,7 +407,10 @@ async def login_post(request: web.Request) -> web.StreamResponse:
         return aiohttp_jinja2.render_template(
             "login.html",
             request,
-            {"error": "Admin panel is not configured. Set ADMIN_PASSWORD and ADMIN_SESSION_SECRET."},
+            {
+                "error": "Admin panel is not configured. Set ADMIN_PASSWORD and ADMIN_SESSION_SECRET.",
+                "show_2fa_field": show_2fa,
+            },
             status=500,
         )
 
@@ -307,7 +435,10 @@ async def login_post(request: web.Request) -> web.StreamResponse:
         return aiohttp_jinja2.render_template(
             "login.html",
             request,
-            {"error": "Too many login attempts. Please wait a minute."},
+            {
+                "error": "Too many login attempts. Please wait a minute.",
+                "show_2fa_field": show_2fa,
+            },
             status=429,
         )
 
@@ -331,9 +462,38 @@ async def login_post(request: web.Request) -> web.StreamResponse:
         return aiohttp_jinja2.render_template(
             "login.html",
             request,
-            {"error": "Wrong password."},
+            {"error": "Wrong password.", "show_2fa_field": show_2fa},
             status=401,
         )
+
+    # Stage-9-Step-3: optional second factor. Gate on TOTP secret so
+    # password-only deploys are unchanged; when configured, the 2FA
+    # check runs AFTER the password compare so an attacker without
+    # the password gets a generic "Wrong password" error and can't
+    # use the form to brute-force the 6-digit code in isolation.
+    if totp_secret:
+        submitted_code = str(form.get("code", ""))
+        if not verify_totp_code(totp_secret, submitted_code):
+            reason = "missing_2fa" if not submitted_code.strip() else "bad_2fa"
+            log.warning(
+                "admin login: %s key=%s remote=%s",
+                reason, client_key, request.remote,
+            )
+            await _record_audit_safe(
+                request,
+                "login_deny",
+                outcome="deny",
+                meta={"reason": reason},
+            )
+            return aiohttp_jinja2.render_template(
+                "login.html",
+                request,
+                {
+                    "error": "Invalid 2FA code.",
+                    "show_2fa_field": show_2fa,
+                },
+                status=401,
+            )
 
     expires_at = datetime.now(timezone.utc) + timedelta(hours=ttl_hours)
     cookie_value = sign_cookie(expires_at, secret=secret)
@@ -428,6 +588,7 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     "broadcast_start": "Broadcast started",
     "string_save": "Bot text override saved",
     "string_revert": "Bot text override reverted",
+    "enroll_2fa_view": "2FA enrolment page viewed",
 }
 
 
@@ -1895,6 +2056,13 @@ def _new_broadcast_job(
         "created_at": _now_iso(),
         "started_at": None,
         "completed_at": None,
+        # Stage-9-Step-6 soft-cancel flag. Set by
+        # ``broadcast_cancel_post``; polled by ``_do_broadcast`` at
+        # the top of every send. ``False`` means the job was never
+        # cancelled; if the flag was set but the loop already drained
+        # to completion the resulting state stays ``"completed"`` —
+        # cancellation is best-effort, not retroactive.
+        "cancel_requested": False,
     }
 
 
@@ -1909,7 +2077,7 @@ def _store_broadcast_job(app: web.Application, job: dict) -> None:
     if len(jobs) > BROADCAST_MAX_HISTORY:
         terminal = [
             jid for jid, j in jobs.items()
-            if j["state"] in ("completed", "failed")
+            if j["state"] in ("completed", "failed", "cancelled")
             and jid != job["id"]
         ]
         # Evict oldest terminal jobs first. ``jobs`` is insertion-
@@ -1975,6 +2143,12 @@ async def _run_broadcast_job(
         job["blocked"] = stats["blocked"]
         job["failed"] = stats["failed"]
 
+    def _cancel_requested() -> bool:
+        # Stage-9-Step-6: ``broadcast_cancel_post`` flips this flag in
+        # the live job dict. Polled at the top of every send loop in
+        # ``admin._do_broadcast``; honoured within one pacing tick.
+        return bool(job.get("cancel_requested"))
+
     try:
         # Import locally so a test that doesn't need admin.py
         # (e.g. pure form-parser tests) doesn't pay the aiogram
@@ -1987,6 +2161,7 @@ async def _run_broadcast_job(
             text=text,
             admin_id=0,  # web-admin sentinel — see ADMIN_WEB_SENTINEL_ID
             progress_callback=_on_progress,
+            should_cancel=_cancel_requested,
         )
     except asyncio.CancelledError:
         job["state"] = "failed"
@@ -2000,11 +2175,19 @@ async def _run_broadcast_job(
         job["completed_at"] = _now_iso()
         return
 
-    job["i"] = stats["total"]
+    # ``i`` is the count of recipients we actually attempted — for a
+    # cancelled run that's ``sent + blocked + failed`` (every loop
+    # iteration that didn't bail at the cancel-check), NOT
+    # ``stats["total"]`` which is the recipient list length.
     job["sent"] = stats["sent"]
     job["blocked"] = stats["blocked"]
     job["failed"] = stats["failed"]
-    job["state"] = "completed"
+    if stats.get("cancelled"):
+        job["i"] = stats["sent"] + stats["blocked"] + stats["failed"]
+        job["state"] = "cancelled"
+    else:
+        job["i"] = stats["total"]
+        job["state"] = "completed"
     job["completed_at"] = _now_iso()
 
 
@@ -2145,6 +2328,8 @@ async def broadcast_detail_get(request: web.Request) -> web.StreamResponse:
         {
             "active_page": "broadcast",
             "job": dict(job),
+            # Stage-9-Step-6: CSRF token for the cancel-button form.
+            "csrf_token": csrf_token_for(request),
         },
     )
 
@@ -2160,6 +2345,114 @@ async def broadcast_status_get(request: web.Request) -> web.StreamResponse:
     # Snapshot before handing to json_response so a concurrent
     # writer can't mutate mid-serialize.
     return web.json_response(dict(job))
+
+
+async def broadcast_cancel_post(request: web.Request) -> web.StreamResponse:
+    """POST /admin/broadcast/{job_id}/cancel — flip the soft-cancel flag.
+
+    Stage-9-Step-6. The cancel is *cooperative* — we just set
+    ``job["cancel_requested"] = True`` in the in-memory job dict.
+    The running ``_do_broadcast`` loop polls this flag at the top of
+    each iteration and exits cleanly within one pacing tick. The
+    background task itself is NOT ``task.cancel()``-ed because
+    ``CancelledError`` mid-send would be counted as a failure for a
+    recipient who actually received the message.
+
+    Idempotent: a second cancel on an already-cancelled job is a
+    no-op redirect with no audit double-write. Refuses with a flash
+    error on terminal-state jobs (``completed`` / ``failed`` /
+    already ``cancelled``).
+    """
+    job_id = request.match_info.get("job_id", "")
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    back = web.HTTPFound(location=f"/admin/broadcast/{job_id}")
+
+    form = await request.post()
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning(
+            "broadcast_cancel_post: CSRF token mismatch from %s",
+            request.remote,
+        )
+        set_flash(
+            back,
+            kind="error",
+            message="Form submission was rejected (CSRF). Refresh and try again.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return back
+
+    job = request.app[APP_KEY_BROADCAST_JOBS].get(job_id)
+    if job is None:
+        # Don't redirect into a 404 detail page; bounce to the index.
+        response = web.HTTPFound(location="/admin/broadcast")
+        set_flash(
+            response,
+            kind="error",
+            message=(
+                f"Broadcast job '{job_id}' not found "
+                "(it may have been evicted from the in-memory registry)."
+            ),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    if job["state"] not in ("queued", "running"):
+        set_flash(
+            back,
+            kind="error",
+            message=(
+                f"Cannot cancel a {job['state']} broadcast — only "
+                "queued or running jobs can be cancelled."
+            ),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return back
+
+    if job.get("cancel_requested"):
+        # Already in the cancellation window; don't re-audit.
+        set_flash(
+            back,
+            kind="info",
+            message=(
+                "Cancel already requested — the worker will exit at the "
+                "next loop iteration."
+            ),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return back
+
+    job["cancel_requested"] = True
+    log.info(
+        "broadcast_cancel_post: cancel requested for job=%s "
+        "(state=%s, sent=%d/%d)",
+        job_id, job["state"], job.get("sent", 0), job.get("total", 0),
+    )
+    await _record_audit_safe(
+        request,
+        "broadcast_cancel",
+        target=f"broadcast:{job_id}",
+        meta={
+            "state_at_cancel": job["state"],
+            "sent_at_cancel": job.get("sent", 0),
+            "total": job.get("total", 0),
+        },
+    )
+    set_flash(
+        back,
+        kind="info",
+        message=(
+            "Cancel requested — the worker will stop at the next "
+            "recipient (within ~1 second)."
+        ),
+        secret=secret,
+        cookie_secure=cookie_secure,
+    )
+    return back
 
 
 # ---------------------------------------------------------------------
@@ -2268,8 +2561,208 @@ def _encode_tx_query(filters: dict, *, page: int | None = None) -> str:
     return urlencode(params)
 
 
+# Stage-9-Step-7: page size used by the CSV streamer.
+# 500 rows ≈ 100 KB after CSV serialization — small enough that we
+# don't pin the asyncpg connection for too long on a single page,
+# big enough that we don't pay round-trip overhead for every row.
+TRANSACTIONS_CSV_BATCH_SIZE = 500
+# Defence-in-depth: refuse a CSV export beyond this many rows so a
+# pathological filter ("everything ever") can't lock the connection
+# pool indefinitely. 500k rows ≈ 100 MB CSV which is already past
+# what a browser-side download will gracefully handle.
+TRANSACTIONS_CSV_MAX_ROWS = 500_000
+
+# Header row is hoisted to a module constant so the test can pin it
+# without copy-pasting the column list. Order MUST match the values
+# yielded in :func:`transactions_csv_get`.
+TRANSACTIONS_CSV_HEADERS = (
+    "transaction_id",
+    "telegram_id",
+    "gateway",
+    "currency",
+    "amount_crypto_or_rial",
+    "amount_usd",
+    "status",
+    "gateway_invoice_id",
+    "created_at",
+    "completed_at",
+    "notes",
+)
+
+
+def _csv_quote(value) -> str:
+    """Minimal RFC 4180 CSV field encoder.
+
+    We could use the stdlib ``csv`` module here but ``csv.writer``
+    expects a writable text-IO target; for streaming we want to emit
+    one row at a time as a string and let aiohttp handle the
+    transport. Hand-rolling keeps the streamer trivially testable
+    and avoids the ``StringIO`` allocation per batch. None ⇒ empty
+    field.
+    """
+    if value is None:
+        return ""
+    s = str(value)
+    if any(ch in s for ch in ('"', ",", "\n", "\r")):
+        # Double up internal quotes, then wrap.
+        return '"' + s.replace('"', '""') + '"'
+    return s
+
+
+def _format_tx_row_for_csv(row: dict) -> str:
+    """Serialize one row from ``Database.list_transactions['rows']``
+    into a single CSV line (with trailing CRLF).
+
+    Numeric ``amount_usd`` is emitted with **4 decimal places, no
+    commas, no dollar sign** — CSV is a machine-readable format and
+    accounting software (Excel, QuickBooks) will reject ``$1,234``
+    but happily import ``1234.5678``. The 4-decimal precision matches
+    the in-UI ``format_usd`` default so a manual reconciliation
+    against the on-screen ledger is exact.
+    """
+    fields = [
+        row["id"],
+        row["telegram_id"] if row["telegram_id"] is not None else "",
+        row["gateway"],
+        row["currency"],
+        f"{row['amount_crypto_or_rial']}" if row["amount_crypto_or_rial"] is not None else "",
+        f"{row['amount_usd']:.4f}",
+        row["status"],
+        row["gateway_invoice_id"] or "",
+        row["created_at"] or "",
+        row["completed_at"] or "",
+        row["notes"] or "",
+    ]
+    return ",".join(_csv_quote(f) for f in fields) + "\r\n"
+
+
+async def transactions_csv_get(request: web.Request) -> web.StreamResponse:
+    """GET /admin/transactions?format=csv — streamed CSV export.
+
+    Stage-9-Step-7. Same filter semantics as the HTML page (gateway,
+    status, telegram_id) but pagination params are ignored — a CSV
+    export is always full-result. Streamed via aiohttp
+    :class:`StreamResponse` in batches of
+    ``TRANSACTIONS_CSV_BATCH_SIZE`` so even a 500k-row export
+    doesn't blow the bot's memory.
+    """
+    db = request.app[APP_KEY_DB]
+    filters = parse_transactions_query(request.rel_url.query)
+
+    response = web.StreamResponse(
+        status=200,
+        reason="OK",
+        headers={
+            "Content-Type": "text/csv; charset=utf-8",
+            # Filename includes the timestamp so an admin running
+            # multiple exports doesn't accidentally overwrite an
+            # in-progress download. ``transactions-YYYYMMDDTHHMMSSZ.csv``.
+            "Content-Disposition": (
+                "attachment; "
+                f"filename=\"transactions-{_now_compact()}.csv\""
+            ),
+            # Defence-in-depth: explicitly disable any caching layer
+            # between the bot and the admin's browser. A cached CSV
+            # would leak ledger data to a later admin session that
+            # logged in to the same machine.
+            "Cache-Control": "no-store, max-age=0",
+        },
+    )
+    await response.prepare(request)
+
+    # Header row first.
+    header = ",".join(_csv_quote(h) for h in TRANSACTIONS_CSV_HEADERS) + "\r\n"
+    await response.write(header.encode("utf-8"))
+
+    page = 1
+    rows_emitted = 0
+    while True:
+        try:
+            page_result = await db.list_transactions(
+                gateway=filters["gateway"],
+                status=filters["status"],
+                telegram_id=filters["telegram_id"],
+                page=page,
+                per_page=TRANSACTIONS_CSV_BATCH_SIZE,
+            )
+        except ValueError:
+            # Filters were already enum-validated by
+            # parse_transactions_query, so reaching this branch means
+            # the DB layer added a new validation rule mid-export.
+            # Truncate cleanly rather than raising; the partial CSV
+            # is still useful for forensics.
+            log.warning(
+                "transactions_csv_get: list_transactions rejected "
+                "filters=%s mid-export",
+                filters,
+            )
+            break
+
+        rows = page_result.get("rows", [])
+        if not rows:
+            break
+
+        chunk_lines: list[str] = []
+        for row in rows:
+            chunk_lines.append(_format_tx_row_for_csv(row))
+            rows_emitted += 1
+            if rows_emitted >= TRANSACTIONS_CSV_MAX_ROWS:
+                log.warning(
+                    "transactions_csv_get: reached cap of %d rows "
+                    "for filters=%s — truncating",
+                    TRANSACTIONS_CSV_MAX_ROWS, filters,
+                )
+                break
+        await response.write("".join(chunk_lines).encode("utf-8"))
+
+        if rows_emitted >= TRANSACTIONS_CSV_MAX_ROWS:
+            break
+        if page >= page_result.get("total_pages", 0):
+            break
+        page += 1
+
+    await response.write_eof()
+
+    # Audit the export (best-effort; never break the response over a
+    # failed audit insert).
+    await _record_audit_safe(
+        request,
+        "transactions_export_csv",
+        target="transactions",
+        meta={
+            "rows": rows_emitted,
+            "filters": {
+                "gateway": filters.get("gateway"),
+                "status": filters.get("status"),
+                "telegram_id": filters.get("telegram_id"),
+            },
+        },
+    )
+    log.info(
+        "transactions_csv_get: exported %d rows for filters=%s",
+        rows_emitted, filters,
+    )
+    return response
+
+
+def _now_compact() -> str:
+    """``20260101T120000Z`` style timestamp for CSV filenames.
+
+    Hoisted out of ``transactions_csv_get`` so a future caller
+    needing the same shape (e.g. ledger-snapshot dump) can reuse it.
+    """
+    return datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
 async def transactions_get(request: web.Request) -> web.StreamResponse:
-    """GET /admin/transactions — paginated ledger browser."""
+    """GET /admin/transactions — paginated ledger browser.
+
+    Special-cases ``?format=csv`` to delegate to the streaming CSV
+    exporter (see :func:`transactions_csv_get`).
+    """
+    if request.rel_url.query.get("format", "").lower() == "csv":
+        return await transactions_csv_get(request)
+
     db = request.app[APP_KEY_DB]
     filters = parse_transactions_query(request.rel_url.query)
 
@@ -2309,6 +2802,14 @@ async def transactions_get(request: web.Request) -> web.StreamResponse:
         q = _encode_tx_query(filters, page=page_result["page"] + 1)
         next_url = f"/admin/transactions?{q}" if q else "/admin/transactions"
 
+    # Stage-9-Step-7: pre-build the CSV-export query string. Same
+    # filters as the page, plus ``format=csv`` and explicitly NO
+    # pagination params (CSV exports the whole filtered set).
+    csv_query_parts = _encode_tx_query({**filters, "page": 1})
+    csv_query = (
+        csv_query_parts + "&format=csv" if csv_query_parts else "format=csv"
+    )
+
     return aiohttp_jinja2.render_template(
         "transactions.html",
         request,
@@ -2321,6 +2822,7 @@ async def transactions_get(request: web.Request) -> web.StreamResponse:
             "gateway_choices": sorted(Database.TRANSACTIONS_GATEWAY_VALUES),
             "status_choices": sorted(Database.TRANSACTIONS_STATUS_VALUES),
             "per_page_choices": TRANSACTIONS_PER_PAGE_CHOICES,
+            "csv_query": csv_query,
         },
     )
 
@@ -3026,6 +3528,59 @@ async def audit_get(request: web.Request) -> web.StreamResponse:
 
 
 # ---------------------------------------------------------------------
+# 2FA enrolment helper page (Stage-9-Step-3)
+# ---------------------------------------------------------------------
+
+
+async def enroll_2fa_get(request: web.Request) -> web.StreamResponse:
+    """Render the TOTP enrolment helper.
+
+    Always behind the admin login. The page does NOT mutate the
+    configured secret — it just renders the operator-friendly view of
+    whatever's currently in ``ADMIN_2FA_SECRET`` (so they can re-scan
+    the QR after losing their device) and, when nothing is configured,
+    suggests a freshly-generated random secret to copy into the env
+    file. Restarting the bot is required to pick the new value up.
+    """
+    issuer = request.app.get(APP_KEY_TOTP_ISSUER, "Meowassist Admin") or "Meowassist Admin"
+    configured_secret = request.app.get(APP_KEY_TOTP_SECRET, "")
+
+    if configured_secret:
+        secret = configured_secret
+        is_suggestion = False
+    else:
+        # No secret on the running app — generate one so the operator
+        # has something to paste into ``ADMIN_2FA_SECRET``. We
+        # deliberately do NOT cache it server-side: the next page load
+        # gets a fresh suggestion. That way an operator who eyeballs
+        # the page without copying the secret can't be locked into a
+        # value an attacker also saw via, e.g., a screenshot in chat.
+        secret = pyotp.random_base32()
+        is_suggestion = True
+
+    uri = build_otpauth_uri(secret, issuer=issuer)
+    qr_svg = render_qr_svg(uri)
+
+    await _record_audit_safe(
+        request,
+        "enroll_2fa_view",
+        meta={"is_suggestion": is_suggestion},
+    )
+    return aiohttp_jinja2.render_template(
+        "enroll_2fa.html",
+        request,
+        {
+            "active_page": "enroll_2fa",
+            "secret": secret,
+            "issuer": issuer,
+            "uri": uri,
+            "qr_svg": qr_svg,
+            "is_suggestion": is_suggestion,
+        },
+    )
+
+
+# ---------------------------------------------------------------------
 # App wiring
 # ---------------------------------------------------------------------
 
@@ -3039,16 +3594,60 @@ def setup_admin_routes(
     ttl_hours: int = DEFAULT_TTL_HOURS,
     cookie_secure: bool = True,
     bot=None,
+    totp_secret: str = "",
+    totp_issuer: str = "Meowassist Admin",
 ) -> None:
     """Mount the admin panel onto *app*.
 
     Called from ``main.start_webhook_server``. Idempotent — refusing
     a second call with a clear log line beats silently overwriting
     state on a hot reload.
+
+    Stage-9-Step-3 bundled bug fix: refuse to start the panel when
+    either ``password`` or ``session_secret`` is *non-empty but
+    whitespace-only* (a common ``ADMIN_PASSWORD=" "`` deploy typo).
+    The previous behaviour stored the whitespace string verbatim and
+    silently rejected every login attempt — operators spent hours
+    debugging "wrong password" before realising they had a stray
+    space in their .env. We still allow truly empty values (so the
+    documented "panel unreachable in dev when env vars unset" path
+    keeps working); only whitespace-only values fail-fast at startup.
+
+    ``totp_secret`` enables optional TOTP / 2FA enforcement on
+    ``/admin/login``. Empty string keeps the password-only flow
+    untouched. Non-empty values are validated as base32 at boot via
+    ``validate_totp_secret`` — invalid input raises ``ValueError``
+    with a clear message rather than failing on first login.
     """
     if app.get(APP_KEY_INSTALLED):
         log.warning("setup_admin_routes called twice — ignoring second call.")
         return
+
+    # Bundled bug fix (Stage-9-Step-3): whitespace-only credentials are
+    # always a deploy typo — surface immediately instead of "panel
+    # unreachable, login refuses everything" half a day later.
+    if password and not password.strip():
+        raise ValueError(
+            "ADMIN_PASSWORD contains only whitespace — refusing to start "
+            "with a half-configured admin panel. Either set a real "
+            "password or leave the variable empty to keep the panel "
+            "disabled."
+        )
+    if session_secret and not session_secret.strip():
+        raise ValueError(
+            "ADMIN_SESSION_SECRET contains only whitespace — refusing to "
+            "start with a half-configured admin panel. Either set a real "
+            "secret (≥32 random chars) or leave the variable empty."
+        )
+
+    # Validate the TOTP secret at boot so a base32 typo is rejected
+    # immediately. Empty input → 2FA disabled (back-compat).
+    try:
+        totp_secret = validate_totp_secret(totp_secret)
+    except ValueError:
+        # Re-raise with context so the deploy log makes the
+        # misconfig obvious without needing to grep into the helper.
+        raise
 
     if not password:
         log.warning(
@@ -3088,6 +3687,21 @@ def setup_admin_routes(
     app[APP_KEY_BOT] = bot
     app[APP_KEY_BROADCAST_JOBS] = {}
     app[APP_KEY_BROADCAST_TASKS] = {}
+    # Stage-9-Step-3: validated TOTP secret (or "" when 2FA disabled).
+    app[APP_KEY_TOTP_SECRET] = totp_secret
+    app[APP_KEY_TOTP_ISSUER] = totp_issuer or "Meowassist Admin"
+    if totp_secret:
+        log.info(
+            "Admin 2FA is ENABLED (issuer=%s). Login requires a 6-digit "
+            "TOTP code in addition to ADMIN_PASSWORD.",
+            app[APP_KEY_TOTP_ISSUER],
+        )
+    else:
+        log.info(
+            "Admin 2FA is disabled (ADMIN_2FA_SECRET unset). Login is "
+            "password-only. Visit /admin/enroll_2fa to provision a "
+            "secret."
+        )
 
     aiohttp_jinja2.setup(
         app,
@@ -3096,6 +3710,10 @@ def setup_admin_routes(
         # being explicit here protects us if a future template ever loses
         # the .html extension.
         autoescape=jinja2.select_autoescape(["html"]),
+        # Stage-9-Step-7: single canonical USD formatter — see
+        # ``formatting.format_usd`` for why the ad-hoc per-template
+        # ``"${:,.4f}".format(...)`` calls were replaced.
+        filters={"format_usd": format_usd},
     )
     app.middlewares.append(admin_auth_middleware)
 
@@ -3159,6 +3777,11 @@ def setup_admin_routes(
         "/admin/broadcast/{job_id}/status",
         _require_auth(broadcast_status_get),
     )
+    # Stage-9-Step-6: soft-cancel for a running/queued broadcast.
+    app.router.add_post(
+        "/admin/broadcast/{job_id}/cancel",
+        _require_auth(broadcast_cancel_post),
+    )
 
     # Stage-8-Part-6: transactions browser (read-only, paginated).
     app.router.add_get(
@@ -3187,6 +3810,16 @@ def setup_admin_routes(
         _require_auth(user_edit_post),
     )
     app.router.add_get("/admin/audit", _require_auth(audit_get))
+
+    # Stage-9-Step-3: TOTP / 2FA enrolment helper. Always behind the
+    # admin login. Operators who haven't configured ADMIN_2FA_SECRET
+    # yet get a freshly-suggested random secret to copy into env;
+    # operators who have already configured one get the QR for the
+    # current value (re-pairing a new device).
+    app.router.add_get(
+        "/admin/enroll_2fa",
+        _require_auth(enroll_2fa_get),
+    )
 
     app[APP_KEY_INSTALLED] = True
     log.info("Web admin routes installed under /admin/")

@@ -158,7 +158,7 @@
             <td><code class="id">{{ t.id }}</code></td>
             <td><code class="code">{{ t.gateway }}</code></td>
             <td class="{% if t.amount_usd >= 0 %}tx-sign-pos{% else %}tx-sign-neg{% endif %}">
-              {% if t.amount_usd >= 0 %}+{% else %}−{% endif %}${{ "{:,.4f}".format(t.amount_usd|abs) }}
+              {% if t.amount_usd >= 0 %}+{% endif %}{{ t.amount_usd | format_usd }}
             </td>
             <td>{{ t.status }}</td>
             <td>{% if t.created_at %}{{ t.created_at[:19] }}Z{% else %}—{% endif %}</td>

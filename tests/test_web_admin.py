@@ -14,8 +14,9 @@ Two flavours of tests:
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -328,6 +329,8 @@ def make_admin_app():
         db=None,
         cookie_secure: bool = False,
         bot=None,
+        totp_secret: str = "",
+        totp_issuer: str = "Meowassist Admin",
     ):
         app = web.Application()
         setup_admin_routes(
@@ -338,6 +341,8 @@ def make_admin_app():
             ttl_hours=24,
             cookie_secure=cookie_secure,
             bot=bot,
+            totp_secret=totp_secret,
+            totp_issuer=totp_issuer,
         )
         return app
 
@@ -516,6 +521,412 @@ async def test_unconfigured_session_secret_refuses_login(
     assert resp.status == 500
     body = await resp.text()
     assert "not configured" in body
+
+
+# ---------------------------------------------------------------------
+# Stage-9-Step-3: bundled bug fix — whitespace-only credentials
+# ---------------------------------------------------------------------
+
+
+def test_setup_admin_routes_rejects_whitespace_password(make_admin_app):
+    """Whitespace-only ADMIN_PASSWORD is the documented deploy typo.
+
+    Pre-fix the value would be stored verbatim and every login attempt
+    silently rejected as "Wrong password" — operators could spend
+    hours debugging a stray space in their .env. Now it raises at
+    boot with a clear message.
+    """
+    with pytest.raises(ValueError, match="ADMIN_PASSWORD"):
+        make_admin_app(password="   ")
+
+
+def test_setup_admin_routes_rejects_whitespace_session_secret(
+    make_admin_app,
+):
+    """Same fail-fast rule for ADMIN_SESSION_SECRET."""
+    with pytest.raises(ValueError, match="ADMIN_SESSION_SECRET"):
+        make_admin_app(password="letmein", session_secret="\t\n ")
+
+
+def test_setup_admin_routes_accepts_truly_empty_credentials(
+    make_admin_app,
+):
+    """Empty (not whitespace) creds keep the documented dev path:
+    panel installs, login refuses. This pins the back-compat boundary.
+    """
+    # Should not raise.
+    app = make_admin_app(password="", session_secret="")
+    from web_admin import APP_KEY_PASSWORD, APP_KEY_SESSION_SECRET
+    assert app[APP_KEY_PASSWORD] == ""
+    assert app[APP_KEY_SESSION_SECRET] == ""
+
+
+# ---------------------------------------------------------------------
+# Stage-9-Step-3: TOTP / 2FA pure-helper tests
+# ---------------------------------------------------------------------
+
+
+def test_validate_totp_secret_empty_returns_empty():
+    from web_admin import validate_totp_secret
+
+    assert validate_totp_secret("") == ""
+    assert validate_totp_secret("   ") == ""
+    assert validate_totp_secret("\t\n") == ""
+
+
+def test_validate_totp_secret_normalizes_whitespace_and_case():
+    """A copy-pasted authenticator-app secret like
+    ``"abcd efgh ijkl mnop"`` should validate and uppercase cleanly.
+    """
+    from web_admin import validate_totp_secret
+
+    norm = validate_totp_secret("abcd efgh ijkl mnop")
+    assert norm == "ABCDEFGHIJKLMNOP"
+
+
+def test_validate_totp_secret_rejects_short_input():
+    """< 16 base32 chars = < 80 bits of entropy = brute-forceable."""
+    from web_admin import validate_totp_secret
+
+    with pytest.raises(ValueError, match="at least 16"):
+        validate_totp_secret("ABCDEFG")
+
+
+def test_validate_totp_secret_rejects_invalid_base32():
+    """Non-base32 chars (1, 8, 9, 0, lowercase l, etc) must fail."""
+    from web_admin import validate_totp_secret
+
+    with pytest.raises(ValueError, match="not a valid base32"):
+        # 16 chars but '!' is not in the base32 alphabet.
+        validate_totp_secret("ABCDEFGHIJKLMNO!")
+
+
+def test_verify_totp_code_accepts_current():
+    import pyotp
+    from web_admin import verify_totp_code
+
+    secret = pyotp.random_base32()
+    code = pyotp.TOTP(secret).now()
+    assert verify_totp_code(secret, code) is True
+
+
+def test_verify_totp_code_strips_whitespace():
+    """Authenticators show codes as ``"123 456"`` for readability;
+    we should accept that.
+    """
+    import pyotp
+    from web_admin import verify_totp_code
+
+    secret = pyotp.random_base32()
+    code = pyotp.TOTP(secret).now()
+    assert verify_totp_code(secret, f"{code[:3]} {code[3:]}") is True
+
+
+def test_verify_totp_code_rejects_empty():
+    from web_admin import verify_totp_code
+
+    assert verify_totp_code("ABCDEFGHIJKLMNOP", "") is False
+    assert verify_totp_code("ABCDEFGHIJKLMNOP", "   ") is False
+
+
+def test_verify_totp_code_rejects_non_digits():
+    from web_admin import verify_totp_code
+
+    assert verify_totp_code("ABCDEFGHIJKLMNOP", "abc123") is False
+    assert verify_totp_code("ABCDEFGHIJKLMNOP", "12345") is False  # 5 digits
+    assert verify_totp_code("ABCDEFGHIJKLMNOP", "1234567") is False  # 7 digits
+
+
+def test_verify_totp_code_rejects_wrong_code():
+    import pyotp
+    from web_admin import verify_totp_code
+
+    secret = pyotp.random_base32()
+    # 000000 is statistically unlikely to be the current code; if it is,
+    # 999999 won't be — try both.
+    now = pyotp.TOTP(secret).now()
+    bad = "000000" if now != "000000" else "999999"
+    assert verify_totp_code(secret, bad) is False
+
+
+def test_verify_totp_code_swallows_pyotp_errors_returns_false(monkeypatch):
+    """If pyotp raises, we refuse the code (don't 500 the request)."""
+    import pyotp
+    from web_admin import verify_totp_code
+
+    class _Boom:
+        def verify(self, *_a, **_k):
+            raise RuntimeError("simulated pyotp failure")
+
+    monkeypatch.setattr(pyotp, "TOTP", lambda secret: _Boom())
+    assert verify_totp_code("ABCDEFGHIJKLMNOP", "123456") is False
+
+
+def test_setup_admin_routes_rejects_invalid_totp_secret(make_admin_app):
+    """Invalid base32 in ADMIN_2FA_SECRET fails at boot — the app must
+    not start with a half-broken 2FA config.
+    """
+    with pytest.raises(ValueError, match="ADMIN_2FA_SECRET"):
+        make_admin_app(totp_secret="not-base32!!!")
+
+
+def test_setup_admin_routes_normalizes_totp_secret(make_admin_app):
+    """A copy-pasted spaced secret is normalized at boot, so the
+    ``APP_KEY_TOTP_SECRET`` value is the canonical base32 string
+    every downstream consumer expects.
+    """
+    from web_admin import APP_KEY_TOTP_SECRET
+
+    app = make_admin_app(totp_secret="abcd efgh ijkl mnop")
+    assert app[APP_KEY_TOTP_SECRET] == "ABCDEFGHIJKLMNOP"
+
+
+# ---------------------------------------------------------------------
+# Stage-9-Step-3: TOTP / 2FA login flow integration
+# ---------------------------------------------------------------------
+
+
+async def test_login_form_omits_2fa_field_when_disabled(
+    aiohttp_client, make_admin_app,
+):
+    """No ADMIN_2FA_SECRET → login form is password-only."""
+    client = await aiohttp_client(make_admin_app())
+    resp = await client.get("/admin/login")
+    body = await resp.text()
+    assert 'name="password"' in body
+    assert 'name="code"' not in body
+
+
+async def test_login_form_includes_2fa_field_when_enabled(
+    aiohttp_client, make_admin_app,
+):
+    """Configured ADMIN_2FA_SECRET → login form prompts for a code."""
+    client = await aiohttp_client(
+        make_admin_app(totp_secret="ABCDEFGHIJKLMNOP")
+    )
+    resp = await client.get("/admin/login")
+    body = await resp.text()
+    assert 'name="password"' in body
+    assert 'name="code"' in body
+    # Hint to mobile keyboards / password managers so the right
+    # autofill kicks in.
+    assert 'autocomplete="one-time-code"' in body
+
+
+async def test_login_with_2fa_rejects_missing_code(
+    aiohttp_client, make_admin_app,
+):
+    """Right password but no code → 401 with no cookie."""
+    client = await aiohttp_client(
+        make_admin_app(password="letmein", totp_secret="ABCDEFGHIJKLMNOP")
+    )
+    resp = await client.post(
+        "/admin/login",
+        data={"password": "letmein"},
+        allow_redirects=False,
+    )
+    assert resp.status == 401
+    body = await resp.text()
+    assert "Invalid 2FA code" in body
+    assert COOKIE_NAME not in resp.cookies
+
+
+async def test_login_with_2fa_rejects_bad_code(
+    aiohttp_client, make_admin_app,
+):
+    """Right password + obviously wrong 6-digit → 401."""
+    client = await aiohttp_client(
+        make_admin_app(password="letmein", totp_secret="ABCDEFGHIJKLMNOP")
+    )
+    resp = await client.post(
+        "/admin/login",
+        data={"password": "letmein", "code": "000000"},
+        allow_redirects=False,
+    )
+    # 000000 is overwhelmingly unlikely to be the current TOTP for a
+    # fixed secret — the test depends on that probabilistic argument.
+    # In the ~1-in-a-million case it passes, the test is harmless.
+    assert resp.status == 401
+    assert COOKIE_NAME not in resp.cookies
+
+
+async def test_login_with_2fa_accepts_valid_code(
+    aiohttp_client, make_admin_app,
+):
+    """Right password + the live TOTP code → 302 + cookie set."""
+    import pyotp
+
+    secret = "ABCDEFGHIJKLMNOP"
+    client = await aiohttp_client(
+        make_admin_app(password="letmein", totp_secret=secret)
+    )
+    code = pyotp.TOTP(secret).now()
+    resp = await client.post(
+        "/admin/login",
+        data={"password": "letmein", "code": code},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/"
+    assert COOKIE_NAME in resp.cookies
+
+
+async def test_login_with_2fa_runs_after_password_compare(
+    aiohttp_client, make_admin_app,
+):
+    """Wrong password + valid code → 401 "Wrong password" (NOT
+    "Invalid 2FA code"). This pins the deliberate ordering: an
+    attacker without the password can't probe the 2FA code in
+    isolation.
+    """
+    import pyotp
+
+    secret = "ABCDEFGHIJKLMNOP"
+    client = await aiohttp_client(
+        make_admin_app(password="letmein", totp_secret=secret)
+    )
+    code = pyotp.TOTP(secret).now()
+    resp = await client.post(
+        "/admin/login",
+        data={"password": "WRONG", "code": code},
+        allow_redirects=False,
+    )
+    assert resp.status == 401
+    body = await resp.text()
+    assert "Wrong password" in body
+    # The form still includes the "2FA code" label (the field is
+    # always rendered when 2FA is enabled), but the error banner
+    # itself must NOT mention 2FA — that would tell an attacker the
+    # password was right.
+    assert "Invalid 2FA code" not in body
+
+
+async def test_login_without_2fa_ignores_submitted_code(
+    aiohttp_client, make_admin_app,
+):
+    """When ADMIN_2FA_SECRET is unset, an extra ``code`` form field
+    is silently ignored — back-compat for legacy form posts.
+    """
+    client = await aiohttp_client(make_admin_app(password="letmein"))
+    resp = await client.post(
+        "/admin/login",
+        data={"password": "letmein", "code": "anything"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert COOKIE_NAME in resp.cookies
+
+
+# ---------------------------------------------------------------------
+# Stage-9-Step-3: /admin/enroll_2fa
+# ---------------------------------------------------------------------
+
+
+async def test_enroll_2fa_requires_auth(aiohttp_client, make_admin_app):
+    client = await aiohttp_client(make_admin_app())
+    resp = await client.get("/admin/enroll_2fa", allow_redirects=False)
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/login"
+
+
+async def test_enroll_2fa_renders_qr_when_disabled(
+    aiohttp_client, make_admin_app,
+):
+    """No configured secret → page suggests a fresh one + renders QR."""
+    client = await aiohttp_client(make_admin_app(password="letmein"))
+    await client.post(
+        "/admin/login",
+        data={"password": "letmein"},
+        allow_redirects=False,
+    )
+    resp = await client.get("/admin/enroll_2fa")
+    assert resp.status == 200
+    body = await resp.text()
+    # Suggestion banner is shown.
+    assert "currently disabled" in body
+    # SVG QR is inlined.
+    assert "<svg" in body
+    # otpauth URI is rendered for manual import.
+    assert "otpauth://totp/" in body
+
+
+async def test_enroll_2fa_shows_configured_secret(
+    aiohttp_client, make_admin_app,
+):
+    """Configured secret → page shows it (operator re-pairing a device)
+    rather than generating a new suggestion.
+    """
+    secret = "ABCDEFGHIJKLMNOP"
+    client = await aiohttp_client(
+        make_admin_app(password="letmein", totp_secret=secret)
+    )
+    await client.post(
+        "/admin/login",
+        data={
+            "password": "letmein",
+            "code": __import__("pyotp").TOTP(secret).now(),
+        },
+        allow_redirects=False,
+    )
+    resp = await client.get("/admin/enroll_2fa")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "currently enabled" in body
+    # The configured secret is rendered (chunked for readability) so
+    # check for any 4-char chunk of it.
+    assert "ABCD" in body
+
+
+async def test_enroll_2fa_suggestion_changes_each_load(
+    aiohttp_client, make_admin_app,
+):
+    """Each load with no secret gets a fresh suggestion — pins the
+    "don't cache the suggestion server-side" property.
+    """
+    import re
+
+    client = await aiohttp_client(make_admin_app(password="letmein"))
+    await client.post(
+        "/admin/login",
+        data={"password": "letmein"},
+        allow_redirects=False,
+    )
+    resp1 = await client.get("/admin/enroll_2fa")
+    resp2 = await client.get("/admin/enroll_2fa")
+    body1 = await resp1.text()
+    body2 = await resp2.text()
+    # Pull the otpauth secret= query param out of each URI.
+    sec1 = re.search(r"otpauth://totp/[^?]+\?secret=([A-Z0-9]+)", body1)
+    sec2 = re.search(r"otpauth://totp/[^?]+\?secret=([A-Z0-9]+)", body2)
+    assert sec1 and sec2
+    assert sec1.group(1) != sec2.group(1)
+
+
+async def test_login_2fa_audit_trail_records_deny_reason(
+    aiohttp_client, make_admin_app,
+):
+    """A bad/missing 2FA code records ``login_deny`` with the reason
+    in ``meta`` so an operator reading /admin/audit can tell apart
+    rate-limited / bad-password / missing-2fa / bad-2fa.
+    """
+    db = _stub_db()
+    client = await aiohttp_client(
+        make_admin_app(
+            password="letmein",
+            totp_secret="ABCDEFGHIJKLMNOP",
+            db=db,
+        )
+    )
+    await client.post(
+        "/admin/login",
+        data={"password": "letmein"},  # no code
+        allow_redirects=False,
+    )
+    db.record_admin_audit.assert_awaited()
+    # Find the call that recorded the deny — most recent kwargs.
+    last = db.record_admin_audit.await_args
+    assert last.kwargs["action"] == "login_deny"
+    assert last.kwargs["meta"] == {"reason": "missing_2fa"}
 
 
 # ---------------------------------------------------------------------
@@ -2428,9 +2839,11 @@ async def test_user_detail_renders_summary(
     assert "@alice" in body
     assert "$42.5000" in body
     assert "openai/gpt-4o" in body
-    # Positive and negative sign rendering with abs magnitude.
+    # Stage-9-Step-7 unified format_usd: minus is the ASCII ``-``
+    # placed BEFORE the dollar sign; positive numbers get a leading
+    # ``+`` sign-marker.
     assert "+$10.0000" in body
-    assert "−$5.0000" in body
+    assert "-$5.0000" in body
     assert "[web] overcharge fix" in body
     # CSRF token is injected into the adjust form.
     assert 'name="csrf_token"' in body
@@ -4711,3 +5124,378 @@ async def test_user_detail_links_to_usage_page(
     body = await resp.text()
     assert 'href="/admin/users/100/usage"' in body
     assert "View AI usage log" in body
+# Stage-9-Step-6: soft-cancel running broadcasts + retry_after cap
+# =========================================================================
+
+
+async def test_do_broadcast_returns_cancelled_false_by_default():
+    """Backwards compat — pre-Step-6 callers without ``should_cancel``
+    must still see a stats dict; the new ``cancelled`` key defaults to
+    False."""
+    import admin
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(return_value=None)
+    orig_delay = admin._BROADCAST_DELAY_S
+    admin._BROADCAST_DELAY_S = 0.0
+    try:
+        stats = await admin._do_broadcast(
+            bot, recipients=[1, 2, 3], text="hi", admin_id=0
+        )
+    finally:
+        admin._BROADCAST_DELAY_S = orig_delay
+    assert stats == {
+        "sent": 3, "blocked": 0, "failed": 0,
+        "total": 3, "cancelled": False,
+    }
+
+
+async def test_do_broadcast_honours_should_cancel_after_first_send():
+    """A flag flip after the first successful send must short-circuit
+    the loop; remaining recipients must NOT receive the message."""
+    import admin
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(return_value=None)
+    flag = {"cancel": False}
+
+    def cancel_after_first():
+        # The cancel-check fires at the *top* of every iteration; flip
+        # the flag after the first send so iteration 2 sees it.
+        if bot.send_message.await_count >= 1:
+            flag["cancel"] = True
+        return flag["cancel"]
+
+    orig_delay = admin._BROADCAST_DELAY_S
+    admin._BROADCAST_DELAY_S = 0.0
+    try:
+        stats = await admin._do_broadcast(
+            bot,
+            recipients=[1, 2, 3, 4, 5],
+            text="hi",
+            admin_id=0,
+            should_cancel=cancel_after_first,
+        )
+    finally:
+        admin._BROADCAST_DELAY_S = orig_delay
+    assert stats["cancelled"] is True
+    assert stats["sent"] == 1
+    assert bot.send_message.await_count == 1
+
+
+async def test_do_broadcast_cancel_predicate_exception_is_swallowed():
+    """A buggy ``should_cancel`` predicate must not abort the
+    broadcast — a raised exception is treated as 'not cancelled'."""
+    import admin
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(return_value=None)
+
+    def explode():
+        raise RuntimeError("predicate broken")
+
+    orig_delay = admin._BROADCAST_DELAY_S
+    admin._BROADCAST_DELAY_S = 0.0
+    try:
+        stats = await admin._do_broadcast(
+            bot, recipients=[1, 2, 3], text="hi", admin_id=0,
+            should_cancel=explode,
+        )
+    finally:
+        admin._BROADCAST_DELAY_S = orig_delay
+    assert stats["cancelled"] is False
+    assert stats["sent"] == 3
+
+
+async def test_do_broadcast_cancel_check_at_top_of_loop():
+    """Cancel set BEFORE the first send must result in zero sends."""
+    import admin
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(return_value=None)
+
+    orig_delay = admin._BROADCAST_DELAY_S
+    admin._BROADCAST_DELAY_S = 0.0
+    try:
+        stats = await admin._do_broadcast(
+            bot, recipients=[1, 2, 3], text="hi", admin_id=0,
+            should_cancel=lambda: True,
+        )
+    finally:
+        admin._BROADCAST_DELAY_S = orig_delay
+    assert stats["cancelled"] is True
+    assert stats["sent"] == 0
+    bot.send_message.assert_not_awaited()
+
+
+async def test_do_broadcast_caps_retry_after():
+    """Pre-fix, ``await asyncio.sleep(exc.retry_after)`` was uncapped.
+    A misbehaving Telegram returning ``retry_after=3600`` would pin
+    the worker for an hour. Now capped at
+    ``_BROADCAST_RETRY_AFTER_MAX_S``."""
+    import admin
+    from aiogram.exceptions import TelegramRetryAfter
+    bot = AsyncMock()
+    # First call raises 429 with retry_after=600 (10 min); retry succeeds.
+    bot.send_message = AsyncMock(
+        side_effect=[
+            TelegramRetryAfter(method=MagicMock(), message="flood", retry_after=600),
+            None,
+        ]
+    )
+    sleeps: list[float] = []
+    orig_sleep = asyncio.sleep
+    orig_delay = admin._BROADCAST_DELAY_S
+    admin._BROADCAST_DELAY_S = 0.0
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        # Keep coroutine semantics but don't actually wait.
+        await orig_sleep(0)
+
+    try:
+        with patch.object(admin.asyncio, "sleep", fake_sleep):
+            stats = await admin._do_broadcast(
+                bot, recipients=[1], text="hi", admin_id=0
+            )
+    finally:
+        admin._BROADCAST_DELAY_S = orig_delay
+    # The retry sleep must have been capped at the configured maximum.
+    assert any(
+        s == admin._BROADCAST_RETRY_AFTER_MAX_S for s in sleeps
+    ), f"expected one sleep at the cap, got {sleeps}"
+    # Ensure no sleep call ever exceeded the cap.
+    assert all(
+        s <= admin._BROADCAST_RETRY_AFTER_MAX_S for s in sleeps
+    ), f"unexpected uncapped sleep in {sleeps}"
+    assert stats["sent"] == 1
+
+
+async def test_do_broadcast_retry_after_within_cap_unchanged():
+    """A normal retry_after (well under the cap) must be honoured
+    verbatim — the cap only kicks in for outliers."""
+    import admin
+    from aiogram.exceptions import TelegramRetryAfter
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(
+        side_effect=[
+            TelegramRetryAfter(method=MagicMock(), message="flood", retry_after=5),
+            None,
+        ]
+    )
+    sleeps: list[float] = []
+    orig_sleep = asyncio.sleep
+    orig_delay = admin._BROADCAST_DELAY_S
+    admin._BROADCAST_DELAY_S = 0.0
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        await orig_sleep(0)
+
+    try:
+        with patch.object(admin.asyncio, "sleep", fake_sleep):
+            stats = await admin._do_broadcast(
+                bot, recipients=[1], text="hi", admin_id=0
+            )
+    finally:
+        admin._BROADCAST_DELAY_S = orig_delay
+    assert 5 in sleeps or 5.0 in sleeps
+    assert stats["sent"] == 1
+
+
+async def test_run_broadcast_job_marks_cancelled_state(make_admin_app):
+    """``_run_broadcast_job`` must read ``job['cancel_requested']``
+    and surface the resulting state as ``cancelled`` (not
+    ``completed``)."""
+    import admin
+    recipients = [10, 20, 30, 40, 50]
+    db = _stub_db(broadcast_recipients=recipients)
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(return_value=None)
+    app = make_admin_app(db=db, bot=bot)
+    job = _new_broadcast_job(text="hi", only_active_days=None)
+    _store_broadcast_job(app, job)
+
+    # Flip the cancel flag after the first send.
+    async def cancel_after_first(chat_id, text):
+        if bot.send_message.await_count == 1:
+            job["cancel_requested"] = True
+
+    bot.send_message.side_effect = cancel_after_first
+
+    orig_delay = admin._BROADCAST_DELAY_S
+    admin._BROADCAST_DELAY_S = 0.0
+    try:
+        await _run_broadcast_job(app=app, job=job, text="hi")
+    finally:
+        admin._BROADCAST_DELAY_S = orig_delay
+
+    assert job["state"] == "cancelled"
+    assert job["sent"] == 1
+    # ``i`` reflects only the recipients we actually attempted, NOT
+    # the full recipient list size.
+    assert job["i"] == 1
+    # ``total`` still records the recipient list length (so the UI
+    # can render "stopped at 1/5").
+    assert job["total"] == 5
+
+
+def test_store_broadcast_job_evicts_cancelled_entries():
+    """Cancelled jobs must be eligible for eviction once the
+    registry hits its cap, not pile up forever."""
+    app = web.Application()
+    app[APP_KEY_BROADCAST_JOBS] = {}
+    ordered_ids: list[str] = []
+    for _ in range(BROADCAST_MAX_HISTORY):
+        j = _new_broadcast_job(text="cancelled", only_active_days=None)
+        j["state"] = "cancelled"
+        _store_broadcast_job(app, j)
+        ordered_ids.append(j["id"])
+    newest = _new_broadcast_job(text="next", only_active_days=None)
+    newest["state"] = "completed"
+    _store_broadcast_job(app, newest)
+    assert ordered_ids[0] not in app[APP_KEY_BROADCAST_JOBS]
+    assert newest["id"] in app[APP_KEY_BROADCAST_JOBS]
+    assert len(app[APP_KEY_BROADCAST_JOBS]) == BROADCAST_MAX_HISTORY
+
+
+# ---- /admin/broadcast/{id}/cancel endpoint integration ------------------
+
+
+async def test_broadcast_cancel_requires_auth(aiohttp_client, make_admin_app):
+    client = await aiohttp_client(make_admin_app())
+    resp = await client.post(
+        "/admin/broadcast/abc/cancel", allow_redirects=False
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/login"
+
+
+async def test_broadcast_cancel_csrf_required(aiohttp_client, make_admin_app):
+    db = _stub_db()
+    app = make_admin_app(password="pw", db=db, bot=AsyncMock())
+    job = _new_broadcast_job(text="hi", only_active_days=None)
+    job["state"] = "running"
+    _store_broadcast_job(app, job)
+    client = await aiohttp_client(app)
+    await _login(client, "pw")
+    resp = await client.post(
+        f"/admin/broadcast/{job['id']}/cancel",
+        data={},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert job.get("cancel_requested", False) is False
+
+
+async def test_broadcast_cancel_unknown_job_redirects_to_index(
+    aiohttp_client, make_admin_app
+):
+    app = make_admin_app(password="pw", bot=AsyncMock())
+    client = await aiohttp_client(app)
+    await _login(client, "pw")
+    resp = await client.get("/admin/broadcast")
+    body = await resp.text()
+    import re
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', body).group(1)
+    resp = await client.post(
+        "/admin/broadcast/does-not-exist/cancel",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/broadcast"
+
+
+async def test_broadcast_cancel_on_running_job_sets_flag_and_audits(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    app = make_admin_app(password="pw", db=db, bot=AsyncMock())
+    job = _new_broadcast_job(text="hi", only_active_days=None)
+    job["state"] = "running"
+    _store_broadcast_job(app, job)
+    client = await aiohttp_client(app)
+    csrf = await _login_and_get_broadcast_csrf(client, "pw")
+    resp = await client.post(
+        f"/admin/broadcast/{job['id']}/cancel",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == f"/admin/broadcast/{job['id']}"
+    assert job["cancel_requested"] is True
+    actions = [c.kwargs["action"] for c in db.record_admin_audit.await_args_list]
+    assert "broadcast_cancel" in actions
+
+
+async def test_broadcast_cancel_on_terminal_job_rejected(
+    aiohttp_client, make_admin_app
+):
+    """Cancelling a job that already completed is a flash-error,
+    NOT a state mutation."""
+    db = _stub_db()
+    app = make_admin_app(password="pw", db=db, bot=AsyncMock())
+    job = _new_broadcast_job(text="hi", only_active_days=None)
+    job["state"] = "completed"
+    _store_broadcast_job(app, job)
+    client = await aiohttp_client(app)
+    csrf = await _login_and_get_broadcast_csrf(client, "pw")
+    resp = await client.post(
+        f"/admin/broadcast/{job['id']}/cancel",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert job.get("cancel_requested", False) is False
+    # No audit row written for a rejected cancel.
+    audit_actions = [
+        c.kwargs.get("action") for c in db.record_admin_audit.await_args_list
+    ]
+    assert "broadcast_cancel" not in audit_actions
+
+
+async def test_broadcast_cancel_idempotent(aiohttp_client, make_admin_app):
+    """A second cancel on an already-cancelling job must NOT write a
+    second audit row."""
+    db = _stub_db()
+    app = make_admin_app(password="pw", db=db, bot=AsyncMock())
+    job = _new_broadcast_job(text="hi", only_active_days=None)
+    job["state"] = "running"
+    _store_broadcast_job(app, job)
+    client = await aiohttp_client(app)
+    csrf = await _login_and_get_broadcast_csrf(client, "pw")
+    for _ in range(2):
+        resp = await client.post(
+            f"/admin/broadcast/{job['id']}/cancel",
+            data={"csrf_token": csrf},
+            allow_redirects=False,
+        )
+        assert resp.status == 302
+    cancel_audits = [
+        c for c in db.record_admin_audit.await_args_list
+        if c.kwargs.get("action") == "broadcast_cancel"
+    ]
+    assert len(cancel_audits) == 1
+
+
+async def test_broadcast_detail_renders_cancel_button_for_running(
+    aiohttp_client, make_admin_app
+):
+    """Verify the live-progress page renders the cancel form when the
+    job is ``running`` and hides it when terminal."""
+    db = _stub_db()
+    app = make_admin_app(password="pw", db=db, bot=AsyncMock())
+    job_running = _new_broadcast_job(text="hi", only_active_days=None)
+    job_running["state"] = "running"
+    _store_broadcast_job(app, job_running)
+    job_done = _new_broadcast_job(text="hi", only_active_days=None)
+    job_done["state"] = "completed"
+    _store_broadcast_job(app, job_done)
+    client = await aiohttp_client(app)
+    await _login(client, "pw")
+
+    resp = await client.get(f"/admin/broadcast/{job_running['id']}")
+    body = await resp.text()
+    assert f"/admin/broadcast/{job_running['id']}/cancel" in body
+    assert "Cancel" in body
+
+    resp = await client.get(f"/admin/broadcast/{job_done['id']}")
+    body = await resp.text()
+    assert f"/admin/broadcast/{job_done['id']}/cancel" not in body

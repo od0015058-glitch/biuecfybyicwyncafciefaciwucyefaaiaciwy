@@ -120,7 +120,7 @@
             {% if r.discount_percent is not none %}
               {{ r.discount_percent }}%
             {% elif r.discount_amount is not none %}
-              ${{ "{:,.2f}".format(r.discount_amount) }}
+              {{ r.discount_amount | format_usd(2) }}
             {% else %}
               ?
             {% endif %}
