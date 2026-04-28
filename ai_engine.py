@@ -11,6 +11,39 @@ log = logging.getLogger("bot.ai_engine")
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
+# Schema default from ``alembic/versions/0001_baseline.py``:
+#     active_model VARCHAR(255) DEFAULT 'openai/gpt-3.5-turbo'
+# Mirrored here so we can self-heal a row whose ``active_model``
+# column is somehow ``NULL`` / empty / whitespace at chat time. The
+# column is nullable (no ``NOT NULL`` constraint) and direct DB
+# writes (an operator running raw SQL, a bad migration backfill, a
+# legacy tool that bypassed ``set_active_model``) can leave it
+# blank. Without this fallback the bot would send
+# ``{"model": null, ...}`` to OpenRouter, get a 400, and reply
+# ``ai_provider_unavailable`` for *every* subsequent chat from
+# that user — no actionable hint, no recovery path. The 429 branch
+# below also crashes outright (``None.endswith(":free")``) and
+# surfaces as ``ai_transient_error``. Falling back to a known-good
+# id keeps the user productive while the row is repaired.
+_ACTIVE_MODEL_FALLBACK = "openai/gpt-3.5-turbo"
+
+
+def _resolve_active_model(raw: object) -> str:
+    """Return a non-empty model id, falling back to the schema
+    default when ``raw`` is ``None`` / empty / whitespace.
+
+    Coerces to ``str`` defensively so a row that somehow stored a
+    non-string (e.g. via a future schema migration accident) still
+    routes through the fallback rather than blowing up at
+    ``endswith`` / ``.lower()`` later in the function.
+    """
+    if raw is None:
+        return _ACTIVE_MODEL_FALLBACK
+    coerced = str(raw).strip()
+    if not coerced:
+        return _ACTIVE_MODEL_FALLBACK
+    return coerced
+
 async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
     # 1. Fetch user data and check limits
     user = await db.get_user(telegram_id)
@@ -20,7 +53,18 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
 
     free_msgs = user['free_messages_left']
     balance = float(user['balance_usd'])
-    active_model = user['active_model']
+    raw_active_model = user['active_model']
+    active_model = _resolve_active_model(raw_active_model)
+    if active_model != raw_active_model:
+        # Either the row was NULL / blank, or the value had stray
+        # surrounding whitespace. Log loud-and-once so ops can
+        # repair the row; we keep the chat moving rather than
+        # surface the issue to the user.
+        log.warning(
+            "active_model fallback engaged for user %d: stored "
+            "value %r → using %r",
+            telegram_id, raw_active_model, active_model,
+        )
     lang = user['language_code'] if user['language_code'] in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
     # P3-5: pull the toggle from the same row so we don't fire a second
     # SELECT for what's effectively a one-byte flag. Defaults to False
