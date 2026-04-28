@@ -178,32 +178,73 @@ async def _echo(request):
     return web.Response(text="ok")
 
 
+# The middleware only rate-limits the NowPayments IPN path, so the
+# test routes must be mounted at that path (not an arbitrary ``/x``)
+# to exercise the limiter. See ``rate_limit.WEBHOOK_PATH``.
+
+
 @pytest.mark.asyncio
 async def test_webhook_under_cap_passes(aiohttp_client, fake_clock):
     """5 requests well under the default cap (30 tokens) sail through."""
+    from rate_limit import WEBHOOK_PATH
     app = web.Application()
     install_webhook_rate_limit(app)
-    app.router.add_post("/x", _echo)
+    app.router.add_post(WEBHOOK_PATH, _echo)
     client = await aiohttp_client(app)
     for _ in range(5):
-        resp = await client.post("/x", data="x")
+        resp = await client.post(WEBHOOK_PATH, data="x")
         assert resp.status == 200
 
 
 @pytest.mark.asyncio
 async def test_webhook_burst_throttles(aiohttp_client, fake_clock):
     """Tight cap → small burst trips 429."""
+    from rate_limit import WEBHOOK_PATH
     app = web.Application()
     install_webhook_rate_limit(app, capacity=2, refill_rate=0.001)
-    app.router.add_post("/x", _echo)
+    app.router.add_post(WEBHOOK_PATH, _echo)
     client = await aiohttp_client(app)
 
-    r1 = await client.post("/x", data="a")
-    r2 = await client.post("/x", data="b")
-    r3 = await client.post("/x", data="c")
+    r1 = await client.post(WEBHOOK_PATH, data="a")
+    r2 = await client.post(WEBHOOK_PATH, data="b")
+    r3 = await client.post(WEBHOOK_PATH, data="c")
     assert r1.status == 200
     assert r2.status == 200
     assert r3.status == 429
+
+
+@pytest.mark.asyncio
+async def test_webhook_middleware_scoped_to_webhook_path(
+    aiohttp_client, fake_clock,
+):
+    """Admin panel / other paths on the same app must NOT share the
+    webhook's rate-limit bucket. Pre-Stage-8-Part-5 the middleware
+    consumed a token on every request regardless of path, which let
+    an admin browsing the panel lock NowPayments IPNs out of the
+    webhook (or vice versa)."""
+    from rate_limit import WEBHOOK_PATH
+    app = web.Application()
+    # Capacity of 1 so the bucket is guaranteed to be empty after one
+    # webhook POST — if the unrelated path ate from the same bucket
+    # it would 429 too.
+    install_webhook_rate_limit(app, capacity=1, refill_rate=0.001)
+    app.router.add_post(WEBHOOK_PATH, _echo)
+    app.router.add_get("/admin/", _echo)
+    client = await aiohttp_client(app)
+
+    # Burn the webhook bucket …
+    r1 = await client.post(WEBHOOK_PATH, data="a")
+    r2 = await client.post(WEBHOOK_PATH, data="b")
+    assert r1.status == 200
+    assert r2.status == 429
+
+    # … the admin path must still be reachable.
+    r3 = await client.get("/admin/")
+    r4 = await client.get("/admin/")
+    r5 = await client.get("/admin/")
+    assert r3.status == 200
+    assert r4.status == 200
+    assert r5.status == 200
 
 
 @pytest.mark.asyncio

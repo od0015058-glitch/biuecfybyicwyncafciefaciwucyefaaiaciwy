@@ -1,0 +1,197 @@
+{% extends "_layout.html" %}
+
+{% block title %}Broadcast {{ job.id }}{% endblock %}
+
+{% block extra_head %}
+<style>
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  @media (max-width: 700px) {
+    .stats-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+  .stat {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+  }
+  .stat .label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+  }
+  .stat .value {
+    font-size: 22px;
+    font-weight: 600;
+    margin-top: 4px;
+  }
+  .stat.sent    .value { color: var(--success); }
+  .stat.blocked .value { color: var(--text-muted); }
+  .stat.failed  .value { color: var(--danger, #f45d5d); }
+  .progressbar {
+    height: 8px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+    margin-bottom: 16px;
+  }
+  .progressbar > span {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+    width: 0%;
+    transition: width 200ms ease-out;
+  }
+  .state-pill {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .state-queued    { background: rgba(148,148,148,0.15); color: #9c9c9c; }
+  .state-running   { background: rgba(79,140,255,0.15);  color: var(--accent); }
+  .state-completed { background: rgba(74,222,128,0.15);  color: var(--success); }
+  .state-failed    { background: rgba(244,93,93,0.18);   color: var(--danger, #f45d5d); }
+  pre.body {
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-size: 13px;
+    max-height: 200px;
+    overflow: auto;
+  }
+  .meta {
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+  .err {
+    background: rgba(244,93,93,0.1);
+    border: 1px solid var(--danger, #f45d5d);
+    color: var(--danger, #f45d5d);
+    padding: 10px 12px;
+    border-radius: 6px;
+    margin-top: 12px;
+    font-size: 13px;
+  }
+</style>
+{% endblock %}
+
+{% block main %}
+<p>
+  <a href="/admin/broadcast">← Back to broadcast</a>
+</p>
+
+<h2 style="margin-top:0">
+  Broadcast <code>{{ job.id }}</code>
+  <span id="state-pill" class="state-pill state-{{ job.state }}">{{ job.state }}</span>
+</h2>
+
+<div class="meta">
+  Created {{ job.created_at }}
+  {% if job.only_active_days %}
+    · active ≤ <strong>{{ job.only_active_days }}</strong> days
+  {% else %}
+    · all registered users
+  {% endif %}
+  · body length <strong>{{ job.full_text_len }}</strong> chars
+</div>
+
+<div class="stats-grid" style="margin-top:12px">
+  <div class="stat">
+    <div class="label">Progress</div>
+    <div class="value"><span id="progress-i">{{ job.i }}</span>/<span id="progress-total">{{ job.total }}</span></div>
+  </div>
+  <div class="stat sent">
+    <div class="label">Sent</div>
+    <div class="value" id="stat-sent">{{ job.sent }}</div>
+  </div>
+  <div class="stat blocked">
+    <div class="label">Blocked</div>
+    <div class="value" id="stat-blocked">{{ job.blocked }}</div>
+  </div>
+  <div class="stat failed">
+    <div class="label">Failed</div>
+    <div class="value" id="stat-failed">{{ job.failed }}</div>
+  </div>
+</div>
+
+<div class="progressbar"><span id="progress-bar"></span></div>
+
+<h3 style="margin-bottom:6px">Message</h3>
+<pre class="body">{{ job.text_preview }}</pre>
+
+<div id="err-box" {% if not job.error %}style="display:none"{% endif %}>
+  <div class="err"><strong>Error:</strong> <span id="err-msg">{{ job.error or "" }}</span></div>
+</div>
+
+<script>
+(function () {
+  var jobId = {{ job.id | tojson }};
+  var terminal = new Set(["completed", "failed"]);
+  var pill = document.getElementById("state-pill");
+  var bar = document.getElementById("progress-bar");
+  var errBox = document.getElementById("err-box");
+  var errMsg = document.getElementById("err-msg");
+
+  function paint(j) {
+    document.getElementById("progress-i").textContent = j.i;
+    document.getElementById("progress-total").textContent = j.total;
+    document.getElementById("stat-sent").textContent = j.sent;
+    document.getElementById("stat-blocked").textContent = j.blocked;
+    document.getElementById("stat-failed").textContent = j.failed;
+    pill.textContent = j.state;
+    pill.className = "state-pill state-" + j.state;
+    var pct = j.total > 0 ? Math.round((j.i / j.total) * 100) : 0;
+    bar.style.width = pct + "%";
+    if (j.error) {
+      errMsg.textContent = j.error;
+      errBox.style.display = "";
+    }
+  }
+
+  function tick() {
+    fetch("/admin/broadcast/" + encodeURIComponent(jobId) + "/status", {
+      credentials: "same-origin",
+    }).then(function (r) {
+      if (!r.ok) return;
+      return r.json();
+    }).then(function (j) {
+      if (!j) return;
+      paint(j);
+      if (terminal.has(j.state)) return;  // stop polling
+      setTimeout(tick, 1000);
+    }).catch(function () {
+      // Network hiccup — try again in a bit.
+      setTimeout(tick, 2500);
+    });
+  }
+
+  // Only poll if the current state is non-terminal on initial render.
+  var initialState = {{ job.state | tojson }};
+  if (!terminal.has(initialState)) {
+    setTimeout(tick, 1000);
+  } else {
+    // Paint once to ensure the bar width reflects the rendered counts
+    // even when the job completed before the page loaded.
+    paint({
+      i: {{ job.i }}, total: {{ job.total }},
+      sent: {{ job.sent }}, blocked: {{ job.blocked }},
+      failed: {{ job.failed }}, state: initialState,
+      error: {{ (job.error or "") | tojson }},
+    });
+  }
+})();
+</script>
+{% endblock %}

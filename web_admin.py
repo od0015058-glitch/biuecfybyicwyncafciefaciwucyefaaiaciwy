@@ -54,11 +54,13 @@ Subsequent Stage-8-Part-* PRs add /admin/gifts, /admin/users,
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
 import logging
 import os
+import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -86,6 +88,25 @@ APP_KEY_TTL_HOURS: web.AppKey = web.AppKey("admin_ttl_hours", int)
 APP_KEY_COOKIE_SECURE: web.AppKey = web.AppKey("admin_cookie_secure", bool)
 APP_KEY_DB: web.AppKey = web.AppKey("admin_db", object)
 APP_KEY_INSTALLED: web.AppKey = web.AppKey("admin_routes_installed", bool)
+# Stage-8-Part-5: the aiogram ``Bot`` used by the broadcast page's
+# background task to send Telegram messages. Optional — handlers
+# render a friendly banner and refuse to start jobs when it's absent
+# (e.g. unit tests that don't wire up a bot).
+APP_KEY_BOT: web.AppKey = web.AppKey("admin_bot", object)
+# In-memory registry of broadcast jobs. Keyed by short uuid, values
+# are dicts of the shape documented in :func:`_new_broadcast_job`.
+# Bounded to ``BROADCAST_MAX_HISTORY`` entries (oldest evicted once
+# completed so an active job is never dropped). State is lost on
+# process restart — the Telegram ``/admin_broadcast`` command has the
+# same semantics, so this matches operator expectations.
+APP_KEY_BROADCAST_JOBS: web.AppKey = web.AppKey(
+    "admin_broadcast_jobs", dict
+)
+# Background asyncio.Task handles, kept so setup_admin_routes can
+# cancel in-flight jobs during a clean app shutdown.
+APP_KEY_BROADCAST_TASKS: web.AppKey = web.AppKey(
+    "admin_broadcast_tasks", dict
+)
 
 # Per-request flag set by the auth middleware. ``request[]`` doesn't
 # emit NotAppKeyWarning for string keys (only ``app[]`` does), so
@@ -1490,6 +1511,403 @@ async def user_adjust_post(request: web.Request) -> web.StreamResponse:
 
 
 # ---------------------------------------------------------------------
+# Broadcast (Stage-8-Part-5)
+# ---------------------------------------------------------------------
+#
+# Design sketch:
+#
+# * ``GET  /admin/broadcast`` renders a form (textarea + optional
+#   "only users active in the last N days" filter) plus a list of
+#   recent jobs. ``POST  /admin/broadcast`` validates, kicks off a
+#   background ``asyncio.Task``, and 302s to the detail page.
+# * ``GET  /admin/broadcast/{job_id}`` renders the live-progress page,
+#   which polls ``GET  /admin/broadcast/{job_id}/status`` every second
+#   via a small vanilla-JS snippet baked into the template (no new
+#   runtime deps / no HTMX). The status endpoint returns JSON so the
+#   same data can be scraped by curl for out-of-browser monitoring.
+# * State is kept in ``app[APP_KEY_BROADCAST_JOBS]`` — a dict keyed
+#   by opaque id. Each job dict has fields::
+#
+#       {
+#         "id": "abcd1234",
+#         "text": "<preview>",       # first 120 chars, UI-safe
+#         "full_text_len": 280,      # cheap way to show length
+#         "only_active_days": 7 | None,
+#         "state": "queued" | "running" | "completed" | "failed",
+#         "total": 0,                # set once recipients are fetched
+#         "sent": 0, "blocked": 0, "failed": 0, "i": 0,
+#         "error": None | "...",     # populated on "failed"
+#         "created_at": iso8601-utc,
+#         "started_at": iso8601 | None,
+#         "completed_at": iso8601 | None,
+#       }
+#
+#   The background task updates the job dict in-place. All reads
+#   from the HTTP handlers go through a copy so the JSON serializer
+#   isn't racing with the writer coroutine.
+#
+# * We bound the registry to ``BROADCAST_MAX_HISTORY`` entries (newest
+#   wins), pruning only ``completed`` / ``failed`` jobs so a long
+#   broadcast backlog can never be silently killed mid-run.
+#
+# The Telegram ``/admin_broadcast`` command already exists and stays
+# authoritative — the web page is the same feature with a different
+# front-end. Both callers share ``admin._do_broadcast`` under the hood
+# so the paced-send + retry-after + error-bucketing behaviour is
+# identical.
+
+
+BROADCAST_MAX_HISTORY = 50
+# Upper bound on the broadcast body. Aligns with the Telegram command
+# (``admin._BROADCAST_MAX_TEXT_LEN``) — kept as a separate constant
+# here rather than imported so a hotfix to one doesn't silently move
+# the other. The two are compared in tests.
+BROADCAST_TEXT_MAX_LEN = 3500
+
+
+def parse_broadcast_web_form(form) -> dict | str:
+    """Parse the /admin/broadcast submission form.
+
+    Returns a dict shaped::
+
+        {
+          "text": "…",
+          "only_active_days": 7 | None,
+        }
+
+    On failure returns one of the error keys: ``"missing_text"``,
+    ``"text_too_long"``, ``"bad_active"``.
+    """
+    text = (form.get("text") or "").strip()
+    if not text:
+        return "missing_text"
+    if len(text) > BROADCAST_TEXT_MAX_LEN:
+        return "text_too_long"
+
+    raw_active = (form.get("only_active_days") or "").strip()
+    only_active_days: int | None
+    if not raw_active:
+        only_active_days = None
+    else:
+        try:
+            only_active_days = int(raw_active)
+        except ValueError:
+            return "bad_active"
+        if only_active_days <= 0:
+            return "bad_active"
+
+    return {"text": text, "only_active_days": only_active_days}
+
+
+_BROADCAST_FORM_ERR_TEXT = {
+    "missing_text": "Broadcast body is required.",
+    "text_too_long": (
+        f"Broadcast body must be at most {BROADCAST_TEXT_MAX_LEN} characters."
+    ),
+    "bad_active": "Active-days filter must be a positive integer.",
+}
+
+
+def _now_iso() -> str:
+    """Wall-clock ISO-8601 (UTC, seconds precision) for job timestamps.
+
+    Deliberately NOT monotonic — operator-visible timestamps should
+    line up with log lines and the DB's ``created_at`` values, which
+    are also wall-clock UTC.
+    """
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _new_broadcast_job(
+    *,
+    text: str,
+    only_active_days: int | None,
+) -> dict:
+    """Build a fresh job dict in its initial ``"queued"`` state.
+
+    ``id`` is ``secrets.token_urlsafe(6)`` — 8-ish chars of randomness,
+    short enough to URL without wrapping but wide enough to make
+    guessing someone else's job id pointless (and it's only usable by
+    a logged-in admin anyway).
+
+    ``text_preview`` is stored truncated so the jobs-list page can
+    render a snippet without dumping a 3500-char body into every row.
+    """
+    preview = text if len(text) <= 120 else text[:117] + "…"
+    return {
+        "id": secrets.token_urlsafe(6),
+        "text_preview": preview,
+        "full_text_len": len(text),
+        "only_active_days": only_active_days,
+        "state": "queued",
+        "total": 0,
+        "sent": 0,
+        "blocked": 0,
+        "failed": 0,
+        "i": 0,
+        "error": None,
+        "created_at": _now_iso(),
+        "started_at": None,
+        "completed_at": None,
+    }
+
+
+def _store_broadcast_job(app: web.Application, job: dict) -> None:
+    """Record *job* in the registry and evict old completed entries.
+
+    We never evict a job whose ``state`` is ``queued`` or ``running``
+    — a rolling eviction policy must not silently kill live work.
+    """
+    jobs: dict = app[APP_KEY_BROADCAST_JOBS]
+    jobs[job["id"]] = job
+    if len(jobs) > BROADCAST_MAX_HISTORY:
+        terminal = [
+            jid for jid, j in jobs.items()
+            if j["state"] in ("completed", "failed")
+            and jid != job["id"]
+        ]
+        # Evict oldest terminal jobs first. ``jobs`` is insertion-
+        # ordered (CPython dicts preserve insertion order) so the
+        # list above is naturally "oldest first". Trim until we're
+        # back under cap.
+        while len(jobs) > BROADCAST_MAX_HISTORY and terminal:
+            jobs.pop(terminal.pop(0), None)
+
+
+async def _run_broadcast_job(
+    *,
+    app: web.Application,
+    job: dict,
+    text: str,
+) -> None:
+    """Background coroutine that does the actual fan-out.
+
+    Runs under ``asyncio.create_task`` from :func:`broadcast_post`.
+    Swallows exceptions into ``job["error"]`` so a DB or Telegram
+    failure marks the job "failed" rather than leaking up into the
+    aiohttp error log as an unretrieved task exception.
+    """
+    db = app.get(APP_KEY_DB)
+    bot = app.get(APP_KEY_BOT)
+
+    job["state"] = "running"
+    job["started_at"] = _now_iso()
+
+    if db is None or bot is None:
+        # Should never happen in production (both wired up by
+        # setup_admin_routes) — belt-and-suspenders so a misconfigured
+        # test path doesn't silently "complete" a zero-recipient job.
+        job["state"] = "failed"
+        job["error"] = (
+            "Background task launched without a DB or bot wired up."
+        )
+        job["completed_at"] = _now_iso()
+        return
+
+    try:
+        recipients = await db.iter_broadcast_recipients(
+            only_active_days=job["only_active_days"]
+        )
+    except Exception as exc:
+        log.exception(
+            "broadcast_job=%s: recipient query failed", job["id"]
+        )
+        job["state"] = "failed"
+        job["error"] = f"DB query failed: {exc}"
+        job["completed_at"] = _now_iso()
+        return
+
+    job["total"] = len(recipients)
+    if not recipients:
+        job["state"] = "completed"
+        job["completed_at"] = _now_iso()
+        return
+
+    async def _on_progress(stats: dict) -> None:
+        job["i"] = stats["i"]
+        job["sent"] = stats["sent"]
+        job["blocked"] = stats["blocked"]
+        job["failed"] = stats["failed"]
+
+    try:
+        # Import locally so a test that doesn't need admin.py
+        # (e.g. pure form-parser tests) doesn't pay the aiogram
+        # import cost at module-load time.
+        from admin import _do_broadcast
+
+        stats = await _do_broadcast(
+            bot,
+            recipients=recipients,
+            text=text,
+            admin_id=0,  # web-admin sentinel — see ADMIN_WEB_SENTINEL_ID
+            progress_callback=_on_progress,
+        )
+    except asyncio.CancelledError:
+        job["state"] = "failed"
+        job["error"] = "Cancelled (admin panel shutting down)."
+        job["completed_at"] = _now_iso()
+        raise
+    except Exception as exc:
+        log.exception("broadcast_job=%s: _do_broadcast raised", job["id"])
+        job["state"] = "failed"
+        job["error"] = f"Broadcast failed: {exc}"
+        job["completed_at"] = _now_iso()
+        return
+
+    job["i"] = stats["total"]
+    job["sent"] = stats["sent"]
+    job["blocked"] = stats["blocked"]
+    job["failed"] = stats["failed"]
+    job["state"] = "completed"
+    job["completed_at"] = _now_iso()
+
+
+async def broadcast_get(request: web.Request) -> web.StreamResponse:
+    """GET /admin/broadcast — form + recent jobs list."""
+    jobs: dict = request.app[APP_KEY_BROADCAST_JOBS]
+    # Newest first. Copy dicts so a background writer can't mutate
+    # under the Jinja template iterator.
+    recent = [dict(j) for j in reversed(list(jobs.values()))]
+
+    response = aiohttp_jinja2.render_template(
+        "broadcast.html",
+        request,
+        {
+            "active_page": "broadcast",
+            "csrf_token": csrf_token_for(request),
+            "recent": recent,
+            "text_max_len": BROADCAST_TEXT_MAX_LEN,
+            "flash": None,
+        },
+    )
+    flash = pop_flash(request, response)
+    if flash is not None:
+        response = aiohttp_jinja2.render_template(
+            "broadcast.html",
+            request,
+            {
+                "active_page": "broadcast",
+                "csrf_token": csrf_token_for(request),
+                "recent": recent,
+                "text_max_len": BROADCAST_TEXT_MAX_LEN,
+                "flash": flash,
+            },
+        )
+        response.del_cookie(FLASH_COOKIE, path="/admin/")
+    return response
+
+
+async def broadcast_post(request: web.Request) -> web.StreamResponse:
+    """POST /admin/broadcast — validate form + kick off background job."""
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+
+    form = await request.post()
+    back = web.HTTPFound(location="/admin/broadcast")
+
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning(
+            "broadcast_post: CSRF token mismatch from %s", request.remote
+        )
+        set_flash(
+            back,
+            kind="error",
+            message="Form submission was rejected (CSRF). Refresh and try again.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return back
+
+    parsed = parse_broadcast_web_form(form)
+    if isinstance(parsed, str):
+        set_flash(
+            back,
+            kind="error",
+            message=_BROADCAST_FORM_ERR_TEXT.get(
+                parsed, f"Invalid input ({parsed})."
+            ),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return back
+
+    if request.app.get(APP_KEY_BOT) is None:
+        set_flash(
+            back,
+            kind="error",
+            message=(
+                "Bot is not wired up — cannot start a broadcast. "
+                "This is almost certainly a deploy misconfiguration."
+            ),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return back
+
+    job = _new_broadcast_job(
+        text=parsed["text"],
+        only_active_days=parsed["only_active_days"],
+    )
+    _store_broadcast_job(request.app, job)
+    task = asyncio.create_task(
+        _run_broadcast_job(
+            app=request.app,
+            job=job,
+            text=parsed["text"],
+        ),
+        name=f"broadcast-{job['id']}",
+    )
+    request.app[APP_KEY_BROADCAST_TASKS][job["id"]] = task
+    log.info(
+        "broadcast_post: started job=%s len=%d active=%s",
+        job["id"], job["full_text_len"], parsed["only_active_days"],
+    )
+    return web.HTTPFound(location=f"/admin/broadcast/{job['id']}")
+
+
+async def broadcast_detail_get(request: web.Request) -> web.StreamResponse:
+    """GET /admin/broadcast/{job_id} — live-progress page."""
+    job_id = request.match_info.get("job_id", "")
+    job = request.app[APP_KEY_BROADCAST_JOBS].get(job_id)
+    if job is None:
+        response = web.HTTPFound(location="/admin/broadcast")
+        set_flash(
+            response,
+            kind="error",
+            message=(
+                f"Unknown broadcast job {job_id!r}. "
+                f"(Jobs are in-memory and are lost on process restart.)"
+            ),
+            secret=request.app.get(APP_KEY_SESSION_SECRET, ""),
+            cookie_secure=request.app.get(APP_KEY_COOKIE_SECURE, True),
+        )
+        return response
+
+    # Snapshot so the template never sees a half-updated dict.
+    return aiohttp_jinja2.render_template(
+        "broadcast_detail.html",
+        request,
+        {
+            "active_page": "broadcast",
+            "job": dict(job),
+        },
+    )
+
+
+async def broadcast_status_get(request: web.Request) -> web.StreamResponse:
+    """GET /admin/broadcast/{job_id}/status — JSON for polling."""
+    job_id = request.match_info.get("job_id", "")
+    job = request.app[APP_KEY_BROADCAST_JOBS].get(job_id)
+    if job is None:
+        return web.json_response(
+            {"error": "unknown_job", "job_id": job_id}, status=404
+        )
+    # Snapshot before handing to json_response so a concurrent
+    # writer can't mutate mid-serialize.
+    return web.json_response(dict(job))
+
+
+# ---------------------------------------------------------------------
 # App wiring
 # ---------------------------------------------------------------------
 
@@ -1502,6 +1920,7 @@ def setup_admin_routes(
     session_secret: str,
     ttl_hours: int = DEFAULT_TTL_HOURS,
     cookie_secure: bool = True,
+    bot=None,
 ) -> None:
     """Mount the admin panel onto *app*.
 
@@ -1544,6 +1963,13 @@ def setup_admin_routes(
     app[APP_KEY_TTL_HOURS] = ttl_hours
     app[APP_KEY_COOKIE_SECURE] = cookie_secure
     app[APP_KEY_DB] = db
+    # Stage-8-Part-5: broadcast plumbing. The bot reference is
+    # optional so unit tests that don't need Telegram fan-out can
+    # still mount the routes — broadcast_post refuses to start a job
+    # when it's missing.
+    app[APP_KEY_BOT] = bot
+    app[APP_KEY_BROADCAST_JOBS] = {}
+    app[APP_KEY_BROADCAST_TASKS] = {}
 
     aiohttp_jinja2.setup(
         app,
@@ -1592,6 +2018,18 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/users/{telegram_id}/adjust",
         _require_auth(user_adjust_post),
+    )
+
+    # Stage-8-Part-5: broadcast.
+    app.router.add_get("/admin/broadcast", _require_auth(broadcast_get))
+    app.router.add_post("/admin/broadcast", _require_auth(broadcast_post))
+    app.router.add_get(
+        "/admin/broadcast/{job_id}",
+        _require_auth(broadcast_detail_get),
+    )
+    app.router.add_get(
+        "/admin/broadcast/{job_id}/status",
+        _require_auth(broadcast_status_get),
     )
 
     app[APP_KEY_INSTALLED] = True
