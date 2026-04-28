@@ -74,6 +74,7 @@ from aiohttp import web
 # parse_transactions_query (Stage-8-Part-6). Only the class is
 # referenced — not the module-level ``db`` singleton — so the admin
 # still works against the injected DB in tests.
+import strings as bot_strings_module
 from database import Database
 from rate_limit import (
     client_ip_for_rate_limit,
@@ -2114,6 +2115,381 @@ async def transactions_get(request: web.Request) -> web.StreamResponse:
 
 
 # ---------------------------------------------------------------------
+# Stage-9-Step-1.6: editable bot strings
+# ---------------------------------------------------------------------
+#
+# The compiled string table in ``strings.py`` is the source of truth
+# for every user-visible label. The ``/admin/strings`` page lets the
+# operator override individual ``(lang, key)`` pairs at runtime — the
+# DB row in ``bot_strings`` shadows the compiled default. Reverting
+# (deleting the DB row) resurrects the compiled default.
+#
+# After every successful write the in-memory cache in
+# ``strings.set_overrides`` is refreshed so the next ``t()`` call
+# inside the bot serves the new value immediately.
+
+# Hard cap on the override length the admin can submit. The compiled
+# defaults max out around ~600 chars; allowing ~2 KB gives the operator
+# room to add explanatory text without letting them paste a megabyte
+# JSON blob into a button label.
+STRING_OVERRIDE_MAX_CHARS = 2048
+
+
+def _filter_compiled_strings(
+    *,
+    lang_filter: str | None,
+    search: str | None,
+    overrides_map: dict[tuple[str, str], str],
+) -> list[dict]:
+    """Build the per-row list rendered by ``strings.html``.
+
+    Each row carries:
+        * ``lang`` / ``key`` — the (lang, key) pair
+        * ``default`` — compiled default text
+        * ``current`` — override (or default if no override)
+        * ``has_override`` — bool, drives the "revert" button
+        * ``edit_url`` — fully-qualified link to the per-string editor
+
+    Filters: case-insensitive substring match against either the slug
+    or the current text. Lang filter clamps to a single locale.
+    """
+    rows: list[dict] = []
+    needle = (search or "").strip().lower()
+    for lang, key, default in bot_strings_module.iter_compiled_strings():
+        if lang_filter and lang != lang_filter:
+            continue
+        override = overrides_map.get((lang, key))
+        current = override if override is not None else default
+        if needle:
+            haystack = f"{key} {current}".lower()
+            if needle not in haystack:
+                continue
+        rows.append(
+            {
+                "lang": lang,
+                "key": key,
+                "default": default,
+                "current": current,
+                "has_override": override is not None,
+                "edit_url": f"/admin/strings/{lang}/{key}",
+            }
+        )
+    return rows
+
+
+async def strings_get(request: web.Request) -> web.StreamResponse:
+    """List every (lang, key) string with current value + override flag."""
+    db = request.app.get(APP_KEY_DB)
+    overrides_map: dict[tuple[str, str], str] = {}
+    db_error: str | None = None
+    if db is not None:
+        try:
+            overrides_map = await db.load_all_string_overrides()
+        except Exception:
+            log.exception("strings_get: load_all_string_overrides failed")
+            db_error = "Database query failed — see logs."
+
+    lang_filter = request.query.get("lang") or None
+    if lang_filter not in bot_strings_module.SUPPORTED_LANGUAGES:
+        lang_filter = None
+    search = request.query.get("q") or None
+
+    rows = _filter_compiled_strings(
+        lang_filter=lang_filter,
+        search=search,
+        overrides_map=overrides_map,
+    )
+
+    response = aiohttp_jinja2.render_template(
+        "strings.html",
+        request,
+        {
+            "rows": rows,
+            "lang_filter": lang_filter,
+            "search": search or "",
+            "supported_langs": list(
+                bot_strings_module.SUPPORTED_LANGUAGES
+            ),
+            "override_count": sum(1 for r in rows if r["has_override"]),
+            "db_error": db_error,
+            "active_page": "strings",
+            "csrf_token": csrf_token_for(request),
+            "flash": None,
+        },
+    )
+    flash = pop_flash(request, response)
+    if flash is not None:
+        response = aiohttp_jinja2.render_template(
+            "strings.html",
+            request,
+            {
+                "rows": rows,
+                "lang_filter": lang_filter,
+                "search": search or "",
+                "supported_langs": list(
+                    bot_strings_module.SUPPORTED_LANGUAGES
+                ),
+                "override_count": sum(1 for r in rows if r["has_override"]),
+                "db_error": db_error,
+                "active_page": "strings",
+                "csrf_token": csrf_token_for(request),
+                "flash": flash,
+            },
+        )
+        response.del_cookie(FLASH_COOKIE, path="/admin/")
+    return response
+
+
+async def string_detail_get(request: web.Request) -> web.StreamResponse:
+    """Single-string editor: shows compiled default, current override
+    (if any), and a textarea pre-filled with the override-or-default."""
+    lang = request.match_info["lang"]
+    key = request.match_info["key"]
+    if lang not in bot_strings_module.SUPPORTED_LANGUAGES:
+        raise web.HTTPNotFound()
+    default = bot_strings_module.get_compiled_default(lang, key)
+    if default is None:
+        # Slug doesn't exist in the compiled table for this lang —
+        # don't let the admin invent new slugs (they'd never be read
+        # by t()). 404 is the right answer.
+        raise web.HTTPNotFound()
+
+    db = request.app.get(APP_KEY_DB)
+    override: str | None = None
+    db_error: str | None = None
+    if db is not None:
+        try:
+            overrides_map = await db.load_all_string_overrides()
+            override = overrides_map.get((lang, key))
+        except Exception:
+            log.exception("string_detail_get: load failed")
+            db_error = "Database query failed — see logs."
+
+    response = aiohttp_jinja2.render_template(
+        "string_detail.html",
+        request,
+        {
+            "lang": lang,
+            "key": key,
+            "default": default,
+            "override": override,
+            "current": override if override is not None else default,
+            "max_chars": STRING_OVERRIDE_MAX_CHARS,
+            "db_error": db_error,
+            "active_page": "strings",
+            "csrf_token": csrf_token_for(request),
+            "flash": None,
+        },
+    )
+    flash = pop_flash(request, response)
+    if flash is not None:
+        response = aiohttp_jinja2.render_template(
+            "string_detail.html",
+            request,
+            {
+                "lang": lang,
+                "key": key,
+                "default": default,
+                "override": override,
+                "current": override if override is not None else default,
+                "max_chars": STRING_OVERRIDE_MAX_CHARS,
+                "db_error": db_error,
+                "active_page": "strings",
+                "csrf_token": csrf_token_for(request),
+                "flash": flash,
+            },
+        )
+        response.del_cookie(FLASH_COOKIE, path="/admin/")
+    return response
+
+
+async def _refresh_overrides_cache(db) -> None:
+    """Reload the in-memory override cache so the bot serves the
+    new values on the very next ``t()`` call. Failures are logged
+    but not fatal — the admin already saved successfully."""
+    try:
+        overrides = await db.load_all_string_overrides()
+        bot_strings_module.set_overrides(overrides)
+    except Exception:
+        log.exception(
+            "string override cache refresh failed — bot may serve "
+            "stale text until next process restart"
+        )
+
+
+async def string_save_post(request: web.Request) -> web.StreamResponse:
+    """POST /admin/strings/{lang}/{key} — upsert a single override."""
+    lang = request.match_info["lang"]
+    key = request.match_info["key"]
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+
+    redirect_to = f"/admin/strings/{lang}/{key}"
+    response = web.HTTPFound(location=redirect_to)
+
+    if lang not in bot_strings_module.SUPPORTED_LANGUAGES:
+        raise web.HTTPNotFound()
+    if bot_strings_module.get_compiled_default(lang, key) is None:
+        raise web.HTTPNotFound()
+
+    form = await request.post()
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning(
+            "string_save_post: CSRF token mismatch from %s", request.remote
+        )
+        set_flash(
+            response,
+            kind="error",
+            message="Form submission was rejected (CSRF). Refresh and try again.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    raw = str(form.get("value", ""))
+    # Telegram strips leading/trailing whitespace on inline-button
+    # text anyway; trim it server-side so the override matches
+    # what users will actually see.
+    value = raw.strip()
+    if not value:
+        set_flash(
+            response,
+            kind="error",
+            message="Override cannot be empty. Use 'Revert' to restore the default.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+    if len(value) > STRING_OVERRIDE_MAX_CHARS:
+        set_flash(
+            response,
+            kind="error",
+            message=(
+                f"Override is {len(value):,} characters; max is "
+                f"{STRING_OVERRIDE_MAX_CHARS:,}."
+            ),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    db = request.app.get(APP_KEY_DB)
+    if db is None:
+        set_flash(
+            response,
+            kind="error",
+            message="No database wired up — cannot save.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        await db.upsert_string_override(
+            lang, key, value, updated_by="web"
+        )
+    except Exception:
+        log.exception("string_save_post: upsert failed")
+        set_flash(
+            response,
+            kind="error",
+            message="Database write failed — see logs.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    await _refresh_overrides_cache(db)
+    log.info(
+        "string override saved lang=%s key=%s len=%d actor=web",
+        lang, key, len(value),
+    )
+    set_flash(
+        response,
+        kind="success",
+        message=f"Saved override for {lang}:{key}.",
+        secret=secret,
+        cookie_secure=cookie_secure,
+    )
+    return response
+
+
+async def string_revert_post(request: web.Request) -> web.StreamResponse:
+    """POST /admin/strings/{lang}/{key}/revert — drop the DB row so
+    the compiled default takes effect again."""
+    lang = request.match_info["lang"]
+    key = request.match_info["key"]
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+
+    redirect_to = f"/admin/strings/{lang}/{key}"
+    response = web.HTTPFound(location=redirect_to)
+
+    if lang not in bot_strings_module.SUPPORTED_LANGUAGES:
+        raise web.HTTPNotFound()
+    if bot_strings_module.get_compiled_default(lang, key) is None:
+        raise web.HTTPNotFound()
+
+    form = await request.post()
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning(
+            "string_revert_post: CSRF token mismatch from %s", request.remote
+        )
+        set_flash(
+            response,
+            kind="error",
+            message="Form submission was rejected (CSRF). Refresh and try again.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    db = request.app.get(APP_KEY_DB)
+    if db is None:
+        set_flash(
+            response,
+            kind="error",
+            message="No database wired up — cannot revert.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        deleted = await db.delete_string_override(lang, key)
+    except Exception:
+        log.exception("string_revert_post: delete failed")
+        set_flash(
+            response,
+            kind="error",
+            message="Database write failed — see logs.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    await _refresh_overrides_cache(db)
+    if deleted:
+        log.info("string override reverted lang=%s key=%s actor=web", lang, key)
+        set_flash(
+            response,
+            kind="success",
+            message=f"Reverted {lang}:{key} to compiled default.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+    else:
+        set_flash(
+            response,
+            kind="info",
+            message=f"{lang}:{key} had no override — nothing to revert.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+    return response
+
+
+# ---------------------------------------------------------------------
 # App wiring
 # ---------------------------------------------------------------------
 
@@ -2247,6 +2623,21 @@ def setup_admin_routes(
     app.router.add_get(
         "/admin/transactions",
         _require_auth(transactions_get),
+    )
+
+    # Stage-9-Step-1.6: editable bot strings.
+    app.router.add_get("/admin/strings", _require_auth(strings_get))
+    app.router.add_get(
+        "/admin/strings/{lang}/{key}",
+        _require_auth(string_detail_get),
+    )
+    app.router.add_post(
+        "/admin/strings/{lang}/{key}",
+        _require_auth(string_save_post),
+    )
+    app.router.add_post(
+        "/admin/strings/{lang}/{key}/revert",
+        _require_auth(string_revert_post),
     )
 
     app[APP_KEY_INSTALLED] = True
