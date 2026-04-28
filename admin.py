@@ -680,6 +680,17 @@ _BROADCAST_MAX_TEXT_LEN = 3500
 # a WARNING when the server-supplied window exceeds the cap so
 # ops can spot prolonged degradation.
 _BROADCAST_RETRY_AFTER_MAX_S = 60.0
+# How finely we slice a long ``TelegramRetryAfter`` sleep when a
+# ``should_cancel`` predicate is wired in (see ``_do_broadcast``).
+# Pre-fix, the retry-after sleep was a single ``asyncio.sleep(60)``
+# call — a cancel arriving mid-sleep was honoured only after the
+# full window elapsed AND the post-sleep retry attempt completed.
+# Slicing the sleep into ~1 s chunks bounds cancel latency to one
+# slice while preserving the back-off semantics. We deliberately
+# keep the fast path (no ``should_cancel``) on a single sleep so the
+# cap-enforcement test in ``test_web_admin.py`` still observes the
+# canonical "sleep == cap" call.
+_BROADCAST_RETRY_AFTER_SLICE_S = 1.0
 # Upper bound on ``--active=N`` / ``only_active_days=``. PostgreSQL's
 # ``interval`` stores days in a 32-bit int; an admin typing
 # ``--active=9999999999`` (ten digits) would overflow the
@@ -852,10 +863,79 @@ async def _do_broadcast(
                     "(recipient %d of %d)",
                     raw_retry, i, total,
                 )
-            await asyncio.sleep(sleep_for)
+            # Cancel-aware sleep: if a ``should_cancel`` predicate was
+            # wired in, slice the (potentially long) back-off into
+            # ~1 s chunks so a cancel arriving mid-sleep is honoured
+            # within ``_BROADCAST_RETRY_AFTER_SLICE_S`` instead of
+            # after the full ``_BROADCAST_RETRY_AFTER_MAX_S`` window.
+            # Without a predicate (legacy / Telegram-driven callers
+            # like ``admin_broadcast``) we keep the original single
+            # ``asyncio.sleep(sleep_for)`` so the cap-enforcement
+            # test in ``test_web_admin.py`` continues to observe the
+            # canonical "sleep == cap" call.
+            cancelled_during_sleep = False
+            if should_cancel is None:
+                await asyncio.sleep(sleep_for)
+            else:
+                remaining = sleep_for
+                while remaining > 0:
+                    try:
+                        if should_cancel():
+                            cancelled = True
+                            cancelled_during_sleep = True
+                            log.info(
+                                "broadcast: cancel requested during "
+                                "retry-after sleep at recipient %d of "
+                                "%d (sent=%d blocked=%d failed=%d)",
+                                i, total, sent, blocked, failed,
+                            )
+                            break
+                    except Exception:
+                        log.debug(
+                            "broadcast: should_cancel predicate raised "
+                            "during retry-after sleep "
+                            "(treating as not-cancelled)",
+                            exc_info=True,
+                        )
+                    slice_s = min(_BROADCAST_RETRY_AFTER_SLICE_S, remaining)
+                    await asyncio.sleep(slice_s)
+                    remaining -= slice_s
+            if cancelled_during_sleep:
+                # ``cancelled`` is set; drop out of the for-loop so the
+                # final summary stats reflect the abort.
+                break
+
+            # Retry attempt — preserve the same Telegram-exception
+            # categorization the parent handler uses, instead of the
+            # pre-fix ``except Exception`` that lumped a "blocked the
+            # bot during retry" or "rate-limited again" outcome into
+            # the generic ``failed`` bucket and emitted a noisy stack
+            # trace for what should be a quiet ``blocked`` increment.
             try:
                 await bot.send_message(chat_id=chat_id, text=text)
                 sent += 1
+            except TelegramForbiddenError:
+                blocked += 1
+            except TelegramRetryAfter:
+                # A second 429 inside the same recipient is rare but
+                # possible (Telegram occasionally returns a fresh
+                # back-off window mid-burst). We don't recurse — one
+                # back-off per recipient is enough to keep the
+                # broadcast moving — and surface the rare event at
+                # WARNING so ops can correlate with Telegram-side
+                # incidents.
+                failed += 1
+                log.warning(
+                    "broadcast: second 429 on retry for chat_id=%d; "
+                    "recording as failed and moving on",
+                    chat_id,
+                )
+            except TelegramBadRequest:
+                failed += 1
+                log.exception(
+                    "broadcast: post-429 bad_request for chat_id=%d",
+                    chat_id,
+                )
             except Exception:
                 failed += 1
                 log.exception(
