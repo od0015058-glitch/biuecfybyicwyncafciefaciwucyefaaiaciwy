@@ -1198,9 +1198,17 @@ class Database:
         on success.
 
         The ``reason`` is stored in ``transactions.notes`` for audit;
-        the admin's telegram id is encoded into ``gateway_invoice_id``
-        as ``admin-<admin_id>-<timestamp>-<rand>`` (UNIQUE on the
-        column means we get a free duplicate-click guard).
+        the admin's telegram id lands in two places for redundancy:
+        a dedicated ``admin_telegram_id`` column (Stage-9-Step-2 —
+        forensics queries can do
+        ``WHERE admin_telegram_id IS NOT NULL`` cleanly) and as part
+        of the ``gateway_invoice_id`` string
+        ``admin-<admin_id>-<timestamp>-<rand>``. The legacy encoding
+        is kept because (a) the UNIQUE constraint on
+        ``gateway_invoice_id`` doubles as a duplicate-click guard
+        and (b) older rows from before the column existed only have
+        the encoded form, so any forensics tool needs to know to
+        check both.
         """
         if delta_usd == 0:
             raise ValueError("delta_usd must be non-zero")
@@ -1239,16 +1247,19 @@ class Database:
                     INSERT INTO transactions (
                         telegram_id, gateway, currency_used,
                         amount_crypto_or_rial, amount_usd_credited,
-                        status, gateway_invoice_id, completed_at, notes
+                        status, gateway_invoice_id, completed_at,
+                        notes, admin_telegram_id
                     )
                     VALUES (
                         $1, 'admin', 'USD',
                         NULL, $2,
-                        'SUCCESS', $3, NOW(), $4
+                        'SUCCESS', $3, NOW(),
+                        $4, $5
                     )
                     RETURNING transaction_id
                     """,
                     telegram_id, delta_usd, invoice_id, reason,
+                    admin_telegram_id,
                 )
         return {
             "new_balance": new_balance,
@@ -1270,6 +1281,7 @@ class Database:
               "free_messages_left": int,
               "active_model": str,
               "language_code": str,
+              "memory_enabled": bool,
               "total_credited_usd": float,   # sum SUCCESS|PARTIAL tx, signed
               "total_spent_usd": float,      # sum usage_logs.cost
               "recent_transactions": [
@@ -1285,7 +1297,8 @@ class Database:
             user_row = await connection.fetchrow(
                 """
                 SELECT telegram_id, username, balance_usd,
-                       free_messages_left, active_model, language_code
+                       free_messages_left, active_model, language_code,
+                       memory_enabled
                 FROM users WHERE telegram_id = $1
                 """,
                 telegram_id,
@@ -1328,6 +1341,7 @@ class Database:
             "free_messages_left": int(user_row["free_messages_left"]),
             "active_model": user_row["active_model"],
             "language_code": user_row["language_code"],
+            "memory_enabled": bool(user_row["memory_enabled"]),
             "total_credited_usd": float(credited or 0),
             "total_spent_usd": float(spent or 0),
             "recent_transactions": [
@@ -1759,6 +1773,154 @@ class Database:
         # status string. Anything other than ``"DELETE 0"`` means at
         # least one row went.
         return not result.endswith(" 0")
+
+    # ------------------------------------------------------------------
+    # Stage-9-Step-2: admin audit log + per-user-field editor.
+    # ------------------------------------------------------------------
+
+    # Allow-list of user fields the admin /admin/users/{id} editor can
+    # touch. Anything outside this set is rejected — we don't want a
+    # malformed POST to be able to set arbitrary columns (e.g.
+    # ``balance_usd`` should ONLY change through ``admin_adjust_balance``
+    # so the change shows up in the transactions ledger).
+    USER_EDITABLE_FIELDS = (
+        "language_code",
+        "active_model",
+        "memory_enabled",
+        "free_messages_left",
+        "username",
+    )
+
+    async def record_admin_audit(
+        self,
+        actor: str,
+        action: str,
+        *,
+        target: str | None = None,
+        ip: str | None = None,
+        outcome: str = "ok",
+        meta: dict | None = None,
+    ) -> int | None:
+        """Append one row to ``admin_audit_log``. Returns the new id.
+
+        Best-effort: callers should wrap the call in their own
+        try/except so an audit-write failure never blocks the
+        underlying admin operation. We log the exception here as well
+        so the failure is double-visible in ops logs.
+        """
+        import json as _json
+        meta_json = _json.dumps(meta) if meta is not None else None
+        try:
+            async with self.pool.acquire() as connection:
+                row_id = await connection.fetchval(
+                    """
+                    INSERT INTO admin_audit_log
+                        (actor, action, target, ip, outcome, meta)
+                    VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                    RETURNING id
+                    """,
+                    actor,
+                    action,
+                    target,
+                    ip,
+                    outcome,
+                    meta_json,
+                )
+            return int(row_id) if row_id is not None else None
+        except Exception:
+            log.exception(
+                "record_admin_audit failed actor=%s action=%s",
+                actor, action,
+            )
+            return None
+
+    async def list_admin_audit_log(
+        self,
+        *,
+        limit: int = 200,
+        action: str | None = None,
+        actor: str | None = None,
+    ) -> list[dict]:
+        """Most recent audit rows, newest first. Optional filters
+        narrow by action slug or actor."""
+        clauses: list[str] = []
+        params: list[object] = []
+        if action:
+            params.append(action)
+            clauses.append(f"action = ${len(params)}")
+        if actor:
+            params.append(actor)
+            clauses.append(f"actor = ${len(params)}")
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(int(limit))
+        sql = f"""
+            SELECT id, ts, actor, action, target, ip, outcome, meta
+              FROM admin_audit_log
+              {where}
+             ORDER BY ts DESC, id DESC
+             LIMIT ${len(params)}
+        """
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(sql, *params)
+        return [
+            {
+                "id": int(r["id"]),
+                "ts": r["ts"].isoformat() if r["ts"] is not None else None,
+                "actor": r["actor"],
+                "action": r["action"],
+                "target": r["target"],
+                "ip": r["ip"],
+                "outcome": r["outcome"],
+                "meta": dict(r["meta"]) if r["meta"] is not None else None,
+            }
+            for r in rows
+        ]
+
+    async def update_user_admin_fields(
+        self,
+        telegram_id: int,
+        *,
+        fields: dict,
+    ) -> dict | None:
+        """Update an allow-listed subset of user fields atomically.
+
+        ``fields`` is a dict whose keys must be in
+        ``USER_EDITABLE_FIELDS``. Any key outside that allow-list is
+        a programming error and is rejected with ``ValueError``
+        before we touch the DB — defense in depth, the caller is
+        already supposed to clamp the form input to this set.
+
+        Returns:
+            * ``None`` if no row matched ``telegram_id``
+            * ``{"changed": {field: new_value, ...}}`` on success
+              (echoing what was actually written so the caller can
+              flash a precise summary)
+        """
+        if not fields:
+            raise ValueError("fields must be non-empty")
+        for k in fields:
+            if k not in self.USER_EDITABLE_FIELDS:
+                raise ValueError(f"field {k!r} is not user-editable")
+        # Build a positional UPDATE — asyncpg can't bind an arbitrary
+        # column-name list, so we string-format the (allow-listed)
+        # column names directly. NEVER do this with caller-supplied
+        # column names; the allow-list above is the only thing
+        # keeping this safe.
+        set_clauses: list[str] = []
+        params: list[object] = []
+        for col, value in fields.items():
+            params.append(value)
+            set_clauses.append(f"{col} = ${len(params)}")
+        params.append(telegram_id)
+        sql = (
+            f"UPDATE users SET {', '.join(set_clauses)} "
+            f"WHERE telegram_id = ${len(params)} RETURNING telegram_id"
+        )
+        async with self.pool.acquire() as connection:
+            result = await connection.fetchval(sql, *params)
+        if result is None:
+            return None
+        return {"changed": dict(fields)}
 
 
 # Export a single instance to be used across the app

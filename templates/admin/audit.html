@@ -1,0 +1,148 @@
+{% extends "_layout.html" %}
+
+{% block title %}Audit log{% endblock %}
+
+{% block extra_head %}
+<style>
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: flex-end;
+    margin-bottom: 16px;
+  }
+  .filters .field { margin-bottom: 0; min-width: 200px; }
+  .filters button.primary {
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 6px;
+    padding: 9px 18px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  .filters button.primary:hover { background: var(--accent-hover); }
+  .filters a.reset {
+    padding: 9px 14px;
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+  code.mono {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  table.audit { width: 100%; }
+  table.audit td, table.audit th {
+    vertical-align: top;
+    font-size: 13px;
+  }
+  table.audit td.meta {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+    max-width: 360px;
+    word-break: break-all;
+  }
+  .outcome-ok    { color: var(--success); }
+  .outcome-deny  { color: var(--warn, #d97706); }
+  .outcome-error { color: var(--danger); }
+  .pill-action {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--text);
+  }
+</style>
+{% endblock %}
+
+{% block main %}
+<h2>Audit log</h2>
+
+<div class="explainer panel" style="margin-bottom: 16px; padding: 12px 14px; font-size: 13px; color: var(--text-muted);">
+  Newest 200 admin actions, recorded by <code class="mono">record_admin_audit</code>.
+  Web actor is recorded as <code class="mono">"web"</code>; per-admin
+  identity will arrive when the panel grows real user accounts.
+  Filter by action slug to scope to one kind of activity.
+</div>
+
+<form method="get" action="/admin/audit" class="filters">
+  <div class="field">
+    <label for="action">Action</label>
+    <select id="action" name="action">
+      <option value="">— all actions —</option>
+      {% for slug, label in action_labels.items() %}
+      <option value="{{ slug }}"
+        {% if slug == selected_action %}selected{% endif %}>
+        {{ label }}
+      </option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="actor">Actor</label>
+    <input type="text" id="actor" name="actor"
+           value="{{ selected_actor }}"
+           placeholder="web">
+  </div>
+  <button type="submit" class="primary">Filter</button>
+  {% if selected_action or selected_actor %}
+  <a href="/admin/audit" class="reset">Reset</a>
+  {% endif %}
+</form>
+
+{% if db_error %}
+<div class="alert alert-warn">{{ db_error }}</div>
+{% endif %}
+
+<div class="panel">
+  {% if rows %}
+  <table class="audit">
+    <thead>
+      <tr>
+        <th>When (UTC)</th>
+        <th>Actor</th>
+        <th>Action</th>
+        <th>Target</th>
+        <th>Outcome</th>
+        <th>IP</th>
+        <th>Meta</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td><code class="mono">{% if r.ts %}{{ r.ts[:19] }}Z{% else %}—{% endif %}</code></td>
+        <td><code class="mono">{{ r.actor }}</code></td>
+        <td>
+          <span class="pill-action">
+            {{ action_labels.get(r.action, r.action) }}
+          </span>
+          <div class="hint" style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">
+            <code class="mono">{{ r.action }}</code>
+          </div>
+        </td>
+        <td>
+          {% if r.target %}<code class="mono">{{ r.target }}</code>
+          {% else %}—{% endif %}
+        </td>
+        <td>
+          <span class="outcome-{{ r.outcome }}">{{ r.outcome }}</span>
+        </td>
+        <td>{% if r.ip %}<code class="mono">{{ r.ip }}</code>{% else %}—{% endif %}</td>
+        <td class="meta">
+          {% if r.meta %}{{ r.meta }}{% else %}—{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p style="margin: 0; color: var(--text-muted);">No audit rows.</p>
+  {% endif %}
+</div>
+{% endblock %}
