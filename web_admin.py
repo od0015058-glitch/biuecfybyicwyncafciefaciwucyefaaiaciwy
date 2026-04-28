@@ -76,6 +76,7 @@ from aiohttp import web
 # still works against the injected DB in tests.
 import strings as bot_strings_module
 from database import Database
+from formatting import format_usd
 from rate_limit import (
     client_ip_for_rate_limit,
     consume_login_token,
@@ -2183,8 +2184,208 @@ def _encode_tx_query(filters: dict, *, page: int | None = None) -> str:
     return urlencode(params)
 
 
+# Stage-9-Step-7: page size used by the CSV streamer.
+# 500 rows ≈ 100 KB after CSV serialization — small enough that we
+# don't pin the asyncpg connection for too long on a single page,
+# big enough that we don't pay round-trip overhead for every row.
+TRANSACTIONS_CSV_BATCH_SIZE = 500
+# Defence-in-depth: refuse a CSV export beyond this many rows so a
+# pathological filter ("everything ever") can't lock the connection
+# pool indefinitely. 500k rows ≈ 100 MB CSV which is already past
+# what a browser-side download will gracefully handle.
+TRANSACTIONS_CSV_MAX_ROWS = 500_000
+
+# Header row is hoisted to a module constant so the test can pin it
+# without copy-pasting the column list. Order MUST match the values
+# yielded in :func:`transactions_csv_get`.
+TRANSACTIONS_CSV_HEADERS = (
+    "transaction_id",
+    "telegram_id",
+    "gateway",
+    "currency",
+    "amount_crypto_or_rial",
+    "amount_usd",
+    "status",
+    "gateway_invoice_id",
+    "created_at",
+    "completed_at",
+    "notes",
+)
+
+
+def _csv_quote(value) -> str:
+    """Minimal RFC 4180 CSV field encoder.
+
+    We could use the stdlib ``csv`` module here but ``csv.writer``
+    expects a writable text-IO target; for streaming we want to emit
+    one row at a time as a string and let aiohttp handle the
+    transport. Hand-rolling keeps the streamer trivially testable
+    and avoids the ``StringIO`` allocation per batch. None ⇒ empty
+    field.
+    """
+    if value is None:
+        return ""
+    s = str(value)
+    if any(ch in s for ch in ('"', ",", "\n", "\r")):
+        # Double up internal quotes, then wrap.
+        return '"' + s.replace('"', '""') + '"'
+    return s
+
+
+def _format_tx_row_for_csv(row: dict) -> str:
+    """Serialize one row from ``Database.list_transactions['rows']``
+    into a single CSV line (with trailing CRLF).
+
+    Numeric ``amount_usd`` is emitted with **4 decimal places, no
+    commas, no dollar sign** — CSV is a machine-readable format and
+    accounting software (Excel, QuickBooks) will reject ``$1,234``
+    but happily import ``1234.5678``. The 4-decimal precision matches
+    the in-UI ``format_usd`` default so a manual reconciliation
+    against the on-screen ledger is exact.
+    """
+    fields = [
+        row["id"],
+        row["telegram_id"] if row["telegram_id"] is not None else "",
+        row["gateway"],
+        row["currency"],
+        f"{row['amount_crypto_or_rial']}" if row["amount_crypto_or_rial"] is not None else "",
+        f"{row['amount_usd']:.4f}",
+        row["status"],
+        row["gateway_invoice_id"] or "",
+        row["created_at"] or "",
+        row["completed_at"] or "",
+        row["notes"] or "",
+    ]
+    return ",".join(_csv_quote(f) for f in fields) + "\r\n"
+
+
+async def transactions_csv_get(request: web.Request) -> web.StreamResponse:
+    """GET /admin/transactions?format=csv — streamed CSV export.
+
+    Stage-9-Step-7. Same filter semantics as the HTML page (gateway,
+    status, telegram_id) but pagination params are ignored — a CSV
+    export is always full-result. Streamed via aiohttp
+    :class:`StreamResponse` in batches of
+    ``TRANSACTIONS_CSV_BATCH_SIZE`` so even a 500k-row export
+    doesn't blow the bot's memory.
+    """
+    db = request.app[APP_KEY_DB]
+    filters = parse_transactions_query(request.rel_url.query)
+
+    response = web.StreamResponse(
+        status=200,
+        reason="OK",
+        headers={
+            "Content-Type": "text/csv; charset=utf-8",
+            # Filename includes the timestamp so an admin running
+            # multiple exports doesn't accidentally overwrite an
+            # in-progress download. ``transactions-YYYYMMDDTHHMMSSZ.csv``.
+            "Content-Disposition": (
+                "attachment; "
+                f"filename=\"transactions-{_now_compact()}.csv\""
+            ),
+            # Defence-in-depth: explicitly disable any caching layer
+            # between the bot and the admin's browser. A cached CSV
+            # would leak ledger data to a later admin session that
+            # logged in to the same machine.
+            "Cache-Control": "no-store, max-age=0",
+        },
+    )
+    await response.prepare(request)
+
+    # Header row first.
+    header = ",".join(_csv_quote(h) for h in TRANSACTIONS_CSV_HEADERS) + "\r\n"
+    await response.write(header.encode("utf-8"))
+
+    page = 1
+    rows_emitted = 0
+    while True:
+        try:
+            page_result = await db.list_transactions(
+                gateway=filters["gateway"],
+                status=filters["status"],
+                telegram_id=filters["telegram_id"],
+                page=page,
+                per_page=TRANSACTIONS_CSV_BATCH_SIZE,
+            )
+        except ValueError:
+            # Filters were already enum-validated by
+            # parse_transactions_query, so reaching this branch means
+            # the DB layer added a new validation rule mid-export.
+            # Truncate cleanly rather than raising; the partial CSV
+            # is still useful for forensics.
+            log.warning(
+                "transactions_csv_get: list_transactions rejected "
+                "filters=%s mid-export",
+                filters,
+            )
+            break
+
+        rows = page_result.get("rows", [])
+        if not rows:
+            break
+
+        chunk_lines: list[str] = []
+        for row in rows:
+            chunk_lines.append(_format_tx_row_for_csv(row))
+            rows_emitted += 1
+            if rows_emitted >= TRANSACTIONS_CSV_MAX_ROWS:
+                log.warning(
+                    "transactions_csv_get: reached cap of %d rows "
+                    "for filters=%s — truncating",
+                    TRANSACTIONS_CSV_MAX_ROWS, filters,
+                )
+                break
+        await response.write("".join(chunk_lines).encode("utf-8"))
+
+        if rows_emitted >= TRANSACTIONS_CSV_MAX_ROWS:
+            break
+        if page >= page_result.get("total_pages", 0):
+            break
+        page += 1
+
+    await response.write_eof()
+
+    # Audit the export (best-effort; never break the response over a
+    # failed audit insert).
+    await _record_audit_safe(
+        request,
+        "transactions_export_csv",
+        target="transactions",
+        meta={
+            "rows": rows_emitted,
+            "filters": {
+                "gateway": filters.get("gateway"),
+                "status": filters.get("status"),
+                "telegram_id": filters.get("telegram_id"),
+            },
+        },
+    )
+    log.info(
+        "transactions_csv_get: exported %d rows for filters=%s",
+        rows_emitted, filters,
+    )
+    return response
+
+
+def _now_compact() -> str:
+    """``20260101T120000Z`` style timestamp for CSV filenames.
+
+    Hoisted out of ``transactions_csv_get`` so a future caller
+    needing the same shape (e.g. ledger-snapshot dump) can reuse it.
+    """
+    return datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
 async def transactions_get(request: web.Request) -> web.StreamResponse:
-    """GET /admin/transactions — paginated ledger browser."""
+    """GET /admin/transactions — paginated ledger browser.
+
+    Special-cases ``?format=csv`` to delegate to the streaming CSV
+    exporter (see :func:`transactions_csv_get`).
+    """
+    if request.rel_url.query.get("format", "").lower() == "csv":
+        return await transactions_csv_get(request)
+
     db = request.app[APP_KEY_DB]
     filters = parse_transactions_query(request.rel_url.query)
 
@@ -2224,6 +2425,14 @@ async def transactions_get(request: web.Request) -> web.StreamResponse:
         q = _encode_tx_query(filters, page=page_result["page"] + 1)
         next_url = f"/admin/transactions?{q}" if q else "/admin/transactions"
 
+    # Stage-9-Step-7: pre-build the CSV-export query string. Same
+    # filters as the page, plus ``format=csv`` and explicitly NO
+    # pagination params (CSV exports the whole filtered set).
+    csv_query_parts = _encode_tx_query({**filters, "page": 1})
+    csv_query = (
+        csv_query_parts + "&format=csv" if csv_query_parts else "format=csv"
+    )
+
     return aiohttp_jinja2.render_template(
         "transactions.html",
         request,
@@ -2236,6 +2445,7 @@ async def transactions_get(request: web.Request) -> web.StreamResponse:
             "gateway_choices": sorted(Database.TRANSACTIONS_GATEWAY_VALUES),
             "status_choices": sorted(Database.TRANSACTIONS_STATUS_VALUES),
             "per_page_choices": TRANSACTIONS_PER_PAGE_CHOICES,
+            "csv_query": csv_query,
         },
     )
 
@@ -3011,6 +3221,10 @@ def setup_admin_routes(
         # being explicit here protects us if a future template ever loses
         # the .html extension.
         autoescape=jinja2.select_autoescape(["html"]),
+        # Stage-9-Step-7: single canonical USD formatter — see
+        # ``formatting.format_usd`` for why the ad-hoc per-template
+        # ``"${:,.4f}".format(...)`` calls were replaced.
+        filters={"format_usd": format_usd},
     )
     app.middlewares.append(admin_auth_middleware)
 

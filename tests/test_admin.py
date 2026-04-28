@@ -277,7 +277,10 @@ def test_format_balance_summary_full():
     assert "$2.5000" in out  # admin debit
     assert "double-charged user" in out
     assert "+$25.0000" in out
-    assert "−$2.5000" in out
+    # Stage-9-Step-7 unified format_usd: minus is the ASCII
+    # ``-`` placed BEFORE the dollar sign (matching accounting
+    # convention).
+    assert "-$2.5000" in out
 
 
 def test_format_balance_summary_no_username():

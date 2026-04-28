@@ -32,6 +32,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from database import db
+from formatting import format_usd
 
 log = logging.getLogger("bot.admin")
 
@@ -267,20 +268,19 @@ def _format_balance_summary(summary: dict) -> str:
     lines = [
         f"💼 *Wallet for {user_label}* (`{summary['telegram_id']}`)",
         "",
-        f"• Balance: *${summary['balance_usd']:.4f}*",
+        f"• Balance: *{format_usd(summary['balance_usd'])}*",
         f"• Free messages left: {summary['free_messages_left']}",
         f"• Active model: `{summary['active_model']}`",
         f"• Language: `{summary['language_code']}`",
-        f"• Total credited (lifetime): ${summary['total_credited_usd']:.4f}",
-        f"• Total spent (lifetime): ${summary['total_spent_usd']:.4f}",
+        f"• Total credited (lifetime): {format_usd(summary['total_credited_usd'])}",
+        f"• Total spent (lifetime): {format_usd(summary['total_spent_usd'])}",
     ]
     txs = summary.get("recent_transactions") or []
     if txs:
         lines.append("")
         lines.append("📜 *Last 5 transactions*")
         for r in txs:
-            sign = "+" if r["amount_usd"] >= 0 else "−"
-            amount_abs = abs(r["amount_usd"])
+            sign = "+" if r["amount_usd"] >= 0 else ""
             note = r.get("notes")
             # Escape free-form note text — Markdown-special chars
             # in a stored note (`_`, `*`, `` ` ``, `[`) would
@@ -289,7 +289,7 @@ def _format_balance_summary(summary: dict) -> str:
             note_suffix = f" — _{_escape_md(note)}_" if note else ""
             lines.append(
                 f"  • #{r['id']} `{r['gateway']}` "
-                f"{sign}${amount_abs:.4f} ({r['status']}){note_suffix}"
+                f"{sign}{format_usd(r['amount_usd'])} ({r['status']}){note_suffix}"
             )
     return "\n".join(lines)
 
@@ -356,9 +356,9 @@ async def _handle_balance_op(
             await message.answer(f"❌ No user with id `{user_id}`.")
         else:
             await message.answer(
-                f"❌ Refused — debit of ${amount:.4f} would take user "
+                f"❌ Refused — debit of {format_usd(amount)} would take user "
                 f"`{user_id}` below zero "
-                f"(current balance: ${summary['balance_usd']:.4f})."
+                f"(current balance: {format_usd(summary['balance_usd'])})."
             )
         return
 
@@ -369,8 +369,8 @@ async def _handle_balance_op(
         result["transaction_id"], reason,
     )
     await message.answer(
-        f"✅ {sign_label} `{user_id}` ${amount:.4f}.\n"
-        f"New balance: *${result['new_balance']:.4f}*\n"
+        f"✅ {sign_label} `{user_id}` {format_usd(amount)}.\n"
+        f"New balance: *{format_usd(result['new_balance'])}*\n"
         f"Tx id: `{result['transaction_id']}`\n"
         # Escape free-form reason — without this, a reason like
         # ``stuck_invoice`` (admin's natural shorthand) would crash

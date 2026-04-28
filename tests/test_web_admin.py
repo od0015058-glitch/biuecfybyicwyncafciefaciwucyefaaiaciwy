@@ -2397,9 +2397,11 @@ async def test_user_detail_renders_summary(
     assert "@alice" in body
     assert "$42.5000" in body
     assert "openai/gpt-4o" in body
-    # Positive and negative sign rendering with abs magnitude.
+    # Stage-9-Step-7 unified format_usd: minus is the ASCII ``-``
+    # placed BEFORE the dollar sign; positive numbers get a leading
+    # ``+`` sign-marker.
     assert "+$10.0000" in body
-    assert "−$5.0000" in body
+    assert "-$5.0000" in body
     assert "[web] overcharge fix" in body
     # CSRF token is injected into the adjust form.
     assert 'name="csrf_token"' in body
@@ -4512,3 +4514,259 @@ async def test_promos_create_records_audit(
     assert resp.status == 302
     actions = [c.kwargs["action"] for c in db.record_admin_audit.await_args_list]
     assert "promo_create" in actions
+
+
+# =========================================================================
+# Stage-9-Step-7: format_usd unification + CSV export
+# =========================================================================
+
+
+def test_format_usd_default_4dp():
+    """4-decimal default — matches the in-UI ledger precision."""
+    from formatting import format_usd
+    assert format_usd(0) == "$0.0000"
+    assert format_usd(1) == "$1.0000"
+    assert format_usd(1.2345678) == "$1.2346"  # rounds at 4dp
+    assert format_usd(1234.5) == "$1,234.5000"
+
+
+def test_format_usd_2dp_for_settlement_amounts():
+    """``places=2`` for settlement-grade fields (gifts, promos)."""
+    from formatting import format_usd
+    assert format_usd(1234.5, places=2) == "$1,234.50"
+    assert format_usd(0.999, places=2) == "$1.00"
+    assert format_usd(0.001, places=2) == "$0.00"
+
+
+def test_format_usd_negative_uses_leading_minus():
+    """``-$1,234.56`` not ``$-1,234.56`` (accounting convention)."""
+    from formatting import format_usd
+    assert format_usd(-7.89) == "-$7.8900"
+    assert format_usd(-1234.5, places=2) == "-$1,234.50"
+    assert format_usd(-0.0001) == "-$0.0001"
+
+
+def test_format_usd_clamps_places():
+    """Stray ``places`` values are clamped to ``[0, 8]``."""
+    from formatting import format_usd
+    assert format_usd(1.5, places=0) == "$2"
+    assert format_usd(1.5, places=99) == format_usd(1.5, places=8)
+    assert format_usd(1.5, places=-3) == "$2"
+
+
+def test_format_usd_handles_int_input():
+    """Int inputs are widened to float (no TypeError)."""
+    from formatting import format_usd
+    assert format_usd(42) == "$42.0000"
+    assert format_usd(0, places=2) == "$0.00"
+
+
+# ---- CSV export endpoint -------------------------------------------------
+
+
+def _csv_tx_row(**overrides) -> dict:
+    """Helper — base shape matching ``Database.list_transactions``."""
+    base = {
+        "id": 1,
+        "telegram_id": 100,
+        "gateway": "nowpayments",
+        "currency": "USDT",
+        "amount_crypto_or_rial": 5.0,
+        "amount_usd": 9.99,
+        "status": "SUCCESS",
+        "gateway_invoice_id": "inv-1",
+        "created_at": "2026-04-28T12:00:00+00:00",
+        "completed_at": "2026-04-28T12:05:00+00:00",
+        "notes": None,
+    }
+    base.update(overrides)
+    return base
+
+
+async def test_transactions_csv_requires_auth(aiohttp_client, make_admin_app):
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    resp = await client.get(
+        "/admin/transactions?format=csv", allow_redirects=False
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+
+
+async def test_transactions_csv_emits_headers_and_rows(
+    aiohttp_client, make_admin_app
+):
+    rows = [
+        _csv_tx_row(id=1, amount_usd=9.99),
+        _csv_tx_row(id=2, telegram_id=None, amount_usd=-2.5,
+                    gateway="admin", currency="USD",
+                    amount_crypto_or_rial=None,
+                    gateway_invoice_id=None,
+                    notes="[web] refund"),
+    ]
+    db = _stub_db(
+        list_transactions_result={
+            "rows": rows,
+            "total": 2,
+            "page": 1,
+            "per_page": 500,
+            "total_pages": 1,
+        }
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/transactions?format=csv")
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("text/csv")
+    assert "attachment" in resp.headers["Content-Disposition"]
+    assert resp.headers["Cache-Control"] == "no-store, max-age=0"
+    body = await resp.text()
+    # Header row first.
+    lines = body.splitlines()
+    assert lines[0] == (
+        "transaction_id,telegram_id,gateway,currency,"
+        "amount_crypto_or_rial,amount_usd,status,gateway_invoice_id,"
+        "created_at,completed_at,notes"
+    )
+    # Two data rows. CSV uses ``\r\n`` line endings.
+    assert body.endswith("\r\n")
+    # Row 1 — straightforward positive amount, USDT, with invoice id.
+    assert "1,100,nowpayments,USDT,5.0,9.9900,SUCCESS,inv-1," in body
+    # Row 2 — negative amount, NULL fields rendered as empty, quoted note.
+    assert ",,admin,USD,,-2.5000,SUCCESS,," in body
+    assert '"[web] refund"' not in body  # no internal commas → unquoted
+    assert "[web] refund" in body
+
+
+async def test_transactions_csv_quotes_fields_with_commas(
+    aiohttp_client, make_admin_app
+):
+    """Notes containing commas / quotes / newlines must be RFC4180-quoted."""
+    rows = [
+        _csv_tx_row(id=42, notes='note with, comma'),
+        _csv_tx_row(id=43, notes='note with "quotes"'),
+        _csv_tx_row(id=44, notes='line1\nline2'),
+    ]
+    db = _stub_db(
+        list_transactions_result={
+            "rows": rows, "total": 3, "page": 1,
+            "per_page": 500, "total_pages": 1,
+        }
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/transactions?format=csv")
+    body = await resp.text()
+    assert ',"note with, comma"' in body
+    assert ',"note with ""quotes"""' in body
+    assert ',"line1\nline2"' in body
+
+
+async def test_transactions_csv_audits_export(
+    aiohttp_client, make_admin_app
+):
+    """A successful export writes one ``transactions_export_csv``
+    audit row recording the row count + filters."""
+    rows = [_csv_tx_row(id=i) for i in range(3)]
+    db = _stub_db(
+        list_transactions_result={
+            "rows": rows, "total": 3, "page": 1,
+            "per_page": 500, "total_pages": 1,
+        }
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get(
+        "/admin/transactions?format=csv&gateway=nowpayments"
+    )
+    assert resp.status == 200
+    await resp.read()
+    actions = [c.kwargs["action"] for c in db.record_admin_audit.await_args_list]
+    assert "transactions_export_csv" in actions
+
+
+async def test_transactions_csv_honours_filters(
+    aiohttp_client, make_admin_app
+):
+    """The CSV streamer must hand the same filter params to
+    ``list_transactions`` that the HTML page does."""
+    db = _stub_db(
+        list_transactions_result={
+            "rows": [], "total": 0, "page": 1,
+            "per_page": 500, "total_pages": 0,
+        }
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get(
+        "/admin/transactions"
+        "?format=csv&gateway=admin&status=SUCCESS&telegram_id=99"
+    )
+    assert resp.status == 200
+    await resp.read()
+    db.list_transactions.assert_awaited_with(
+        gateway="admin",
+        status="SUCCESS",
+        telegram_id=99,
+        page=1,
+        per_page=500,  # TRANSACTIONS_CSV_BATCH_SIZE
+    )
+
+
+async def test_transactions_csv_streams_multiple_pages(
+    aiohttp_client, make_admin_app
+):
+    """Pagination is handled internally — the streamer must walk all
+    pages until ``total_pages`` is exhausted, not just emit page 1.
+    """
+    page1 = {
+        "rows": [_csv_tx_row(id=i) for i in range(1, 4)],
+        "total": 5, "page": 1, "per_page": 500, "total_pages": 2,
+    }
+    page2 = {
+        "rows": [_csv_tx_row(id=i) for i in range(4, 6)],
+        "total": 5, "page": 2, "per_page": 500, "total_pages": 2,
+    }
+    db = _stub_db()
+    db.list_transactions = AsyncMock(side_effect=[page1, page2])
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/transactions?format=csv")
+    body = await resp.text()
+    # All 5 ids present.
+    for tx_id in (1, 2, 3, 4, 5):
+        assert f"\n{tx_id}," in body or body.startswith(f"{tx_id},")
+    # ``list_transactions`` was called twice — once per page.
+    assert db.list_transactions.await_count == 2
+
+
+async def test_transactions_csv_button_appears_on_html_page(
+    aiohttp_client, make_admin_app
+):
+    """The HTML transactions page must surface the CSV-export link."""
+    db = _stub_db(
+        list_transactions_result={
+            "rows": [], "total": 0, "page": 1,
+            "per_page": 50, "total_pages": 0,
+        }
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/transactions?gateway=nowpayments")
+    body = await resp.text()
+    # Link present, includes format=csv, and carries the active filters.
+    assert "format=csv" in body
+    assert "gateway=nowpayments" in body
+    # Specifically the CSV export anchor.
+    assert "Export CSV" in body
+
+
+async def test_format_usd_jinja_filter_registered(make_admin_app):
+    """Sanity-check: the ``format_usd`` Jinja2 filter is wired so
+    every existing template gets the unified formatter without per-
+    template imports."""
+    import aiohttp_jinja2
+    app = make_admin_app(password="pw")
+    env = aiohttp_jinja2.get_env(app)
+    assert "format_usd" in env.filters
+    template = env.from_string("{{ x | format_usd }}")
+    assert template.render(x=-7.5) == "-$7.5000"
