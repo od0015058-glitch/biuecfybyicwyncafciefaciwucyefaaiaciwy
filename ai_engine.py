@@ -106,9 +106,47 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
                     return t(lang, "ai_provider_unavailable")
                 
                 # 4. Economic Settlement
+                #
+                # ``free_msgs`` was read from a stale ``users`` row at
+                # the top of this function. Between that read and now
+                # we made a (slow) HTTP call to OpenRouter, so several
+                # concurrent prompts from the same user can all observe
+                # the same pre-call snapshot and all enter the
+                # ``free_msgs > 0`` branch.
+                #
+                # ``decrement_free_message`` is atomic — its WHERE
+                # ``free_messages_left > 0`` only fires once per
+                # remaining free message — so a concurrent racer
+                # returns ``None`` instead of decrementing.
+                # Pre-fix that ``None`` was silently swallowed and
+                # the racer got a free reply with no settlement at
+                # all (no decrement, no balance deduction, no
+                # usage_log row). Five concurrent prompts with
+                # ``free_messages_left=1`` therefore granted four
+                # un-paid replies and the bot ate the OpenRouter cost.
+                #
+                # Fall through to the paid-settlement branch when the
+                # decrement no-ops so the wallet is charged like any
+                # other paid call. The pre-check at the top of this
+                # function still gates whether the user is allowed to
+                # call OpenRouter at all (``free_msgs <= 0`` AND
+                # ``balance < 0.05``), so the worst case here is a
+                # user with one free message and a paid balance who
+                # fires N concurrent prompts: the first decrements
+                # the free counter, the rest spend balance.
+                settled_as_free = False
                 if free_msgs > 0:
-                    await db.decrement_free_message(telegram_id)
-                else:
+                    decremented = await db.decrement_free_message(telegram_id)
+                    if decremented is not None:
+                        settled_as_free = True
+                    else:
+                        log.info(
+                            "free-message race for user %d: counter "
+                            "already exhausted by a concurrent prompt; "
+                            "falling back to paid settlement",
+                            telegram_id,
+                        )
+                if not settled_as_free:
                     cost = await calculate_cost_async(
                         active_model, prompt_tokens, completion_tokens
                     )

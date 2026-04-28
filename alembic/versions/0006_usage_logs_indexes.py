@@ -25,7 +25,27 @@ builds require ``autocommit_block`` and aren't worth the complexity
 for tables this small at deploy time.
 
 Revision ID: 0006_usage_logs_indexes
-Revises: 0005_admin_audit_log
+Revises: 0006_payment_status_transitions
+
+The parent revision is the *other* 0006-prefixed migration
+(``0006_payment_status_transitions``). Both were added concurrently —
+Stage-9-Step-4 (IPN replay-dedupe table) and Stage-9-Step-8 (this
+one, indexes on ``usage_logs``) — and both originally chained off
+``0005_admin_audit_log``. That left the alembic graph with two heads,
+which blocks ``alembic upgrade head`` with::
+
+    Multiple head revisions are present for given argument 'head'
+
+Linearizing here (this migration depends on the IPN replay-dedupe
+one) is the cheap fix: nothing in this migration *needs* the
+``payment_status_transitions`` table, and nothing in that migration
+touches ``usage_logs``, so the order is essentially arbitrary. We
+picked this direction because in production a deploy that's
+been running since before either 0006 was merged will already be at
+``0005_admin_audit_log``; ``alembic upgrade head`` from there will
+first apply ``0006_payment_status_transitions`` (a CREATE TABLE,
+fast) and then this migration (two CREATE INDEX statements, also
+fast). No data backfill is involved either way.
 """
 
 from alembic import op
@@ -33,7 +53,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "0006_usage_logs_indexes"
-down_revision = "0005_admin_audit_log"
+down_revision = "0006_payment_status_transitions"
 branch_labels = None
 depends_on = None
 
