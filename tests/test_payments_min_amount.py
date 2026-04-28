@@ -158,3 +158,138 @@ async def test_uppercase_currency_normalized_in_cache_key():
         # correctly, this is a cache hit (no new HTTP).
         await payments.get_min_amount_usd("btc", attempted_usd=0.10)
     assert mock_query.await_count == 2
+
+
+# ---------------------------------------------------------------------
+# ``_query_min_amount`` finite / non-negative guards
+# ---------------------------------------------------------------------
+#
+# Pre-fix bug: ``_query_min_amount`` parsed the API response's
+# ``fiat_equivalent`` field with a bare ``float()``. ``float("NaN")``
+# / ``float("inf")`` succeed silently and return the IEEE-754
+# special. The non-finite value then:
+#
+# 1. was cached by ``get_min_amount_usd`` against the pay_currency
+# 2. slipped past the trustworthiness filter unchanged because every
+#    comparison against NaN is False (``nan < attempted`` is False),
+# 3. was returned to ``create_crypto_invoice`` and stored on
+#    ``MinAmountError.min_usd``,
+# 4. was rendered to the user as ``f"min ${nan:.2f}"`` ⇒ ``"min $nan"``.
+#
+# A negative ``fiat_equivalent`` (clearly wrong — a min amount is by
+# definition non-negative) similarly slipped through and rendered
+# nonsensically.
+#
+# Post-fix: the parser returns ``None`` for non-finite or negative
+# input, so ``get_min_amount_usd`` falls back to the generic
+# "unknown min" branch of the UI rather than rendering nonsense.
+
+import math  # noqa: E402  (placed here to keep the diff localised)
+
+
+@pytest.mark.parametrize("bad", ["NaN", "nan", "Inf", "inf", "-inf"])
+async def test_query_min_amount_rejects_non_finite_strings(bad):
+    """``_query_min_amount`` must NOT return NaN/Inf even though the
+    API surfaced them as parseable strings.
+
+    Pre-fix ``float("NaN")`` returned ``nan`` and the value
+    propagated all the way to the user-facing error message
+    (``"min $nan"``). Post-fix returns ``None``.
+    """
+    fake_response = AsyncMock()
+    fake_response.status = 200
+    fake_response.json = AsyncMock(return_value={"fiat_equivalent": bad})
+    fake_response.__aenter__ = AsyncMock(return_value=fake_response)
+    fake_response.__aexit__ = AsyncMock(return_value=None)
+
+    fake_session = AsyncMock()
+    fake_session.get = lambda *a, **kw: fake_response
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(payments.aiohttp, "ClientSession", lambda *a, **kw: fake_session):
+        result = await payments._query_min_amount("btc", "usd")
+    assert result is None
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+async def test_query_min_amount_rejects_non_finite_numerics(bad):
+    """Same guard applied when the API returns a JSON number that
+    deserialises to a non-finite Python float (e.g. some libraries
+    parse ``Infinity`` literals as ``inf``).
+    """
+    fake_response = AsyncMock()
+    fake_response.status = 200
+    fake_response.json = AsyncMock(return_value={"fiat_equivalent": bad})
+    fake_response.__aenter__ = AsyncMock(return_value=fake_response)
+    fake_response.__aexit__ = AsyncMock(return_value=None)
+
+    fake_session = AsyncMock()
+    fake_session.get = lambda *a, **kw: fake_response
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(payments.aiohttp, "ClientSession", lambda *a, **kw: fake_session):
+        result = await payments._query_min_amount("btc", "usd")
+    assert result is None
+
+
+@pytest.mark.parametrize("neg", [-0.001, -1.0, -100.0, "-0.5", "-1"])
+async def test_query_min_amount_rejects_negative(neg):
+    """A negative min-amount is meaningless; the API shouldn't send
+    one but if it does, treat it as malformed rather than caching
+    a value that would render as ``"min -$1.00"`` in the UI.
+    """
+    fake_response = AsyncMock()
+    fake_response.status = 200
+    fake_response.json = AsyncMock(return_value={"fiat_equivalent": neg})
+    fake_response.__aenter__ = AsyncMock(return_value=fake_response)
+    fake_response.__aexit__ = AsyncMock(return_value=None)
+
+    fake_session = AsyncMock()
+    fake_session.get = lambda *a, **kw: fake_response
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(payments.aiohttp, "ClientSession", lambda *a, **kw: fake_session):
+        result = await payments._query_min_amount("btc", "usd")
+    assert result is None
+
+
+async def test_query_min_amount_accepts_zero():
+    """Edge: a returned ``"0"`` is unusual but not malformed —
+    it parses as a finite non-negative number. Don't drop it; let
+    the trustworthiness filter and downstream callers decide.
+    """
+    fake_response = AsyncMock()
+    fake_response.status = 200
+    fake_response.json = AsyncMock(return_value={"fiat_equivalent": 0})
+    fake_response.__aenter__ = AsyncMock(return_value=fake_response)
+    fake_response.__aexit__ = AsyncMock(return_value=None)
+
+    fake_session = AsyncMock()
+    fake_session.get = lambda *a, **kw: fake_response
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(payments.aiohttp, "ClientSession", lambda *a, **kw: fake_session):
+        result = await payments._query_min_amount("btc", "usd")
+    assert result == 0.0
+    assert math.isfinite(result)
+
+
+async def test_get_min_amount_usd_returns_none_on_non_finite_lookup():
+    """End-to-end pin: when ``_query_min_amount`` rejects the
+    upstream NaN/Inf and returns ``None``, ``get_min_amount_usd``
+    must NOT hand back a non-finite value to ``create_crypto_invoice``.
+    Pre-fix a NaN flowed all the way into ``MinAmountError.min_usd``.
+    """
+    with patch.object(
+        payments,
+        "_query_min_amount",
+        AsyncMock(side_effect=[None, None]),
+    ):
+        result = await payments.get_min_amount_usd(
+            "btc", attempted_usd=5.0
+        )
+    assert result is None

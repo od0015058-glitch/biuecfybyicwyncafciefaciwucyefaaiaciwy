@@ -213,10 +213,28 @@ async def _query_min_amount(
         return None
 
     fiat = data.get("fiat_equivalent")
+    if fiat is None:
+        return None
     try:
-        return float(fiat) if fiat is not None else None
+        value = float(fiat)
     except (TypeError, ValueError):
         return None
+    # Reject ``NaN`` / ``±Infinity`` / negative values explicitly.
+    # ``float("NaN")`` succeeds and returns the IEEE-754 special, then
+    # the caller (:func:`get_min_amount_usd`) caches it and surfaces
+    # it back through ``MinAmountError(min_usd=NaN)`` whose
+    # user-facing rendering is ``f"min ${nan:.2f}"`` ⇒ ``"min $nan"``.
+    # Worse, the trustworthiness filter below uses ``value <
+    # attempted_usd`` which is False for NaN, so the NaN passes
+    # straight through unmasked. ``max(...)`` over NaN candidates
+    # is also order-dependent (``max(nan, 5)`` is ``nan`` but
+    # ``max(5, nan)`` is ``5``) so a NaN here corrupts the cache in
+    # an order-sensitive way. Reject upstream so the caller sees a
+    # clean ``None`` and falls back to the generic "min not met"
+    # branch of the UI rather than rendering nonsense.
+    if not math.isfinite(value) or value < 0.0:
+        return None
+    return value
 
 
 async def get_min_amount_usd(
