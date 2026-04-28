@@ -1673,6 +1673,147 @@ async def user_detail_get(request: web.Request) -> web.StreamResponse:
     return response
 
 
+# ---------------------------------------------------------------------
+# Stage-9-Step-8: per-user usage browser
+# ---------------------------------------------------------------------
+#
+# Read-only paginated dump of one user's ``usage_logs`` rows so the
+# operator can see exactly which models that user has invoked, with
+# token + cost breakdown. Mounted at ``/admin/users/{id}/usage`` so
+# the path is a strict child of the existing user-detail URL — the
+# detail page links into it via "View AI usage".
+
+
+# Per-page tuning is identical to the transactions browser so the
+# operator's mental model is consistent. ``Database.list_user_usage``
+# clamps to ``USAGE_LOGS_MAX_PER_PAGE`` at the data layer; we cap a
+# second time at the form boundary so a hand-typed ``per_page=500``
+# query param renders the same "200" the dropdown actually offers.
+USAGE_PER_PAGE_DEFAULT = 50
+USAGE_PER_PAGE_MAX = 200
+USAGE_PER_PAGE_CHOICES = (25, 50, 100, 200)
+
+
+def parse_usage_query(query) -> dict:
+    """Parse the ``/admin/users/{id}/usage`` query string into a
+    normalised dict consumed by :func:`Database.list_user_usage`.
+
+    Mirrors :func:`parse_transactions_query` but is scoped per-user
+    so it doesn't accept gateway / status / telegram_id filters —
+    the user id comes from the URL match group, not the query
+    string.
+    """
+    try:
+        page = max(1, int(query.get("page", "1")))
+    except (ValueError, TypeError):
+        page = 1
+    try:
+        per_page = int(query.get("per_page", str(USAGE_PER_PAGE_DEFAULT)))
+    except (ValueError, TypeError):
+        per_page = USAGE_PER_PAGE_DEFAULT
+    per_page = max(1, min(per_page, USAGE_PER_PAGE_MAX))
+    return {"page": page, "per_page": per_page}
+
+
+def _encode_usage_query(filters: dict, *, page: int | None = None) -> str:
+    """Build a canonical query string for prev/next links on the
+    usage page. Empty defaults are omitted so a no-filter URL stays
+    clean.
+    """
+    from urllib.parse import urlencode
+
+    params: list[tuple[str, str]] = []
+    effective_page = filters.get("page", 1) if page is None else page
+    if effective_page != 1:
+        params.append(("page", str(effective_page)))
+    if filters.get("per_page", USAGE_PER_PAGE_DEFAULT) != USAGE_PER_PAGE_DEFAULT:
+        params.append(("per_page", str(filters["per_page"])))
+    return urlencode(params)
+
+
+async def user_usage_get(request: web.Request) -> web.StreamResponse:
+    """GET /admin/users/{telegram_id}/usage — paginated AI-usage
+    history for one user.
+
+    Read-only. The user-detail page is the canonical entry point;
+    this view exists for operators investigating a specific user's
+    spend pattern (which models, how many tokens, when).
+
+    A bad ``telegram_id`` redirects back to ``/admin/users`` so a
+    typo'd URL doesn't render a 404 wall.
+    """
+    raw_id = request.match_info.get("telegram_id", "")
+    try:
+        user_id = int(raw_id)
+    except ValueError:
+        return web.HTTPFound(location="/admin/users")
+
+    db = request.app.get(APP_KEY_DB)
+    summary: dict | None = None
+    page_result: dict | None = None
+    db_error: str | None = None
+    filters = parse_usage_query(request.rel_url.query)
+
+    if db is None:
+        db_error = "No database wired up (development mode)."
+    else:
+        # Fetch the user header (so the page can show username +
+        # current balance) and the usage page in sequence. We only
+        # need a tiny ``recent_tx_limit=1`` because the usage page
+        # doesn't render the transaction list — but the existing
+        # ``get_user_admin_summary`` is the cheapest way to confirm
+        # the user exists + grab the username for the header.
+        try:
+            summary = await db.get_user_admin_summary(
+                user_id, recent_tx_limit=1
+            )
+        except Exception:
+            log.exception(
+                "user_usage_get: get_user_admin_summary failed"
+            )
+            db_error = "Database query failed — see logs."
+        if summary is not None and db_error is None:
+            try:
+                page_result = await db.list_user_usage(
+                    user_id,
+                    page=filters["page"],
+                    per_page=filters["per_page"],
+                )
+            except Exception:
+                log.exception(
+                    "user_usage_get: list_user_usage failed"
+                )
+                db_error = "Database query failed — see logs."
+
+    prev_url: str | None = None
+    next_url: str | None = None
+    if page_result is not None:
+        if page_result["page"] > 1:
+            q = _encode_usage_query(filters, page=page_result["page"] - 1)
+            base = f"/admin/users/{user_id}/usage"
+            prev_url = f"{base}?{q}" if q else base
+        if page_result["page"] < page_result["total_pages"]:
+            q = _encode_usage_query(filters, page=page_result["page"] + 1)
+            base = f"/admin/users/{user_id}/usage"
+            next_url = f"{base}?{q}" if q else base
+
+    return aiohttp_jinja2.render_template(
+        "user_usage.html",
+        request,
+        {
+            "user_id": user_id,
+            "summary": summary,
+            "result": page_result,
+            "filters": filters,
+            "prev_url": prev_url,
+            "next_url": next_url,
+            "per_page_choices": USAGE_PER_PAGE_CHOICES,
+            "db_error": db_error,
+            "active_page": "users",
+        },
+    )
+
+
 async def user_adjust_post(request: web.Request) -> web.StreamResponse:
     """POST /admin/users/{telegram_id}/adjust — credit or debit.
 
@@ -3674,6 +3815,14 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/users/{telegram_id}/adjust",
         _require_auth(user_adjust_post),
+    )
+    # Stage-9-Step-8: per-user AI-usage browser (read-only). Routed
+    # BEFORE the catch-all ``/admin/users/{telegram_id}`` detail
+    # handler would matter — aiohttp picks the longer match-spec
+    # for ``/usage`` automatically, so order here is decorative.
+    app.router.add_get(
+        "/admin/users/{telegram_id}/usage",
+        _require_auth(user_usage_get),
     )
 
     # Stage-8-Part-5: broadcast.

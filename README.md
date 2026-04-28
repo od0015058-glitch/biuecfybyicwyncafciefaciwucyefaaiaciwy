@@ -47,6 +47,14 @@ NowPayments crypto invoices.
   table. View the feed at `${WEBHOOK_BASE_URL}/admin/audit` with
   optional action/actor filters. Audit writes are best-effort — a
   failed audit insert never blocks the underlying admin operation.
+- **Per-user AI usage browser** — `/admin/users/{id}/usage` paginates the
+  `usage_logs` table for one user, showing model, prompt / completion / total
+  tokens, per-call USD cost, and timestamp. Newest call on top. Reachable from
+  the user-detail page's "View AI usage →" link. Every USD value across the
+  admin panel now goes through the canonical `format_usd` filter so the same
+  number renders identically on the dashboard, users list, user detail,
+  transactions browser, and the new usage browser (no more
+  `$1,234.5678` ⇄ `$1234.5678` drift between pages).
 - **TOTP / 2FA on admin login** — set `ADMIN_2FA_SECRET` to a base32
   string and `/admin/login` will require a 6-digit code from your
   authenticator app (Google Authenticator, Authy, 1Password,

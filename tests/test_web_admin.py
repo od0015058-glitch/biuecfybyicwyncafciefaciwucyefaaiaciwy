@@ -146,6 +146,7 @@ def _stub_db(
     audit_log_result: list | Exception | None = None,
     record_audit_result: object | Exception = 1,
     update_user_fields_result: dict | None | Exception = None,
+    list_user_usage_result: dict | Exception | None = None,
 ):
     """A minimal Database stub that exposes the methods web_admin uses.
 
@@ -284,6 +285,22 @@ def _stub_db(
     else:
         db.update_user_admin_fields = AsyncMock(
             return_value=update_user_fields_result
+        )
+    # Stage-9-Step-8: per-user usage browser.
+    default_user_usage = {
+        "rows": [],
+        "total": 0,
+        "page": 1,
+        "per_page": 50,
+        "total_pages": 0,
+    }
+    if isinstance(list_user_usage_result, Exception):
+        db.list_user_usage = AsyncMock(side_effect=list_user_usage_result)
+    else:
+        db.list_user_usage = AsyncMock(
+            return_value=list_user_usage_result
+            if list_user_usage_result is not None
+            else default_user_usage
         )
     return db
 
@@ -2831,6 +2848,384 @@ async def test_user_detail_db_error_shows_banner(
     assert resp.status == 200
     body = await resp.text()
     assert "Database query failed" in body
+
+
+async def test_user_detail_links_to_usage_page(
+    aiohttp_client, make_admin_app
+):
+    """Stage-9-Step-8: the user-detail page must surface a link
+    into the per-user usage browser. The link is the only entry
+    point — there's no top-level ``/admin/usage`` page.
+    """
+    db = _stub_db(
+        user_summary_result={
+            "telegram_id": 777,
+            "username": "alice",
+            "balance_usd": 0.0,
+            "free_messages_left": 0,
+            "active_model": "openrouter/auto",
+            "language_code": "en",
+            "memory_enabled": False,
+            "total_credited_usd": 0.0,
+            "total_spent_usd": 0.0,
+            "recent_transactions": [],
+        }
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/777")
+    assert resp.status == 200
+    body = await resp.text()
+    assert 'href="/admin/users/777/usage"' in body
+    assert "View AI usage" in body
+
+
+# ---------------------------------------------------------------------
+# Stage-9-Step-8: per-user AI-usage browser
+# ---------------------------------------------------------------------
+
+
+async def test_user_usage_requires_auth(aiohttp_client, make_admin_app):
+    client = await aiohttp_client(make_admin_app())
+    resp = await client.get(
+        "/admin/users/123/usage", allow_redirects=False
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+
+
+async def test_user_usage_bad_id_redirects_to_list(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get(
+        "/admin/users/not-an-int/usage", allow_redirects=False
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/users"
+    db.list_user_usage.assert_not_awaited()
+
+
+async def test_user_usage_unknown_user_shows_empty_state(
+    aiohttp_client, make_admin_app
+):
+    """Unknown user → header empty-state, ``list_user_usage`` not
+    called (we short-circuit if ``get_user_admin_summary`` returns
+    ``None``).
+    """
+    db = _stub_db(user_summary_result=None)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/999/usage")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "No user with id" in body
+    db.list_user_usage.assert_not_awaited()
+
+
+async def test_user_usage_renders_rows(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        user_summary_result={
+            "telegram_id": 777,
+            "username": "alice",
+            "balance_usd": 12.3400,
+            "free_messages_left": 0,
+            "active_model": "openai/gpt-4o",
+            "language_code": "en",
+            "memory_enabled": True,
+            "total_credited_usd": 50.0,
+            "total_spent_usd": 0.5678,
+            "recent_transactions": [],
+        },
+        list_user_usage_result={
+            "rows": [
+                {
+                    "id": 11,
+                    "model": "openai/gpt-4o",
+                    "prompt_tokens": 1234,
+                    "completion_tokens": 5678,
+                    "total_tokens": 6912,
+                    "cost_usd": 0.1234,
+                    "created_at": "2026-04-28T09:00:00+00:00",
+                },
+                {
+                    "id": 10,
+                    "model": "anthropic/claude-3.5-sonnet",
+                    "prompt_tokens": 100,
+                    "completion_tokens": 250,
+                    "total_tokens": 350,
+                    "cost_usd": 0.0042,
+                    "created_at": "2026-04-27T08:30:00+00:00",
+                },
+            ],
+            "total": 2,
+            "page": 1,
+            "per_page": 50,
+            "total_pages": 1,
+        },
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/777/usage")
+    assert resp.status == 200
+    body = await resp.text()
+    # Header pulls in the username + lifetime spend (uses the
+    # canonical format_usd filter — the same numbers must render
+    # the same way on every admin page, that's the bundled fix.)
+    assert "@alice" in body
+    assert "$0.5678" in body
+    assert "$12.3400" in body
+    # Token columns + model + cost.
+    assert "openai/gpt-4o" in body
+    assert "anthropic/claude-3.5-sonnet" in body
+    assert "1,234" in body  # prompt tokens, comma-grouped
+    assert "5,678" in body
+    assert "6,912" in body  # total_tokens column
+    assert "$0.1234" in body
+    assert "$0.0042" in body
+    db.list_user_usage.assert_awaited_once_with(
+        777, page=1, per_page=50
+    )
+
+
+async def test_user_usage_pagination_links(
+    aiohttp_client, make_admin_app
+):
+    """When there are multiple pages, prev/next URLs must carry
+    the active page number through the query string and only show
+    when the corresponding direction is reachable.
+    """
+    db = _stub_db(
+        user_summary_result={
+            "telegram_id": 1,
+            "username": None,
+            "balance_usd": 0.0,
+            "free_messages_left": 0,
+            "active_model": "openrouter/auto",
+            "language_code": "en",
+            "memory_enabled": False,
+            "total_credited_usd": 0.0,
+            "total_spent_usd": 0.0,
+            "recent_transactions": [],
+        },
+        list_user_usage_result={
+            "rows": [
+                {
+                    "id": 50,
+                    "model": "x",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                    "cost_usd": 0.0,
+                    "created_at": None,
+                }
+            ],
+            "total": 200,
+            "page": 2,
+            "per_page": 25,
+            "total_pages": 8,
+        },
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get(
+        "/admin/users/1/usage?page=2&per_page=25"
+    )
+    assert resp.status == 200
+    body = await resp.text()
+    # Prev → page=1 omitted (default), per_page=25 carried.
+    assert 'href="/admin/users/1/usage?per_page=25"' in body
+    # Next → page=3, per_page=25.
+    assert 'href="/admin/users/1/usage?page=3&amp;per_page=25"' in body
+    db.list_user_usage.assert_awaited_once_with(
+        1, page=2, per_page=25
+    )
+
+
+async def test_user_usage_db_error_shows_banner(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        user_summary_result={
+            "telegram_id": 1,
+            "username": None,
+            "balance_usd": 0.0,
+            "free_messages_left": 0,
+            "active_model": "openrouter/auto",
+            "language_code": "en",
+            "memory_enabled": False,
+            "total_credited_usd": 0.0,
+            "total_spent_usd": 0.0,
+            "recent_transactions": [],
+        },
+        list_user_usage_result=RuntimeError("boom"),
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/1/usage")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Database query failed" in body
+
+
+async def test_user_usage_clamps_per_page_at_form_boundary(
+    aiohttp_client, make_admin_app
+):
+    """A hand-typed ``per_page=9999`` query param must be clamped
+    to ``USAGE_PER_PAGE_MAX`` BEFORE hitting the DB layer — the
+    DB clamps again as defense-in-depth, but the form-level
+    clamp keeps the URL honest about which value actually took
+    effect.
+    """
+    db = _stub_db(
+        user_summary_result={
+            "telegram_id": 1,
+            "username": None,
+            "balance_usd": 0.0,
+            "free_messages_left": 0,
+            "active_model": "openrouter/auto",
+            "language_code": "en",
+            "memory_enabled": False,
+            "total_credited_usd": 0.0,
+            "total_spent_usd": 0.0,
+            "recent_transactions": [],
+        },
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    await client.get("/admin/users/1/usage?per_page=9999")
+    db.list_user_usage.assert_awaited_once_with(
+        1, page=1, per_page=200
+    )
+
+
+async def test_user_usage_empty_rows_renders_empty_state(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        user_summary_result={
+            "telegram_id": 1,
+            "username": "bob",
+            "balance_usd": 0.0,
+            "free_messages_left": 0,
+            "active_model": "openrouter/auto",
+            "language_code": "en",
+            "memory_enabled": False,
+            "total_credited_usd": 0.0,
+            "total_spent_usd": 0.0,
+            "recent_transactions": [],
+        },
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/1/usage")
+    body = await resp.text()
+    assert "No AI calls logged" in body
+
+
+# ---------------------------------------------------------------------
+# Stage-9-Step-8 bundled bug fix: format_usd retrofit on legacy templates
+# ---------------------------------------------------------------------
+
+
+async def test_dashboard_uses_format_usd_filter(
+    aiohttp_client, make_admin_app
+):
+    """Stage-9-Step-7 introduced ``format_usd`` as the canonical
+    USD formatter but the dashboard template kept using ad-hoc
+    ``"${:,.2f}".format(...)`` / ``"${:,.4f}".format(...)`` —
+    so an admin reconciling the dashboard against the
+    transactions browser would still see two slightly different
+    renderings of the same number. Stage-9-Step-8 retrofits the
+    filter onto the dashboard.
+
+    Pin the leading-minus convention (``-$X`` not ``$-X``) on
+    spend_usd to make the regression unambiguous.
+    """
+    db = _stub_db(
+        {
+            "users_total": 0,
+            "users_active_7d": 0,
+            "revenue_usd": 1234.5,
+            "spend_usd": -7.89,  # synthetic neg to pin -$ ordering
+            "top_models": [
+                {
+                    "model": "openai/gpt-4o",
+                    "count": 3,
+                    "cost_usd": 0.5,
+                }
+            ],
+        }
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/")
+    body = await resp.text()
+    # Revenue: format_usd(places=2) → "$1,234.50".
+    assert "$1,234.50" in body
+    # Spend (neg): "-$7.8900" — minus before dollar sign.
+    assert "-$7.8900" in body
+    # Top-model cost: 4dp filter default.
+    assert "$0.5000" in body
+
+
+async def test_users_list_uses_format_usd_filter(
+    aiohttp_client, make_admin_app
+):
+    """Same bundled fix applied to the users list — balance was
+    rendered with ``"${:,.4f}".format(...)`` pre-fix.
+    """
+    db = _stub_db(
+        search_users_result=[
+            {
+                "telegram_id": 42,
+                "username": "alice",
+                "balance_usd": 1234.5,
+                "free_messages_left": 0,
+                "language_code": "en",
+            }
+        ]
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users?q=alice")
+    body = await resp.text()
+    assert "$1,234.5000" in body
+
+
+async def test_user_detail_uses_format_usd_filter(
+    aiohttp_client, make_admin_app
+):
+    """Wallet panel on user_detail used three ad-hoc formatters
+    (balance, lifetime credited, lifetime spent) — retrofit pin.
+    """
+    db = _stub_db(
+        user_summary_result={
+            "telegram_id": 1,
+            "username": "alice",
+            "balance_usd": 1.5,
+            "free_messages_left": 0,
+            "active_model": "openrouter/auto",
+            "language_code": "en",
+            "memory_enabled": False,
+            "total_credited_usd": 2000.0,
+            "total_spent_usd": -3.5,
+            "recent_transactions": [],
+        }
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/1")
+    body = await resp.text()
+    assert "$1.5000" in body
+    assert "$2,000.0000" in body
+    # Spent is conventionally non-negative, but the formatter
+    # still has to handle a stray neg without rendering ``$-3.5``.
+    assert "-$3.5000" in body
 
 
 async def test_user_adjust_requires_auth(aiohttp_client, make_admin_app):

@@ -1705,6 +1705,104 @@ class Database:
             "total_pages": total_pages,
         }
 
+    # ------------------------------------------------------------------
+    # Per-user usage browser (Stage-9-Step-8)
+    # ------------------------------------------------------------------
+    #
+    # Read-only paginated dump of one user's ``usage_logs`` rows for the
+    # admin UI. Mirrors the ``list_transactions`` shape so the template
+    # / pagination plumbing stays uniform — same ``rows / total /
+    # page / per_page / total_pages`` contract.
+
+    # Per-page cap. 200 mirrors ``TRANSACTIONS_MAX_PER_PAGE`` so the
+    # operator's mental model of "what fits on one page" is consistent
+    # across the two ledger-style tables.
+    USAGE_LOGS_MAX_PER_PAGE: int = 200
+
+    async def list_user_usage(
+        self,
+        telegram_id: int,
+        *,
+        page: int = 1,
+        per_page: int = 50,
+    ) -> dict:
+        """Paginated read of one user's ``usage_logs`` rows.
+
+        ``per_page`` is clamped to ``[1, USAGE_LOGS_MAX_PER_PAGE]`` and
+        ``page`` is clamped to ``>= 1``. Sort is ``log_id DESC`` —
+        ``log_id`` is ``SERIAL`` so this is identical to
+        ``created_at DESC`` for any real deploy and is strictly
+        monotonic (no tie-breaking needed).
+
+        Returns a dict shaped::
+
+            {
+              "rows": [
+                {"id": int,
+                 "model": str,
+                 "prompt_tokens": int,
+                 "completion_tokens": int,
+                 "total_tokens": int,
+                 "cost_usd": float,
+                 "created_at": iso str | None},
+                ...
+              ],
+              "total": int,         # full match count for this user
+              "page": int,          # clamped page number
+              "per_page": int,      # clamped per-page
+              "total_pages": int,   # 0 when total == 0
+            }
+        """
+        per_page = max(1, min(int(per_page), self.USAGE_LOGS_MAX_PER_PAGE))
+        page = max(1, int(page))
+        offset = (page - 1) * per_page
+
+        async with self.pool.acquire() as connection:
+            total = await connection.fetchval(
+                "SELECT COUNT(*) FROM usage_logs WHERE telegram_id = $1",
+                int(telegram_id),
+            )
+            rows = await connection.fetch(
+                """
+                SELECT log_id, model_used, prompt_tokens, completion_tokens,
+                       cost_deducted_usd, created_at
+                FROM usage_logs
+                WHERE telegram_id = $1
+                ORDER BY log_id DESC
+                LIMIT $2 OFFSET $3
+                """,
+                int(telegram_id),
+                per_page,
+                offset,
+            )
+
+        total = int(total or 0)
+        total_pages = (total + per_page - 1) // per_page
+
+        return {
+            "rows": [
+                {
+                    "id": int(r["log_id"]),
+                    "model": r["model_used"],
+                    "prompt_tokens": int(r["prompt_tokens"]),
+                    "completion_tokens": int(r["completion_tokens"]),
+                    "total_tokens": (
+                        int(r["prompt_tokens"]) + int(r["completion_tokens"])
+                    ),
+                    "cost_usd": float(r["cost_deducted_usd"]),
+                    "created_at": (
+                        r["created_at"].isoformat()
+                        if r["created_at"] is not None else None
+                    ),
+                }
+                for r in rows
+            ],
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages,
+        }
+
     async def get_system_metrics(self) -> dict:
         """Aggregate counters for the admin metrics panel.
 

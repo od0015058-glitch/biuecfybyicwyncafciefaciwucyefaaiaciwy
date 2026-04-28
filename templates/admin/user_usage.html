@@ -1,0 +1,186 @@
+{% extends "_layout.html" %}
+
+{% block title %}AI usage · user {{ user_id }}{% endblock %}
+
+{% block extra_head %}
+<style>
+  code.id, code.code, code.mono {
+    background: var(--bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+  }
+  td.amount, th.amount,
+  td.tokens, th.tokens {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: flex-end;
+    margin-bottom: 16px;
+  }
+  .filters .field {
+    margin-bottom: 0;
+    min-width: 140px;
+  }
+  .filters button.primary {
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 6px;
+    padding: 9px 18px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  .pager {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    margin-top: 16px;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  .pager a {
+    padding: 6px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+  }
+  .pager .disabled {
+    padding: 6px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    opacity: 0.4;
+    pointer-events: none;
+  }
+  .empty {
+    color: var(--text-muted);
+    font-size: 13px;
+    margin: 0;
+    text-align: center;
+    padding: 40px 20px;
+  }
+  .back-link {
+    display: inline-block;
+    margin-bottom: 16px;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  .back-link:hover { color: var(--text); }
+  .summary-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 24px;
+    margin-bottom: 16px;
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+  .summary-row strong { color: var(--text); }
+</style>
+{% endblock %}
+
+{% block main %}
+<a class="back-link" href="/admin/users/{{ user_id }}">← Back to user</a>
+
+<h2>
+  AI usage —
+  {% if summary and summary.username %}
+    @{{ summary.username }}
+  {% else %}
+    <code class="id">{{ user_id }}</code>
+  {% endif %}
+</h2>
+
+{% if db_error %}
+<div class="alert alert-warn">{{ db_error }}</div>
+{% endif %}
+
+{% if summary is none and not db_error %}
+<div class="panel">
+  <p style="margin: 0; color: var(--text-muted);">
+    No user with id <code class="id">{{ user_id }}</code>.
+  </p>
+</div>
+{% elif summary %}
+<div class="panel">
+  <div class="summary-row">
+    <div>
+      Telegram id: <code class="id">{{ summary.telegram_id }}</code>
+    </div>
+    <div>
+      Lifetime spent: <strong>{{ summary.total_spent_usd | format_usd }}</strong>
+    </div>
+    <div>
+      Current balance: <strong>{{ summary.balance_usd | format_usd }}</strong>
+    </div>
+  </div>
+
+  <form class="filters" method="get" action="/admin/users/{{ user_id }}/usage">
+    <div class="field">
+      <label for="per_page">Per page</label>
+      <select id="per_page" name="per_page">
+        {% for c in per_page_choices %}
+        <option value="{{ c }}" {% if filters.per_page == c %}selected{% endif %}>{{ c }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <button type="submit" class="primary">Apply</button>
+  </form>
+
+  {% if result and result.rows %}
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>When</th>
+        <th>Model</th>
+        <th class="tokens">Prompt tokens</th>
+        <th class="tokens">Completion tokens</th>
+        <th class="tokens">Total tokens</th>
+        <th class="amount">Cost (USD)</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in result.rows %}
+      <tr>
+        <td><code class="mono">{{ r.id }}</code></td>
+        <td>
+          {% if r.created_at %}
+          <code class="mono">{{ r.created_at[:19].replace("T", " ") }}</code>
+          {% else %}—{% endif %}
+        </td>
+        <td><code class="code">{{ r.model }}</code></td>
+        <td class="tokens">{{ "{:,}".format(r.prompt_tokens) }}</td>
+        <td class="tokens">{{ "{:,}".format(r.completion_tokens) }}</td>
+        <td class="tokens"><strong>{{ "{:,}".format(r.total_tokens) }}</strong></td>
+        <td class="amount">{{ r.cost_usd | format_usd }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <div class="pager">
+    {% if prev_url %}
+    <a href="{{ prev_url }}">← Prev</a>
+    {% else %}
+    <span class="disabled">← Prev</span>
+    {% endif %}
+    <span>
+      Page {{ result.page }} of {{ result.total_pages or 1 }} · {{ result.total }} call(s)
+    </span>
+    {% if next_url %}
+    <a href="{{ next_url }}">Next →</a>
+    {% else %}
+    <span class="disabled">Next →</span>
+    {% endif %}
+  </div>
+  {% elif result %}
+  <p class="empty">No AI calls logged for this user yet.</p>
+  {% endif %}
+</div>
+{% endif %}
+{% endblock %}

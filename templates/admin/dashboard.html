@@ -20,11 +20,11 @@
   </div>
   <div class="stat">
     <div class="label">Total revenue</div>
-    <div class="value">${{ "{:,.2f}".format(metrics.revenue_usd) }}</div>
+    <div class="value">{{ metrics.revenue_usd | format_usd(2) }}</div>
   </div>
   <div class="stat">
     <div class="label">Total spend (AI)</div>
-    <div class="value">${{ "{:,.4f}".format(metrics.spend_usd) }}</div>
+    <div class="value">{{ metrics.spend_usd | format_usd }}</div>
   </div>
 </div>
 
@@ -44,7 +44,7 @@
       <tr>
         <td>{{ row.model }}</td>
         <td>{{ "{:,}".format(row.count) }}</td>
-        <td>${{ "{:,.4f}".format(row.cost_usd) }}</td>
+        <td>{{ row.cost_usd | format_usd }}</td>
       </tr>
       {% endfor %}
     </tbody>

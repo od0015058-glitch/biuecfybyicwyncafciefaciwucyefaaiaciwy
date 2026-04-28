@@ -117,7 +117,7 @@
           {% if summary.username %}@{{ summary.username }}{% else %}—{% endif %}
         </dd>
         <dt>Balance</dt>
-        <dd><strong>${{ "{:,.4f}".format(summary.balance_usd) }}</strong></dd>
+        <dd><strong>{{ summary.balance_usd | format_usd }}</strong></dd>
         <dt>Free messages left</dt>
         <dd>{{ summary.free_messages_left }}</dd>
         <dt>Active model</dt>
@@ -125,14 +125,20 @@
         <dt>Language</dt>
         <dd><code class="code">{{ summary.language_code }}</code></dd>
         <dt>Lifetime credited</dt>
-        <dd>${{ "{:,.4f}".format(summary.total_credited_usd) }}</dd>
+        <dd>{{ summary.total_credited_usd | format_usd }}</dd>
         <dt>Lifetime spent</dt>
-        <dd>${{ "{:,.4f}".format(summary.total_spent_usd) }}</dd>
+        <dd>{{ summary.total_spent_usd | format_usd }}</dd>
       </dl>
     </div>
 
     <div class="panel">
-      <h3>Recent transactions ({{ summary.recent_transactions|length }})</h3>
+      <h3>
+        Recent transactions ({{ summary.recent_transactions|length }})
+        <a href="/admin/users/{{ summary.telegram_id }}/usage"
+           style="font-size: 12px; font-weight: 400; margin-left: 12px;">
+          View AI usage →
+        </a>
+      </h3>
       {% if summary.recent_transactions %}
       <table>
         <thead>

@@ -103,7 +103,7 @@
           <td>
             {% if r.username %}@{{ r.username }}{% else %}—{% endif %}
           </td>
-          <td>${{ "{:,.4f}".format(r.balance_usd) }}</td>
+          <td>{{ r.balance_usd | format_usd }}</td>
           <td>{{ r.free_messages_left }}</td>
           <td>{{ r.language_code }}</td>
           <td>

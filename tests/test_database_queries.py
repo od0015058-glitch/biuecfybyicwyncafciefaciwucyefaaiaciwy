@@ -494,6 +494,114 @@ async def test_list_transactions_null_fields_pass_through():
 
 
 # ---------------------------------------------------------------------
+# list_user_usage — per-user usage browser query (Stage-9-Step-8)
+# ---------------------------------------------------------------------
+
+
+async def test_list_user_usage_paginates_by_log_id_desc():
+    """Sorts by ``log_id DESC`` (== ``created_at DESC`` since SERIAL),
+    binds the user id as ``$1`` then LIMIT/OFFSET as ``$2``/``$3``.
+    """
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=2)
+    conn.fetch = AsyncMock(
+        return_value=[
+            {
+                "log_id": 11,
+                "model_used": "openai/gpt-4o",
+                "prompt_tokens": 100,
+                "completion_tokens": 200,
+                "cost_deducted_usd": 0.0042,
+                "created_at": None,
+            }
+        ]
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    out = await db.list_user_usage(777, page=1, per_page=50)
+
+    count_sql = conn.fetchval.await_args.args[0]
+    assert "COUNT(*)" in count_sql
+    assert "telegram_id = $1" in count_sql
+
+    list_sql = conn.fetch.await_args.args[0]
+    assert "ORDER BY log_id DESC" in list_sql
+    assert "LIMIT $2 OFFSET $3" in list_sql
+    binds = conn.fetch.await_args.args[1:]
+    assert binds == (777, 50, 0)
+
+    assert out["total"] == 2
+    assert out["total_pages"] == 1
+    assert out["page"] == 1
+    assert out["per_page"] == 50
+    r = out["rows"][0]
+    assert r["id"] == 11
+    assert r["model"] == "openai/gpt-4o"
+    assert r["prompt_tokens"] == 100
+    assert r["completion_tokens"] == 200
+    assert r["total_tokens"] == 300
+    assert r["cost_usd"] == pytest.approx(0.0042)
+    assert r["created_at"] is None
+
+
+async def test_list_user_usage_clamps_page_and_per_page():
+    """``page<1`` clamps to 1, ``per_page`` is clamped to
+    ``[1, USAGE_LOGS_MAX_PER_PAGE]``.
+    """
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=0)
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.list_user_usage(42, page=-10, per_page=9999)
+    binds = conn.fetch.await_args.args[1:]
+    assert binds == (42, db.USAGE_LOGS_MAX_PER_PAGE, 0)
+
+    conn.fetch.reset_mock()
+    await db.list_user_usage(42, page=3, per_page=0)
+    binds = conn.fetch.await_args.args[1:]
+    # per_page clamped to 1, page=3 → offset (3-1)*1 = 2
+    assert binds == (42, 1, 2)
+
+
+async def test_list_user_usage_total_pages_ceiling():
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    conn.fetchval = AsyncMock(return_value=0)
+    out = await db.list_user_usage(1, per_page=10)
+    assert out["total_pages"] == 0
+
+    conn.fetchval = AsyncMock(return_value=11)
+    out = await db.list_user_usage(1, per_page=10)
+    assert out["total_pages"] == 2
+
+    conn.fetchval = AsyncMock(return_value=250)
+    out = await db.list_user_usage(1, per_page=100)
+    assert out["total_pages"] == 3
+
+
+async def test_list_user_usage_isolates_by_telegram_id():
+    """The WHERE clause MUST scope by telegram_id — we do not want
+    a user-detail page accidentally leaking another user's usage
+    if the URL match group ever shifts.
+    """
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=0)
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.list_user_usage(999, page=1, per_page=25)
+    list_sql = conn.fetch.await_args.args[0]
+    assert "WHERE telegram_id = $1" in list_sql
+
+
+# ---------------------------------------------------------------------
 # Stage-9-Step-2: admin_audit_log + user-field editor + admin_telegram_id col
 # ---------------------------------------------------------------------
 
