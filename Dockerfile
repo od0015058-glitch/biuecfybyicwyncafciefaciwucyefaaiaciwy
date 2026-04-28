@@ -47,10 +47,14 @@ WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
 COPY --chown=bot:bot . /app
+RUN chmod +x /app/entrypoint.sh
 
 USER bot
 
 # Webhook listener. The aiogram long-poll loop does not bind a port.
 EXPOSE 8080
 
+# entrypoint.sh runs `alembic upgrade head` on every start (idempotent)
+# then execs whatever CMD/`docker compose run` asks for.
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["python", "main.py"]

@@ -69,3 +69,66 @@ jobs:
           assert callable(verify_ipn_signature)
           print('all imports + verify_ipn_signature OK')
           "
+
+  alembic:
+    name: alembic upgrade/downgrade roundtrip
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: botuser
+          POSTGRES_PASSWORD: testpw
+          POSTGRES_DB: aibot_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U botuser -d aibot_db"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      DB_HOST: localhost
+      DB_PORT: "5432"
+      DB_USER: botuser
+      DB_PASSWORD: testpw
+      DB_NAME: aibot_db
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install runtime deps (alembic + psycopg2)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: alembic upgrade head
+        run: alembic upgrade head
+
+      - name: Verify expected tables exist
+        run: |
+          PGPASSWORD=testpw psql -h localhost -U botuser -d aibot_db -tAc \
+            "SELECT count(*) FROM information_schema.tables
+             WHERE table_schema='public' AND table_name IN
+               ('users','transactions','usage_logs','system_settings',
+                'promo_codes','promo_usage','conversation_messages')" \
+            | grep -qx 7
+
+      - name: alembic downgrade base
+        run: alembic downgrade base
+
+      - name: Verify all schema tables dropped
+        run: |
+          PGPASSWORD=testpw psql -h localhost -U botuser -d aibot_db -tAc \
+            "SELECT count(*) FROM information_schema.tables
+             WHERE table_schema='public' AND table_name IN
+               ('users','transactions','usage_logs','system_settings',
+                'promo_codes','promo_usage','conversation_messages')" \
+            | grep -qx 0

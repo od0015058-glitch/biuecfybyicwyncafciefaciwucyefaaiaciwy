@@ -22,15 +22,9 @@ services:
       POSTGRES_DB:       ${DB_NAME:-aibot_db}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      # Postgres' official image runs every .sql in /docker-entrypoint-initdb.d
-      # alphabetically, ONLY on first boot of an empty data directory. Number
-      # the prefixes so schema.sql lands before any migration. New migrations
-      # need a new line here until P3-Op-4 (Alembic) replaces this whole
-      # mechanism.
-      - ./schema.sql:/docker-entrypoint-initdb.d/00_schema.sql:ro
-      - ./migrations/001_promo_codes.sql:/docker-entrypoint-initdb.d/01_promo_codes.sql:ro
-      - ./migrations/002_conversation_memory.sql:/docker-entrypoint-initdb.d/02_conversation_memory.sql:ro
-      - ./migrations/003_bump_free_messages_to_10.sql:/docker-entrypoint-initdb.d/03_bump_free_messages_to_10.sql:ro
+      # Migrations are applied by the bot container's entrypoint via
+      # `alembic upgrade head`; postgres no longer runs init scripts.
+      # See alembic/README.md for how to stamp existing prod databases.
     healthcheck:
       # Make sure the bot doesn't try to connect before postgres has accepted
       # init scripts. -d guards against the pg_isready quirk where it returns
