@@ -298,6 +298,12 @@ async def login_post(request: web.Request) -> web.StreamResponse:
             "admin login: rate-limited key=%s remote=%s",
             client_key, request.remote,
         )
+        await _record_audit_safe(
+            request,
+            "login_deny",
+            outcome="deny",
+            meta={"reason": "rate_limited"},
+        )
         return aiohttp_jinja2.render_template(
             "login.html",
             request,
@@ -316,6 +322,12 @@ async def login_post(request: web.Request) -> web.StreamResponse:
             "admin login: bad password key=%s remote=%s",
             client_key, request.remote,
         )
+        await _record_audit_safe(
+            request,
+            "login_deny",
+            outcome="deny",
+            meta={"reason": "bad_password"},
+        )
         return aiohttp_jinja2.render_template(
             "login.html",
             request,
@@ -330,6 +342,7 @@ async def login_post(request: web.Request) -> web.StreamResponse:
         "admin login: success from %s (cookie expires %s)",
         request.remote, expires_at.isoformat(),
     )
+    await _record_audit_safe(request, "login_ok")
     response = web.HTTPFound(location="/admin/")
     response.set_cookie(
         COOKIE_NAME,
@@ -392,6 +405,69 @@ async def dashboard(request: web.Request) -> web.StreamResponse:
             "active_page": "dashboard",
         },
     )
+
+
+# ---------------------------------------------------------------------
+# Admin audit helper (Stage-9-Step-2)
+# ---------------------------------------------------------------------
+
+
+# Slug → human label mapping for the /admin/audit page filter dropdown.
+# Keep this in sync with every ``record_admin_audit`` callsite in this
+# module — anything not listed here still records and displays, but
+# won't appear in the filter UI.
+AUDIT_ACTION_LABELS: dict[str, str] = {
+    "login_ok": "Login (success)",
+    "login_deny": "Login (denied)",
+    "promo_create": "Promo created",
+    "promo_revoke": "Promo revoked",
+    "gift_create": "Gift created",
+    "gift_revoke": "Gift revoked",
+    "user_adjust": "Wallet credit / debit",
+    "user_edit": "User fields edited",
+    "broadcast_start": "Broadcast started",
+    "string_save": "Bot text override saved",
+    "string_revert": "Bot text override reverted",
+}
+
+
+async def _record_audit_safe(
+    request: web.Request,
+    action: str,
+    *,
+    target: str | None = None,
+    outcome: str = "ok",
+    meta: dict | None = None,
+) -> None:
+    """Best-effort audit-log write. Swallows every exception so an
+    audit-write failure can never block the underlying admin
+    operation. The actor is derived from the auth context — for now
+    every web admin shares one identity (``"web"``) since the panel
+    only enforces a single password. The IP comes from the same
+    helper used by the rate limiter so reverse-proxy deploys with
+    ``TRUST_PROXY_HEADERS=1`` get the real client address rather
+    than the proxy's TCP address."""
+    db = request.app.get(APP_KEY_DB)
+    if db is None:
+        return
+    try:
+        ip = client_ip_for_rate_limit(request)
+    except Exception:
+        ip = request.remote
+    try:
+        await db.record_admin_audit(
+            actor="web",
+            action=action,
+            target=target,
+            ip=ip,
+            outcome=outcome,
+            meta=meta,
+        )
+    except Exception:
+        log.exception(
+            "audit log write failed action=%s target=%s outcome=%s",
+            action, target, outcome,
+        )
 
 
 # ---------------------------------------------------------------------
@@ -801,6 +877,17 @@ async def promos_create(request: web.Request) -> web.StreamResponse:
         "web_admin promos_create: code=%s disc=%s cap=%s",
         parsed["code"], disc, parsed["max_uses"],
     )
+    await _record_audit_safe(
+        request,
+        "promo_create",
+        target=f"promo:{parsed['code']}",
+        meta={
+            "discount_percent": parsed["discount_percent"],
+            "discount_amount": parsed["discount_amount"],
+            "max_uses": parsed["max_uses"],
+            "expires_in_days": parsed["expires_in_days"],
+        },
+    )
     set_flash(
         response,
         kind="success",
@@ -869,6 +956,9 @@ async def promos_revoke(request: web.Request) -> web.StreamResponse:
 
     if ok:
         log.info("web_admin promos_revoke: code=%s", code)
+        await _record_audit_safe(
+            request, "promo_revoke", target=f"promo:{code}",
+        )
         set_flash(
             response,
             kind="success",
@@ -1135,6 +1225,16 @@ async def gifts_create(request: web.Request) -> web.StreamResponse:
         "web_admin gifts_create: code=%s amount=%s cap=%s",
         parsed["code"], parsed["amount_usd"], parsed["max_uses"],
     )
+    await _record_audit_safe(
+        request,
+        "gift_create",
+        target=f"gift:{parsed['code']}",
+        meta={
+            "amount_usd": parsed["amount_usd"],
+            "max_uses": parsed["max_uses"],
+            "expires_in_days": parsed["expires_in_days"],
+        },
+    )
     set_flash(
         response,
         kind="success",
@@ -1206,6 +1306,9 @@ async def gifts_revoke(request: web.Request) -> web.StreamResponse:
 
     if ok:
         log.info("web_admin gifts_revoke: code=%s", code)
+        await _record_audit_safe(
+            request, "gift_revoke", target=f"gift:{code}",
+        )
         set_flash(
             response,
             kind="success",
@@ -1392,6 +1495,9 @@ async def user_detail_get(request: web.Request) -> web.StreamResponse:
         "active_page": "users",
         "csrf_token": csrf_token_for(request),
         "flash": None,
+        "supported_languages": list(
+            bot_strings_module.SUPPORTED_LANGUAGES
+        ),
     }
     response = aiohttp_jinja2.render_template(
         "user_detail.html", request, context
@@ -1526,6 +1632,17 @@ async def user_adjust_post(request: web.Request) -> web.StreamResponse:
     log.info(
         "web_admin user_adjust: user=%s delta=$%.4f tx=%d reason=%r",
         user_id, delta, result["transaction_id"], parsed["reason"],
+    )
+    await _record_audit_safe(
+        request,
+        "user_adjust",
+        target=f"user:{user_id}",
+        meta={
+            "delta_usd": delta,
+            "new_balance_usd": result["new_balance"],
+            "transaction_id": result["transaction_id"],
+            "reason": parsed["reason"],
+        },
     )
     verb = "Credited" if sign > 0 else "Debited"
     set_flash(
@@ -1905,6 +2022,15 @@ async def broadcast_post(request: web.Request) -> web.StreamResponse:
     log.info(
         "broadcast_post: started job=%s len=%d active=%s",
         job["id"], job["full_text_len"], parsed["only_active_days"],
+    )
+    await _record_audit_safe(
+        request,
+        "broadcast_start",
+        target=f"broadcast:{job['id']}",
+        meta={
+            "text_len": job["full_text_len"],
+            "only_active_days": parsed["only_active_days"],
+        },
     )
     return web.HTTPFound(location=f"/admin/broadcast/{job['id']}")
 
@@ -2404,6 +2530,12 @@ async def string_save_post(request: web.Request) -> web.StreamResponse:
         "string override saved lang=%s key=%s len=%d actor=web",
         lang, key, len(value),
     )
+    await _record_audit_safe(
+        request,
+        "string_save",
+        target=f"string:{lang}:{key}",
+        meta={"length": len(value)},
+    )
     set_flash(
         response,
         kind="success",
@@ -2471,6 +2603,11 @@ async def string_revert_post(request: web.Request) -> web.StreamResponse:
     await _refresh_overrides_cache(db)
     if deleted:
         log.info("string override reverted lang=%s key=%s actor=web", lang, key)
+        await _record_audit_safe(
+            request,
+            "string_revert",
+            target=f"string:{lang}:{key}",
+        )
         set_flash(
             response,
             kind="success",
@@ -2487,6 +2624,320 @@ async def string_revert_post(request: web.Request) -> web.StreamResponse:
             cookie_secure=cookie_secure,
         )
     return response
+
+
+# ---------------------------------------------------------------------
+# User-field editor + audit log viewer (Stage-9-Step-2)
+# ---------------------------------------------------------------------
+
+
+# Length / value caps on the editable user fields. Kept generous so
+# we don't reject a legitimate model id we haven't seen before, but
+# tight enough that a malformed POST can't explode the row size.
+USER_FIELD_MODEL_MAX_CHARS = 200
+USER_FIELD_USERNAME_MAX_CHARS = 64
+USER_FIELD_FREE_MSGS_MAX = 1_000_000
+
+
+def parse_user_edit_form(form, *, current: dict) -> dict | str:
+    """Parse the /admin/users/{id}/edit form into a dict of changed
+    fields, or return an error-key string on validation failure.
+
+    Only fields whose new value differs from ``current`` make it into
+    the returned dict — that way ``update_user_admin_fields`` skips
+    no-op writes and the audit-log entry only mentions what actually
+    changed.
+
+    ``current`` is the user's current row from
+    ``Database.get_user_admin_summary``; we read ``language_code``,
+    ``active_model``, ``memory_enabled`` (optional), ``username``,
+    and ``free_messages_left`` from it.
+
+    Error keys: ``bad_lang``, ``bad_model``, ``bad_memory``,
+    ``bad_free_messages``, ``free_messages_too_large``,
+    ``bad_username``, ``username_too_long``.
+    """
+    fields: dict = {}
+
+    raw_lang = (form.get("language_code") or "").strip()
+    if raw_lang:
+        if raw_lang not in bot_strings_module.SUPPORTED_LANGUAGES:
+            return "bad_lang"
+        if raw_lang != (current.get("language_code") or ""):
+            fields["language_code"] = raw_lang
+
+    raw_model = (form.get("active_model") or "").strip()
+    if raw_model:
+        # Sanity-check the shape — OpenRouter ids are always
+        # ``provider/name``. Anything else is almost certainly a typo
+        # and would 400 on the next message anyway.
+        if len(raw_model) > USER_FIELD_MODEL_MAX_CHARS or "/" not in raw_model:
+            return "bad_model"
+        if raw_model != (current.get("active_model") or ""):
+            fields["active_model"] = raw_model
+
+    # Memory toggle uses the standard "checkbox + hidden marker" trick:
+    # a checkbox only submits ``on`` when checked, so we pair it with a
+    # hidden ``memory_enabled_present=1`` field that tells us the form
+    # actually rendered the toggle. Without the hidden field we can't
+    # distinguish "unchecked" from "field omitted", and a partial form
+    # would silently flip memory off for every user.
+    if form.get("memory_enabled_present"):
+        raw_memory = form.get("memory_enabled")
+        new_memory = (
+            str(raw_memory).lower() in ("on", "true", "1", "yes")
+            if raw_memory is not None else False
+        )
+        current_memory = bool(current.get("memory_enabled", False))
+        if new_memory != current_memory:
+            fields["memory_enabled"] = new_memory
+
+    raw_free = (form.get("free_messages_left") or "").strip()
+    if raw_free:
+        try:
+            free_value = int(raw_free)
+        except ValueError:
+            return "bad_free_messages"
+        if free_value < 0:
+            return "bad_free_messages"
+        if free_value > USER_FIELD_FREE_MSGS_MAX:
+            return "free_messages_too_large"
+        if free_value != int(current.get("free_messages_left") or 0):
+            fields["free_messages_left"] = free_value
+
+    # Username is the only optional / clearable field — empty input
+    # means "clear it" (set to NULL). A whitespace-only value is also
+    # treated as "clear".
+    if "username" in form:
+        raw_username = (form.get("username") or "").strip()
+        if raw_username:
+            if len(raw_username) > USER_FIELD_USERNAME_MAX_CHARS:
+                return "username_too_long"
+            # Telegram usernames are alphanumeric + underscore. We
+            # accept the canonical form without the leading "@".
+            cleaned = raw_username.lstrip("@")
+            if not all(c.isalnum() or c == "_" for c in cleaned):
+                return "bad_username"
+            new_username: str | None = cleaned
+        else:
+            new_username = None
+        if new_username != current.get("username"):
+            fields["username"] = new_username
+
+    return fields
+
+
+_USER_EDIT_ERR_TEXT = {
+    "bad_lang": "Pick a supported language code.",
+    "bad_model": "Active model must be a non-empty 'provider/model' id.",
+    "bad_memory": "Memory toggle had an unexpected value.",
+    "bad_free_messages": "Free messages must be a non-negative integer.",
+    "free_messages_too_large": (
+        f"Free messages must be at most {USER_FIELD_FREE_MSGS_MAX:,}."
+    ),
+    "bad_username": (
+        "Username must be alphanumeric or underscore (no spaces, no '@')."
+    ),
+    "username_too_long": (
+        f"Username must be at most {USER_FIELD_USERNAME_MAX_CHARS} chars."
+    ),
+}
+
+
+async def user_edit_post(request: web.Request) -> web.StreamResponse:
+    """POST /admin/users/{telegram_id}/edit — update non-balance fields.
+
+    Balance is intentionally NOT editable here; it routes through
+    ``user_adjust_post`` so every change leaves a transactions-ledger
+    row. This handler only touches the allow-listed
+    ``Database.USER_EDITABLE_FIELDS`` set.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+
+    raw_id = request.match_info.get("telegram_id", "")
+    try:
+        user_id = int(raw_id)
+    except ValueError:
+        return web.HTTPFound(location="/admin/users")
+
+    form = await request.post()
+    detail_url = f"/admin/users/{user_id}"
+    response = web.HTTPFound(location=detail_url)
+
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning(
+            "user_edit_post: CSRF token mismatch from %s", request.remote
+        )
+        set_flash(
+            response,
+            kind="error",
+            message=(
+                "Form submission was rejected (CSRF). "
+                "Refresh and try again."
+            ),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    db = request.app.get(APP_KEY_DB)
+    if db is None:
+        set_flash(
+            response,
+            kind="error",
+            message="No database wired up — cannot edit.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    # Refetch the current row so the diff in ``parse_user_edit_form``
+    # is against the latest state — we don't want to clobber a value
+    # someone else changed since the form was rendered.
+    try:
+        summary = await db.get_user_admin_summary(user_id)
+    except Exception:
+        log.exception("user_edit_post: get_user_admin_summary failed")
+        set_flash(
+            response,
+            kind="error",
+            message="Database read failed — see logs.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    if summary is None:
+        set_flash(
+            response,
+            kind="error",
+            message=f"No user with id {user_id}.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    parsed = parse_user_edit_form(form, current=summary)
+    if isinstance(parsed, str):
+        set_flash(
+            response,
+            kind="error",
+            message=_USER_EDIT_ERR_TEXT.get(parsed, f"Invalid input ({parsed})."),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    if not parsed:
+        set_flash(
+            response,
+            kind="info",
+            message="No changes — every field already matches.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        result = await db.update_user_admin_fields(
+            user_id, fields=parsed,
+        )
+    except ValueError as exc:
+        # ``update_user_admin_fields`` raises ValueError on
+        # disallowed columns. The allow-list keeps this unreachable
+        # in normal flow; surface as a generic error if it ever fires.
+        log.warning(
+            "user_edit_post: update rejected user=%s err=%s",
+            user_id, exc,
+        )
+        set_flash(
+            response,
+            kind="error",
+            message="Field rejected — see logs.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+    except Exception:
+        log.exception("user_edit_post: update_user_admin_fields failed")
+        set_flash(
+            response,
+            kind="error",
+            message="Database write failed — see logs.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    if result is None:
+        set_flash(
+            response,
+            kind="error",
+            message=f"No user with id {user_id}.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    log.info(
+        "web_admin user_edit: user=%s fields=%s",
+        user_id, sorted(parsed.keys()),
+    )
+    await _record_audit_safe(
+        request,
+        "user_edit",
+        target=f"user:{user_id}",
+        meta={"changed": parsed},
+    )
+    summary_changes = ", ".join(f"{k}" for k in sorted(parsed.keys()))
+    set_flash(
+        response,
+        kind="success",
+        message=f"Saved changes to: {summary_changes}.",
+        secret=secret,
+        cookie_secure=cookie_secure,
+    )
+    return response
+
+
+async def audit_get(request: web.Request) -> web.StreamResponse:
+    """GET /admin/audit — read-only feed of admin activity.
+
+    Filters: ``?action=<slug>`` narrows by action, ``?actor=<id>``
+    narrows by actor (currently always ``"web"`` — left in place
+    for the day per-admin identity lands).
+    """
+    db = request.app.get(APP_KEY_DB)
+    rows: list[dict] = []
+    db_error: str | None = None
+    if db is None:
+        db_error = "No database wired up (development mode)."
+    else:
+        action_filter = (request.query.get("action") or "").strip() or None
+        actor_filter = (request.query.get("actor") or "").strip() or None
+        try:
+            rows = await db.list_admin_audit_log(
+                limit=200,
+                action=action_filter,
+                actor=actor_filter,
+            )
+        except Exception:
+            log.exception("audit_get: list_admin_audit_log failed")
+            db_error = "Database query failed — see logs."
+
+    context = {
+        "rows": rows,
+        "db_error": db_error,
+        "active_page": "audit",
+        "csrf_token": csrf_token_for(request),
+        "action_labels": AUDIT_ACTION_LABELS,
+        "selected_action": (request.query.get("action") or "").strip(),
+        "selected_actor": (request.query.get("actor") or "").strip(),
+    }
+    return aiohttp_jinja2.render_template(
+        "audit.html", request, context
+    )
 
 
 # ---------------------------------------------------------------------
@@ -2639,6 +3090,13 @@ def setup_admin_routes(
         "/admin/strings/{lang}/{key}/revert",
         _require_auth(string_revert_post),
     )
+
+    # Stage-9-Step-2: user-field editor + audit-log viewer.
+    app.router.add_post(
+        "/admin/users/{telegram_id}/edit",
+        _require_auth(user_edit_post),
+    )
+    app.router.add_get("/admin/audit", _require_auth(audit_get))
 
     app[APP_KEY_INSTALLED] = True
     log.info("Web admin routes installed under /admin/")

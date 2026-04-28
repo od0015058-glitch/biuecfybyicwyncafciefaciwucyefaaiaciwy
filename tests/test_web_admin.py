@@ -142,6 +142,9 @@ def _stub_db(
     string_overrides_result: dict | Exception | None = None,
     upsert_string_result: object | Exception = None,
     delete_string_result: bool | Exception = True,
+    audit_log_result: list | Exception | None = None,
+    record_audit_result: object | Exception = 1,
+    update_user_fields_result: dict | None | Exception = None,
 ):
     """A minimal Database stub that exposes the methods web_admin uses.
 
@@ -260,6 +263,26 @@ def _stub_db(
     else:
         db.delete_string_override = AsyncMock(
             return_value=delete_string_result
+        )
+    # Stage-9-Step-2: admin_audit_log + user-field editor.
+    if isinstance(audit_log_result, Exception):
+        db.list_admin_audit_log = AsyncMock(side_effect=audit_log_result)
+    else:
+        db.list_admin_audit_log = AsyncMock(
+            return_value=audit_log_result
+            if audit_log_result is not None else []
+        )
+    if isinstance(record_audit_result, Exception):
+        db.record_admin_audit = AsyncMock(side_effect=record_audit_result)
+    else:
+        db.record_admin_audit = AsyncMock(return_value=record_audit_result)
+    if isinstance(update_user_fields_result, Exception):
+        db.update_user_admin_fields = AsyncMock(
+            side_effect=update_user_fields_result
+        )
+    else:
+        db.update_user_admin_fields = AsyncMock(
+            return_value=update_user_fields_result
         )
     return db
 
@@ -3959,3 +3982,533 @@ async def test_strings_routes_require_auth(
             resp = await client.post(path, data={}, allow_redirects=False)
         assert resp.status == 302
         assert resp.headers["Location"] == "/admin/login"
+
+
+# ---------------------------------------------------------------------
+# Stage-9-Step-2: user-field editor + audit log
+# ---------------------------------------------------------------------
+
+# A canonical full user_summary fixture for the user-edit tests. Always
+# spread + override per-test rather than mutating in place.
+_BASE_USER_SUMMARY = {
+    "telegram_id": 777,
+    "username": "alice",
+    "balance_usd": 42.5,
+    "free_messages_left": 3,
+    "active_model": "openai/gpt-4o",
+    "language_code": "en",
+    "memory_enabled": False,
+    "total_credited_usd": 100.0,
+    "total_spent_usd": 57.5,
+    "recent_transactions": [],
+}
+
+
+async def test_user_detail_renders_edit_form(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(user_summary_result={**_BASE_USER_SUMMARY})
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+
+    resp = await client.get("/admin/users/777")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Edit user fields" in body
+    # Language dropdown gets pre-selected.
+    assert 'value="en"\n              selected' in body or 'value="en" selected' in body
+    # Active model input rendered.
+    assert 'value="openai/gpt-4o"' in body
+    # Memory checkbox NOT pre-checked when False.
+    assert 'name="memory_enabled" value="on"\n' in body
+    assert 'memory_enabled" value="on"\n              checked' not in body
+    # Free messages numeric pre-filled.
+    assert 'value="3"' in body
+    # Username pre-filled.
+    assert 'value="alice"' in body
+    # Sentinel field present.
+    assert 'name="memory_enabled_present"' in body
+
+
+async def test_user_edit_post_happy_path_changes_language(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        user_summary_result={**_BASE_USER_SUMMARY},
+        update_user_fields_result={"changed": {"language_code": "fa"}},
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_user_csrf(client, "pw", 777)
+
+    resp = await client.post(
+        "/admin/users/777/edit",
+        data={
+            "csrf_token": csrf,
+            "language_code": "fa",
+            "active_model": "openai/gpt-4o",
+            "memory_enabled_present": "1",
+            # memory_enabled omitted = unchecked = False (matches current)
+            "free_messages_left": "3",
+            "username": "alice",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/users/777"
+    db.update_user_admin_fields.assert_awaited_once()
+    call = db.update_user_admin_fields.await_args
+    assert call.args == (777,)
+    assert call.kwargs == {"fields": {"language_code": "fa"}}
+    db.record_admin_audit.assert_awaited()
+    audit_call = db.record_admin_audit.await_args
+    assert audit_call.kwargs["action"] == "user_edit"
+    assert audit_call.kwargs["target"] == "user:777"
+    assert audit_call.kwargs["meta"] == {"changed": {"language_code": "fa"}}
+
+
+async def test_user_edit_post_no_changes_flashes_info(
+    aiohttp_client, make_admin_app
+):
+    """Resubmitting the form with every field unchanged is a no-op
+    flash, NOT a DB write — keeps the audit log and txn history clean."""
+    db = _stub_db(user_summary_result={**_BASE_USER_SUMMARY})
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_user_csrf(client, "pw", 777)
+
+    resp = await client.post(
+        "/admin/users/777/edit",
+        data={
+            "csrf_token": csrf,
+            "language_code": "en",
+            "active_model": "openai/gpt-4o",
+            "memory_enabled_present": "1",
+            "free_messages_left": "3",
+            "username": "alice",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.update_user_admin_fields.assert_not_awaited()
+    user_edit_calls = [
+        c for c in db.record_admin_audit.await_args_list
+        if c.kwargs.get("action") == "user_edit"
+    ]
+    assert user_edit_calls == []
+
+
+async def test_user_edit_post_toggles_memory_on(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        user_summary_result={**_BASE_USER_SUMMARY, "memory_enabled": False},
+        update_user_fields_result={"changed": {"memory_enabled": True}},
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_user_csrf(client, "pw", 777)
+
+    resp = await client.post(
+        "/admin/users/777/edit",
+        data={
+            "csrf_token": csrf,
+            "memory_enabled_present": "1",
+            "memory_enabled": "on",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.update_user_admin_fields.assert_awaited_once_with(
+        777, fields={"memory_enabled": True},
+    )
+
+
+async def test_user_edit_post_clears_username(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        user_summary_result={**_BASE_USER_SUMMARY},
+        update_user_fields_result={"changed": {"username": None}},
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_user_csrf(client, "pw", 777)
+
+    resp = await client.post(
+        "/admin/users/777/edit",
+        data={
+            "csrf_token": csrf,
+            "memory_enabled_present": "1",
+            "username": "",  # explicitly cleared
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.update_user_admin_fields.assert_awaited_once_with(
+        777, fields={"username": None},
+    )
+
+
+async def test_user_edit_post_strips_at_prefix_from_username(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        user_summary_result={**_BASE_USER_SUMMARY},
+        update_user_fields_result={"changed": {"username": "bob"}},
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_user_csrf(client, "pw", 777)
+
+    resp = await client.post(
+        "/admin/users/777/edit",
+        data={
+            "csrf_token": csrf,
+            "memory_enabled_present": "1",
+            "username": "@bob",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.update_user_admin_fields.assert_awaited_once_with(
+        777, fields={"username": "bob"},
+    )
+
+
+async def test_user_edit_post_rejects_unknown_lang(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(user_summary_result={**_BASE_USER_SUMMARY})
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_user_csrf(client, "pw", 777)
+
+    resp = await client.post(
+        "/admin/users/777/edit",
+        data={
+            "csrf_token": csrf,
+            "memory_enabled_present": "1",
+            "language_code": "zh",  # not in SUPPORTED_LANGUAGES
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.update_user_admin_fields.assert_not_awaited()
+
+
+async def test_user_edit_post_rejects_bad_model_id(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(user_summary_result={**_BASE_USER_SUMMARY})
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_user_csrf(client, "pw", 777)
+
+    resp = await client.post(
+        "/admin/users/777/edit",
+        data={
+            "csrf_token": csrf,
+            "memory_enabled_present": "1",
+            "active_model": "no-slash-here",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.update_user_admin_fields.assert_not_awaited()
+
+
+async def test_user_edit_post_rejects_negative_free_messages(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(user_summary_result={**_BASE_USER_SUMMARY})
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_user_csrf(client, "pw", 777)
+
+    resp = await client.post(
+        "/admin/users/777/edit",
+        data={
+            "csrf_token": csrf,
+            "memory_enabled_present": "1",
+            "free_messages_left": "-5",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.update_user_admin_fields.assert_not_awaited()
+
+
+async def test_user_edit_post_rejects_oversize_free_messages(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(user_summary_result={**_BASE_USER_SUMMARY})
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_user_csrf(client, "pw", 777)
+
+    resp = await client.post(
+        "/admin/users/777/edit",
+        data={
+            "csrf_token": csrf,
+            "memory_enabled_present": "1",
+            "free_messages_left": "9999999999",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.update_user_admin_fields.assert_not_awaited()
+
+
+async def test_user_edit_post_rejects_username_with_spaces(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(user_summary_result={**_BASE_USER_SUMMARY})
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_user_csrf(client, "pw", 777)
+
+    resp = await client.post(
+        "/admin/users/777/edit",
+        data={
+            "csrf_token": csrf,
+            "memory_enabled_present": "1",
+            "username": "bad name",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.update_user_admin_fields.assert_not_awaited()
+
+
+async def test_user_edit_post_requires_csrf(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(user_summary_result={**_BASE_USER_SUMMARY})
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.post(
+        "/admin/users/777/edit",
+        data={"language_code": "fa", "memory_enabled_present": "1"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.update_user_admin_fields.assert_not_awaited()
+
+
+async def test_user_edit_post_user_not_found(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(user_summary_result=None)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    # We can't fetch CSRF from the detail page when summary is None,
+    # so log in via promos like the other patterns and reuse that.
+    csrf = await _login_and_get_csrf(client, "pw")
+
+    resp = await client.post(
+        "/admin/users/12345/edit",
+        data={
+            "csrf_token": csrf,
+            "memory_enabled_present": "1",
+            "language_code": "fa",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.update_user_admin_fields.assert_not_awaited()
+
+
+async def test_user_edit_post_invalid_user_id_redirects_to_users(
+    aiohttp_client, make_admin_app
+):
+    """Bad URL segment shouldn't 500 — silently bounce to the list.
+    Mirrors ``user_adjust_post`` and ``user_detail_get`` behaviour."""
+    db = _stub_db(user_summary_result={**_BASE_USER_SUMMARY})
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.post(
+        "/admin/users/notanumber/edit",
+        data={"csrf_token": "x"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/users"
+    db.update_user_admin_fields.assert_not_awaited()
+
+
+async def test_user_edit_post_audit_failure_does_not_block_save(
+    aiohttp_client, make_admin_app
+):
+    """An audit-write failure must not cause the underlying user-edit
+    to fail or roll back. The flash should still be ``success``."""
+    db = _stub_db(
+        user_summary_result={**_BASE_USER_SUMMARY},
+        update_user_fields_result={"changed": {"language_code": "fa"}},
+        record_audit_result=RuntimeError("audit pool down"),
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_user_csrf(client, "pw", 777)
+
+    resp = await client.post(
+        "/admin/users/777/edit",
+        data={
+            "csrf_token": csrf,
+            "memory_enabled_present": "1",
+            "language_code": "fa",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.update_user_admin_fields.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------
+# /admin/audit
+# ---------------------------------------------------------------------
+
+
+async def test_audit_get_renders_rows(aiohttp_client, make_admin_app):
+    db = _stub_db(audit_log_result=[
+        {
+            "id": 1,
+            "ts": "2026-04-28T09:00:00+00:00",
+            "actor": "web",
+            "action": "user_adjust",
+            "target": "user:777",
+            "ip": "203.0.113.10",
+            "outcome": "ok",
+            "meta": {"delta_usd": 5.0},
+        },
+        {
+            "id": 2,
+            "ts": "2026-04-28T08:59:00+00:00",
+            "actor": "web",
+            "action": "login_deny",
+            "target": None,
+            "ip": "203.0.113.10",
+            "outcome": "deny",
+            "meta": {"reason": "bad_password"},
+        },
+    ])
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/audit")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "user:777" in body
+    assert "Wallet credit / debit" in body  # action label
+    assert "Login (denied)" in body
+    db.list_admin_audit_log.assert_awaited_once_with(
+        limit=200, action=None, actor=None,
+    )
+
+
+async def test_audit_get_passes_filters(aiohttp_client, make_admin_app):
+    db = _stub_db(audit_log_result=[])
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/audit?action=user_adjust&actor=web")
+    assert resp.status == 200
+    db.list_admin_audit_log.assert_awaited_once_with(
+        limit=200, action="user_adjust", actor="web",
+    )
+
+
+async def test_audit_get_handles_db_error(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(audit_log_result=RuntimeError("pool exhausted"))
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/audit")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Database query failed" in body
+
+
+async def test_audit_get_requires_auth(aiohttp_client, make_admin_app):
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    resp = await client.get("/admin/audit", allow_redirects=False)
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/login"
+
+
+async def test_user_edit_route_requires_auth(
+    aiohttp_client, make_admin_app
+):
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    resp = await client.post(
+        "/admin/users/777/edit", data={}, allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/login"
+
+
+# ---------------------------------------------------------------------
+# Audit hook coverage on existing handlers
+# ---------------------------------------------------------------------
+
+
+async def test_login_post_records_audit_on_success(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    resp = await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.record_admin_audit.assert_awaited()
+    actions = [c.kwargs["action"] for c in db.record_admin_audit.await_args_list]
+    assert "login_ok" in actions
+
+
+async def test_login_post_records_audit_on_bad_password(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    resp = await client.post(
+        "/admin/login", data={"password": "wrong"}, allow_redirects=False,
+    )
+    assert resp.status == 401
+    actions = [c.kwargs["action"] for c in db.record_admin_audit.await_args_list]
+    assert "login_deny" in actions
+
+
+async def test_user_adjust_post_records_audit_on_success(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        user_summary_result={**_BASE_USER_SUMMARY},
+        adjust_balance_result={
+            "new_balance": 47.5, "transaction_id": 999, "delta": 5.0,
+        },
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_user_csrf(client, "pw", 777)
+    resp = await client.post(
+        "/admin/users/777/adjust",
+        data={
+            "csrf_token": csrf,
+            "action": "credit",
+            "amount_usd": "5",
+            "reason": "manual top-up",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    actions = [c.kwargs["action"] for c in db.record_admin_audit.await_args_list]
+    assert "user_adjust" in actions
+
+
+async def test_promos_create_records_audit(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(create_promo_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/promos",
+        data={
+            "csrf_token": csrf,
+            "code": "SAVE10",
+            "discount_kind": "percent",
+            "discount_value": "10",
+            "max_uses": "5",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    actions = [c.kwargs["action"] for c in db.record_admin_audit.await_args_list]
+    assert "promo_create" in actions

@@ -207,6 +207,7 @@ async def test_get_user_admin_summary_default_limit_is_5():
             "free_messages_left": 0,
             "active_model": "m",
             "language_code": "en",
+            "memory_enabled": False,
         }
     )
     conn.fetchval = AsyncMock(return_value=0)
@@ -230,6 +231,7 @@ async def test_get_user_admin_summary_custom_limit_clamps():
             "free_messages_left": 0,
             "active_model": "m",
             "language_code": "en",
+            "memory_enabled": False,
         }
     )
     db = database_module.Database()
@@ -489,3 +491,185 @@ async def test_list_transactions_null_fields_pass_through():
     assert r["notes"] is None
     # Debit rows stay negative so the template can colourise.
     assert r["amount_usd"] == -2.5
+
+
+# ---------------------------------------------------------------------
+# Stage-9-Step-2: admin_audit_log + user-field editor + admin_telegram_id col
+# ---------------------------------------------------------------------
+
+
+async def test_record_admin_audit_inserts_row_and_returns_id():
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=12345)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    new_id = await db.record_admin_audit(
+        actor="web",
+        action="user_adjust",
+        target="user:777",
+        ip="203.0.113.10",
+        outcome="ok",
+        meta={"delta_usd": 5.0},
+    )
+    assert new_id == 12345
+    sql = conn.fetchval.await_args.args[0]
+    assert "INSERT INTO admin_audit_log" in sql
+    args = conn.fetchval.await_args.args[1:]
+    assert args[0] == "web"
+    assert args[1] == "user_adjust"
+    assert args[2] == "user:777"
+    assert args[3] == "203.0.113.10"
+    assert args[4] == "ok"
+    # meta is JSON-serialized to text before being cast to ::jsonb in the SQL.
+    import json
+    assert json.loads(args[5]) == {"delta_usd": 5.0}
+
+
+async def test_record_admin_audit_swallows_db_error_and_returns_none():
+    """A failed audit-log write must NOT propagate — callers wrap
+    in ``_record_audit_safe`` already, but defense in depth."""
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(side_effect=RuntimeError("pool gone"))
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.record_admin_audit(
+        actor="web", action="login_ok",
+    )
+    assert result is None
+
+
+async def test_record_admin_audit_omits_meta_when_none():
+    """A row with no meta should pass NULL, not the JSON string 'null'."""
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=1)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.record_admin_audit(actor="web", action="login_ok")
+    args = conn.fetchval.await_args.args[1:]
+    assert args[5] is None  # meta param
+
+
+async def test_list_admin_audit_log_default_no_filters():
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.list_admin_audit_log()
+    sql = conn.fetch.await_args.args[0]
+    assert "FROM admin_audit_log" in sql
+    assert "WHERE" not in sql.split("ORDER BY")[0]
+    assert conn.fetch.await_args.args[1] == 200  # default limit
+
+
+async def test_list_admin_audit_log_filters_by_action_and_actor():
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.list_admin_audit_log(
+        limit=50, action="user_adjust", actor="web",
+    )
+    sql = conn.fetch.await_args.args[0]
+    args = conn.fetch.await_args.args[1:]
+    assert "action = $1" in sql
+    assert "actor = $2" in sql
+    assert args == ("user_adjust", "web", 50)
+
+
+async def test_update_user_admin_fields_rejects_unknown_column():
+    db = database_module.Database()
+    db.pool = _PoolStub(_make_conn())
+    with pytest.raises(ValueError, match="balance_usd"):
+        await db.update_user_admin_fields(
+            777, fields={"balance_usd": 999.99},
+        )
+
+
+async def test_update_user_admin_fields_rejects_empty_fields():
+    db = database_module.Database()
+    db.pool = _PoolStub(_make_conn())
+    with pytest.raises(ValueError, match="non-empty"):
+        await db.update_user_admin_fields(777, fields={})
+
+
+async def test_update_user_admin_fields_returns_none_for_missing_user():
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.update_user_admin_fields(
+        777, fields={"language_code": "fa"},
+    )
+    assert result is None
+
+
+async def test_update_user_admin_fields_builds_update_sql_for_multiple_columns():
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=777)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.update_user_admin_fields(
+        777,
+        fields={
+            "language_code": "fa",
+            "memory_enabled": True,
+        },
+    )
+    assert result == {"changed": {"language_code": "fa", "memory_enabled": True}}
+    sql = conn.fetchval.await_args.args[0]
+    assert "UPDATE users SET" in sql
+    assert "language_code = $1" in sql
+    assert "memory_enabled = $2" in sql
+    assert "WHERE telegram_id = $3" in sql
+    assert conn.fetchval.await_args.args[1:] == ("fa", True, 777)
+
+
+async def test_admin_adjust_balance_populates_admin_telegram_id_column():
+    """Stage-9-Step-2 fix: the admin id now lives in a real column,
+    not buried inside ``gateway_invoice_id``. Forensics queries do
+    ``WHERE admin_telegram_id IS NOT NULL`` instead of substring matching.
+    """
+    conn = _make_conn()
+    # Two fetchval calls: balance lookup, then the INSERT RETURNING.
+    # An asyncpg fetchrow then fetchval pattern.
+    conn.fetchrow = AsyncMock(return_value={"balance_usd": 10.0})
+    conn.execute = AsyncMock(return_value="UPDATE 1")
+    conn.fetchval = AsyncMock(return_value=999)
+    # Mock transaction context
+    class _TxCtx:
+        async def __aenter__(self_inner): return None
+        async def __aexit__(self_inner, *a): return False
+    conn.transaction = MagicMock(return_value=_TxCtx())
+
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.admin_adjust_balance(
+        telegram_id=777,
+        delta_usd=5.0,
+        reason="manual top-up",
+        admin_telegram_id=42,
+    )
+    assert result["transaction_id"] == 999
+
+    # Find the INSERT call (the second fetchval after the row lock check).
+    sql_calls = [c.args[0] for c in conn.fetchval.await_args_list]
+    insert_calls = [s for s in sql_calls if "INSERT INTO transactions" in s]
+    assert insert_calls, "expected an INSERT INTO transactions"
+    insert_sql = insert_calls[0]
+    assert "admin_telegram_id" in insert_sql
+
+    # Find the args of that fetchval call.
+    insert_args = next(
+        c.args for c in conn.fetchval.await_args_list
+        if "INSERT INTO transactions" in c.args[0]
+    )
+    # Last positional arg should be the admin id (42).
+    assert insert_args[-1] == 42

@@ -166,39 +166,99 @@
     </div>
   </div>
 
-  <div class="panel">
-    <h3>Credit / debit wallet</h3>
-    <form method="post" action="/admin/users/{{ summary.telegram_id }}/adjust">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div>
+    <div class="panel">
+      <h3>Credit / debit wallet</h3>
+      <form method="post" action="/admin/users/{{ summary.telegram_id }}/adjust">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
-      <div class="field">
-        <label>Action</label>
-        <div class="radio-row">
-          <label>
-            <input type="radio" name="action" value="credit" checked> Credit
-          </label>
-          <label>
-            <input type="radio" name="action" value="debit"> Debit
-          </label>
+        <div class="field">
+          <label>Action</label>
+          <div class="radio-row">
+            <label>
+              <input type="radio" name="action" value="credit" checked> Credit
+            </label>
+            <label>
+              <input type="radio" name="action" value="debit"> Debit
+            </label>
+          </div>
         </div>
-      </div>
 
-      <div class="field">
-        <label for="amount_usd">Amount (USD)</label>
-        <input type="text" id="amount_usd" name="amount_usd"
-               placeholder="5.00" required>
-        <div class="hint">Positive number. Debit won't take the user below zero.</div>
-      </div>
+        <div class="field">
+          <label for="amount_usd">Amount (USD)</label>
+          <input type="text" id="amount_usd" name="amount_usd"
+                 placeholder="5.00" required>
+          <div class="hint">Positive number. Debit won't take the user below zero.</div>
+        </div>
 
-      <div class="field">
-        <label for="reason">Reason (audit note)</label>
-        <input type="text" id="reason" name="reason"
-               placeholder="stuck invoice refund" required maxlength="500">
-        <div class="hint">Stored in <code class="code">transactions.notes</code> with a <code class="code">[web]</code> prefix.</div>
-      </div>
+        <div class="field">
+          <label for="reason">Reason (audit note)</label>
+          <input type="text" id="reason" name="reason"
+                 placeholder="stuck invoice refund" required maxlength="500">
+          <div class="hint">Stored in <code class="code">transactions.notes</code> with a <code class="code">[web]</code> prefix.</div>
+        </div>
 
-      <button type="submit" class="primary">Apply adjustment</button>
-    </form>
+        <button type="submit" class="primary">Apply adjustment</button>
+      </form>
+    </div>
+
+    <div class="panel" style="margin-top: 24px;">
+      <h3>Edit user fields</h3>
+      <form method="post" action="/admin/users/{{ summary.telegram_id }}/edit">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        {# Sentinel so the parser can tell "checkbox unchecked" from
+           "field omitted". See parse_user_edit_form. #}
+        <input type="hidden" name="memory_enabled_present" value="1">
+
+        <div class="field">
+          <label for="language_code">Language</label>
+          <select id="language_code" name="language_code">
+            {% for lang in supported_languages %}
+            <option value="{{ lang }}"
+              {% if lang == summary.language_code %}selected{% endif %}>
+              {{ lang }}
+            </option>
+            {% endfor %}
+          </select>
+          <div class="hint">User-facing locale (<code class="code">strings.SUPPORTED_LANGUAGES</code>).</div>
+        </div>
+
+        <div class="field">
+          <label for="active_model">Active model</label>
+          <input type="text" id="active_model" name="active_model"
+                 value="{{ summary.active_model }}"
+                 maxlength="200" required>
+          <div class="hint">OpenRouter id, e.g. <code class="code">openai/gpt-4o-mini</code>. Must include a <code class="code">/</code>.</div>
+        </div>
+
+        <div class="field">
+          <label>
+            <input type="checkbox" name="memory_enabled" value="on"
+              {% if summary.memory_enabled %}checked{% endif %}>
+            Memory enabled
+          </label>
+          <div class="hint">When OFF, conversation buffer is ignored and not appended to.</div>
+        </div>
+
+        <div class="field">
+          <label for="free_messages_left">Free messages left</label>
+          <input type="number" id="free_messages_left" name="free_messages_left"
+                 min="0" max="1000000"
+                 value="{{ summary.free_messages_left }}">
+          <div class="hint">Counter consumed before paid wallet usage kicks in.</div>
+        </div>
+
+        <div class="field">
+          <label for="username">Username</label>
+          <input type="text" id="username" name="username"
+                 value="{{ summary.username or '' }}"
+                 placeholder="(blank to clear)" maxlength="64">
+          <div class="hint">Telegram username override (alphanumeric + underscore, no <code class="code">@</code>).</div>
+        </div>
+
+        <button type="submit" class="primary">Save changes</button>
+      </form>
+    </div>
   </div>
 </div>
 {% endif %}

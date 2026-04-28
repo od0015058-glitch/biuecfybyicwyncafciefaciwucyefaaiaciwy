@@ -38,6 +38,15 @@ NowPayments crypto invoices.
   an in-memory cache so the next message uses the new text. Reverting
   resurrects the compiled default. Missing-slug typos now log a
   WARNING instead of silently shipping the slug to the user.
+- **User-field editor + admin audit log** — `/admin/users/{id}` now
+  edits language, active model, memory toggle, free-message counter,
+  and username (allow-listed via `Database.USER_EDITABLE_FIELDS`) in
+  addition to balance credit/debit. Every admin POST (login, promo
+  create/revoke, gift create/revoke, user adjust, user edit, broadcast
+  start, string save/revert) writes a row to the new `admin_audit_log`
+  table. View the feed at `${WEBHOOK_BASE_URL}/admin/audit` with
+  optional action/actor filters. Audit writes are best-effort — a
+  failed audit insert never blocks the underlying admin operation.
 
 For the full project history, file map, and roadmap **read [HANDOFF.md](./HANDOFF.md)**.
 
