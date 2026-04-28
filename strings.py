@@ -191,6 +191,9 @@ _STRINGS: dict[str, dict[str, str]] = {
             "برای داشتن پاسخ بدون انتظار، یک مدل پولی را انتخاب کنید یا یک-دو دقیقه دیگر صبر کنید."
         ),
         "ai_transient_error": "❌ خطای ارتباطی موقت رخ داد. لطفاً چند لحظه دیگر دوباره تلاش کنید.",
+        "ai_local_rate_limited": (
+            "⏳ سرعت ارسال پیام‌های شما زیاد است. لطفاً یک لحظه صبر کنید."
+        ),
         # ---- Payment notifications ----
         "pay_credited_full": "✅ پرداخت تایید شد! مبلغ ${delta:.4f} به حساب شما اضافه شد.",
         "pay_credited_total_only": (
@@ -430,6 +433,9 @@ _STRINGS: dict[str, dict[str, str]] = {
             "For an immediate reply, pick a paid model — or try again in a minute."
         ),
         "ai_transient_error": "❌ A temporary connectivity error occurred. Please try again in a moment.",
+        "ai_local_rate_limited": (
+            "⏳ You're sending messages too quickly. Please wait a moment."
+        ),
         # ---- Payment notifications ----
         "pay_credited_full": "✅ Payment confirmed! ${delta:.4f} has been added to your wallet.",
         "pay_credited_total_only": (
