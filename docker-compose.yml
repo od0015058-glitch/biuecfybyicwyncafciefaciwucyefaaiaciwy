@@ -1,0 +1,70 @@
+# docker-compose.yml — local + production deployment for the Meowassist bot.
+#
+# Usage:
+#   1. cp .env.example .env   and fill in BOT_TOKEN / OPENROUTER_API_KEY /
+#      NOWPAYMENTS_* / WEBHOOK_BASE_URL / DB_PASSWORD.
+#   2. docker compose up -d --build
+#   3. docker compose logs -f bot
+#
+# Replaces the `mv /root/bot_project /root/bot_project.broken` rollback
+# pattern with `docker compose down` + `docker compose up -d`.
+#
+# DB_HOST is forced to `postgres` here so the bot resolves the service
+# inside the compose network. Anything DB-related in .env is otherwise
+# honoured (DB_USER, DB_PASSWORD, DB_NAME, DB_PORT).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER:     ${DB_USER:-botuser}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
+      POSTGRES_DB:       ${DB_NAME:-aibot_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Postgres' official image runs every .sql in /docker-entrypoint-initdb.d
+      # alphabetically, ONLY on first boot of an empty data directory. Number
+      # the prefixes so schema.sql lands before any migration. New migrations
+      # need a new line here until P3-Op-4 (Alembic) replaces this whole
+      # mechanism.
+      - ./schema.sql:/docker-entrypoint-initdb.d/00_schema.sql:ro
+      - ./migrations/001_promo_codes.sql:/docker-entrypoint-initdb.d/01_promo_codes.sql:ro
+      - ./migrations/002_conversation_memory.sql:/docker-entrypoint-initdb.d/02_conversation_memory.sql:ro
+      - ./migrations/003_bump_free_messages_to_10.sql:/docker-entrypoint-initdb.d/03_bump_free_messages_to_10.sql:ro
+    healthcheck:
+      # Make sure the bot doesn't try to connect before postgres has accepted
+      # init scripts. -d guards against the pg_isready quirk where it returns
+      # "ready" against the bootstrap DB during init.
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-botuser} -d ${DB_NAME:-aibot_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      # Override DB_HOST regardless of what's in .env: inside the
+      # compose network, the postgres container is reachable as the
+      # service name.
+      DB_HOST: postgres
+      # Force the listener to 8080 inside the container; published port
+      # below maps it to whatever the operator wants on the host.
+      WEBHOOK_PORT: "8080"
+    ports:
+      # Expose to localhost only — production should put nginx/Caddy/
+      # Cloudflare Tunnel in front for TLS. NowPayments only needs to
+      # reach ${WEBHOOK_BASE_URL}/nowpayments-webhook over HTTPS.
+      - "127.0.0.1:${WEBHOOK_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

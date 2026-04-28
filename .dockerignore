@@ -1,0 +1,52 @@
+# Keep the build context small: nothing in here ends up in the image.
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+ENV/
+
+# Editor / OS
+*.save
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# Logs / dumps
+*.log
+logs/
+*.sqlite*
+*.db
+*.dump
+
+# Git + docs (kept out of the image; rebuild from the repo)
+.git/
+.gitignore
+.github/
+*.md
+HANDOFF.md
+README.md
+
+# Tests aren't shipped to production
+tests/
+requirements-dev.txt
