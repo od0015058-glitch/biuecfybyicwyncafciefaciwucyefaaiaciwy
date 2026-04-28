@@ -91,9 +91,11 @@ _ADMIN_HUB_TEXT = (
     "• `/admin_balance <user_id>` — view a user's wallet + last 5 txs\n"
     "• `/admin_credit <user_id> <usd> <reason>` — add USD to wallet\n"
     "• `/admin_debit <user_id> <usd> <reason>` — subtract USD from wallet\n"
+    "• `/admin_promo_create <CODE> <pct%|$amt> [max_uses] [days]` — new promo\n"
+    "• `/admin_promo_list` — list promo codes (newest 20)\n"
+    "• `/admin_promo_revoke <CODE>` — soft-delete a promo code\n"
     "\n"
-    "_More commands will be added in subsequent PRs (promo creation,"
-    " broadcast)._"
+    "_More commands will be added in subsequent PRs (broadcast)._"
 )
 
 
@@ -347,3 +349,250 @@ async def admin_debit(message: Message) -> None:
     if not is_admin(message.from_user.id if message.from_user else None):
         return
     await _handle_balance_op(message, sign=-1)
+
+
+# ---------------------------------------------------------------------
+# Promo creation / list / revoke
+# ---------------------------------------------------------------------
+
+
+def parse_promo_create_args(text: str) -> dict | str:
+    """Parse ``/admin_promo_create <CODE> <pct%|$amt> [max_uses] [days]``.
+
+    Returns a dict shaped::
+
+        {
+          "code": "WELCOME20",
+          "discount_percent": 20,            # XOR with discount_amount
+          "discount_amount": None,           # XOR with discount_percent
+          "max_uses": 100 | None,
+          "expires_in_days": 30 | None,
+        }
+
+    Returns a string error key on failure: ``"missing"``,
+    ``"bad_code"``, ``"bad_discount"``, ``"bad_max_uses"``,
+    ``"bad_days"``.
+
+    Discount syntax:
+      * ``20%``       → percent
+      * ``$2.50``     → fixed USD
+      * ``2.5``       → fixed USD (bare number assumed dollars)
+    """
+    parts = text.strip().split()
+    if len(parts) < 3:
+        return "missing"
+    code = parts[1].upper()
+    if not code or len(code) > 64 or not all(
+        c.isalnum() or c in "_-" for c in code
+    ):
+        return "bad_code"
+
+    raw_disc = parts[2]
+    discount_percent: int | None = None
+    discount_amount: float | None = None
+    if raw_disc.endswith("%"):
+        try:
+            pct = int(raw_disc[:-1])
+        except ValueError:
+            return "bad_discount"
+        if not (1 <= pct <= 100):
+            return "bad_discount"
+        discount_percent = pct
+    else:
+        try:
+            amount = float(raw_disc.lstrip("$"))
+        except ValueError:
+            return "bad_discount"
+        if not (amount == amount) or amount in (
+            float("inf"), float("-inf")
+        ) or amount <= 0:
+            return "bad_discount"
+        discount_amount = amount
+
+    max_uses: int | None = None
+    if len(parts) >= 4:
+        try:
+            max_uses = int(parts[3])
+        except ValueError:
+            return "bad_max_uses"
+        if max_uses <= 0:
+            return "bad_max_uses"
+
+    expires_in_days: int | None = None
+    if len(parts) >= 5:
+        try:
+            expires_in_days = int(parts[4])
+        except ValueError:
+            return "bad_days"
+        if expires_in_days <= 0:
+            return "bad_days"
+
+    return {
+        "code": code,
+        "discount_percent": discount_percent,
+        "discount_amount": discount_amount,
+        "max_uses": max_uses,
+        "expires_in_days": expires_in_days,
+    }
+
+
+_PROMO_CREATE_ERR_TEXT = {
+    "missing": (
+        "❌ Usage: `/admin_promo_create <CODE> <pct%|$amount> "
+        "[max_uses] [days]`\n"
+        "Examples:\n"
+        "  `/admin_promo_create WELCOME20 20% 100 30`\n"
+        "  `/admin_promo_create WINTER $5 50`\n"
+        "  `/admin_promo_create FIVEOFF $5`"
+    ),
+    "bad_code": (
+        "❌ Code must be alphanumeric (plus `_`/`-`), 1-64 chars."
+    ),
+    "bad_discount": (
+        "❌ Discount must be `<int>%` (1-100) or `$<num>` "
+        "(positive USD)."
+    ),
+    "bad_max_uses": (
+        "❌ max_uses must be a positive integer (or omit it for "
+        "unlimited)."
+    ),
+    "bad_days": (
+        "❌ days-until-expiry must be a positive integer (or omit "
+        "it for no expiry)."
+    ),
+}
+
+
+def _format_promo_row(r: dict) -> str:
+    if r.get("discount_percent") is not None:
+        disc = f"{r['discount_percent']}%"
+    elif r.get("discount_amount") is not None:
+        disc = f"${r['discount_amount']:.2f}"
+    else:
+        disc = "?"
+    used = r.get("used_count", 0)
+    cap = r.get("max_uses")
+    used_label = f"{used}/{cap}" if cap is not None else f"{used}/∞"
+    state = "active" if r.get("is_active") else "*revoked*"
+    expiry = r.get("expires_at")
+    expiry_label = f" exp={expiry[:10]}" if expiry else ""
+    return (
+        f"`{r['code']}` — {disc} — {used_label}{expiry_label} — {state}"
+    )
+
+
+@router.message(Command("admin_promo_create"))
+async def admin_promo_create(message: Message) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return
+    parsed = parse_promo_create_args(message.text or "")
+    if isinstance(parsed, str):
+        await message.answer(_PROMO_CREATE_ERR_TEXT[parsed])
+        return
+
+    expires_at = None
+    if parsed["expires_in_days"] is not None:
+        from datetime import datetime, timedelta, timezone
+        expires_at = datetime.now(timezone.utc) + timedelta(
+            days=parsed["expires_in_days"]
+        )
+
+    try:
+        ok = await db.create_promo_code(
+            code=parsed["code"],
+            discount_percent=parsed["discount_percent"],
+            discount_amount=parsed["discount_amount"],
+            max_uses=parsed["max_uses"],
+            expires_at=expires_at,
+        )
+    except ValueError as exc:
+        # Defensive — parse_promo_create_args already enforces the
+        # XOR / range invariants, so create_promo_code should not
+        # raise. Surface anyway in case the contract drifts.
+        await message.answer(f"❌ {exc}")
+        return
+    except Exception:
+        log.exception("admin_promo_create: DB write failed")
+        await message.answer("❌ DB write failed — see logs.")
+        return
+
+    if not ok:
+        await message.answer(
+            f"❌ Code `{parsed['code']}` already exists. Pick another or "
+            f"use `/admin_promo_revoke {parsed['code']}` first."
+        )
+        return
+
+    if parsed["discount_percent"] is not None:
+        disc_label = f"{parsed['discount_percent']}%"
+    else:
+        disc_label = f"${parsed['discount_amount']:.2f}"
+    cap = parsed["max_uses"]
+    cap_label = f"{cap} uses" if cap is not None else "unlimited uses"
+    exp_label = (
+        f", expires in {parsed['expires_in_days']} days"
+        if parsed["expires_in_days"] is not None else ", no expiry"
+    )
+    log.info(
+        "admin_promo_create: admin=%s code=%s disc=%s cap=%s",
+        message.from_user.id, parsed["code"], disc_label, cap,
+    )
+    await message.answer(
+        f"✅ Created promo `{parsed['code']}`: {disc_label}, "
+        f"{cap_label}{exp_label}.",
+        parse_mode="Markdown",
+    )
+
+
+@router.message(Command("admin_promo_list"))
+async def admin_promo_list(message: Message) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return
+    try:
+        rows = await db.list_promo_codes(limit=20)
+    except Exception:
+        log.exception("admin_promo_list: DB read failed")
+        await message.answer("❌ DB query failed — see logs.")
+        return
+    if not rows:
+        await message.answer("_No promo codes yet._", parse_mode="Markdown")
+        return
+    lines = ["🎁 *Promo codes* (newest 20)", ""]
+    for r in rows:
+        lines.append(f"• {_format_promo_row(r)}")
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+@router.message(Command("admin_promo_revoke"))
+async def admin_promo_revoke(message: Message) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return
+    parts = (message.text or "").strip().split(None, 1)
+    if len(parts) < 2:
+        await message.answer("❌ Usage: `/admin_promo_revoke <CODE>`")
+        return
+    code = parts[1].strip().upper()
+    if not code:
+        await message.answer("❌ Code is required.")
+        return
+    try:
+        revoked = await db.revoke_promo_code(code)
+    except Exception:
+        log.exception("admin_promo_revoke: DB write failed")
+        await message.answer("❌ DB write failed — see logs.")
+        return
+    if revoked:
+        log.info(
+            "admin_promo_revoke: admin=%s code=%s",
+            message.from_user.id, code,
+        )
+        await message.answer(
+            f"✅ Revoked `{code}`. Existing redemptions are kept; "
+            f"new validations of this code will fail with `inactive`.",
+            parse_mode="Markdown",
+        )
+    else:
+        await message.answer(
+            f"❌ `{code}` does not exist or is already revoked.",
+            parse_mode="Markdown",
+        )

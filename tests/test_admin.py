@@ -172,6 +172,9 @@ def test_admin_router_has_admin_command():
     assert '@router.message(Command("admin_balance"))' in src
     assert '@router.message(Command("admin_credit"))' in src
     assert '@router.message(Command("admin_debit"))' in src
+    assert '@router.message(Command("admin_promo_create"))' in src
+    assert '@router.message(Command("admin_promo_list"))' in src
+    assert '@router.message(Command("admin_promo_revoke"))' in src
 
 
 # ---- parse_balance_args ------------------------------------------
@@ -311,3 +314,157 @@ def test_format_balance_summary_user_with_no_notes():
     assert "#1" in out
     assert "$5.0000" in out
     assert " — _" not in out
+
+
+# ---- parse_promo_create_args ------------------------------------
+
+
+from admin import (  # noqa: E402
+    _format_promo_row,
+    parse_promo_create_args,
+)
+
+
+def test_parse_promo_create_args_percent_no_extras():
+    out = parse_promo_create_args("/admin_promo_create WELCOME20 20%")
+    assert out == {
+        "code": "WELCOME20",
+        "discount_percent": 20,
+        "discount_amount": None,
+        "max_uses": None,
+        "expires_in_days": None,
+    }
+
+
+def test_parse_promo_create_args_dollar_amount():
+    out = parse_promo_create_args("/admin_promo_create FIVEOFF $5")
+    assert out == {
+        "code": "FIVEOFF",
+        "discount_percent": None,
+        "discount_amount": 5.0,
+        "max_uses": None,
+        "expires_in_days": None,
+    }
+
+
+def test_parse_promo_create_args_bare_amount():
+    out = parse_promo_create_args("/admin_promo_create FIVEOFF 5")
+    assert out["discount_amount"] == 5.0
+    assert out["discount_percent"] is None
+
+
+def test_parse_promo_create_args_full():
+    out = parse_promo_create_args(
+        "/admin_promo_create WINTER20 20% 100 30"
+    )
+    assert out == {
+        "code": "WINTER20",
+        "discount_percent": 20,
+        "discount_amount": None,
+        "max_uses": 100,
+        "expires_in_days": 30,
+    }
+
+
+def test_parse_promo_create_args_uppercases_code():
+    out = parse_promo_create_args("/admin_promo_create welcome20 20%")
+    assert out["code"] == "WELCOME20"
+
+
+def test_parse_promo_create_args_missing():
+    assert parse_promo_create_args("/admin_promo_create") == "missing"
+    assert parse_promo_create_args("/admin_promo_create CODE") == "missing"
+
+
+@pytest.mark.parametrize(
+    "code", ["has/slash", "🎉", "a" * 65]
+)
+def test_parse_promo_create_args_bad_code(code):
+    assert (
+        parse_promo_create_args(f"/admin_promo_create {code} 20%")
+        == "bad_code"
+    )
+
+
+def test_parse_promo_create_args_empty_code_resolves_to_missing():
+    # "/admin_promo_create  20%" splits to 2 parts -> missing
+    assert parse_promo_create_args("/admin_promo_create  20%") == "missing"
+
+
+@pytest.mark.parametrize(
+    "disc",
+    [
+        "0%", "101%", "-5%", "abc%", "%", "$0", "$-1", "$nan",
+        "$inf", "nan", "inf", "abc",
+    ],
+)
+def test_parse_promo_create_args_bad_discount(disc):
+    assert (
+        parse_promo_create_args(f"/admin_promo_create CODE {disc}")
+        == "bad_discount"
+    )
+
+
+@pytest.mark.parametrize("max_uses", ["abc", "0", "-5"])
+def test_parse_promo_create_args_bad_max_uses(max_uses):
+    assert (
+        parse_promo_create_args(
+            f"/admin_promo_create CODE 20% {max_uses}"
+        )
+        == "bad_max_uses"
+    )
+
+
+@pytest.mark.parametrize("days", ["abc", "0", "-5"])
+def test_parse_promo_create_args_bad_days(days):
+    assert (
+        parse_promo_create_args(
+            f"/admin_promo_create CODE 20% 100 {days}"
+        )
+        == "bad_days"
+    )
+
+
+def test_parse_promo_create_args_allows_underscore_and_dash():
+    out = parse_promo_create_args("/admin_promo_create EARLY_BIRD-25 25%")
+    assert out["code"] == "EARLY_BIRD-25"
+
+
+# ---- _format_promo_row -----------------------------------------
+
+
+def test_format_promo_row_active_percent():
+    row = {
+        "code": "WELCOME20",
+        "discount_percent": 20,
+        "discount_amount": None,
+        "max_uses": 100,
+        "used_count": 5,
+        "expires_at": "2026-12-31T00:00:00+00:00",
+        "is_active": True,
+    }
+    out = _format_promo_row(row)
+    assert "WELCOME20" in out
+    assert "20%" in out
+    assert "5/100" in out
+    assert "2026-12-31" in out
+    assert "active" in out
+    assert "revoked" not in out
+
+
+def test_format_promo_row_revoked_amount_no_cap_no_expiry():
+    row = {
+        "code": "FIVEOFF",
+        "discount_percent": None,
+        "discount_amount": 5.0,
+        "max_uses": None,
+        "used_count": 3,
+        "expires_at": None,
+        "is_active": False,
+    }
+    out = _format_promo_row(row)
+    assert "$5.00" in out
+    assert "3/∞" in out
+    assert "revoked" in out
+    # No "exp=" segment when expires_at is None
+    assert "exp=" not in out
