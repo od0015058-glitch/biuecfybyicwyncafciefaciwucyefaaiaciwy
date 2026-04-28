@@ -3279,7 +3279,31 @@ def parse_user_edit_form(form, *, current: dict) -> dict | str:
         # Sanity-check the shape — OpenRouter ids are always
         # ``provider/name``. Anything else is almost certainly a typo
         # and would 400 on the next message anyway.
-        if len(raw_model) > USER_FIELD_MODEL_MAX_CHARS or "/" not in raw_model:
+        #
+        # Pre-fix the shape check was just ``"/" not in raw_model``,
+        # which accepted ``"foo/"`` (provider + empty name),
+        # ``"/bar"`` (empty provider + name), ``"/"``, ``"a/b/c"``
+        # (ambiguous double-provider), and any string containing
+        # whitespace mid-id (e.g. ``"openai/ gpt-4"`` after strip kept
+        # the inner space). Each of those wrote garbage into
+        # ``users.active_model`` and the user's next chat 400'd at
+        # OpenRouter, surfacing as ``ai_provider_unavailable`` with no
+        # hint that an admin just bricked their model. Tighten to:
+        # exactly one ``/``, both sides non-empty, neither side
+        # contains whitespace. We deliberately don't restrict the
+        # allowed character set further (dots, dashes, colons,
+        # underscores all appear in legitimate IDs like
+        # ``qwen/qwen-2.5-72b-instruct:free``), but whitespace is a
+        # reliable typo signal that no real model id contains.
+        if len(raw_model) > USER_FIELD_MODEL_MAX_CHARS:
+            return "bad_model"
+        parts = raw_model.split("/")
+        if len(parts) != 2:
+            return "bad_model"
+        provider, name = parts
+        if not provider or not name:
+            return "bad_model"
+        if any(c.isspace() for c in raw_model):
             return "bad_model"
         if raw_model != (current.get("active_model") or ""):
             fields["active_model"] = raw_model
