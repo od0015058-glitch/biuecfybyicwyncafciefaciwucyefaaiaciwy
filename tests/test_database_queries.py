@@ -778,3 +778,269 @@ async def test_get_user_usage_aggregates_handles_none_row():
     assert out == {
         "total_calls": 0, "total_tokens": 0, "total_cost_usd": 0.0,
     }
+
+
+# ---------------------------------------------------------------------
+# Bug-fix sweep: defense-in-depth NaN / Infinity guards on the four
+# money-handling DB methods.
+#
+# PR #75 closed the same hole at the IPN webhook layer; this PR adds
+# the matching belt-and-suspenders at the DB layer so any future
+# caller that bypasses the IPN path (a new internal call site, a
+# refactor, a test stub) still can't quietly INSERT ``NaN`` into the
+# wallet — which PostgreSQL silently accepts (it's a valid IEEE-754
+# value) and which then bricks every subsequent balance comparison
+# (``balance_usd >= $1`` is always ``False`` for ``NaN``).
+# ---------------------------------------------------------------------
+
+
+def test_is_finite_amount_helper_basic():
+    """The pure helper used by all four guarded methods."""
+    f = database_module._is_finite_amount
+    assert f(0) is True
+    assert f(0.0) is True
+    assert f(1.5) is True
+    assert f(-1.5) is True
+    assert f(1_000_000) is True
+    assert f(float("nan")) is False
+    assert f(float("inf")) is False
+    assert f(float("-inf")) is False
+    assert f("nan") is False
+    assert f("inf") is False
+    assert f("not a number") is False
+    assert f(None) is False
+
+
+async def test_deduct_balance_refuses_nan_cost():
+    """``balance_usd >= $1`` would silently return no rows for NaN
+    (the WHERE comparison is always False), masking the bug. We refuse
+    BEFORE issuing the SQL so the log line points at the bad caller."""
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.deduct_balance(telegram_id=777, cost_usd=float("nan"))
+    assert result is False
+    conn.fetchval.assert_not_awaited()
+
+
+async def test_deduct_balance_refuses_negative_infinity_cost():
+    """Negative infinity is the more dangerous case: it would *match*
+    the WHERE clause for any finite balance and then write
+    ``balance_usd - (-inf) = inf`` into the row, bricking the wallet.
+    """
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.deduct_balance(telegram_id=777, cost_usd=float("-inf"))
+    assert result is False
+    conn.fetchval.assert_not_awaited()
+
+
+async def test_deduct_balance_refuses_positive_infinity_cost():
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.deduct_balance(telegram_id=777, cost_usd=float("inf"))
+    assert result is False
+    conn.fetchval.assert_not_awaited()
+
+
+async def test_deduct_balance_finite_zero_cost_still_runs_sql():
+    """Regression pin: a $0 cost (free message that still settles
+    through the paid path) is still a valid call — only NaN / Infinity
+    short-circuit. The WHERE clause naturally accepts 0 deductions."""
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=10.0)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.deduct_balance(telegram_id=777, cost_usd=0.0)
+    assert result is True
+    conn.fetchval.assert_awaited_once()
+
+
+async def test_deduct_balance_finite_positive_cost_still_runs_sql():
+    """Regression pin: the happy path still issues the UPDATE."""
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=4.5)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.deduct_balance(telegram_id=777, cost_usd=0.5)
+    assert result is True
+    sql, cost, tg = conn.fetchval.await_args.args
+    assert "UPDATE users" in sql
+    assert "balance_usd >= $1" in sql
+    assert cost == 0.5
+    assert tg == 777
+
+
+async def test_admin_adjust_balance_raises_on_nan_delta():
+    """``new_balance < 0`` is False for NaN, so the existing guard
+    would let the NaN slip through and write into the wallet. The new
+    guard upgrades this to a ValueError BEFORE the FOR UPDATE lock so
+    the caller's error path runs immediately."""
+    conn = _make_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    with pytest.raises(ValueError, match="finite"):
+        await db.admin_adjust_balance(
+            telegram_id=777,
+            delta_usd=float("nan"),
+            reason="manual",
+            admin_telegram_id=42,
+        )
+    conn.fetchrow.assert_not_awaited()
+
+
+async def test_admin_adjust_balance_raises_on_positive_infinity_delta():
+    conn = _make_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    with pytest.raises(ValueError, match="finite"):
+        await db.admin_adjust_balance(
+            telegram_id=777,
+            delta_usd=float("inf"),
+            reason="manual",
+            admin_telegram_id=42,
+        )
+    conn.fetchrow.assert_not_awaited()
+
+
+async def test_admin_adjust_balance_raises_on_negative_infinity_delta():
+    conn = _make_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    with pytest.raises(ValueError, match="finite"):
+        await db.admin_adjust_balance(
+            telegram_id=777,
+            delta_usd=float("-inf"),
+            reason="manual",
+            admin_telegram_id=42,
+        )
+    conn.fetchrow.assert_not_awaited()
+
+
+async def test_admin_adjust_balance_still_raises_on_zero_delta():
+    """Regression pin: the existing zero-delta guard is preserved
+    (independent of the new finite check) — the error message is
+    distinct."""
+    conn = _make_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    with pytest.raises(ValueError, match="non-zero"):
+        await db.admin_adjust_balance(
+            telegram_id=777,
+            delta_usd=0,
+            reason="manual",
+            admin_telegram_id=42,
+        )
+
+
+async def test_finalize_payment_refuses_nan_full_price():
+    """Defense-in-depth: PR #75 already validates at the IPN layer,
+    but the DB function refuses too so a future internal caller can't
+    silently brick a wallet."""
+    conn = _make_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.finalize_payment(
+        gateway_invoice_id="np-1", full_price_usd=float("nan")
+    )
+    assert result is None
+    conn.fetchrow.assert_not_awaited()
+
+
+async def test_finalize_payment_refuses_infinity_full_price():
+    conn = _make_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.finalize_payment(
+        gateway_invoice_id="np-1", full_price_usd=float("inf")
+    )
+    assert result is None
+    conn.fetchrow.assert_not_awaited()
+
+
+async def test_finalize_payment_refuses_negative_full_price():
+    conn = _make_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.finalize_payment(
+        gateway_invoice_id="np-1", full_price_usd=-5.0
+    )
+    assert result is None
+    conn.fetchrow.assert_not_awaited()
+
+
+async def test_finalize_payment_refuses_zero_full_price():
+    conn = _make_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.finalize_payment(
+        gateway_invoice_id="np-1", full_price_usd=0.0
+    )
+    assert result is None
+    conn.fetchrow.assert_not_awaited()
+
+
+async def test_finalize_partial_payment_refuses_nan_actually_paid():
+    conn = _make_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.finalize_partial_payment(
+        gateway_invoice_id="np-1", actually_paid_usd=float("nan")
+    )
+    assert result is None
+    conn.fetchrow.assert_not_awaited()
+
+
+async def test_finalize_partial_payment_refuses_infinity_actually_paid():
+    conn = _make_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.finalize_partial_payment(
+        gateway_invoice_id="np-1", actually_paid_usd=float("inf")
+    )
+    assert result is None
+    conn.fetchrow.assert_not_awaited()
+
+
+async def test_finalize_partial_payment_refuses_zero_actually_paid():
+    conn = _make_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.finalize_partial_payment(
+        gateway_invoice_id="np-1", actually_paid_usd=0.0
+    )
+    assert result is None
+    conn.fetchrow.assert_not_awaited()
+
+
+async def test_finalize_partial_payment_refuses_negative_actually_paid():
+    conn = _make_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.finalize_partial_payment(
+        gateway_invoice_id="np-1", actually_paid_usd=-1.0
+    )
+    assert result is None
+    conn.fetchrow.assert_not_awaited()
