@@ -8,6 +8,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp import web
 from dotenv import load_dotenv
 
+from admin import router as admin_router
 from database import db
 from handlers import router
 from middlewares import UserUpsertMiddleware
@@ -88,6 +89,10 @@ async def main():
     # code input, and reply-keyboard handlers, none of which cost
     # OpenRouter money. See handlers.process_chat.
 
+    # Admin commands first so /admin* never falls through to the public
+    # router's catch-all chat handler. Non-admin callers see a silent
+    # no-op (see admin.is_admin) and the message keeps propagating.
+    dp.include_router(admin_router)
     dp.include_router(router)
 
     await db.connect()

@@ -133,6 +133,7 @@ queued next.
 | `ai_engine.py` | Clean. Pre-check on free messages + balance, atomic deduct, log_usage with the actual amount. **OpenRouter call now has a 60s `aiohttp.ClientTimeout` (10s connect / 50s sock_read)** so a stalled upstream can't pin a coroutine forever. |
 | `pricing.py` | Clean. Conservative fallback for unmapped models, guards markup ≥ 1.0. |
 | `rate_limit.py` | `TokenBucket` + `_LRUBucketCache` primitives, `consume_chat_token(user_id)` per-user limiter (called *inside* `handlers.process_chat` only — defaults 5 tokens / 1s refill), `webhook_rate_limit_middleware` (per-IP, 30 tokens / 5s refill on the IPN endpoint). 15 unit tests. NB: chat rate-limiting must be done in-handler, not as a `dp.message` middleware, otherwise commands / FSM state inputs get throttled too. See PR #47 / #48 history. |
+| `admin.py` | New in Stage-7-Part-1. `parse_admin_user_ids` (env parser), `is_admin` (gate), `/admin` hub command, `/admin_metrics`. Non-admin callers see a silent no-op so the surface isn't leaked. Router included in `main.py` BEFORE the public router. 15 unit tests. |
 | `alembic/` | Clean. `env.py` URL-encodes credentials (PR #45). Baseline = consolidated current schema. |
 | `entrypoint.sh` | Runs idempotent `alembic upgrade head` before exec'ing the bot. |
 | `docker-compose.yml` | postgres + redis + bot. Redis backs FSM. |
@@ -306,18 +307,22 @@ Each is a separate PR, in this order:
 | **P3-Op-4-Hotfix** | URL-encode DB credentials in `alembic/env.py` (Devin Review catch) | ✅ Shipped | [#45](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/45) |
 | **P3-Op-5** | Redis-backed FSM storage **+ NaN/Inf/over-cap rejection in `process_custom_amount_input`** | ✅ Shipped | [#46](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/46) |
 | **P3-Op-6** | Rate limiting on `/chat` and `/nowpayments-webhook` **+ `aiohttp.ClientTimeout` on the OpenRouter call** | ✅ Shipped | [#47](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/47) |
-| **P3-Op-6-Hotfix** | Move chat rate limit OUT of `dp.message` middleware INTO `process_chat` so commands / FSM state inputs aren't incorrectly throttled (Devin Review catch on #47) | ✅ Shipped | this PR |
+| **P3-Op-6-Hotfix** | Move chat rate limit OUT of `dp.message` middleware INTO `process_chat` so commands / FSM state inputs aren't incorrectly throttled (Devin Review catch on #47) | ✅ Shipped | [#48](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/48) |
+| **Stage-7-Part-1** | Admin scaffold: `admin.py` (`parse_admin_user_ids`, `is_admin`, hub `/admin`, `/admin_metrics`) + `Database.get_system_metrics` **+ `message.text=None` crash fix in `process_custom_amount_input`** | ✅ Shipped | this PR |
 
-Operational hardening queue is **complete**. Next: P2 product items (admin panel for promo creation; promo code creation UI).
+Operational hardening queue is **complete**. P2 admin panel is being built next, in 4 small PRs (Stage-7-Part-1 ... Part-4).
 
-### P2 product items still queued (lower priority than P3-Op)
+### P2 admin panel queue (next; one PR each)
 
-The P2-* roadmap from the earlier session had these still unbuilt:
-- Promo codes UI is wired (DB tables exist, validate/redeem methods exist)
-  but has no admin-side creation flow yet.
-- A Telegram-side **admin panel** gated by `ADMIN_USER_IDS` (see env var)
-  for promo creation, balance-adjust, refund, system metrics. Build this as
-  Telegram commands, not a separate CLI binary.
+The previous AI's roadmap had a "Stage 7" CLI admin panel. We're shipping that as Telegram commands instead (already proposed in the original review and confirmed by the user). Breakdown:
+
+| # | Title | Status |
+| --- | --- | --- |
+| **Stage-7-Part-1** | `is_admin` gate, `/admin` hub, `/admin_metrics` (users, revenue, spend, top models) | ✅ this PR |
+| **Stage-7-Part-2** | Balance ops: `/admin_balance <user_id>`, `/admin_credit <user_id> <usd> <reason>`, `/admin_debit ...`. Writes `transactions` rows of type `admin_adjustment`. | ⏳ next |
+| **Stage-7-Part-3** | Promo creation: `/admin_promo_create`, `/admin_promo_list`, `/admin_promo_revoke`. Subsumes the original "Stage 6B" admin gap. | ⏳ |
+| **Stage-7-Part-4** | Broadcast: `/admin_broadcast` with rate-limited fan-out + progress message. | ⏳ |
+| **Cleanup** | Delete legacy `schema.sql` + `migrations/*.sql` (Alembic owns schema; they're confusing leftovers). | ⏳ |
 
 ---
 

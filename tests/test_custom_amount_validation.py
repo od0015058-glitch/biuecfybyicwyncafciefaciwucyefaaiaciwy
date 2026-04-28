@@ -18,14 +18,17 @@ import math
 import pytest
 
 
-def _validate_custom_amount(raw: str) -> tuple[bool, str | None]:
+def _validate_custom_amount(raw: str | None) -> tuple[bool, str | None]:
     """Mirror of the validation logic in handlers.py.
 
     Returns (ok, reject_reason). ok=True only for amounts in
-    [5, 10_000] that aren't NaN / Inf.
+    [5, 10_000] that aren't NaN / Inf. ``None`` (e.g. when a user
+    sends a sticker / photo while in waiting_custom_amount) is
+    treated like an empty string and rejected as ``not_a_number``.
     """
+    raw_text = (raw or "").strip()
     try:
-        amount = float(raw.strip().replace("$", ""))
+        amount = float(raw_text.replace("$", ""))
     except ValueError:
         return False, "not_a_number"
 
@@ -54,6 +57,9 @@ def _validate_custom_amount(raw: str) -> tuple[bool, str | None]:
         ("-inf", "nan_or_inf"),
         ("not a number", "not_a_number"),
         ("", "not_a_number"),
+        # Stickers / photos / voice / video notes: aiogram delivers
+        # ``message.text is None``. Must not crash; must reject.
+        (None, "not_a_number"),
         ("4.99", "below_min"),
         ("0", "below_min"),
         ("-50", "below_min"),
