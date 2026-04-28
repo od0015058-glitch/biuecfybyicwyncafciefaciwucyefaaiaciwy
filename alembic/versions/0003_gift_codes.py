@@ -21,7 +21,7 @@ Schema:
     - ``code TEXT NOT NULL REFERENCES gift_codes(code) ON DELETE CASCADE``
     - ``telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE``
     - ``redeemed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()``
-    - ``transaction_id INTEGER NULL REFERENCES transactions(id) ON DELETE SET NULL``
+    - ``transaction_id INTEGER NULL REFERENCES transactions(transaction_id) ON DELETE SET NULL``
     - ``PRIMARY KEY (code, telegram_id)``
   The ``transaction_id`` link is nullable + ON DELETE SET NULL so a
   manual ``transactions`` cleanup never breaks the redemption record.
@@ -73,7 +73,7 @@ def upgrade() -> None:
                 REFERENCES users(telegram_id) ON DELETE CASCADE,
             redeemed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             transaction_id  INTEGER NULL
-                REFERENCES transactions(id) ON DELETE SET NULL,
+                REFERENCES transactions(transaction_id) ON DELETE SET NULL,
             PRIMARY KEY (code, telegram_id)
         )
         """

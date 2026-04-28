@@ -1114,15 +1114,18 @@ class Database:
                 tx_id = await connection.fetchval(
                     """
                     INSERT INTO transactions (
-                        telegram_id, gateway, gateway_invoice_id,
+                        telegram_id, gateway, currency_used,
                         amount_crypto_or_rial, amount_usd_credited,
-                        currency_code, status, notes
+                        status, gateway_invoice_id, completed_at, notes
                     ) VALUES (
-                        $1, 'gift', $2, NULL, $3, 'USD', 'SUCCESS', $4
+                        $1, 'gift', 'USD',
+                        NULL, $2,
+                        'SUCCESS', $3, NOW(), $4
                     )
-                    RETURNING id
+                    RETURNING transaction_id
                     """,
-                    telegram_id, f"gift:{code}", amount,
+                    telegram_id, amount,
+                    f"gift:{code}:{telegram_id}",
                     f"redeemed gift code '{code}'",
                 )
 
