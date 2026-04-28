@@ -20,3 +20,11 @@ redis>=5.0.0
 # no Node, no separate frontend.
 jinja2>=3.1.2
 aiohttp-jinja2>=1.5.1
+
+# Stage-9-Step-3: TOTP / 2FA on the admin login page. ``pyotp`` does
+# the RFC-6238 verification (constant-time compare + valid_window for
+# clock drift); ``qrcode`` generates the inline SVG enrolment QR
+# (pure-Python, no PIL — we use ``SvgPathImage`` so the optional
+# Pillow dep is NOT pulled in).
+pyotp>=2.9.0
+qrcode>=7.4.2

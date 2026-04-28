@@ -58,6 +58,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import io
 import logging
 import os
 import secrets
@@ -67,6 +68,9 @@ from typing import Awaitable, Callable
 
 import aiohttp_jinja2
 import jinja2
+import pyotp
+import qrcode
+import qrcode.image.svg as qrsvg
 from aiohttp import web
 
 # Imported for the class-level ``TRANSACTIONS_GATEWAY_VALUES`` /
@@ -101,6 +105,14 @@ APP_KEY_TTL_HOURS: web.AppKey = web.AppKey("admin_ttl_hours", int)
 APP_KEY_COOKIE_SECURE: web.AppKey = web.AppKey("admin_cookie_secure", bool)
 APP_KEY_DB: web.AppKey = web.AppKey("admin_db", object)
 APP_KEY_INSTALLED: web.AppKey = web.AppKey("admin_routes_installed", bool)
+# Stage-9-Step-3: optional TOTP / 2FA. ``APP_KEY_TOTP_SECRET`` carries
+# the configured base32 secret (empty = 2FA disabled, login is
+# password-only and backwards-compatible). ``APP_KEY_TOTP_ISSUER`` is
+# the human label baked into the otpauth:// URI so the entry shows up
+# in authenticator apps as "Meowassist Admin: admin" rather than a
+# bare hostname.
+APP_KEY_TOTP_SECRET: web.AppKey = web.AppKey("admin_totp_secret", str)
+APP_KEY_TOTP_ISSUER: web.AppKey = web.AppKey("admin_totp_issuer", str)
 # Stage-8-Part-5: the aiogram ``Bot`` used by the broadcast page's
 # background task to send Telegram messages. Optional — handlers
 # render a friendly banner and refuse to start jobs when it's absent
@@ -216,6 +228,111 @@ def verify_cookie(
 
 
 # ---------------------------------------------------------------------
+# TOTP / 2FA helpers (Stage-9-Step-3)
+# ---------------------------------------------------------------------
+
+
+# RFC-6238 advises a one-step (±30 s) tolerance window so an honest
+# code that ticks over while the form is in flight still verifies.
+# Anything wider hands free codes to a brute-forcer; pyotp's default
+# is 0 (exact match). We pin the value explicitly so a future pyotp
+# release can't widen it on us.
+TOTP_VALID_WINDOW = 1
+
+
+def _normalize_totp_secret(secret: str) -> str:
+    """Return *secret* uppercased + de-spaced (authenticator-app friendly).
+
+    Authenticators format secrets as space-separated 4-char chunks for
+    readability; operators paste those raw into ``ADMIN_2FA_SECRET``
+    and end up with verification failures. Strip whitespace + uppercase
+    so a copy-pasted ``"abcd efgh ijkl mnop"`` still works.
+    """
+    return "".join(secret.split()).upper()
+
+
+def validate_totp_secret(secret: str) -> str:
+    """Return the normalized base32 secret or raise ``ValueError``.
+
+    Empty / whitespace-only input means "2FA disabled" — return ``""``
+    so the caller can short-circuit. Any non-empty value must base32-
+    decode cleanly with at least 80 bits of entropy (16 base32 chars =
+    80 bits, the RFC-4226 floor). We deliberately reject shorter
+    strings even though pyotp would accept them, because a 6-char
+    "secret" is brute-forceable in seconds.
+    """
+    if not secret or not secret.strip():
+        return ""
+    norm = _normalize_totp_secret(secret)
+    if len(norm) < 16:
+        raise ValueError(
+            "ADMIN_2FA_SECRET must be at least 16 base32 characters "
+            "(≥ 80 bits of entropy). Generate a fresh one with "
+            "pyotp.random_base32() or copy the value from "
+            "/admin/enroll_2fa."
+        )
+    try:
+        # ``casefold=True`` lets lowercase secrets decode; we already
+        # uppercased above but keep the flag for defence in depth.
+        base64.b32decode(norm, casefold=True)
+    except (ValueError, TypeError, base64.binascii.Error) as exc:
+        raise ValueError(
+            "ADMIN_2FA_SECRET is not a valid base32 string. Use only "
+            "the characters A-Z and 2-7 (padding optional) — generate "
+            "a fresh one at /admin/enroll_2fa."
+        ) from exc
+    return norm
+
+
+def verify_totp_code(secret: str, submitted: str) -> bool:
+    """Return True iff *submitted* is the current TOTP for *secret*.
+
+    Wraps ``pyotp.TOTP.verify`` so the rest of the module never has
+    to think about pyotp directly. ``submitted`` is normalized
+    (whitespace stripped, but case preserved — TOTP codes are
+    digits only) before dispatch so a stray space copied with the
+    code still verifies.
+    """
+    if not secret or not submitted:
+        return False
+    cleaned = "".join(submitted.split())
+    if not cleaned.isdigit() or len(cleaned) != 6:
+        return False
+    try:
+        return bool(
+            pyotp.TOTP(secret).verify(cleaned, valid_window=TOTP_VALID_WINDOW)
+        )
+    except Exception:
+        # Defence in depth: a malformed secret should never crash the
+        # request — the startup guard already validates the secret,
+        # but if a future code path mutates it we'd rather refuse the
+        # login than 500.
+        log.exception("verify_totp_code: pyotp raised on submitted code")
+        return False
+
+
+def build_otpauth_uri(secret: str, *, issuer: str, account: str = "admin") -> str:
+    """Render a standard ``otpauth://totp/...`` provisioning URI."""
+    return pyotp.TOTP(secret).provisioning_uri(name=account, issuer_name=issuer)
+
+
+def render_qr_svg(uri: str) -> str:
+    """Render a self-contained inline SVG QR for *uri*.
+
+    Uses ``qrcode.image.svg.SvgPathImage`` so we don't pull in Pillow
+    just to ship one image. The returned string is safe to drop into
+    a Jinja template via the ``|safe`` filter.
+    """
+    qr = qrcode.QRCode(box_size=8, border=2)
+    qr.add_data(uri)
+    qr.make(fit=True)
+    img = qr.make_image(image_factory=qrsvg.SvgPathImage)
+    buf = io.BytesIO()
+    img.save(buf)
+    return buf.getvalue().decode("utf-8")
+
+
+# ---------------------------------------------------------------------
 # Auth middleware / decorator
 # ---------------------------------------------------------------------
 
@@ -261,13 +378,20 @@ async def login_get(request: web.Request) -> web.StreamResponse:
     if request.get(REQUEST_KEY_AUTHED, False):
         return web.HTTPFound(location="/admin/")
     return aiohttp_jinja2.render_template(
-        "login.html", request, {"error": None}
+        "login.html",
+        request,
+        {
+            "error": None,
+            "show_2fa_field": bool(request.app.get(APP_KEY_TOTP_SECRET, "")),
+        },
     )
 
 
 async def login_post(request: web.Request) -> web.StreamResponse:
     expected = request.app.get(APP_KEY_PASSWORD, "")
     secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    totp_secret = request.app.get(APP_KEY_TOTP_SECRET, "")
+    show_2fa = bool(totp_secret)
     ttl_hours = request.app.get(APP_KEY_TTL_HOURS, DEFAULT_TTL_HOURS)
     secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
 
@@ -282,7 +406,10 @@ async def login_post(request: web.Request) -> web.StreamResponse:
         return aiohttp_jinja2.render_template(
             "login.html",
             request,
-            {"error": "Admin panel is not configured. Set ADMIN_PASSWORD and ADMIN_SESSION_SECRET."},
+            {
+                "error": "Admin panel is not configured. Set ADMIN_PASSWORD and ADMIN_SESSION_SECRET.",
+                "show_2fa_field": show_2fa,
+            },
             status=500,
         )
 
@@ -307,7 +434,10 @@ async def login_post(request: web.Request) -> web.StreamResponse:
         return aiohttp_jinja2.render_template(
             "login.html",
             request,
-            {"error": "Too many login attempts. Please wait a minute."},
+            {
+                "error": "Too many login attempts. Please wait a minute.",
+                "show_2fa_field": show_2fa,
+            },
             status=429,
         )
 
@@ -331,9 +461,38 @@ async def login_post(request: web.Request) -> web.StreamResponse:
         return aiohttp_jinja2.render_template(
             "login.html",
             request,
-            {"error": "Wrong password."},
+            {"error": "Wrong password.", "show_2fa_field": show_2fa},
             status=401,
         )
+
+    # Stage-9-Step-3: optional second factor. Gate on TOTP secret so
+    # password-only deploys are unchanged; when configured, the 2FA
+    # check runs AFTER the password compare so an attacker without
+    # the password gets a generic "Wrong password" error and can't
+    # use the form to brute-force the 6-digit code in isolation.
+    if totp_secret:
+        submitted_code = str(form.get("code", ""))
+        if not verify_totp_code(totp_secret, submitted_code):
+            reason = "missing_2fa" if not submitted_code.strip() else "bad_2fa"
+            log.warning(
+                "admin login: %s key=%s remote=%s",
+                reason, client_key, request.remote,
+            )
+            await _record_audit_safe(
+                request,
+                "login_deny",
+                outcome="deny",
+                meta={"reason": reason},
+            )
+            return aiohttp_jinja2.render_template(
+                "login.html",
+                request,
+                {
+                    "error": "Invalid 2FA code.",
+                    "show_2fa_field": show_2fa,
+                },
+                status=401,
+            )
 
     expires_at = datetime.now(timezone.utc) + timedelta(hours=ttl_hours)
     cookie_value = sign_cookie(expires_at, secret=secret)
@@ -428,6 +587,7 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     "broadcast_start": "Broadcast started",
     "string_save": "Bot text override saved",
     "string_revert": "Bot text override reverted",
+    "enroll_2fa_view": "2FA enrolment page viewed",
 }
 
 
@@ -3073,6 +3233,59 @@ async def audit_get(request: web.Request) -> web.StreamResponse:
 
 
 # ---------------------------------------------------------------------
+# 2FA enrolment helper page (Stage-9-Step-3)
+# ---------------------------------------------------------------------
+
+
+async def enroll_2fa_get(request: web.Request) -> web.StreamResponse:
+    """Render the TOTP enrolment helper.
+
+    Always behind the admin login. The page does NOT mutate the
+    configured secret — it just renders the operator-friendly view of
+    whatever's currently in ``ADMIN_2FA_SECRET`` (so they can re-scan
+    the QR after losing their device) and, when nothing is configured,
+    suggests a freshly-generated random secret to copy into the env
+    file. Restarting the bot is required to pick the new value up.
+    """
+    issuer = request.app.get(APP_KEY_TOTP_ISSUER, "Meowassist Admin") or "Meowassist Admin"
+    configured_secret = request.app.get(APP_KEY_TOTP_SECRET, "")
+
+    if configured_secret:
+        secret = configured_secret
+        is_suggestion = False
+    else:
+        # No secret on the running app — generate one so the operator
+        # has something to paste into ``ADMIN_2FA_SECRET``. We
+        # deliberately do NOT cache it server-side: the next page load
+        # gets a fresh suggestion. That way an operator who eyeballs
+        # the page without copying the secret can't be locked into a
+        # value an attacker also saw via, e.g., a screenshot in chat.
+        secret = pyotp.random_base32()
+        is_suggestion = True
+
+    uri = build_otpauth_uri(secret, issuer=issuer)
+    qr_svg = render_qr_svg(uri)
+
+    await _record_audit_safe(
+        request,
+        "enroll_2fa_view",
+        meta={"is_suggestion": is_suggestion},
+    )
+    return aiohttp_jinja2.render_template(
+        "enroll_2fa.html",
+        request,
+        {
+            "active_page": "enroll_2fa",
+            "secret": secret,
+            "issuer": issuer,
+            "uri": uri,
+            "qr_svg": qr_svg,
+            "is_suggestion": is_suggestion,
+        },
+    )
+
+
+# ---------------------------------------------------------------------
 # App wiring
 # ---------------------------------------------------------------------
 
@@ -3086,16 +3299,60 @@ def setup_admin_routes(
     ttl_hours: int = DEFAULT_TTL_HOURS,
     cookie_secure: bool = True,
     bot=None,
+    totp_secret: str = "",
+    totp_issuer: str = "Meowassist Admin",
 ) -> None:
     """Mount the admin panel onto *app*.
 
     Called from ``main.start_webhook_server``. Idempotent — refusing
     a second call with a clear log line beats silently overwriting
     state on a hot reload.
+
+    Stage-9-Step-3 bundled bug fix: refuse to start the panel when
+    either ``password`` or ``session_secret`` is *non-empty but
+    whitespace-only* (a common ``ADMIN_PASSWORD=" "`` deploy typo).
+    The previous behaviour stored the whitespace string verbatim and
+    silently rejected every login attempt — operators spent hours
+    debugging "wrong password" before realising they had a stray
+    space in their .env. We still allow truly empty values (so the
+    documented "panel unreachable in dev when env vars unset" path
+    keeps working); only whitespace-only values fail-fast at startup.
+
+    ``totp_secret`` enables optional TOTP / 2FA enforcement on
+    ``/admin/login``. Empty string keeps the password-only flow
+    untouched. Non-empty values are validated as base32 at boot via
+    ``validate_totp_secret`` — invalid input raises ``ValueError``
+    with a clear message rather than failing on first login.
     """
     if app.get(APP_KEY_INSTALLED):
         log.warning("setup_admin_routes called twice — ignoring second call.")
         return
+
+    # Bundled bug fix (Stage-9-Step-3): whitespace-only credentials are
+    # always a deploy typo — surface immediately instead of "panel
+    # unreachable, login refuses everything" half a day later.
+    if password and not password.strip():
+        raise ValueError(
+            "ADMIN_PASSWORD contains only whitespace — refusing to start "
+            "with a half-configured admin panel. Either set a real "
+            "password or leave the variable empty to keep the panel "
+            "disabled."
+        )
+    if session_secret and not session_secret.strip():
+        raise ValueError(
+            "ADMIN_SESSION_SECRET contains only whitespace — refusing to "
+            "start with a half-configured admin panel. Either set a real "
+            "secret (≥32 random chars) or leave the variable empty."
+        )
+
+    # Validate the TOTP secret at boot so a base32 typo is rejected
+    # immediately. Empty input → 2FA disabled (back-compat).
+    try:
+        totp_secret = validate_totp_secret(totp_secret)
+    except ValueError:
+        # Re-raise with context so the deploy log makes the
+        # misconfig obvious without needing to grep into the helper.
+        raise
 
     if not password:
         log.warning(
@@ -3135,6 +3392,21 @@ def setup_admin_routes(
     app[APP_KEY_BOT] = bot
     app[APP_KEY_BROADCAST_JOBS] = {}
     app[APP_KEY_BROADCAST_TASKS] = {}
+    # Stage-9-Step-3: validated TOTP secret (or "" when 2FA disabled).
+    app[APP_KEY_TOTP_SECRET] = totp_secret
+    app[APP_KEY_TOTP_ISSUER] = totp_issuer or "Meowassist Admin"
+    if totp_secret:
+        log.info(
+            "Admin 2FA is ENABLED (issuer=%s). Login requires a 6-digit "
+            "TOTP code in addition to ADMIN_PASSWORD.",
+            app[APP_KEY_TOTP_ISSUER],
+        )
+    else:
+        log.info(
+            "Admin 2FA is disabled (ADMIN_2FA_SECRET unset). Login is "
+            "password-only. Visit /admin/enroll_2fa to provision a "
+            "secret."
+        )
 
     aiohttp_jinja2.setup(
         app,
@@ -3234,6 +3506,16 @@ def setup_admin_routes(
         _require_auth(user_edit_post),
     )
     app.router.add_get("/admin/audit", _require_auth(audit_get))
+
+    # Stage-9-Step-3: TOTP / 2FA enrolment helper. Always behind the
+    # admin login. Operators who haven't configured ADMIN_2FA_SECRET
+    # yet get a freshly-suggested random secret to copy into env;
+    # operators who have already configured one get the QR for the
+    # current value (re-pairing a new device).
+    app.router.add_get(
+        "/admin/enroll_2fa",
+        _require_auth(enroll_2fa_get),
+    )
 
     app[APP_KEY_INSTALLED] = True
     log.info("Web admin routes installed under /admin/")
