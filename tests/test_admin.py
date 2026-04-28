@@ -468,3 +468,120 @@ def test_format_promo_row_revoked_amount_no_cap_no_expiry():
     assert "revoked" in out
     # No "exp=" segment when expires_at is None
     assert "exp=" not in out
+
+
+# ---- _escape_md (Markdown escaping) -----------------------------
+
+
+from admin import _escape_md, parse_broadcast_args  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("", ""),
+        (None, ""),
+        ("plain text", "plain text"),
+        ("stuck_invoice", "stuck\\_invoice"),
+        ("the *real* one", "the \\*real\\* one"),
+        ("`code` block", "\\`code\\` block"),
+        ("[link](url)", "\\[link](url)"),
+        ("a_b*c`d[e", "a\\_b\\*c\\`d\\[e"),
+        # Persian text without reserved chars passes through.
+        ("سلام دنیا", "سلام دنیا"),
+        # Persian + an underscore
+        ("بازپرداخت_فاکتور", "بازپرداخت\\_فاکتور"),
+    ],
+)
+def test_escape_md(raw, expected):
+    assert _escape_md(raw) == expected
+
+
+def test_format_balance_summary_escapes_note():
+    # Regression test for Devin Review finding on PR #50: a stored
+    # note like "stuck_invoice" used to crash the admin reply.
+    summary = {
+        "telegram_id": 123,
+        "username": "alice",
+        "balance_usd": 5.0,
+        "free_messages_left": 0,
+        "active_model": "openai/gpt-4o",
+        "language_code": "fa",
+        "total_credited_usd": 10.0,
+        "total_spent_usd": 5.0,
+        "recent_transactions": [
+            {
+                "id": 1,
+                "gateway": "admin",
+                "amount_usd": 1.0,
+                "status": "SUCCESS",
+                "notes": "stuck_invoice *fix*",
+            }
+        ],
+    }
+    out = _format_balance_summary(summary)
+    # Underscore + asterisks must be escaped, not stripped.
+    assert "stuck\\_invoice \\*fix\\*" in out
+    # Original raw form must NOT appear unescaped.
+    assert " stuck_invoice " not in out
+
+
+# ---- parse_broadcast_args ---------------------------------------
+
+
+def test_parse_broadcast_args_simple():
+    out = parse_broadcast_args("/admin_broadcast hello world")
+    assert out == {"only_active_days": None, "text": "hello world"}
+
+
+def test_parse_broadcast_args_with_active_filter():
+    out = parse_broadcast_args(
+        "/admin_broadcast --active=30 maintenance tonight"
+    )
+    assert out == {
+        "only_active_days": 30,
+        "text": "maintenance tonight",
+    }
+
+
+def test_parse_broadcast_args_preserves_newlines():
+    out = parse_broadcast_args(
+        "/admin_broadcast line1\nline2\nline3"
+    )
+    assert out == {
+        "only_active_days": None,
+        "text": "line1\nline2\nline3",
+    }
+
+
+def test_parse_broadcast_args_missing():
+    assert parse_broadcast_args("/admin_broadcast") == "missing"
+    assert parse_broadcast_args("/admin_broadcast    ") == "missing"
+    # --active without text is still missing
+    assert parse_broadcast_args("/admin_broadcast --active=7") == "missing"
+
+
+@pytest.mark.parametrize("bad", ["abc", "0", "-5"])
+def test_parse_broadcast_args_bad_active(bad):
+    assert (
+        parse_broadcast_args(f"/admin_broadcast --active={bad} hello")
+        == "bad_active"
+    )
+
+
+def test_parse_broadcast_args_too_long():
+    body = "x" * 5000
+    assert (
+        parse_broadcast_args(f"/admin_broadcast {body}") == "too_long"
+    )
+
+
+def test_parse_broadcast_args_unicode_persian():
+    out = parse_broadcast_args("/admin_broadcast سلام به همه")
+    assert out == {"only_active_days": None, "text": "سلام به همه"}
+
+
+def test_admin_broadcast_router_decorator_present():
+    import inspect
+    src = inspect.getsource(admin)
+    assert '@router.message(Command("admin_broadcast"))' in src

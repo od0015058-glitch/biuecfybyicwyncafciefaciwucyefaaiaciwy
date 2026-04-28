@@ -754,6 +754,40 @@ class Database:
             )
         return row is not None
 
+    async def iter_broadcast_recipients(
+        self, *, only_active_days: int | None = None
+    ) -> list[int]:
+        """Return telegram_ids the admin can broadcast to.
+
+        ``only_active_days`` filters to users who logged AI usage in
+        the last N days (joins on ``usage_logs``). ``None`` returns
+        every user. Sorted ascending so the broadcaster paginates
+        deterministically and a crash mid-broadcast doesn't skip
+        people on retry.
+
+        Returns plain ``list[int]`` rather than a streaming cursor —
+        the user table is small (sub-100k expected) and the broadcast
+        coroutine throttles its own send rate, so the memory cost is
+        trivial and we get a simple "took a snapshot at T0" semantic.
+        """
+        async with self.pool.acquire() as connection:
+            if only_active_days is None:
+                rows = await connection.fetch(
+                    "SELECT telegram_id FROM users ORDER BY telegram_id ASC"
+                )
+            else:
+                rows = await connection.fetch(
+                    """
+                    SELECT DISTINCT u.telegram_id
+                    FROM users u
+                    JOIN usage_logs l ON l.telegram_id = u.telegram_id
+                    WHERE l.created_at >= NOW() - $1::interval
+                    ORDER BY u.telegram_id ASC
+                    """,
+                    f"{int(only_active_days)} days",
+                )
+        return [int(r["telegram_id"]) for r in rows]
+
     async def list_promo_codes(self, *, limit: int = 20) -> list[dict]:
         """Return up to ``limit`` most recently created promo codes
         for ``/admin_promo_list``.
