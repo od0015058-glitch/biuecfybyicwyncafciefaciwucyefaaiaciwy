@@ -1185,8 +1185,15 @@ async def process_add_crypto_currency(callback: CallbackQuery):
 @router.message(UserStates.waiting_custom_amount)
 async def process_custom_amount_input(message: Message, state: FSMContext):
     lang = await _get_user_language(message.from_user.id)
+    # ``message.text`` is None for stickers / photos / voice / video
+    # notes / etc. The previous ``message.text.strip()`` raised
+    # ``AttributeError`` and bubbled up as a 500-style "Run polling"
+    # crash for that user with no actionable message back. Coerce to
+    # empty string so the float parse below fails the same way an
+    # alphabetic message would and we route through ``charge_custom_invalid``.
+    raw_text = (message.text or "").strip()
     try:
-        amount = float(message.text.strip().replace("$", ""))
+        amount = float(raw_text.replace("$", ""))
     except ValueError:
         await message.answer(t(lang, "charge_custom_invalid"))
         return

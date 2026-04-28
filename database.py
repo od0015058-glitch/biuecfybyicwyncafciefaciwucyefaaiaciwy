@@ -754,6 +754,79 @@ class Database:
             )
         return row is not None
 
+    async def get_system_metrics(self) -> dict:
+        """Aggregate counters for the admin metrics panel.
+
+        Single round trip via ``acquire`` → multiple ``fetch*`` calls
+        on the same connection. We don't bother wrapping in a
+        transaction because the values are all snapshot-style and
+        slight drift between the four queries is tolerable for an
+        admin dashboard.
+
+        Returns a dict shaped like::
+
+            {
+              "users_total":     int,
+              "users_active_7d": int,
+              "revenue_usd":     float,   # sum amount_usd_credited where status IN (SUCCESS, PARTIAL)
+              "spend_usd":       float,   # sum cost_deducted_usd from usage_logs
+              "top_models":      [
+                {"model": str, "count": int, "cost_usd": float},
+                ...  # up to 5 rows, by call count over last 30d
+              ],
+            }
+        """
+        async with self.pool.acquire() as connection:
+            users_total = await connection.fetchval(
+                "SELECT COUNT(*) FROM users"
+            )
+            # "Active" = sent at least one prompt in the last 7 days.
+            # usage_logs has the right granularity for that — the user
+            # may have a balance and have done /start without ever
+            # invoking the model.
+            users_active_7d = await connection.fetchval(
+                """
+                SELECT COUNT(DISTINCT telegram_id) FROM usage_logs
+                WHERE created_at >= NOW() - INTERVAL '7 days'
+                """
+            )
+            revenue_usd = await connection.fetchval(
+                """
+                SELECT COALESCE(SUM(amount_usd_credited), 0)
+                FROM transactions
+                WHERE status IN ('SUCCESS', 'PARTIAL')
+                """
+            )
+            spend_usd = await connection.fetchval(
+                "SELECT COALESCE(SUM(cost_deducted_usd), 0) FROM usage_logs"
+            )
+            top_rows = await connection.fetch(
+                """
+                SELECT model_used AS model,
+                       COUNT(*)::int AS count,
+                       COALESCE(SUM(cost_deducted_usd), 0) AS cost_usd
+                FROM usage_logs
+                WHERE created_at >= NOW() - INTERVAL '30 days'
+                GROUP BY model_used
+                ORDER BY count DESC
+                LIMIT 5
+                """
+            )
+        return {
+            "users_total": int(users_total or 0),
+            "users_active_7d": int(users_active_7d or 0),
+            "revenue_usd": float(revenue_usd or 0),
+            "spend_usd": float(spend_usd or 0),
+            "top_models": [
+                {
+                    "model": r["model"],
+                    "count": int(r["count"]),
+                    "cost_usd": float(r["cost_usd"]),
+                }
+                for r in top_rows
+            ],
+        }
+
 
 # Export a single instance to be used across the app
 db = Database()
