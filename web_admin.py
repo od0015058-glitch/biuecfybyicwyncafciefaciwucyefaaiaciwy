@@ -805,7 +805,16 @@ def parse_promo_form(form) -> dict | str:
     if not code_raw:
         return "missing_code"
     code = code_raw.upper()
-    if len(code) > 64 or not all(c.isalnum() or c in "_-" for c in code):
+    # ASCII-only: ``str.isalnum`` returns True for Unicode digits and
+    # letters (Persian "۱", Roman numerals, Cyrillic homoglyphs of
+    # Latin letters, etc.). A code stored as ``"PROMO۱"`` would never
+    # match a user typing ``"PROMO1"`` with an ASCII digit, so the
+    # admin's promo silently never redeems. Constrain to ASCII
+    # ``[A-Z0-9_-]`` so the stored code is always exactly what a user
+    # typing on a standard keyboard can produce.
+    if len(code) > 64 or not all(
+        (c.isascii() and c.isalnum()) or c in "_-" for c in code
+    ):
         return "bad_code"
 
     kind = (form.get("discount_kind") or "").strip().lower()
@@ -1095,8 +1104,12 @@ async def promos_revoke(request: web.Request) -> web.StreamResponse:
 
     code = request.match_info.get("code", "").upper()
     response = web.HTTPFound(location="/admin/promos")
+    # ASCII-only validation matches ``parse_promo_form`` so the URL
+    # path can't carry a Unicode-digit lookalike past the revoke
+    # gate (the DB lookup would simply 404, but rejecting upstream
+    # gives a clearer flash banner).
     if not code or len(code) > 64 or not all(
-        c.isalnum() or c in "_-" for c in code
+        (c.isascii() and c.isalnum()) or c in "_-" for c in code
     ):
         set_flash(
             response,
@@ -1193,7 +1206,13 @@ def parse_gift_form(form) -> dict | str:
     if not code_raw:
         return "missing_code"
     code = code_raw.upper()
-    if len(code) > 64 or not all(c.isalnum() or c in "_-" for c in code):
+    # ASCII-only: see the equivalent guard in ``parse_promo_form`` for
+    # the reasoning. A gift code containing a Persian / Roman-numeral
+    # / Cyrillic-homoglyph character would store fine but would never
+    # match a user typing the visually-identical ASCII version.
+    if len(code) > 64 or not all(
+        (c.isascii() and c.isalnum()) or c in "_-" for c in code
+    ):
         return "bad_code"
 
     raw_amount = (form.get("amount_usd") or "").strip()
@@ -1450,8 +1469,9 @@ async def gifts_revoke(request: web.Request) -> web.StreamResponse:
 
     code = request.match_info.get("code", "").upper()
     response = web.HTTPFound(location="/admin/gifts")
+    # ASCII-only validation matches ``parse_gift_form``.
     if not code or len(code) > 64 or not all(
-        c.isalnum() or c in "_-" for c in code
+        (c.isascii() and c.isalnum()) or c in "_-" for c in code
     ):
         set_flash(
             response,

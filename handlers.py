@@ -287,8 +287,15 @@ async def _redeem_code_for_user(
     """Validate + redeem *code_arg* and return the localized response."""
     # Cap on length matches the DB column / parser bound — anything
     # longer is definitely junk, no need to round-trip the DB.
+    # ASCII-only matches the admin-side ``parse_promo_form`` /
+    # ``parse_gift_form`` validators (web_admin.py): codes are stored
+    # as ASCII ``[A-Z0-9_-]`` and matching a user-typed string with
+    # Unicode lookalikes (Persian "۱" vs ASCII "1", Cyrillic "А" vs
+    # Latin "A") would always 404 in the DB anyway. Reject upstream
+    # so the user gets ``redeem_bad_code`` (a clearer message than
+    # the generic ``redeem_not_found`` they'd get from the DB miss).
     if len(code_arg) > 64 or not all(
-        c.isalnum() or c in "_-" for c in code_arg
+        (c.isascii() and c.isalnum()) or c in "_-" for c in code_arg
     ):
         return t(lang, "redeem_bad_code")
 

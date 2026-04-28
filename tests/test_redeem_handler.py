@@ -82,6 +82,37 @@ async def test_cmd_redeem_long_code_format_rejected_early():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "code",
+    [
+        "GIFT\u06f1",      # Persian digit '۱'
+        "PROMO\u041e",     # Cyrillic 'О' homoglyph of Latin 'O'
+        "X\u00b2",         # Superscript 2
+        "\u2164",          # Roman numeral V
+    ],
+)
+async def test_cmd_redeem_unicode_alnum_rejected_early(code):
+    """ASCII-only guard mirrors the admin-side ``parse_promo_form`` /
+    ``parse_gift_form`` validators. Pre-fix ``str.isalnum`` returned
+    True for Unicode digits / homoglyphs and the handler would
+    happily round-trip the DB to get a ``not_found`` miss back —
+    spending a query on something we can determine is malformed at
+    parse time. Post-fix the user gets the clearer
+    ``redeem_bad_code`` reply (``"Invalid code"``) without a DB hit.
+    """
+    from handlers import cmd_redeem
+    msg = _make_message(f"/redeem {code}")
+    state = _make_state()
+    with patch("handlers._get_user_language", new=AsyncMock(return_value="en")), \
+         patch("handlers.db.redeem_gift_code", new=AsyncMock()) as mock_redeem:
+        await cmd_redeem(msg, state)
+    msg.answer.assert_awaited_once()
+    sent = msg.answer.await_args.args[0]
+    assert "Invalid" in sent or "نامعتبر" in sent
+    mock_redeem.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_cmd_redeem_ok_credits_user():
     from handlers import cmd_redeem
     msg = _make_message("/redeem GIFT5")

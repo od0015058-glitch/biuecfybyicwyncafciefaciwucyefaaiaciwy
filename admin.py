@@ -447,8 +447,14 @@ def parse_promo_create_args(text: str) -> dict | str:
     if len(parts) < 3:
         return "missing"
     code = parts[1].upper()
+    # ASCII-only: Telegram-side equivalent of the ``parse_promo_form``
+    # guard in web_admin. ``str.isalnum`` returns True for Unicode
+    # digits ("۱") and letters (Cyrillic homoglyphs of Latin chars),
+    # which would store fine but never match the DB row a user types
+    # on a standard keyboard later. Constrain to ASCII so the
+    # Telegram-DM and web admin code-creation flows stay in lock-step.
     if not code or len(code) > 64 or not all(
-        c.isalnum() or c in "_-" for c in code
+        (c.isascii() and c.isalnum()) or c in "_-" for c in code
     ):
         return "bad_code"
 

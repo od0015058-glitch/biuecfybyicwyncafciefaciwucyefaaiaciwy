@@ -433,6 +433,49 @@ def test_parse_promo_create_args_allows_underscore_and_dash():
     assert out["code"] == "EARLY_BIRD-25"
 
 
+@pytest.mark.parametrize(
+    "code",
+    [
+        # Persian (Eastern Arabic) digit instead of ASCII '1'.
+        "PROMO\u06f1",
+        # Roman numeral V — visually identical to ASCII 'V' but a
+        # distinct Unicode codepoint (U+2164).
+        "CODE\u2164",
+        # Cyrillic 'А' (U+0410) homoglyph of Latin 'A'.
+        "PROM\u041e",
+        # Superscript 2 — ``str.isalnum`` returns True for it.
+        "GIFT\u00b2",
+        # Pure non-ASCII alnum (Persian "PROMO1").
+        "\u067e\u0631\u0648\u0645\u0648\u06f1",
+    ],
+)
+def test_parse_promo_create_args_rejects_unicode_alnum(code):
+    """ASCII-only guard: ``str.isalnum`` returns True for Persian
+    digits / Roman numerals / Cyrillic homoglyphs / superscripts.
+    Pre-fix these stored fine but no user typing on a standard
+    keyboard could ever match the row, so the admin's promo
+    silently never redeemed. Post-fix the parser rejects them at
+    creation time so the admin sees the ``bad_code`` error and
+    re-types the code in plain ASCII.
+    """
+    assert (
+        parse_promo_create_args(f"/admin_promo_create {code} 20%")
+        == "bad_code"
+    )
+
+
+def test_parse_promo_create_args_accepts_full_ascii_alnum():
+    """Regression pin: every ASCII letter + digit + the two reserved
+    punctuation characters must still pass through unchanged. Without
+    this the new ``isascii()`` guard could regress to rejecting
+    legitimate codes.
+    """
+    out = parse_promo_create_args(
+        "/admin_promo_create ABCdef-123_XYZ 10%"
+    )
+    assert out["code"] == "ABCDEF-123_XYZ"
+
+
 # ---- _format_promo_row -----------------------------------------
 
 

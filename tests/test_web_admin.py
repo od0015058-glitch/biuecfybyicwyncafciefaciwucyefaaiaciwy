@@ -1292,6 +1292,50 @@ def test_parse_promo_form_bad_code_chars():
     })) == "bad_code"
 
 
+@pytest.mark.parametrize(
+    "code",
+    [
+        # Persian (Eastern Arabic) digit '۱' (U+06F1).
+        "PROMO\u06f1",
+        # Roman numeral V (U+2164) — visually identical to ASCII 'V'.
+        "CODE\u2164",
+        # Cyrillic 'О' (U+041E) homoglyph of Latin 'O'.
+        "PROM\u041e",
+        # Superscript 2 (U+00B2) — ``str.isalnum`` returns True for it.
+        "GIFT\u00b2",
+        # Pure non-ASCII alnum (Persian).
+        "\u067e\u0631\u0648\u0645\u0648\u06f1",
+    ],
+)
+def test_parse_promo_form_rejects_unicode_alnum(code):
+    """ASCII-only guard: pre-fix ``str.isalnum`` returned True for
+    Unicode digits / letters, so an admin pasting (or fat-fingering)
+    a code with a Persian digit or a Cyrillic homoglyph would store
+    the row but no user typing on a standard keyboard could ever
+    match it. Post-fix the parser rejects them so the admin sees
+    ``bad_code`` and re-types in plain ASCII.
+    """
+    assert parse_promo_form(_form({
+        "code": code,
+        "discount_kind": "percent",
+        "discount_value": "10",
+    })) == "bad_code"
+
+
+def test_parse_promo_form_accepts_full_ascii_alnum_with_punct():
+    """Regression pin: the new ``isascii()`` guard must not regress
+    legitimate ASCII codes that mix letters / digits / underscore /
+    dash. ``"ABCdef-123_XYZ"`` exercises every allowed character class.
+    """
+    out = parse_promo_form(_form({
+        "code": "ABCdef-123_XYZ",
+        "discount_kind": "percent",
+        "discount_value": "10",
+    }))
+    assert isinstance(out, dict)
+    assert out["code"] == "ABCDEF-123_XYZ"
+
+
 def test_parse_promo_form_bad_discount_kind():
     assert parse_promo_form(_form({
         "code": "X",
@@ -1963,6 +2007,36 @@ def test_parse_gift_form_code_too_long():
         "code": "A" * 65,
         "amount_usd": "5",
     })) == "bad_code"
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "GIFT\u06f1",      # Persian digit
+        "PROM\u041e",      # Cyrillic O homoglyph
+        "X\u00b2",         # superscript 2
+        "\u2164",          # Roman numeral V
+    ],
+)
+def test_parse_gift_form_rejects_unicode_alnum(code):
+    """ASCII-only guard: see the equivalent ``parse_promo_form`` test
+    for the rationale. Gift codes redeem via the same case-insensitive
+    DB lookup so a Unicode digit / homoglyph stored in the row would
+    never match an ASCII-keyed user typing the same-looking code.
+    """
+    assert parse_gift_form(_form({
+        "code": code,
+        "amount_usd": "5",
+    })) == "bad_code"
+
+
+def test_parse_gift_form_accepts_full_ascii_alnum_with_punct():
+    out = parse_gift_form(_form({
+        "code": "GIFT_ABCdef-123",
+        "amount_usd": "5",
+    }))
+    assert isinstance(out, dict)
+    assert out["code"] == "GIFT_ABCDEF-123"
 
 
 def test_parse_gift_form_missing_amount():
