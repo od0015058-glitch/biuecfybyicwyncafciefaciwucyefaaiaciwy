@@ -286,11 +286,15 @@ async def dashboard(request: web.Request) -> web.StreamResponse:
     if db is None:
         # Local dev / unit-test path where the app didn't get a Database
         # wired up. Render with empty data so the UI is at least visible.
+        # Keys MUST match ``Database.get_system_metrics`` (and
+        # ``admin.format_metrics`` consumers) so the template renders
+        # the same in dev / DB-error / live: users_total, users_active_7d,
+        # revenue_usd, spend_usd, top_models[{model,count,cost_usd}].
         metrics = {
-            "user_count": 0,
-            "active_users_7d": 0,
-            "total_revenue_usd": 0.0,
-            "total_spend_usd": 0.0,
+            "users_total": 0,
+            "users_active_7d": 0,
+            "revenue_usd": 0.0,
+            "spend_usd": 0.0,
             "top_models": [],
         }
         db_error = "No database wired up (development mode)."
@@ -299,11 +303,12 @@ async def dashboard(request: web.Request) -> web.StreamResponse:
             metrics = await db.get_system_metrics()
         except Exception:
             log.exception("dashboard: get_system_metrics failed")
+            # Same shape as the dev-mode fallback above — see comment.
             metrics = {
-                "user_count": 0,
-                "active_users_7d": 0,
-                "total_revenue_usd": 0.0,
-                "total_spend_usd": 0.0,
+                "users_total": 0,
+                "users_active_7d": 0,
+                "revenue_usd": 0.0,
+                "spend_usd": 0.0,
                 "top_models": [],
             }
             db_error = "Database query failed — see logs."

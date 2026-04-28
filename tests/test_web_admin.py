@@ -127,20 +127,29 @@ def test_signed_cookie_contains_no_secret():
 
 
 def _stub_db(metrics: dict | None = None):
-    """A minimal Database stub that exposes the methods web_admin uses."""
+    """A minimal Database stub that exposes the methods web_admin uses.
+
+    The default ``metrics`` shape MUST match what
+    ``Database.get_system_metrics`` actually returns in production
+    (``database.py:1088-1101``) — Devin Review caught a key-name
+    mismatch (PR #54) where the template wanted ``user_count`` but
+    the real DB returned ``users_total``, which would 500 every
+    dashboard load. Keep this stub's keys aligned with the real
+    method.
+    """
     db = AsyncMock()
     db.get_system_metrics = AsyncMock(
         return_value=metrics
         or {
-            "user_count": 42,
-            "active_users_7d": 7,
-            "total_revenue_usd": 123.45,
-            "total_spend_usd": 67.89,
+            "users_total": 42,
+            "users_active_7d": 7,
+            "revenue_usd": 123.45,
+            "spend_usd": 67.89,
             "top_models": [
                 {
                     "model": "openrouter/auto",
-                    "request_count": 100,
-                    "total_cost_usd": 3.21,
+                    "count": 100,
+                    "cost_usd": 3.21,
                 }
             ],
         }
@@ -221,10 +230,10 @@ async def test_dashboard_with_auth_renders_metrics(
 ):
     db = _stub_db(
         {
-            "user_count": 1234,
-            "active_users_7d": 5,
-            "total_revenue_usd": 99.50,
-            "total_spend_usd": 12.34,
+            "users_total": 1234,
+            "users_active_7d": 5,
+            "revenue_usd": 99.50,
+            "spend_usd": 12.3456,
             "top_models": [],
         }
     )
@@ -244,7 +253,10 @@ async def test_dashboard_with_auth_renders_metrics(
     body = await resp.text()
     assert "1,234" in body
     assert "$99.50" in body
-    assert "$12.34" in body
+    # ``spend_usd`` is rendered with 4dp precision (matches OpenRouter
+    # token-cost granularity) — render check pins both the format AND
+    # the key spelling.
+    assert "$12.3456" in body
     db.get_system_metrics.assert_awaited()
 
 
@@ -370,3 +382,91 @@ async def test_invalid_cookie_treated_as_unauthed(
     resp = await client.get("/admin/", allow_redirects=False)
     assert resp.status == 302
     assert resp.headers["Location"] == "/admin/login"
+
+
+async def test_dashboard_renders_against_real_db_schema(
+    aiohttp_client, make_admin_app
+):
+    """Pin the contract: dashboard.html must render cleanly against the
+    exact key shape ``Database.get_system_metrics`` returns (see
+    ``database.py:1088-1101`` and ``admin.format_metrics`` which
+    already consumes this shape successfully).
+
+    Devin Review caught a key-name mismatch in the original Stage-8-Part-1
+    where the template was reading ``user_count`` / ``total_revenue_usd``
+    while the DB returned ``users_total`` / ``revenue_usd`` — a 500 on
+    every dashboard load in production. This test fails loudly if the
+    template or fallback dicts drift from the real schema again.
+    """
+    db = AsyncMock()
+    # Exact shape returned by Database.get_system_metrics (verified
+    # from database.py and admin.format_metrics).
+    db.get_system_metrics = AsyncMock(
+        return_value={
+            "users_total": 9999,
+            "users_active_7d": 250,
+            "revenue_usd": 4321.0,
+            "spend_usd": 1234.5678,
+            "top_models": [
+                {
+                    "model": "openai/gpt-4o-mini",
+                    "count": 5000,
+                    "cost_usd": 12.3456,
+                },
+                {
+                    "model": "anthropic/claude-3.5-sonnet",
+                    "count": 1234,
+                    "cost_usd": 7.8901,
+                },
+            ],
+        }
+    )
+    client = await aiohttp_client(
+        make_admin_app(password="letmein", db=db)
+    )
+    await client.post(
+        "/admin/login",
+        data={"password": "letmein"},
+        allow_redirects=False,
+    )
+    resp = await client.get("/admin/")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    # All four stat tiles render with the right values.
+    assert "9,999" in body
+    assert "250" in body
+    assert "$4,321.00" in body
+    assert "$1,234.5678" in body
+    # Top-models table renders both rows, with model name + count + cost.
+    assert "openai/gpt-4o-mini" in body
+    assert "anthropic/claude-3.5-sonnet" in body
+    assert "5,000" in body
+    assert "$12.3456" in body
+    assert "$7.8901" in body
+
+
+async def test_dashboard_fallback_dicts_match_template_keys(
+    aiohttp_client, make_admin_app
+):
+    """When the DB call fails, the fallback dict must use the same
+    keys the template reads — otherwise the error path 500s instead
+    of rendering a graceful 'Database query failed' banner.
+    """
+    db = AsyncMock()
+    db.get_system_metrics = AsyncMock(side_effect=RuntimeError("kaboom"))
+    client = await aiohttp_client(
+        make_admin_app(password="letmein", db=db)
+    )
+    await client.post(
+        "/admin/login",
+        data={"password": "letmein"},
+        allow_redirects=False,
+    )
+    resp = await client.get("/admin/")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert "Database query failed" in body
+    # Tile labels render with zero values (proves the fallback's keys
+    # match the template's reads, otherwise jinja would 500).
+    assert "Total users" in body
+    assert "Active (7d)" in body
