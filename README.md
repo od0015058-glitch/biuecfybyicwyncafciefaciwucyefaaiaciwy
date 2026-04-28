@@ -47,6 +47,15 @@ NowPayments crypto invoices.
   table. View the feed at `${WEBHOOK_BASE_URL}/admin/audit` with
   optional action/actor filters. Audit writes are best-effort — a
   failed audit insert never blocks the underlying admin operation.
+- **TOTP / 2FA on admin login** — set `ADMIN_2FA_SECRET` to a base32
+  string and `/admin/login` will require a 6-digit code from your
+  authenticator app (Google Authenticator, Authy, 1Password,
+  Bitwarden) in addition to `ADMIN_PASSWORD`. The check runs *after*
+  the password compare so an attacker without the password can't use
+  the form to brute-force the TOTP code. Provision a fresh secret at
+  `${WEBHOOK_BASE_URL}/admin/enroll_2fa` (renders an inline-SVG QR
+  + the manual key + an `otpauth://` URI). Leave `ADMIN_2FA_SECRET`
+  unset to keep the existing password-only login flow.
 
 For the full project history, file map, and roadmap **read [HANDOFF.md](./HANDOFF.md)**.
 
@@ -121,6 +130,12 @@ To roll back: `docker compose down && git checkout <previous-sha> && docker comp
      `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
      Set `ADMIN_COOKIE_SECURE=0` ONLY when running over plain HTTP
      locally — the default is HTTPS-only.
+   - `ADMIN_2FA_SECRET` (optional) — base32 TOTP secret. When set,
+     `/admin/login` requires a 6-digit code from your authenticator
+     app in addition to `ADMIN_PASSWORD`. Provision via
+     `${WEBHOOK_BASE_URL}/admin/enroll_2fa` after first login.
+     `ADMIN_2FA_ISSUER` (default `Meowassist Admin`) labels the entry
+     in the authenticator app.
    - `TRUST_PROXY_HEADERS=1` if the bot runs behind a reverse proxy
      (Cloudflare Tunnel, nginx, Caddy). When set, the per-IP rate
      limiters (webhook + `/admin/login`) key on the leftmost
@@ -162,8 +177,8 @@ pytest tests/
 | `rate_limit.py` | Token-bucket primitives + `ChatRateLimitMiddleware` (per-user) and `webhook_rate_limit_middleware` (per-IP). Guards `/chat` against runaway OpenRouter spend and the `/nowpayments-webhook` endpoint against DoS bursts. |
 | `strings.py` | Two-locale (fa/en) compiled string table + `t(lang, key, **kwargs)` helper. Layered with a runtime override cache populated from the `bot_strings` DB table — admin edits at `/admin/strings` shadow the compiled defaults until reverted. Missing-slug lookups now log a one-shot WARNING per `(lang, key)` instead of silently returning the bare slug. |
 | `admin.py` | Telegram-side admin commands gated on `ADMIN_USER_IDS`: `/admin`, `/admin_metrics`, `/admin_balance`, `/admin_credit`, `/admin_debit`, `/admin_promo_create`, `/admin_promo_list`, `/admin_promo_revoke`, `/admin_broadcast`. |
-| `web_admin.py` | aiohttp + jinja2 web admin panel mounted under `/admin/` on the same web server that serves `/nowpayments-webhook`. HMAC-cookie auth via `ADMIN_PASSWORD` / `ADMIN_SESSION_SECRET`. CSRF-protected POST forms + signed flash-cookie banners. Login + dashboard + promo codes UI + gift codes UI + users UI + **broadcast UI with live-progress polling** + **paginated transactions browser** + **editable bot text** (`/admin/strings`) shipped. |
-| `templates/admin/` | Jinja2 templates for the web admin (login, dashboard, promos, gifts, users, user_detail, broadcast, broadcast_detail, transactions, strings, string_detail). |
+| `web_admin.py` | aiohttp + jinja2 web admin panel mounted under `/admin/` on the same web server that serves `/nowpayments-webhook`. HMAC-cookie auth via `ADMIN_PASSWORD` / `ADMIN_SESSION_SECRET`, optional TOTP / 2FA via `ADMIN_2FA_SECRET` (Stage-9-Step-3). CSRF-protected POST forms + signed flash-cookie banners. Login + dashboard + promo codes UI + gift codes UI + users UI + **broadcast UI with live-progress polling** + **paginated transactions browser** + **editable bot text** (`/admin/strings`) + **audit log** + **2FA enrolment helper** (`/admin/enroll_2fa`) shipped. |
+| `templates/admin/` | Jinja2 templates for the web admin (login, dashboard, promos, gifts, users, user_detail, broadcast, broadcast_detail, transactions, strings, string_detail, audit, enroll_2fa). |
 | `alembic/` | Schema migrations. `alembic upgrade head` runs idempotently in `entrypoint.sh` on every container start. New schema changes: `alembic revision -m "..."`. |
 
 ## License / contributing
