@@ -434,6 +434,141 @@ async def test_unconfigured_session_secret_refuses_login(
     assert "not configured" in body
 
 
+# ---------------------------------------------------------------------
+# Stage-9-Step-1: /admin/login rate-limit
+# ---------------------------------------------------------------------
+
+
+async def test_login_rate_limited_after_burst(aiohttp_client, make_admin_app):
+    """N wrong-password attempts in quick succession trip the per-IP
+    bucket and flip the response from 401 to 429.
+
+    Tighten the cache so the test doesn't need a sleep — one token
+    capacity, refill ~0/sec means the very first wrong password exhausts
+    the bucket and every subsequent attempt is rejected before we even
+    compare passwords.
+    """
+    from rate_limit import (
+        LOGIN_RATE_LIMIT_CACHE_KEY,
+        _LRUBucketCache,
+    )
+
+    app = make_admin_app(password="letmein")
+    # Replace the cache with a tighter one so the test is deterministic.
+    app[LOGIN_RATE_LIMIT_CACHE_KEY] = _LRUBucketCache(
+        capacity=1, refill_rate=0.001
+    )
+    client = await aiohttp_client(app)
+
+    first = await client.post(
+        "/admin/login", data={"password": "wrong"}, allow_redirects=False
+    )
+    # Bucket had 1 token, first attempt consumes it, we still reach the
+    # password compare → 401.
+    assert first.status == 401
+
+    second = await client.post(
+        "/admin/login", data={"password": "wrong"}, allow_redirects=False
+    )
+    # Bucket is empty now → 429 BEFORE we compare passwords.
+    assert second.status == 429
+    body = await second.text()
+    assert "Too many login attempts" in body
+
+
+async def test_login_rate_limit_runs_before_password_compare(
+    aiohttp_client, make_admin_app
+):
+    """Even a correct password is rate-limited. Stops an attacker with
+    the right password from re-submitting faster than the bucket refills
+    to brute-force a hypothetical 2FA code later.
+    """
+    from rate_limit import (
+        LOGIN_RATE_LIMIT_CACHE_KEY,
+        _LRUBucketCache,
+    )
+
+    app = make_admin_app(password="letmein")
+    app[LOGIN_RATE_LIMIT_CACHE_KEY] = _LRUBucketCache(
+        capacity=1, refill_rate=0.001
+    )
+    client = await aiohttp_client(app)
+
+    # Burn the bucket with a wrong password.
+    await client.post(
+        "/admin/login", data={"password": "wrong"}, allow_redirects=False
+    )
+    # Now attempt with the correct one — still 429, no cookie set.
+    resp = await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False
+    )
+    assert resp.status == 429
+    assert COOKIE_NAME not in resp.cookies
+
+
+async def test_login_rate_limit_installed_by_setup_admin_routes(
+    make_admin_app,
+):
+    """``setup_admin_routes`` must install the login rate-limit cache
+    on the app — if the bucket isn't there, ``consume_login_token``
+    fails open and the throttle is silently disabled.
+    """
+    from rate_limit import LOGIN_RATE_LIMIT_CACHE_KEY
+
+    app = make_admin_app()
+    assert LOGIN_RATE_LIMIT_CACHE_KEY in app
+
+
+async def test_login_rate_limit_uses_xff_with_trust_proxy(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """Bundled fix regression pin: with ``TRUST_PROXY_HEADERS=1`` set,
+    the login throttle keys on ``X-Forwarded-For`` — two clients behind
+    the same proxy each get their own bucket.
+
+    Without this fix, a Cloudflare-tunnel deploy would bucket every
+    admin onto the tunnel IP: the first password sprayer drains the
+    shared bucket and locks out every legitimate admin.
+    """
+    from rate_limit import (
+        LOGIN_RATE_LIMIT_CACHE_KEY,
+        TRUST_PROXY_HEADERS_ENV,
+        _LRUBucketCache,
+    )
+
+    monkeypatch.setenv(TRUST_PROXY_HEADERS_ENV, "1")
+    app = make_admin_app(password="letmein")
+    app[LOGIN_RATE_LIMIT_CACHE_KEY] = _LRUBucketCache(
+        capacity=1, refill_rate=0.001
+    )
+    client = await aiohttp_client(app)
+
+    # Client A uses up its bucket (2nd attempt 429).
+    a1 = await client.post(
+        "/admin/login",
+        data={"password": "wrong"},
+        headers={"X-Forwarded-For": "203.0.113.1"},
+        allow_redirects=False,
+    )
+    a2 = await client.post(
+        "/admin/login",
+        data={"password": "wrong"},
+        headers={"X-Forwarded-For": "203.0.113.1"},
+        allow_redirects=False,
+    )
+    assert a1.status == 401
+    assert a2.status == 429
+
+    # Client B from a different public IP still has its full bucket.
+    b = await client.post(
+        "/admin/login",
+        data={"password": "wrong"},
+        headers={"X-Forwarded-For": "198.51.100.9"},
+        allow_redirects=False,
+    )
+    assert b.status == 401
+
+
 async def test_admin_bare_path_redirects_to_slash(
     aiohttp_client, make_admin_app
 ):

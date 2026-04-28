@@ -75,6 +75,11 @@ from aiohttp import web
 # referenced — not the module-level ``db`` singleton — so the admin
 # still works against the injected DB in tests.
 from database import Database
+from rate_limit import (
+    client_ip_for_rate_limit,
+    consume_login_token,
+    install_login_rate_limit,
+)
 
 log = logging.getLogger("bot.web_admin")
 
@@ -280,6 +285,25 @@ async def login_post(request: web.Request) -> web.StreamResponse:
             status=500,
         )
 
+    # Per-IP token-bucket throttle. Keyed via the shared ``client_ip_for
+    # _rate_limit`` helper so a reverse-proxy deploy with
+    # ``TRUST_PROXY_HEADERS=1`` actually buckets per real client rather
+    # than collapsing every attempt onto the proxy's TCP address. The
+    # throttle runs BEFORE the password compare so a spraying attacker
+    # doesn't get constant-time feedback on their guesses.
+    client_key = client_ip_for_rate_limit(request)
+    if not await consume_login_token(request.app, client_key):
+        log.warning(
+            "admin login: rate-limited key=%s remote=%s",
+            client_key, request.remote,
+        )
+        return aiohttp_jinja2.render_template(
+            "login.html",
+            request,
+            {"error": "Too many login attempts. Please wait a minute."},
+            status=429,
+        )
+
     form = await request.post()
     submitted = str(form.get("password", ""))
 
@@ -288,8 +312,8 @@ async def login_post(request: web.Request) -> web.StreamResponse:
     # right.
     if not hmac.compare_digest(submitted, expected):
         log.warning(
-            "admin login: bad password from %s",
-            request.remote,
+            "admin login: bad password key=%s remote=%s",
+            client_key, request.remote,
         )
         return aiohttp_jinja2.render_template(
             "login.html",
@@ -2162,6 +2186,11 @@ def setup_admin_routes(
         autoescape=jinja2.select_autoescape(["html"]),
     )
     app.middlewares.append(admin_auth_middleware)
+
+    # Per-IP token-bucket throttle on /admin/login. Mounted here so the
+    # cache lives on the same aiohttp app the handler reads from. See
+    # ``rate_limit.install_login_rate_limit`` for defaults.
+    install_login_rate_limit(app)
 
     app.router.add_get("/admin/login", login_get)
     app.router.add_post("/admin/login", login_post)

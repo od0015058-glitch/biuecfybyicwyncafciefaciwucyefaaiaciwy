@@ -91,6 +91,13 @@ To roll back: `docker compose down && git checkout <previous-sha> && docker comp
      `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
      Set `ADMIN_COOKIE_SECURE=0` ONLY when running over plain HTTP
      locally — the default is HTTPS-only.
+   - `TRUST_PROXY_HEADERS=1` if the bot runs behind a reverse proxy
+     (Cloudflare Tunnel, nginx, Caddy). When set, the per-IP rate
+     limiters (webhook + `/admin/login`) key on the leftmost
+     `X-Forwarded-For` IP instead of the proxy's TCP peer address —
+     so a login sprayer can't use the tunnel IP to bucket-share
+     with legitimate admins. Leave unset on direct-internet deploys
+     because the header can be spoofed by arbitrary clients.
 
 4. **Run**
    ```bash

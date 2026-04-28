@@ -163,6 +163,122 @@ async def consume_chat_token(user_id: int) -> bool:
 WEBHOOK_PATH = "/nowpayments-webhook"
 
 
+# Environment variable that opts the rate-limit keying into trusting
+# the X-Forwarded-For header. See ``client_ip_for_rate_limit`` for
+# the full discussion. Default is OFF (trust only ``request.remote``)
+# so a direct-exposure deploy stays safe.
+TRUST_PROXY_HEADERS_ENV = "TRUST_PROXY_HEADERS"
+
+
+def _is_trusting_proxy() -> bool:
+    """Read ``TRUST_PROXY_HEADERS`` from the process env. Truthy values
+    are ``1``, ``true``, ``yes`` (case-insensitive); everything else
+    is False.
+
+    Read fresh on every call so tests can ``monkeypatch.setenv`` /
+    ``delenv`` without restarting the process. Cheap — it's just
+    ``os.environ.get``.
+    """
+    import os
+
+    return os.environ.get(TRUST_PROXY_HEADERS_ENV, "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def client_ip_for_rate_limit(request: web.Request) -> str:
+    """Pick a rate-limit bucket key for ``request``.
+
+    The default ``request.remote`` is the TCP peer, which in every
+    production deploy of this bot is the reverse proxy (Cloudflare
+    Tunnel, nginx, Caddy) — NOT the real client. Bucketing all
+    admin-panel traffic onto one proxy IP turns "per-IP login
+    throttle" from a brute-force defence into either (a) a no-op
+    (the tunnel IP is fine, the single bucket never drains) or
+    (b) a self-DoS (one attacker spamming the bucket locks out
+    every legitimate admin behind the same tunnel).
+
+    When ``TRUST_PROXY_HEADERS=1`` is set in the env, prefer the
+    leftmost IP in ``X-Forwarded-For`` — that's the convention the
+    major CDNs and reverse proxies all follow. We explicitly don't
+    trust the header by default because on a direct-to-internet
+    deploy an attacker could inject a spoofed header to evade the
+    per-IP limiter entirely.
+
+    Returns a non-empty string; falls back to ``request.path`` +
+    ``"_unknown_"`` as a last resort so the limiter key is always
+    stable.
+    """
+    if _is_trusting_proxy():
+        xff = request.headers.get("X-Forwarded-For", "")
+        if xff:
+            # Leftmost entry is the original client; everything
+            # after is the proxy chain. Strip whitespace that some
+            # proxies insert.
+            first = xff.split(",", 1)[0].strip()
+            if first:
+                return first
+    return request.remote or request.path or "_unknown_"
+
+
+# ---------------------------------------------------------------------
+# /admin/login per-IP throttle
+# ---------------------------------------------------------------------
+#
+# Keyed by client IP (via ``client_ip_for_rate_limit``), so a Cloudflare
+# tunnel deploy doesn't bucket every admin-panel visitor onto one IP
+# the moment ``TRUST_PROXY_HEADERS=1`` is set. Separate from both the
+# chat limiter and the webhook limiter because a password-guessing
+# attacker is a fundamentally different traffic shape from either —
+# slow, persistent, and deserving of its own budget.
+#
+# Defaults: 10-token burst with a 1 token / 30 sec refill. A
+# password-spraying attacker from one IP can therefore check ~10
+# passwords immediately, then only ~1 every 30 seconds. Combined
+# with ``ADMIN_PASSWORD`` being a random 32-char string, this makes
+# brute-force infeasible.
+LOGIN_RATE_LIMIT_CACHE_KEY: web.AppKey = web.AppKey(
+    "_login_rate_limit_cache", _LRUBucketCache
+)
+
+
+def install_login_rate_limit(
+    app: web.Application,
+    capacity: float = 10.0,
+    refill_rate: float = 1.0 / 30.0,
+) -> None:
+    """Pre-seed the per-IP login rate-limit cache on *app*.
+
+    Called from ``web_admin.setup_admin_routes`` so the admin mount
+    gets one bucket cache regardless of how many times the login
+    route is hit. Idempotent by design — re-running on the same
+    app replaces the cache (useful for tests).
+    """
+    app[LOGIN_RATE_LIMIT_CACHE_KEY] = _LRUBucketCache(
+        capacity=capacity, refill_rate=refill_rate
+    )
+
+
+async def consume_login_token(app: web.Application, client_key: str) -> bool:
+    """Try to take one login-attempt token for ``client_key``.
+
+    Returns True if the login attempt should proceed, False if the
+    handler should short-circuit with 429.
+
+    Takes the app + key directly (rather than pulling from the
+    request) so ``login_post`` can key on the sanitised client IP
+    while remaining cheap to unit-test.
+    """
+    cache = app.get(LOGIN_RATE_LIMIT_CACHE_KEY)
+    if cache is None:
+        # Not installed — fail open rather than denying all logins
+        # from a misconfigured deploy. ``install_login_rate_limit``
+        # is called from ``setup_admin_routes`` so this branch is
+        # only reachable in tests that mount routes manually.
+        return True
+    return await cache.consume(client_key)
+
+
 @web.middleware
 async def webhook_rate_limit_middleware(
     request: web.Request,
@@ -196,10 +312,15 @@ async def webhook_rate_limit_middleware(
     # the app on startup and modifying app state after that raises.
     cache = request.app[WEBHOOK_RATE_LIMIT_CACHE_KEY]
 
-    # remote can be None in tests / behind weird proxies; bucket key
-    # falls back to the URL path so at least the limiter's still
-    # bounded.
-    key = request.remote or request.path or "_unknown_"
+    # Use the shared client-IP helper so a reverse-proxy deploy with
+    # ``TRUST_PROXY_HEADERS=1`` actually buckets per real client IP
+    # rather than collapsing every IPN onto the proxy's TCP address.
+    # For webhook traffic specifically this matters less than for
+    # login (NowPayments sends from a known range, the cap is much
+    # higher than the real IPN rhythm) but using the helper keeps
+    # the two limiters in lock-step — when the env var flips, both
+    # limiters gain real-client granularity at once.
+    key = client_ip_for_rate_limit(request)
     ok = await cache.consume(key)
     if not ok:
         log.warning(

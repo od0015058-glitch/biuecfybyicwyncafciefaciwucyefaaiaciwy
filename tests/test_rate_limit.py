@@ -272,3 +272,121 @@ async def test_install_webhook_rate_limit_seeds_cache():
     from rate_limit import webhook_rate_limit_middleware
 
     assert webhook_rate_limit_middleware in tuple(app.middlewares)
+
+
+# ---- client_ip_for_rate_limit + TRUST_PROXY_HEADERS ----------------
+#
+# Stage-9-Step-1 bundled fix: the existing ``request.remote`` keying
+# collapses every reverse-proxy deploy onto one bucket. The helper
+# reads ``X-Forwarded-For`` when ``TRUST_PROXY_HEADERS=1`` is set,
+# leaving direct-exposure deploys untouched.
+
+
+def _make_req(remote: str | None, headers: dict[str, str] | None = None):
+    """Build the tiniest object that quacks like an aiohttp request
+    for the client-IP helper — it only reads ``.remote``, ``.headers``,
+    and ``.path``."""
+
+    class _Req:
+        def __init__(self):
+            self.remote = remote
+            self.headers = headers or {}
+            self.path = "/x"
+
+    return _Req()
+
+
+def test_client_ip_ignores_xff_without_env(monkeypatch):
+    """Default (no env var) must NOT trust X-Forwarded-For — a
+    direct-exposure deploy otherwise lets an attacker spoof the key."""
+    from rate_limit import client_ip_for_rate_limit, TRUST_PROXY_HEADERS_ENV
+
+    monkeypatch.delenv(TRUST_PROXY_HEADERS_ENV, raising=False)
+    req = _make_req("10.0.0.1", {"X-Forwarded-For": "1.2.3.4"})
+    assert client_ip_for_rate_limit(req) == "10.0.0.1"
+
+
+def test_client_ip_uses_xff_leftmost_when_trusted(monkeypatch):
+    """``TRUST_PROXY_HEADERS=1`` → leftmost XFF IP wins."""
+    from rate_limit import client_ip_for_rate_limit, TRUST_PROXY_HEADERS_ENV
+
+    monkeypatch.setenv(TRUST_PROXY_HEADERS_ENV, "1")
+    req = _make_req(
+        "10.0.0.1", {"X-Forwarded-For": "203.0.113.4, 10.0.0.1"}
+    )
+    assert client_ip_for_rate_limit(req) == "203.0.113.4"
+
+
+def test_client_ip_accepts_alternate_truthy_values(monkeypatch):
+    """``true``, ``yes``, ``on`` — case-insensitive — all enable proxy
+    trust. Common deploy-tooling writes any of these."""
+    from rate_limit import client_ip_for_rate_limit, TRUST_PROXY_HEADERS_ENV
+
+    for val in ("true", "TRUE", "yes", "ON"):
+        monkeypatch.setenv(TRUST_PROXY_HEADERS_ENV, val)
+        req = _make_req(
+            "10.0.0.1", {"X-Forwarded-For": "198.51.100.7"}
+        )
+        assert client_ip_for_rate_limit(req) == "198.51.100.7", val
+
+
+def test_client_ip_ignores_empty_xff_when_trusted(monkeypatch):
+    """Empty XFF header under TRUST_PROXY_HEADERS=1 falls back to
+    ``request.remote`` rather than returning an empty string."""
+    from rate_limit import client_ip_for_rate_limit, TRUST_PROXY_HEADERS_ENV
+
+    monkeypatch.setenv(TRUST_PROXY_HEADERS_ENV, "1")
+    req = _make_req("10.0.0.1", {"X-Forwarded-For": ""})
+    assert client_ip_for_rate_limit(req) == "10.0.0.1"
+
+
+def test_client_ip_falls_back_when_remote_is_none(monkeypatch):
+    """The caller must get a stable non-empty string so the LRU
+    bucket cache never keys on ``None``."""
+    from rate_limit import client_ip_for_rate_limit, TRUST_PROXY_HEADERS_ENV
+
+    monkeypatch.delenv(TRUST_PROXY_HEADERS_ENV, raising=False)
+    req = _make_req(None)
+    key = client_ip_for_rate_limit(req)
+    assert isinstance(key, str) and key  # non-empty
+
+
+# ---- install_login_rate_limit + consume_login_token ----------------
+
+
+@pytest.mark.asyncio
+async def test_install_login_rate_limit_seeds_cache():
+    from rate_limit import (
+        LOGIN_RATE_LIMIT_CACHE_KEY,
+        install_login_rate_limit,
+    )
+
+    app = web.Application()
+    install_login_rate_limit(app, capacity=3, refill_rate=0.001)
+    cache = app[LOGIN_RATE_LIMIT_CACHE_KEY]
+    assert isinstance(cache, _LRUBucketCache)
+
+
+@pytest.mark.asyncio
+async def test_consume_login_token_respects_capacity(fake_clock):
+    from rate_limit import consume_login_token, install_login_rate_limit
+
+    app = web.Application()
+    install_login_rate_limit(app, capacity=2, refill_rate=0.001)
+    assert await consume_login_token(app, "1.2.3.4") is True
+    assert await consume_login_token(app, "1.2.3.4") is True
+    # Third burst from the same key is denied.
+    assert await consume_login_token(app, "1.2.3.4") is False
+    # …but a different IP starts fresh.
+    assert await consume_login_token(app, "5.6.7.8") is True
+
+
+@pytest.mark.asyncio
+async def test_consume_login_token_fails_open_without_install():
+    """When the cache isn't installed (manual route mounting in tests),
+    the helper returns True so a misconfigured deploy doesn't lock
+    everyone out."""
+    from rate_limit import consume_login_token
+
+    app = web.Application()
+    assert await consume_login_token(app, "1.2.3.4") is True
