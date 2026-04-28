@@ -87,3 +87,39 @@ async def test_process_custom_amount_input_returns_silently_when_from_user_none(
     mock_message_no_from_user.answer.assert_not_called()
     mock_state.set_state.assert_not_called()
     mock_state.update_data.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cmd_start_returns_silently_when_from_user_none(
+    mock_message_no_from_user, mock_state
+):
+    """``cmd_start`` must not crash when from_user is None.
+
+    /start is the most-reachable command from groups (anonymous group
+    admins). Pre-fix: ``db.create_user(message.from_user.id, ...)``
+    AttributeError'd on .id access. Post-fix: silent early return.
+    The state.clear() call is allowed (it's a defensive cleanup
+    that runs before the from_user check).
+    """
+    from handlers import cmd_start
+
+    await cmd_start(mock_message_no_from_user, mock_state)
+
+    mock_message_no_from_user.answer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_route_legacy_text_to_hub_returns_silently_when_from_user_none(
+    mock_message_no_from_user, mock_state
+):
+    """``_route_legacy_text_to_hub`` must not crash when from_user is None.
+
+    The legacy reply-keyboard buttons are matched by F.text equality,
+    so an anonymous group admin posting one of the legacy labels
+    would route here without ``from_user``.
+    """
+    from handlers import _route_legacy_text_to_hub
+
+    await _route_legacy_text_to_hub(mock_message_no_from_user, mock_state)
+
+    mock_message_no_from_user.answer.assert_not_called()

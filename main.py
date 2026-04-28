@@ -14,6 +14,7 @@ from handlers import router
 from middlewares import UserUpsertMiddleware
 from payments import payment_webhook
 from rate_limit import install_webhook_rate_limit
+from web_admin import setup_admin_routes
 
 load_dotenv()
 
@@ -34,6 +35,22 @@ async def start_webhook_server(bot: Bot) -> web.AppRunner:
     install_webhook_rate_limit(app)
     app["bot"] = bot  # Give the server access to the bot so it can send messages
     app.router.add_post("/nowpayments-webhook", payment_webhook)
+
+    # Mount the web admin panel under /admin/. Same aiohttp app, same
+    # process — one less thing to deploy. Auth is HMAC-cookie based,
+    # gated by ADMIN_PASSWORD + ADMIN_SESSION_SECRET. If either is
+    # unset the admin panel is unreachable (login refuses all attempts
+    # and logs a WARNING on boot).
+    setup_admin_routes(
+        app,
+        db=db,
+        password=os.getenv("ADMIN_PASSWORD", ""),
+        session_secret=os.getenv("ADMIN_SESSION_SECRET", ""),
+        ttl_hours=int(os.getenv("ADMIN_SESSION_TTL_HOURS", "24")),
+        # Default ON so cookies are HTTPS-only. Set ADMIN_COOKIE_SECURE=0
+        # locally if you're running over plain HTTP for development.
+        cookie_secure=os.getenv("ADMIN_COOKIE_SECURE", "1") != "0",
+    )
 
     port = int(os.getenv("WEBHOOK_PORT", "8080"))
 

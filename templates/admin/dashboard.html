@@ -1,0 +1,56 @@
+{% extends "_layout.html" %}
+
+{% block title %}Dashboard{% endblock %}
+
+{% block main %}
+<h2>System dashboard</h2>
+
+{% if db_error %}
+<div class="alert alert-warn">{{ db_error }}</div>
+{% endif %}
+
+<div class="stat-grid">
+  <div class="stat">
+    <div class="label">Total users</div>
+    <div class="value">{{ "{:,}".format(metrics.users_total) }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Active (7d)</div>
+    <div class="value">{{ "{:,}".format(metrics.users_active_7d) }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Total revenue</div>
+    <div class="value">${{ "{:,.2f}".format(metrics.revenue_usd) }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Total spend (AI)</div>
+    <div class="value">${{ "{:,.4f}".format(metrics.spend_usd) }}</div>
+  </div>
+</div>
+
+<div class="panel">
+  <h3>Top models (last 30d, by request count)</h3>
+  {% if metrics.top_models %}
+  <table>
+    <thead>
+      <tr>
+        <th>Model</th>
+        <th>Requests</th>
+        <th>Total cost (USD)</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in metrics.top_models %}
+      <tr>
+        <td>{{ row.model }}</td>
+        <td>{{ "{:,}".format(row.count) }}</td>
+        <td>${{ "{:,.4f}".format(row.cost_usd) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p style="color: var(--text-muted); margin: 0;">No usage data yet.</p>
+  {% endif %}
+</div>
+{% endblock %}

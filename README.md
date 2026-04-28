@@ -71,6 +71,12 @@ To roll back: `docker compose down && git checkout <previous-sha> && docker comp
      unset, the bot logs a WARNING and uses in-memory FSM storage —
      fine for local dev but a bot restart loses every user's
      mid-checkout state.
+   - `ADMIN_PASSWORD` + `ADMIN_SESSION_SECRET` if you want the **web
+     admin panel** at `${WEBHOOK_BASE_URL}/admin/` (Stage-8). Without
+     them the panel is unreachable. Generate a secret with
+     `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+     Set `ADMIN_COOKIE_SECURE=0` ONLY when running over plain HTTP
+     locally — the default is HTTPS-only.
 
 4. **Run**
    ```bash
@@ -104,6 +110,8 @@ pytest tests/
 | `rate_limit.py` | Token-bucket primitives + `ChatRateLimitMiddleware` (per-user) and `webhook_rate_limit_middleware` (per-IP). Guards `/chat` against runaway OpenRouter spend and the `/nowpayments-webhook` endpoint against DoS bursts. |
 | `strings.py` | Two-locale (fa/en) string table + `t(lang, key, **kwargs)` helper. |
 | `admin.py` | Telegram-side admin commands gated on `ADMIN_USER_IDS`: `/admin`, `/admin_metrics`, `/admin_balance`, `/admin_credit`, `/admin_debit`, `/admin_promo_create`, `/admin_promo_list`, `/admin_promo_revoke`, `/admin_broadcast`. |
+| `web_admin.py` | aiohttp + jinja2 web admin panel mounted under `/admin/` on the same web server that serves `/nowpayments-webhook`. HMAC-cookie auth via `ADMIN_PASSWORD` / `ADMIN_SESSION_SECRET`. |
+| `templates/admin/` | Jinja2 templates for the web admin (login, dashboard, etc.). |
 | `alembic/` | Schema migrations. `alembic upgrade head` runs idempotently in `entrypoint.sh` on every container start. New schema changes: `alembic revision -m "..."`. |
 
 ## License / contributing

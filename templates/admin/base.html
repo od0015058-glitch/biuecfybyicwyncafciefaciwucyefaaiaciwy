@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Admin{% endblock %} — Meowassist</title>
+  <style>
+    /* Minimal, opinionated. No build step, no CSS framework — just
+       enough to look professional on a desktop browser. */
+    :root {
+      --bg: #0f1115;
+      --panel: #161a22;
+      --panel-2: #1f2530;
+      --text: #e6e8eb;
+      --text-muted: #8a93a4;
+      --accent: #4f8cff;
+      --accent-hover: #6ba0ff;
+      --danger: #ff6b6b;
+      --success: #4ade80;
+      --border: #2a3140;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                   Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { color: var(--accent-hover); }
+    .layout {
+      display: grid;
+      grid-template-columns: 220px 1fr;
+      min-height: 100vh;
+    }
+    .sidebar {
+      background: var(--panel);
+      border-right: 1px solid var(--border);
+      padding: 20px 0;
+    }
+    .sidebar h1 {
+      font-size: 16px;
+      font-weight: 600;
+      margin: 0 20px 24px;
+      letter-spacing: 0.3px;
+    }
+    .sidebar nav {
+      display: flex;
+      flex-direction: column;
+    }
+    .sidebar nav a {
+      padding: 10px 20px;
+      color: var(--text-muted);
+      border-left: 3px solid transparent;
+    }
+    .sidebar nav a:hover {
+      color: var(--text);
+      background: var(--panel-2);
+    }
+    .sidebar nav a.active {
+      color: var(--text);
+      background: var(--panel-2);
+      border-left-color: var(--accent);
+    }
+    .sidebar nav a.disabled {
+      color: var(--text-muted);
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .sidebar nav a.disabled::after {
+      content: " (soon)";
+      font-size: 11px;
+      opacity: 0.7;
+    }
+    .sidebar .footer {
+      margin-top: auto;
+      padding: 20px;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    main {
+      padding: 32px 40px;
+      max-width: 1100px;
+    }
+    main h2 {
+      margin: 0 0 24px 0;
+      font-size: 22px;
+      font-weight: 600;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+    .panel h3 {
+      margin: 0 0 12px;
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+    }
+    .stat-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+    }
+    .stat {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 20px;
+    }
+    .stat .label {
+      font-size: 12px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+    }
+    .stat .value {
+      font-size: 24px;
+      font-weight: 600;
+      margin-top: 6px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    th, td {
+      padding: 8px 10px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      color: var(--text-muted);
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      font-size: 11px;
+    }
+    .alert {
+      padding: 10px 14px;
+      border-radius: 6px;
+      margin-bottom: 16px;
+      font-size: 13px;
+    }
+    .alert-error {
+      background: rgba(255, 107, 107, 0.1);
+      border: 1px solid var(--danger);
+      color: var(--danger);
+    }
+    .alert-warn {
+      background: rgba(255, 200, 0, 0.08);
+      border: 1px solid #d4a017;
+      color: #f0c14b;
+    }
+    /* Login page-specific */
+    .login-wrap {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .login-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 32px;
+      width: 360px;
+    }
+    .login-card h1 {
+      margin: 0 0 8px;
+      font-size: 20px;
+    }
+    .login-card p.muted {
+      margin: 0 0 24px;
+      color: var(--text-muted);
+      font-size: 13px;
+    }
+    .field {
+      display: flex;
+      flex-direction: column;
+      margin-bottom: 14px;
+    }
+    .field label {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-bottom: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+    }
+    input[type="text"],
+    input[type="password"],
+    input[type="number"] {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 9px 11px;
+      color: var(--text);
+      font-size: 14px;
+      font-family: inherit;
+    }
+    input:focus { outline: none; border-color: var(--accent); }
+    button.primary {
+      width: 100%;
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: 6px;
+      padding: 10px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      margin-top: 8px;
+    }
+    button.primary:hover { background: var(--accent-hover); }
+  </style>
+  {% block extra_head %}{% endblock %}
+</head>
+<body>
+{% block body %}{% endblock %}
+</body>
+</html>
