@@ -146,6 +146,8 @@ def _stub_db(
     audit_log_result: list | Exception | None = None,
     record_audit_result: object | Exception = 1,
     update_user_fields_result: dict | None | Exception = None,
+    user_usage_result: dict | Exception | None = None,
+    user_usage_aggregates_result: dict | Exception | None = None,
 ):
     """A minimal Database stub that exposes the methods web_admin uses.
 
@@ -284,6 +286,35 @@ def _stub_db(
     else:
         db.update_user_admin_fields = AsyncMock(
             return_value=update_user_fields_result
+        )
+    # Stage-9-Step-8: per-user usage browser.
+    default_usage = {
+        "rows": [],
+        "total": 0,
+        "page": 1,
+        "per_page": 50,
+        "total_pages": 0,
+    }
+    if isinstance(user_usage_result, Exception):
+        db.list_user_usage_logs = AsyncMock(side_effect=user_usage_result)
+    else:
+        db.list_user_usage_logs = AsyncMock(
+            return_value=user_usage_result
+            if user_usage_result is not None
+            else default_usage
+        )
+    default_aggregates = {
+        "total_calls": 0, "total_tokens": 0, "total_cost_usd": 0.0,
+    }
+    if isinstance(user_usage_aggregates_result, Exception):
+        db.get_user_usage_aggregates = AsyncMock(
+            side_effect=user_usage_aggregates_result
+        )
+    else:
+        db.get_user_usage_aggregates = AsyncMock(
+            return_value=user_usage_aggregates_result
+            if user_usage_aggregates_result is not None
+            else default_aggregates
         )
     return db
 
@@ -4928,6 +4959,171 @@ async def test_promos_create_records_audit(
 
 
 # =========================================================================
+# Stage-9-Step-8: per-user AI usage log browser
+# =========================================================================
+
+
+def _usage_row(**overrides) -> dict:
+    base = {
+        "id": 1,
+        "model": "openrouter/auto",
+        "prompt_tokens": 100,
+        "completion_tokens": 50,
+        "total_tokens": 150,
+        "cost_usd": 0.0042,
+        "created_at": "2026-04-28T12:00:00+00:00",
+    }
+    base.update(overrides)
+    return base
+
+
+async def test_user_usage_requires_auth(aiohttp_client, make_admin_app):
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    resp = await client.get(
+        "/admin/users/100/usage", allow_redirects=False
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+
+
+async def test_user_usage_invalid_id_redirects_to_users(
+    aiohttp_client, make_admin_app
+):
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    await _login(client, "pw")
+    resp = await client.get(
+        "/admin/users/not-an-int/usage", allow_redirects=False
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/users"
+
+
+async def test_user_usage_renders_empty_state(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/777/usage")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "No AI calls recorded" in body
+    # Breadcrumb back to user detail.
+    assert 'href="/admin/users/777"' in body
+    db.list_user_usage_logs.assert_awaited_once_with(
+        telegram_id=777, page=1, per_page=50,
+    )
+    db.get_user_usage_aggregates.assert_awaited_once_with(777)
+
+
+async def test_user_usage_renders_rows_and_aggregates(
+    aiohttp_client, make_admin_app
+):
+    rows = [
+        _usage_row(id=10, model="openai/gpt-4o", prompt_tokens=1234,
+                   completion_tokens=567, total_tokens=1801,
+                   cost_usd=0.0234),
+        _usage_row(id=11, model="anthropic/claude-3-opus",
+                   prompt_tokens=42, completion_tokens=1024,
+                   total_tokens=1066, cost_usd=0.1500),
+    ]
+    db = _stub_db(
+        user_usage_result={
+            "rows": rows, "total": 2, "page": 1,
+            "per_page": 50, "total_pages": 1,
+        },
+        user_usage_aggregates_result={
+            "total_calls": 2, "total_tokens": 2867, "total_cost_usd": 0.1734,
+        },
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/100/usage")
+    body = await resp.text()
+    assert "openai/gpt-4o" in body
+    assert "anthropic/claude-3-opus" in body
+    # Comma-grouped tokens for legibility.
+    assert "1,234" in body
+    # Aggregates rendered.
+    assert "2,867" in body  # lifetime tokens
+    assert "$0.1734" in body  # lifetime cost (4dp)
+    # Per-row cost rendering.
+    assert "$0.1500" in body
+    assert "Page 1 of 1" in body
+    assert "2 call(s)" in body
+
+
+async def test_user_usage_pagination_forwards_params(
+    aiohttp_client, make_admin_app
+):
+    """``page`` and ``per_page`` query params must be forwarded as
+    kwargs to ``list_user_usage_logs``."""
+    db = _stub_db(
+        user_usage_result={
+            "rows": [], "total": 0, "page": 2,
+            "per_page": 25, "total_pages": 0,
+        }
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/100/usage?page=2&per_page=25")
+    assert resp.status == 200
+    db.list_user_usage_logs.assert_awaited_once_with(
+        telegram_id=100, page=2, per_page=25,
+    )
+
+
+async def test_user_usage_per_page_clamped(
+    aiohttp_client, make_admin_app
+):
+    """Stray ``per_page`` values are clamped to the documented max."""
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/100/usage?per_page=99999")
+    assert resp.status == 200
+    db.list_user_usage_logs.assert_awaited_once_with(
+        telegram_id=100, page=1, per_page=200,  # USAGE_LOGS_PER_PAGE_MAX
+    )
+
+
+async def test_user_usage_db_error_renders_friendly_banner(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(user_usage_result=Exception("boom"))
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/100/usage")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Database query failed" in body
+
+
+async def test_user_detail_links_to_usage_page(
+    aiohttp_client, make_admin_app
+):
+    """The user detail page must include a link to the usage log."""
+    summary = {
+        "telegram_id": 100,
+        "username": "alice",
+        "language_code": "en",
+        "active_model": "openrouter/auto",
+        "balance_usd": 5.0,
+        "free_messages_left": 0,
+        "total_credited_usd": 10.0,
+        "total_spent_usd": 5.0,
+        "is_admin": False,
+        "is_banned": False,
+        "ban_reason": None,
+        "recent_transactions": [],
+    }
+    db = _stub_db(user_summary_result=summary)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/100")
+    body = await resp.text()
+    assert 'href="/admin/users/100/usage"' in body
+    assert "View AI usage log" in body
 # Stage-9-Step-6: soft-cancel running broadcasts + retry_after cap
 # =========================================================================
 

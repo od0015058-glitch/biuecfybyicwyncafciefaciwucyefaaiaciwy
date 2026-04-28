@@ -132,7 +132,14 @@
     </div>
 
     <div class="panel">
-      <h3>Recent transactions ({{ summary.recent_transactions|length }})</h3>
+      <h3 style="display:flex;align-items:center;gap:12px;">
+        Recent transactions ({{ summary.recent_transactions|length }})
+        {# Stage-9-Step-8: jump to the per-user usage browser. #}
+        <a href="/admin/users/{{ summary.telegram_id }}/usage"
+           style="font-size:13px;font-weight:400;">
+          View AI usage log →
+        </a>
+      </h3>
       {% if summary.recent_transactions %}
       <table>
         <thead>

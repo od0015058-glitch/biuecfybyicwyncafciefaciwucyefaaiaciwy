@@ -1673,6 +1673,91 @@ async def user_detail_get(request: web.Request) -> web.StreamResponse:
     return response
 
 
+# Stage-9-Step-8: per-user usage browser pagination knobs.
+USAGE_LOGS_PER_PAGE_DEFAULT = 50
+USAGE_LOGS_PER_PAGE_MAX = 200
+USAGE_LOGS_PER_PAGE_CHOICES = (25, 50, 100, 200)
+
+
+async def user_usage_get(request: web.Request) -> web.StreamResponse:
+    """GET /admin/users/{telegram_id}/usage — per-user AI usage log.
+
+    Stage-9-Step-8. Last N AI calls for one user with model, token
+    counts, and per-call cost. Backed by the new
+    ``idx_usage_logs_telegram_created`` index — without that index
+    this query was a sequential scan over the whole table.
+    """
+    raw_id = request.match_info.get("telegram_id", "")
+    try:
+        user_id = int(raw_id)
+    except ValueError:
+        return web.HTTPFound(location="/admin/users")
+
+    try:
+        page = max(1, int(request.rel_url.query.get("page", "1")))
+    except (ValueError, TypeError):
+        page = 1
+    try:
+        per_page = int(
+            request.rel_url.query.get(
+                "per_page", str(USAGE_LOGS_PER_PAGE_DEFAULT)
+            )
+        )
+    except (ValueError, TypeError):
+        per_page = USAGE_LOGS_PER_PAGE_DEFAULT
+    per_page = max(1, min(per_page, USAGE_LOGS_PER_PAGE_MAX))
+
+    db = request.app.get(APP_KEY_DB)
+    page_result: dict | None = None
+    aggregates: dict | None = None
+    db_error: str | None = None
+    if db is None:
+        db_error = "No database wired up (development mode)."
+    else:
+        try:
+            page_result = await db.list_user_usage_logs(
+                telegram_id=user_id, page=page, per_page=per_page,
+            )
+            aggregates = await db.get_user_usage_aggregates(user_id)
+        except Exception:
+            log.exception(
+                "user_usage_get: list_user_usage_logs failed user=%s",
+                user_id,
+            )
+            db_error = "Database query failed — see logs."
+
+    # Pre-build prev/next URLs.
+    prev_url = next_url = None
+    base = f"/admin/users/{user_id}/usage"
+    qs_extra = (
+        f"&per_page={per_page}"
+        if per_page != USAGE_LOGS_PER_PAGE_DEFAULT else ""
+    )
+    if page_result is not None:
+        if page_result["page"] > 1:
+            p = page_result["page"] - 1
+            prev_url = base if p == 1 and not qs_extra else f"{base}?page={p}{qs_extra}"
+        if page_result["page"] < page_result["total_pages"]:
+            p = page_result["page"] + 1
+            next_url = f"{base}?page={p}{qs_extra}"
+
+    return aiohttp_jinja2.render_template(
+        "user_usage.html",
+        request,
+        {
+            "active_page": "users",
+            "user_id": user_id,
+            "result": page_result,
+            "aggregates": aggregates,
+            "db_error": db_error,
+            "prev_url": prev_url,
+            "next_url": next_url,
+            "per_page": per_page,
+            "per_page_choices": USAGE_LOGS_PER_PAGE_CHOICES,
+        },
+    )
+
+
 async def user_adjust_post(request: web.Request) -> web.StreamResponse:
     """POST /admin/users/{telegram_id}/adjust — credit or debit.
 
@@ -3674,6 +3759,11 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/users/{telegram_id}/adjust",
         _require_auth(user_adjust_post),
+    )
+    # Stage-9-Step-8: per-user AI usage log browser.
+    app.router.add_get(
+        "/admin/users/{telegram_id}/usage",
+        _require_auth(user_usage_get),
     )
 
     # Stage-8-Part-5: broadcast.
