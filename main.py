@@ -59,6 +59,12 @@ async def start_webhook_server(bot: Bot) -> web.AppRunner:
         # routes the same instance into the admin plumbing via a
         # typed AppKey.
         bot=bot,
+        # Stage-9-Step-3: optional TOTP / 2FA. Empty secret keeps the
+        # password-only login. ``setup_admin_routes`` validates the
+        # base32 string at boot so a typo surfaces immediately
+        # instead of failing at first login.
+        totp_secret=os.getenv("ADMIN_2FA_SECRET", ""),
+        totp_issuer=os.getenv("ADMIN_2FA_ISSUER", "Meowassist Admin"),
     )
 
     port = int(os.getenv("WEBHOOK_PORT", "8080"))
