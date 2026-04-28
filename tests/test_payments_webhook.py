@@ -366,3 +366,105 @@ async def test_list_payment_status_transitions_no_filter_omits_where():
     sql, *args = conn.fetch.await_args.args
     assert "WHERE" not in sql
     assert args[0] == 10
+
+
+# ---------------------------------------------------------------------
+# Bug-fix sweep: NaN / Infinity guard in the ``finished`` IPN path.
+#
+# Pre-fix a payload of the form ``{"payment_status": "finished",
+# "price_amount": "NaN", ...}`` slipped past the ``full_price_usd <= 0``
+# check (because ``NaN <= 0`` is ``False``) and got passed to
+# ``finalize_payment`` as the credit amount. PostgreSQL accepts
+# ``'NaN'::numeric`` so the INSERT didn't fail, but every subsequent
+# balance comparison (``deduct_balance``'s
+# ``WHERE balance_usd >= $1 RETURNING ...``) is then a silent no-op.
+# Fix: route through ``_finite_positive_float`` which uses
+# ``math.isfinite``.
+# ---------------------------------------------------------------------
+
+
+async def test_webhook_finished_with_nan_price_amount_refuses_to_credit(
+    patched_db, caplog
+):
+    body = _make_body(payment_id=33333, payment_status="finished",
+                      price_amount="NaN")
+    request = _make_request(body, _sign(body))
+
+    with caplog.at_level("ERROR"):
+        response = await payments.payment_webhook(request)
+
+    assert response.status == 200
+    # The whole point of the fix: finalize_payment must NOT be called
+    # with NaN (or anything else) for this payload.
+    patched_db.finalize_payment.assert_not_awaited()
+    # And the handler logs the rejection so an operator can reconcile.
+    assert any(
+        "missing/invalid" in r.message and "price_amount" in r.message
+        for r in caplog.records
+    )
+
+
+async def test_webhook_finished_with_infinity_price_amount_refuses_to_credit(
+    patched_db,
+):
+    body = _make_body(payment_id=44444, payment_status="finished",
+                      price_amount="Infinity")
+    request = _make_request(body, _sign(body))
+
+    response = await payments.payment_webhook(request)
+
+    assert response.status == 200
+    patched_db.finalize_payment.assert_not_awaited()
+
+
+async def test_webhook_finished_with_negative_price_amount_refuses_to_credit(
+    patched_db,
+):
+    """Pre-existing guard, pinned: ``-5`` was already rejected by the
+    ``<= 0`` check; the refactor must preserve that behaviour."""
+    body = _make_body(payment_id=55555, payment_status="finished",
+                      price_amount=-5.0)
+    request = _make_request(body, _sign(body))
+
+    response = await payments.payment_webhook(request)
+
+    assert response.status == 200
+    patched_db.finalize_payment.assert_not_awaited()
+
+
+async def test_webhook_partially_paid_with_nan_actually_paid_refuses_to_credit(
+    patched_db, caplog
+):
+    """The other half of the fix: ``_compute_actually_paid_usd`` must
+    also reject NaN, and the route handler logs + bails (leaves the row
+    PENDING for manual review) when the helper returns None."""
+    body = _make_body(payment_id=66666, payment_status="partially_paid",
+                      actually_paid="NaN", pay_amount=1.0,
+                      price_amount=100.0)
+    request = _make_request(body, _sign(body))
+
+    with caplog.at_level("ERROR"):
+        response = await payments.payment_webhook(request)
+
+    assert response.status == 200
+    patched_db.finalize_partial_payment.assert_not_awaited()
+    assert any(
+        "missing/invalid" in r.message
+        and "actually_paid" in r.message
+        for r in caplog.records
+    )
+
+
+async def test_webhook_finished_happy_path_still_works_after_refactor(
+    patched_db,
+):
+    """Regression pin: the standard ``finished`` flow with a normal
+    ``price_amount=5.0`` still credits the wallet."""
+    body = _make_body(payment_id=77777, payment_status="finished",
+                      price_amount=5.0)
+    request = _make_request(body, _sign(body))
+
+    response = await payments.payment_webhook(request)
+
+    assert response.status == 200
+    patched_db.finalize_payment.assert_awaited_once_with("77777", 5.0)
