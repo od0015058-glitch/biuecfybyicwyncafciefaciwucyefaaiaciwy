@@ -754,6 +754,76 @@ class Database:
             )
         return row is not None
 
+    async def list_promo_codes(self, *, limit: int = 20) -> list[dict]:
+        """Return up to ``limit`` most recently created promo codes
+        for ``/admin_promo_list``.
+
+        Each row contains the public-facing code metadata + usage
+        counters. ``is_active`` is included so the admin can tell
+        revoked codes apart from active ones.
+        """
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT code, discount_percent, discount_amount,
+                       max_uses, used_count, expires_at,
+                       is_active, created_at
+                FROM promo_codes
+                ORDER BY created_at DESC
+                LIMIT $1
+                """,
+                int(limit),
+            )
+        return [
+            {
+                "code": r["code"],
+                "discount_percent": (
+                    int(r["discount_percent"])
+                    if r["discount_percent"] is not None else None
+                ),
+                "discount_amount": (
+                    float(r["discount_amount"])
+                    if r["discount_amount"] is not None else None
+                ),
+                "max_uses": (
+                    int(r["max_uses"]) if r["max_uses"] is not None else None
+                ),
+                "used_count": int(r["used_count"]),
+                "expires_at": (
+                    r["expires_at"].isoformat()
+                    if r["expires_at"] is not None else None
+                ),
+                "is_active": bool(r["is_active"]),
+                "created_at": (
+                    r["created_at"].isoformat()
+                    if r["created_at"] is not None else None
+                ),
+            }
+            for r in rows
+        ]
+
+    async def revoke_promo_code(self, code: str) -> bool:
+        """Mark a promo code as inactive (soft-delete).
+
+        Returns True iff a row was flipped from active to inactive.
+        Returns False if the code doesn't exist OR was already
+        inactive — the caller can disambiguate by re-querying. A
+        hard DELETE would orphan rows in promo_usage (FK), so we
+        soft-delete instead; ``validate_promo_code`` already filters
+        on ``is_active = TRUE``.
+        """
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchval(
+                """
+                UPDATE promo_codes
+                SET is_active = FALSE
+                WHERE code = $1 AND is_active = TRUE
+                RETURNING code
+                """,
+                code.upper(),
+            )
+        return row is not None
+
     async def admin_adjust_balance(
         self,
         telegram_id: int,

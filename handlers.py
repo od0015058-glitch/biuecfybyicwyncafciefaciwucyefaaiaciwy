@@ -1443,22 +1443,35 @@ async def process_chat(message: Message):
     if message.text in _ALL_KBD_LABELS:
         return
 
+    # Anonymous group admins, sender_chat-only forwards and certain
+    # channel-attribution edge cases land here with ``from_user is
+    # None``. We can't bill or rate-limit those — drop silently
+    # instead of crashing on ``message.from_user.id``.
+    if message.from_user is None:
+        log.info(
+            "process_chat: dropping message with no from_user "
+            "(chat_id=%s, text=%r)",
+            message.chat.id, (message.text or "")[:40],
+        )
+        return
+    user_id = message.from_user.id
+
     # Per-user chat rate limit. Scoped to *this* handler (not a
     # dispatcher-wide middleware) so commands, FSM-state inputs
     # (waiting_custom_amount / waiting_promo_code), and reply-keyboard
     # buttons aren't throttled — they don't cost OpenRouter money.
-    if not await consume_chat_token(message.from_user.id):
-        lang = await _get_user_language(message.from_user.id)
+    if not await consume_chat_token(user_id):
+        lang = await _get_user_language(user_id)
         log.info(
             "chat rate-limited telegram_id=%s text=%r",
-            message.from_user.id,
+            user_id,
             (message.text or "")[:40],
         )
         await message.answer(t(lang, "ai_local_rate_limited"))
         return
 
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    reply = await chat_with_model(message.from_user.id, message.text)
+    reply = await chat_with_model(user_id, message.text)
     # Telegram caps a single message at 4096 characters. Long-form
     # AI replies (essay-style answers, code blocks, etc.) routinely
     # exceed that and were crashing the send with
