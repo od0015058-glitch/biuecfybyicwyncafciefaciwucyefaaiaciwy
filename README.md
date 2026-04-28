@@ -38,8 +38,14 @@ To roll back: `docker compose down && git checkout <previous-sha> && docker comp
    ```bash
    sudo -u postgres createuser botuser -P            # set DB_PASSWORD
    sudo -u postgres createdb -O botuser aibot_db
-   psql -U botuser -d aibot_db -f schema.sql
-   for f in migrations/*.sql; do psql -U botuser -d aibot_db -f "$f"; done
+   alembic upgrade head                               # apply schema via alembic
+   ```
+
+   For an existing prod DB that pre-dates Alembic (already has the
+   tables from the legacy `schema.sql` + `migrations/*.sql`), stamp it
+   once instead of upgrading:
+   ```bash
+   alembic stamp head
    ```
 
 3. **Configure** — copy `.env.example` to `.env` and fill in:

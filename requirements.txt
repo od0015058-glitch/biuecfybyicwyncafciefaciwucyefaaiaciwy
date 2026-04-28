@@ -2,3 +2,9 @@ aiogram>=3.4.0      # The modern, asynchronous Telegram bot framework
 asyncpg>=0.29.0     # The fastest async PostgreSQL driver for Python
 python-dotenv>=1.0.1 # Securely loads your API keys from the .env file
 aiohttp>=3.9.3      # Asynchronous HTTP requests (for OpenRouter & NowPayments)
+
+# Migrations. Alembic itself is sync; psycopg2 is the sync driver used
+# only at deploy time (`alembic upgrade head`). The running bot still
+# talks to Postgres exclusively through asyncpg.
+alembic>=1.13.0
+psycopg2-binary>=2.9.9
