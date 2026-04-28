@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 
@@ -135,21 +136,38 @@ def _finalize_catalog(
 def _parse_price(raw: object) -> float | None:
     """OpenRouter returns prices as strings of USD-per-token. Parse safely.
 
-    Returns ``None`` when the field is missing (``raw is None``) or
-    malformed (non-numeric). The caller uses ``None`` as a signal that
-    we don't actually know this model's price, distinct from
-    legitimately free models whose price is the explicit value
-    ``0`` / ``"0"``. Conflating the two leads to silently charging
-    paid models at $0 (when OpenRouter returns malformed pricing) or
-    silently charging free models at FALLBACK_PRICE (when we treat
-    explicit zero as missing).
+    Returns ``None`` when the field is missing (``raw is None``),
+    malformed (non-numeric), non-finite (``NaN`` / ``±Infinity``), or
+    negative. The caller uses ``None`` as a signal that we don't
+    actually know this model's price, distinct from legitimately free
+    models whose price is the explicit value ``0`` / ``"0"``.
+    Conflating the two leads to silently charging paid models at $0
+    (when OpenRouter returns malformed pricing) or silently charging
+    free models at FALLBACK_PRICE (when we treat explicit zero as
+    missing).
+
+    ``float()`` accepts the strings ``"NaN"``, ``"inf"``, ``"-inf"``
+    (case-insensitive) so without an explicit ``math.isfinite`` check
+    a malformed upstream payload would mint a ``ModelPrice`` whose
+    fields propagate through every IEEE-754 op as ``NaN``/``inf``,
+    ultimately triggering the ``database.deduct_balance`` finite
+    guard and giving the user a free reply on a paid model. A
+    negative price would likewise reach ``_apply_markup`` and round
+    to zero through ``max(raw * markup, 0.0)``, again silently
+    turning the model into a free one. Either way the platform pays
+    OpenRouter for an API call the user never paid for, so reject
+    the value here and let the caller treat the model as
+    unpriced (drop it from the catalog).
     """
     if raw is None:
         return None
     try:
-        return float(raw)  # type: ignore[arg-type]
+        value = float(raw)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+    if not math.isfinite(value) or value < 0.0:
+        return None
+    return value
 
 
 async def _fetch_from_openrouter() -> Catalog:
