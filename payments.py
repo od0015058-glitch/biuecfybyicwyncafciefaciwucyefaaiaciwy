@@ -245,33 +245,63 @@ async def get_min_amount_usd(
     don't fan out two more HTTP calls.
     """
     pay_currency = pay_currency.lower()
+
+    def _apply_trustworthiness(value: float | None) -> float | None:
+        """Suppress the floor as ``None`` when the rejection we're
+        explaining clearly disagrees with the looked-up floor.
+
+        If the user's attempted amount is *above* the floor we got
+        back, then by definition that floor isn't what triggered the
+        rejection — surfacing it tells the user e.g. "min $0.16" when
+        their $5 invoice was rejected, which is more confusing than
+        the generic "unknown min" branch of the UI. The check has to
+        run on every call (not just on a fresh fetch) because
+        ``attempted_usd`` is per-call: a value cached during a
+        small-attempt call can be unmasked as trustworthy now and
+        return correctly, while a value cached during a different
+        call needs to be suppressed for *this* attempt — both
+        decisions depend on the *current* ``attempted_usd``, not the
+        one in effect when the cache was warmed.
+        """
+        if (
+            value is not None
+            and attempted_usd is not None
+            and value < attempted_usd
+        ):
+            log.warning(
+                "min-amount lookup for %s gave $%.2f which is below the "
+                "rejected invoice amount $%.2f; suppressing as untrustworthy",
+                pay_currency, value, attempted_usd,
+            )
+            return None
+        return value
+
     cached = _min_amount_cache.get(pay_currency)
     if cached is not None:
         value, ts = cached
         if (asyncio.get_event_loop().time() - ts) < _MIN_AMOUNT_CACHE_TTL_SECONDS:
-            return value
+            # Pre-fix this returned ``value`` directly, bypassing the
+            # trustworthiness filter. So a small-attempt call would
+            # warm the cache with $0.16, then a follow-up $5 attempt
+            # whose rejection has nothing to do with the $0.16 floor
+            # would render "min $0.16" in the UI — actively misleading.
+            # Apply the same filter we apply to a fresh fetch so the
+            # cached value stays safe to surface across diverse
+            # ``attempted_usd`` values.
+            return _apply_trustworthiness(value)
 
     pay_side = await _query_min_amount(pay_currency, "usd")
     merchant_side = await _query_min_amount("usd", pay_currency)
     candidates = [v for v in (pay_side, merchant_side) if v is not None]
-    value = max(candidates) if candidates else None
+    raw_value = max(candidates) if candidates else None
 
-    # If the user's attempted amount was already above the value we
-    # got back, then by definition this isn't the floor that
-    # actually triggered the rejection — surfacing it would tell the
-    # user e.g. "min $0.16" when their $5 invoice was rejected.
-    # Suppress the number so the "unknown min" branch of the UI fires
-    # (clear language, no false precision).
-    if value is not None and attempted_usd is not None and value < attempted_usd:
-        log.warning(
-            "min-amount lookup for %s gave $%.2f which is below the rejected "
-            "invoice amount $%.2f; suppressing as untrustworthy",
-            pay_currency, value, attempted_usd,
-        )
-        value = None
-
-    _min_amount_cache[pay_currency] = (value, asyncio.get_event_loop().time())
-    return value
+    # Cache the raw (un-suppressed) value so the trustworthiness
+    # check can re-evaluate against future ``attempted_usd`` values.
+    # Only the *current* call's return goes through the filter.
+    _min_amount_cache[pay_currency] = (
+        raw_value, asyncio.get_event_loop().time()
+    )
+    return _apply_trustworthiness(raw_value)
 
 
 async def create_crypto_invoice(
