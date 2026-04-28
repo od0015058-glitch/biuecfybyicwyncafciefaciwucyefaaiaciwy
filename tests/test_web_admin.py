@@ -126,7 +126,12 @@ def test_signed_cookie_contains_no_secret():
 # ---------------------------------------------------------------------
 
 
-def _stub_db(metrics: dict | None = None):
+def _stub_db(
+    metrics: dict | None = None,
+    promo_rows: list | None = None,
+    create_promo_result: bool | Exception = True,
+    revoke_promo_result: bool | Exception = True,
+):
     """A minimal Database stub that exposes the methods web_admin uses.
 
     The default ``metrics`` shape MUST match what
@@ -154,6 +159,17 @@ def _stub_db(metrics: dict | None = None):
             ],
         }
     )
+    db.list_promo_codes = AsyncMock(
+        return_value=promo_rows if promo_rows is not None else []
+    )
+    if isinstance(create_promo_result, Exception):
+        db.create_promo_code = AsyncMock(side_effect=create_promo_result)
+    else:
+        db.create_promo_code = AsyncMock(return_value=create_promo_result)
+    if isinstance(revoke_promo_result, Exception):
+        db.revoke_promo_code = AsyncMock(side_effect=revoke_promo_result)
+    else:
+        db.revoke_promo_code = AsyncMock(return_value=revoke_promo_result)
     return db
 
 
@@ -496,3 +512,697 @@ async def test_dashboard_fallback_dicts_match_template_keys(
     # match the template's reads, otherwise jinja would 500).
     assert "Total users" in body
     assert "Active (7d)" in body
+
+
+# ---------------------------------------------------------------------
+# Stage-8-Part-2: promo codes UI
+# ---------------------------------------------------------------------
+
+
+from web_admin import (
+    DISCOUNT_AMOUNT_MAX,
+    csrf_token_for,
+    parse_promo_form,
+    pop_flash,
+    set_flash,
+    verify_csrf_token,
+)
+
+
+# parse_promo_form (pure function)
+# ---------------------------------------------------------------------
+
+
+def _form(d: dict) -> dict:
+    """Form data is multidict-ish; plain dict is fine here since
+    parse_promo_form only does .get(name)."""
+    return d
+
+
+def test_parse_promo_form_percent_happy():
+    out = parse_promo_form(_form({
+        "code": "welcome20",
+        "discount_kind": "percent",
+        "discount_value": "20",
+    }))
+    assert out == {
+        "code": "WELCOME20",
+        "discount_percent": 20,
+        "discount_amount": None,
+        "max_uses": None,
+        "expires_in_days": None,
+    }
+
+
+def test_parse_promo_form_percent_with_sign():
+    out = parse_promo_form(_form({
+        "code": "BLACKFRI",
+        "discount_kind": "percent",
+        "discount_value": "30%",
+    }))
+    assert out["discount_percent"] == 30
+
+
+def test_parse_promo_form_amount_happy():
+    out = parse_promo_form(_form({
+        "code": "GIFT5",
+        "discount_kind": "amount",
+        "discount_value": "$5",
+    }))
+    assert out["discount_amount"] == 5.0
+    assert out["discount_percent"] is None
+
+
+def test_parse_promo_form_amount_with_max_uses_and_expiry():
+    out = parse_promo_form(_form({
+        "code": "BIRTHDAY",
+        "discount_kind": "amount",
+        "discount_value": "10.5",
+        "max_uses": "100",
+        "expires_in_days": "30",
+    }))
+    assert out["discount_amount"] == 10.5
+    assert out["max_uses"] == 100
+    assert out["expires_in_days"] == 30
+
+
+def test_parse_promo_form_missing_code():
+    assert parse_promo_form(_form({"discount_kind": "percent",
+                                    "discount_value": "10"})) == "missing_code"
+
+
+def test_parse_promo_form_bad_code_chars():
+    assert parse_promo_form(_form({
+        "code": "has spaces",
+        "discount_kind": "percent",
+        "discount_value": "10",
+    })) == "bad_code"
+
+
+def test_parse_promo_form_bad_discount_kind():
+    assert parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "free",
+        "discount_value": "1",
+    })) == "bad_discount_kind"
+
+
+def test_parse_promo_form_bad_percent_zero():
+    assert parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "percent",
+        "discount_value": "0",
+    })) == "bad_percent"
+
+
+def test_parse_promo_form_bad_percent_over_100():
+    assert parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "percent",
+        "discount_value": "101",
+    })) == "bad_percent"
+
+
+def test_parse_promo_form_bad_percent_non_int():
+    assert parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "percent",
+        "discount_value": "10.5",
+    })) == "bad_percent"
+
+
+def test_parse_promo_form_bad_amount_negative():
+    assert parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "amount",
+        "discount_value": "-5",
+    })) == "bad_amount"
+
+
+def test_parse_promo_form_bad_amount_nan():
+    assert parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "amount",
+        "discount_value": "nan",
+    })) == "bad_amount"
+
+
+def test_parse_promo_form_bad_amount_inf():
+    assert parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "amount",
+        "discount_value": "inf",
+    })) == "bad_amount"
+
+
+def test_parse_promo_form_amount_too_large():
+    """The bundled bug fix: discount_amount has no upper bound, so
+    creating a promo with $9_999_999 used to crash the INSERT with
+    PG ``numeric field overflow`` because the column is DECIMAL(10,4)
+    and the parser/db happily passed the giant value through. The
+    parser now rejects it client-side with a friendly error."""
+    out = parse_promo_form(_form({
+        "code": "MILLION",
+        "discount_kind": "amount",
+        "discount_value": str(DISCOUNT_AMOUNT_MAX + 1),
+    }))
+    assert out == "discount_too_large"
+
+
+def test_parse_promo_form_amount_at_cap_passes():
+    out = parse_promo_form(_form({
+        "code": "BIG",
+        "discount_kind": "amount",
+        "discount_value": str(DISCOUNT_AMOUNT_MAX),
+    }))
+    assert isinstance(out, dict)
+    assert out["discount_amount"] == DISCOUNT_AMOUNT_MAX
+
+
+def test_parse_promo_form_bad_max_uses_non_int():
+    assert parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "percent",
+        "discount_value": "10",
+        "max_uses": "many",
+    })) == "bad_max_uses"
+
+
+def test_parse_promo_form_bad_max_uses_zero():
+    assert parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "percent",
+        "discount_value": "10",
+        "max_uses": "0",
+    })) == "bad_max_uses"
+
+
+def test_parse_promo_form_bad_days():
+    assert parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "percent",
+        "discount_value": "10",
+        "expires_in_days": "-1",
+    })) == "bad_days"
+
+
+# create_promo_code DB upper-bound guard (pure unit test on the helper)
+# ---------------------------------------------------------------------
+
+
+def test_create_promo_code_rejects_amount_over_decimal_cap():
+    """Bundled bug fix mirrored on the DB layer.
+
+    Even if a future admin path bypasses parse_promo_form (e.g.
+    direct API integration, or a different web framework), the DB
+    method itself must reject discount_amount > DECIMAL(10,4)
+    capacity so we never get PG ``numeric field overflow``.
+    """
+    from database import Database
+    db = Database.__new__(Database)  # don't need a real connection
+    db.pool = None
+    import asyncio
+    with pytest.raises(ValueError, match="DECIMAL"):
+        asyncio.get_event_loop().run_until_complete(
+            db.create_promo_code(
+                code="X",
+                discount_amount=1_000_000.0,
+            )
+        )
+
+
+# CSRF helpers
+# ---------------------------------------------------------------------
+
+
+async def test_csrf_token_empty_when_not_logged_in(
+    aiohttp_client, make_admin_app
+):
+    """No session cookie = no CSRF token. Forms aren't reachable
+    without auth anyway, but the helper should fail closed."""
+    app = make_admin_app()
+    client = await aiohttp_client(app)
+    resp = await client.get("/admin/login", allow_redirects=False)
+    # We can't call csrf_token_for from outside a request context
+    # easily, so we instead verify the login page (unauthed) doesn't
+    # contain a csrf_token at all.
+    body = await resp.text()
+    assert 'name="csrf_token"' not in body
+
+
+async def test_csrf_token_consistent_within_a_session(
+    aiohttp_client, make_admin_app
+):
+    """Two GETs from the same session should embed the same token."""
+    client = await aiohttp_client(make_admin_app(password="letmein"))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False
+    )
+    r1 = await client.get("/admin/promos")
+    r2 = await client.get("/admin/promos")
+    body1, body2 = await r1.text(), await r2.text()
+
+    import re
+    m1 = re.search(r'name="csrf_token" value="([^"]+)"', body1)
+    m2 = re.search(r'name="csrf_token" value="([^"]+)"', body2)
+    assert m1 and m2
+    assert m1.group(1) == m2.group(1)
+
+
+async def test_csrf_token_changes_after_relogin(
+    aiohttp_client, make_admin_app
+):
+    """A new login = new session cookie = new derived CSRF token,
+    so old form tokens stop working."""
+    client = await aiohttp_client(make_admin_app(password="letmein"))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False
+    )
+    r1 = await client.get("/admin/promos")
+    body1 = await r1.text()
+
+    await client.get("/admin/logout", allow_redirects=False)
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False
+    )
+    r2 = await client.get("/admin/promos")
+    body2 = await r2.text()
+
+    import re
+    m1 = re.search(r'name="csrf_token" value="([^"]+)"', body1)
+    m2 = re.search(r'name="csrf_token" value="([^"]+)"', body2)
+    assert m1 and m2
+    assert m1.group(1) != m2.group(1)
+
+
+# /admin/promos GET
+# ---------------------------------------------------------------------
+
+
+async def test_promos_get_requires_auth(aiohttp_client, make_admin_app):
+    client = await aiohttp_client(make_admin_app())
+    resp = await client.get("/admin/promos", allow_redirects=False)
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+
+
+async def test_promos_get_lists_codes(aiohttp_client, make_admin_app):
+    rows = [
+        {
+            "code": "WELCOME20",
+            "discount_percent": 20,
+            "discount_amount": None,
+            "max_uses": 100,
+            "used_count": 5,
+            "expires_at": "2030-12-31T23:59:59+00:00",
+            "is_active": True,
+            "created_at": "2026-01-01T00:00:00+00:00",
+        },
+        {
+            "code": "REVOKED",
+            "discount_percent": None,
+            "discount_amount": 5.0,
+            "max_uses": None,
+            "used_count": 0,
+            "expires_at": None,
+            "is_active": False,
+            "created_at": "2025-01-01T00:00:00+00:00",
+        },
+    ]
+    client = await aiohttp_client(
+        make_admin_app(password="pw", db=_stub_db(promo_rows=rows))
+    )
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.get("/admin/promos")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert "WELCOME20" in body
+    assert "20%" in body
+    assert "REVOKED" in body
+    assert "$5.00" in body
+    assert "active" in body
+    assert "revoked" in body
+    # CSRF token embedded in revoke form (only for active rows).
+    assert 'action="/admin/promos/WELCOME20/revoke"' in body
+
+
+async def test_promos_get_db_error_renders_banner(
+    aiohttp_client, make_admin_app
+):
+    db = AsyncMock()
+    db.list_promo_codes = AsyncMock(side_effect=RuntimeError("boom"))
+    client = await aiohttp_client(
+        make_admin_app(password="pw", db=db)
+    )
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.get("/admin/promos")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert "Database query failed" in body
+
+
+# /admin/promos POST (create)
+# ---------------------------------------------------------------------
+
+
+async def _login_and_get_csrf(client, password: str = "pw") -> str:
+    """Log in, fetch the promos page, scrape its CSRF token."""
+    await client.post(
+        "/admin/login", data={"password": password}, allow_redirects=False
+    )
+    resp = await client.get("/admin/promos")
+    body = await resp.text()
+    import re
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+    assert m, "Expected CSRF token in /admin/promos form"
+    return m.group(1)
+
+
+async def test_promos_create_happy_path(aiohttp_client, make_admin_app):
+    db = _stub_db(create_promo_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+
+    resp = await client.post(
+        "/admin/promos",
+        data={
+            "csrf_token": csrf,
+            "code": "WELCOME20",
+            "discount_kind": "percent",
+            "discount_value": "20",
+            "max_uses": "10",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/promos"
+    db.create_promo_code.assert_awaited_once()
+    kwargs = db.create_promo_code.await_args.kwargs
+    assert kwargs["code"] == "WELCOME20"
+    assert kwargs["discount_percent"] == 20
+    assert kwargs["discount_amount"] is None
+    assert kwargs["max_uses"] == 10
+
+    # Follow the redirect, expect success flash.
+    resp2 = await client.get("/admin/promos")
+    body = await resp2.text()
+    assert "alert-success" in body
+    assert "Created" in body and "WELCOME20" in body
+
+
+async def test_promos_create_rejects_missing_csrf(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.post(
+        "/admin/promos",
+        data={
+            "code": "X",
+            "discount_kind": "percent",
+            "discount_value": "20",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.create_promo_code.assert_not_awaited()
+    resp2 = await client.get("/admin/promos")
+    body = await resp2.text()
+    assert "CSRF" in body
+
+
+async def test_promos_create_rejects_wrong_csrf(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login_and_get_csrf(client, "pw")  # establish session
+    resp = await client.post(
+        "/admin/promos",
+        data={
+            "csrf_token": "obviously-wrong",
+            "code": "X",
+            "discount_kind": "percent",
+            "discount_value": "20",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.create_promo_code.assert_not_awaited()
+
+
+async def test_promos_create_validation_error_shows_flash(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/promos",
+        data={
+            "csrf_token": csrf,
+            "code": "BAD",
+            "discount_kind": "amount",
+            "discount_value": "9999999",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.create_promo_code.assert_not_awaited()
+    resp2 = await client.get("/admin/promos")
+    body = await resp2.text()
+    assert "alert-error" in body
+    # Friendly message text.
+    assert "DB limit" in body or "999,999.00" in body
+
+
+async def test_promos_create_conflict_shows_flash(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(create_promo_result=False)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/promos",
+        data={
+            "csrf_token": csrf,
+            "code": "EXISTING",
+            "discount_kind": "percent",
+            "discount_value": "10",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    resp2 = await client.get("/admin/promos")
+    body = await resp2.text()
+    assert "already exists" in body
+
+
+async def test_promos_create_db_value_error_shows_flash(
+    aiohttp_client, make_admin_app
+):
+    """If create_promo_code raises ValueError (e.g., the DB-side
+    DECIMAL guard fired because the parser was bypassed), show the
+    raw message rather than 500."""
+    db = _stub_db(create_promo_result=ValueError("DECIMAL(10,4) limit"))
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/promos",
+        data={
+            "csrf_token": csrf,
+            "code": "X",
+            "discount_kind": "percent",
+            "discount_value": "10",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    resp2 = await client.get("/admin/promos")
+    body = await resp2.text()
+    assert "DECIMAL(10,4) limit" in body
+
+
+async def test_promos_create_with_expires_in_days_passes_datetime(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(create_promo_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/promos",
+        data={
+            "csrf_token": csrf,
+            "code": "FRIDAY",
+            "discount_kind": "percent",
+            "discount_value": "15",
+            "expires_in_days": "7",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    kwargs = db.create_promo_code.await_args.kwargs
+    assert kwargs["expires_at"] is not None
+    # 7 days +/- 1 minute (test-runtime slack).
+    delta = kwargs["expires_at"] - datetime.now(timezone.utc)
+    assert timedelta(days=6, hours=23, minutes=58) < delta < timedelta(days=7, minutes=2)
+
+
+# /admin/promos/{code}/revoke POST
+# ---------------------------------------------------------------------
+
+
+async def test_promos_revoke_happy_path(aiohttp_client, make_admin_app):
+    db = _stub_db(revoke_promo_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/promos/WELCOME20/revoke",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.revoke_promo_code.assert_awaited_once_with("WELCOME20")
+    resp2 = await client.get("/admin/promos")
+    body = await resp2.text()
+    assert "alert-success" in body
+    assert "Revoked" in body and "WELCOME20" in body
+
+
+async def test_promos_revoke_already_inactive_shows_info(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(revoke_promo_result=False)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/promos/GHOST/revoke",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    resp2 = await client.get("/admin/promos")
+    body = await resp2.text()
+    assert "alert-info" in body
+    # Apostrophe is HTML-escaped by Jinja's autoescape; tolerate
+    # either form so we don't couple to escape-style.
+    assert "already revoked" in body
+    assert ("doesn't exist" in body) or ("doesn&#39;t exist" in body) \
+        or ("doesn&#x27;t exist" in body)
+
+
+async def test_promos_revoke_rejects_missing_csrf(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(revoke_promo_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.post(
+        "/admin/promos/X/revoke",
+        data={},  # no csrf_token
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.revoke_promo_code.assert_not_awaited()
+
+
+async def test_promos_revoke_requires_auth(aiohttp_client, make_admin_app):
+    db = _stub_db(revoke_promo_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    resp = await client.post(
+        "/admin/promos/X/revoke",
+        data={"csrf_token": "anything"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+    db.revoke_promo_code.assert_not_awaited()
+
+
+async def test_promos_revoke_invalid_url_code(aiohttp_client, make_admin_app):
+    """Even with a valid CSRF token, junk in the URL must be rejected
+    rather than passed through to the DB."""
+    db = _stub_db(revoke_promo_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+    # 80-char code (above 64-char cap)
+    long_code = "A" * 80
+    resp = await client.post(
+        f"/admin/promos/{long_code}/revoke",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.revoke_promo_code.assert_not_awaited()
+
+
+# Flash cookie round-trip
+# ---------------------------------------------------------------------
+
+
+def test_flash_cookie_signed_round_trip():
+    """A flash cookie set with a secret must round-trip through the
+    sign + parse path. Pop should also clear the cookie."""
+    from aiohttp import web as _web
+    secret = "test-secret-1234567890"
+    response = _web.Response()
+    set_flash(response, kind="success", message="Hi", secret=secret)
+    cookie_header = response.cookies.get("meow_flash")
+    assert cookie_header is not None
+    raw_value = cookie_header.value
+
+    # Build a fake request whose cookies carry the flash cookie.
+    class _FakeApp(dict):
+        pass
+    app = _FakeApp()
+    from web_admin import APP_KEY_SESSION_SECRET
+    app[APP_KEY_SESSION_SECRET] = secret
+    req = _web.Request.__new__(_web.Request)
+    req.__dict__["_cookies"] = {"meow_flash": raw_value}
+    # Patch the _cookies property via a lambda — simpler: build a
+    # minimal stand-in object with the attributes we use.
+
+    class _R:
+        def __init__(self, cookies, app):
+            self.cookies = cookies
+            self.app = app
+
+    r = _R({"meow_flash": raw_value}, app)
+    response2 = _web.Response()
+    flash = pop_flash(r, response2)
+    assert flash == {"kind": "success", "message": "Hi"}
+    # Cookie cleared on response.
+    assert response2.cookies.get("meow_flash").value == ""
+
+
+def test_flash_cookie_rejects_tampered_signature():
+    secret = "test-secret-1234567890"
+    response = web.Response()
+    set_flash(response, kind="success", message="Hi", secret=secret)
+    raw = response.cookies.get("meow_flash").value
+    payload_b64, sig_b64 = raw.split(".", 1)
+    # Flip a byte in the signature.
+    tampered = payload_b64 + "." + ("A" + sig_b64[1:] if sig_b64[0] != "A" else "B" + sig_b64[1:])
+
+    class _FakeApp(dict):
+        pass
+    from web_admin import APP_KEY_SESSION_SECRET
+    app = _FakeApp()
+    app[APP_KEY_SESSION_SECRET] = secret
+
+    class _R:
+        def __init__(self):
+            self.cookies = {"meow_flash": tampered}
+            self.app = app
+
+    response2 = web.Response()
+    assert pop_flash(_R(), response2) is None

@@ -736,8 +736,21 @@ class Database:
             )
         if discount_percent is not None and not (1 <= discount_percent <= 100):
             raise ValueError("discount_percent must be between 1 and 100")
-        if discount_amount is not None and discount_amount <= 0:
-            raise ValueError("discount_amount must be positive")
+        if discount_amount is not None:
+            if discount_amount <= 0:
+                raise ValueError("discount_amount must be positive")
+            # ``discount_amount`` is stored as ``DECIMAL(10,4)`` (alembic
+            # 0001) — max representable value is 999_999.9999. Anything
+            # bigger would crash the INSERT with PG ``numeric field
+            # overflow``. Reject up-front with a friendly message so
+            # both the Telegram-side ``/admin_promo_create`` command and
+            # the web admin form (``web_admin.parse_promo_form``) get a
+            # consistent error rather than a 500.
+            if discount_amount > 999_999.9999:
+                raise ValueError(
+                    "discount_amount must be at most 999999.9999 "
+                    "(DECIMAL(10,4) column limit)"
+                )
         async with self.pool.acquire() as connection:
             row = await connection.fetchval(
                 """
