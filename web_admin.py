@@ -69,6 +69,13 @@ import aiohttp_jinja2
 import jinja2
 from aiohttp import web
 
+# Imported for the class-level ``TRANSACTIONS_GATEWAY_VALUES`` /
+# ``TRANSACTIONS_STATUS_VALUES`` allow-lists used by
+# parse_transactions_query (Stage-8-Part-6). Only the class is
+# referenced — not the module-level ``db`` singleton — so the admin
+# still works against the injected DB in tests.
+from database import Database
+
 log = logging.getLogger("bot.web_admin")
 
 # Cookie name + key for stashing the validated identity into the request
@@ -1563,6 +1570,12 @@ BROADCAST_MAX_HISTORY = 50
 # here rather than imported so a hotfix to one doesn't silently move
 # the other. The two are compared in tests.
 BROADCAST_TEXT_MAX_LEN = 3500
+# Mirror of ``admin._BROADCAST_ACTIVE_DAYS_MAX``. Kept as a separate
+# constant for the same reason as ``BROADCAST_TEXT_MAX_LEN`` above —
+# the two forms have independent validation surfaces and the web
+# caller shouldn't import private admin.py symbols. The pair is
+# asserted equal in tests so drift shows up as a test failure.
+BROADCAST_ACTIVE_DAYS_MAX = 36_500
 
 
 def parse_broadcast_web_form(form) -> dict | str:
@@ -1576,7 +1589,7 @@ def parse_broadcast_web_form(form) -> dict | str:
         }
 
     On failure returns one of the error keys: ``"missing_text"``,
-    ``"text_too_long"``, ``"bad_active"``.
+    ``"text_too_long"``, ``"bad_active"``, ``"active_too_large"``.
     """
     text = (form.get("text") or "").strip()
     if not text:
@@ -1595,6 +1608,8 @@ def parse_broadcast_web_form(form) -> dict | str:
             return "bad_active"
         if only_active_days <= 0:
             return "bad_active"
+        if only_active_days > BROADCAST_ACTIVE_DAYS_MAX:
+            return "active_too_large"
 
     return {"text": text, "only_active_days": only_active_days}
 
@@ -1605,6 +1620,10 @@ _BROADCAST_FORM_ERR_TEXT = {
         f"Broadcast body must be at most {BROADCAST_TEXT_MAX_LEN} characters."
     ),
     "bad_active": "Active-days filter must be a positive integer.",
+    "active_too_large": (
+        f"Active-days filter must be at most {BROADCAST_ACTIVE_DAYS_MAX:,} "
+        f"(≈10 decades)."
+    ),
 }
 
 
@@ -1908,6 +1927,169 @@ async def broadcast_status_get(request: web.Request) -> web.StreamResponse:
 
 
 # ---------------------------------------------------------------------
+# Stage-8-Part-6: paginated transactions browser
+# ---------------------------------------------------------------------
+# Read-only ledger explorer that mirrors the Telegram admin's per-user
+# tx view but at global scope with filters. No write paths —
+# credit/debit still lives on the user-detail page so the audit trail
+# has one canonical entry point.
+
+
+TRANSACTIONS_PER_PAGE_DEFAULT = 50
+# Pagination defense-in-depth bound. ``Database.list_transactions``
+# already clamps to ``TRANSACTIONS_MAX_PER_PAGE`` but we also refuse
+# anything larger at the form boundary so "500" in the query string
+# doesn't silently quiet-drop to 200 without the UI acknowledging it.
+TRANSACTIONS_PER_PAGE_MAX = 200
+# Allow-listed ``per_page`` choices surfaced in the dropdown. Keeps
+# the UI honest about which values will actually take effect.
+TRANSACTIONS_PER_PAGE_CHOICES = (25, 50, 100, 200)
+
+
+def parse_transactions_query(query) -> dict:
+    """Parse the ``/admin/transactions`` query string into a normalised
+    dict consumed by both :func:`Database.list_transactions` and the
+    template's "active filters" chips.
+
+    Unknown or malformed values are silently dropped (no flash /
+    redirect) — a filter that doesn't make sense should render the
+    unfiltered page rather than an error banner, matching the
+    behaviour of every other admin page that reads query params.
+
+    Returns a dict shaped::
+
+        {
+          "gateway": "nowpayments" | "admin" | "gift" | None,
+          "status": "PENDING" | "PARTIAL" | "SUCCESS" | "EXPIRED"
+                    | "FAILED" | "REFUNDED" | None,
+          "telegram_id": int | None,
+          "page": int,          # >= 1
+          "per_page": int,      # clamped to TRANSACTIONS_PER_PAGE_MAX
+        }
+    """
+    gateway_raw = (query.get("gateway") or "").strip()
+    gateway: str | None = None
+    if gateway_raw and gateway_raw in Database.TRANSACTIONS_GATEWAY_VALUES:
+        gateway = gateway_raw
+
+    status_raw = (query.get("status") or "").strip()
+    status: str | None = None
+    if status_raw and status_raw in Database.TRANSACTIONS_STATUS_VALUES:
+        status = status_raw
+
+    tid_raw = (query.get("telegram_id") or "").strip()
+    telegram_id: int | None = None
+    if tid_raw:
+        try:
+            telegram_id = int(tid_raw)
+        except ValueError:
+            # Ignore — an un-parseable id chip would otherwise make
+            # "undo filter" harder than just clicking the other
+            # chips.
+            telegram_id = None
+
+    try:
+        page = max(1, int(query.get("page", "1")))
+    except (ValueError, TypeError):
+        page = 1
+    try:
+        per_page = int(query.get("per_page", str(TRANSACTIONS_PER_PAGE_DEFAULT)))
+    except (ValueError, TypeError):
+        per_page = TRANSACTIONS_PER_PAGE_DEFAULT
+    per_page = max(1, min(per_page, TRANSACTIONS_PER_PAGE_MAX))
+
+    return {
+        "gateway": gateway,
+        "status": status,
+        "telegram_id": telegram_id,
+        "page": page,
+        "per_page": per_page,
+    }
+
+
+def _encode_tx_query(filters: dict, *, page: int | None = None) -> str:
+    """Rebuild a canonical ``/admin/transactions?…`` query string from
+    a parsed ``filters`` dict. ``page`` override lets the prev/next
+    links reuse the same dict without mutating it.
+
+    Empty values are omitted so the URL stays readable when no
+    filter is applied.
+    """
+    from urllib.parse import urlencode
+
+    params: list[tuple[str, str]] = []
+    if filters.get("gateway"):
+        params.append(("gateway", filters["gateway"]))
+    if filters.get("status"):
+        params.append(("status", filters["status"]))
+    if filters.get("telegram_id") is not None:
+        params.append(("telegram_id", str(filters["telegram_id"])))
+    effective_page = filters.get("page", 1) if page is None else page
+    if effective_page != 1:
+        params.append(("page", str(effective_page)))
+    if filters.get("per_page", TRANSACTIONS_PER_PAGE_DEFAULT) != TRANSACTIONS_PER_PAGE_DEFAULT:
+        params.append(("per_page", str(filters["per_page"])))
+    return urlencode(params)
+
+
+async def transactions_get(request: web.Request) -> web.StreamResponse:
+    """GET /admin/transactions — paginated ledger browser."""
+    db = request.app[APP_KEY_DB]
+    filters = parse_transactions_query(request.rel_url.query)
+
+    try:
+        page_result = await db.list_transactions(
+            gateway=filters["gateway"],
+            status=filters["status"],
+            telegram_id=filters["telegram_id"],
+            page=filters["page"],
+            per_page=filters["per_page"],
+        )
+    except ValueError:
+        # parse_transactions_query already mapped unknown enums to
+        # None, so this branch is reachable only if the DB layer
+        # adds a new validation rule. Degrade to an empty page with
+        # the filters stripped rather than 500ing.
+        log.warning(
+            "transactions_get: list_transactions rejected filters=%s",
+            filters,
+        )
+        page_result = {
+            "rows": [],
+            "total": 0,
+            "page": 1,
+            "per_page": filters["per_page"],
+            "total_pages": 0,
+        }
+
+    # Build prev/next URLs so the template stays dumb — no URL
+    # manipulation logic in Jinja.
+    prev_url: str | None = None
+    next_url: str | None = None
+    if page_result["page"] > 1:
+        q = _encode_tx_query(filters, page=page_result["page"] - 1)
+        prev_url = f"/admin/transactions?{q}" if q else "/admin/transactions"
+    if page_result["page"] < page_result["total_pages"]:
+        q = _encode_tx_query(filters, page=page_result["page"] + 1)
+        next_url = f"/admin/transactions?{q}" if q else "/admin/transactions"
+
+    return aiohttp_jinja2.render_template(
+        "transactions.html",
+        request,
+        {
+            "active_page": "transactions",
+            "filters": filters,
+            "result": page_result,
+            "prev_url": prev_url,
+            "next_url": next_url,
+            "gateway_choices": sorted(Database.TRANSACTIONS_GATEWAY_VALUES),
+            "status_choices": sorted(Database.TRANSACTIONS_STATUS_VALUES),
+            "per_page_choices": TRANSACTIONS_PER_PAGE_CHOICES,
+        },
+    )
+
+
+# ---------------------------------------------------------------------
 # App wiring
 # ---------------------------------------------------------------------
 
@@ -2030,6 +2212,12 @@ def setup_admin_routes(
     app.router.add_get(
         "/admin/broadcast/{job_id}/status",
         _require_auth(broadcast_status_get),
+    )
+
+    # Stage-8-Part-6: transactions browser (read-only, paginated).
+    app.router.add_get(
+        "/admin/transactions",
+        _require_auth(transactions_get),
     )
 
     app[APP_KEY_INSTALLED] = True

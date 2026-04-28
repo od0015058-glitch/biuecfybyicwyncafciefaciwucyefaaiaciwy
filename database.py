@@ -767,6 +767,14 @@ class Database:
             )
         return row is not None
 
+    # Defense-in-depth cap for ``only_active_days``. The ``admin.py``
+    # / ``web_admin.py`` parsers already reject anything over
+    # ``_BROADCAST_ACTIVE_DAYS_MAX`` before they get here, but this
+    # second line of defence keeps a bogus call (e.g. a direct REPL
+    # invocation during an outage) from formatting an interval string
+    # that PostgreSQL refuses.
+    BROADCAST_ACTIVE_DAYS_MAX: int = 36_500
+
     async def iter_broadcast_recipients(
         self, *, only_active_days: int | None = None
     ) -> list[int]:
@@ -782,7 +790,19 @@ class Database:
         the user table is small (sub-100k expected) and the broadcast
         coroutine throttles its own send rate, so the memory cost is
         trivial and we get a simple "took a snapshot at T0" semantic.
+
+        Raises :class:`ValueError` when ``only_active_days`` is not
+        a positive integer or exceeds
+        ``BROADCAST_ACTIVE_DAYS_MAX`` — would otherwise overflow
+        PG's interval column and surface as an opaque DB error.
         """
+        if only_active_days is not None:
+            days = int(only_active_days)
+            if days <= 0 or days > self.BROADCAST_ACTIVE_DAYS_MAX:
+                raise ValueError(
+                    f"only_active_days out of range: {only_active_days!r} "
+                    f"(must be in [1, {self.BROADCAST_ACTIVE_DAYS_MAX}])"
+                )
         async with self.pool.acquire() as connection:
             if only_active_days is None:
                 rows = await connection.fetch(
@@ -1410,6 +1430,160 @@ class Database:
             }
             for r in rows
         ]
+
+    # ------------------------------------------------------------------
+    # Stage-8-Part-6: paginated transactions browser
+    # ------------------------------------------------------------------
+
+    # The known set of gateway tokens the ledger actually stores.
+    # Used to reject bogus filter values at the ``list_transactions``
+    # boundary rather than at the SQL layer — keeps PostgreSQL from
+    # ever seeing an arbitrary admin-supplied string.
+    TRANSACTIONS_GATEWAY_VALUES: frozenset[str] = frozenset(
+        {"nowpayments", "admin", "gift"}
+    )
+    # Mirror for ``status`` column — the state-machine values the
+    # codebase uses anywhere. ``PARTIAL`` is the NowPayments
+    # partially_paid path, ``SUCCESS`` the terminal credit, and the
+    # three failure states come from ``mark_transaction_terminal``.
+    TRANSACTIONS_STATUS_VALUES: frozenset[str] = frozenset(
+        {"PENDING", "PARTIAL", "SUCCESS", "EXPIRED", "FAILED", "REFUNDED"}
+    )
+    # Per-page cap for the paginated /admin/transactions browser.
+    # 200 is enough to fit a quarterly audit export on one page
+    # without streaming, small enough that a misconfigured page
+    # request can't blow up admin memory.
+    TRANSACTIONS_MAX_PER_PAGE: int = 200
+
+    async def list_transactions(
+        self,
+        *,
+        gateway: str | None = None,
+        status: str | None = None,
+        telegram_id: int | None = None,
+        page: int = 1,
+        per_page: int = 50,
+    ) -> dict:
+        """Paginated read of ``transactions`` for the admin browser.
+
+        All filters are optional and combine with AND. Unknown
+        ``gateway`` / ``status`` values raise :class:`ValueError` — we
+        don't silently return an empty result because that would
+        mask a typo in the filter form. The caller (web_admin) is
+        responsible for mapping those enum strings before handing
+        them to us; an attacker-supplied arbitrary string cannot
+        reach the SQL layer.
+
+        ``per_page`` is clamped to ``[1, TRANSACTIONS_MAX_PER_PAGE]``
+        and ``page`` is clamped to ``>= 1``. Sort is
+        ``transaction_id DESC`` which — since ``transaction_id`` is
+        ``SERIAL`` — is identical to ``created_at DESC`` for any real
+        deploy, and strictly monotonic (i.e. no tie-breaking needed).
+
+        Returns a dict shaped::
+
+            {
+              "rows": [
+                {"id": int, "telegram_id": int | None,
+                 "gateway": str, "currency": str,
+                 "amount_crypto_or_rial": float | None,
+                 "amount_usd": float, "status": str,
+                 "gateway_invoice_id": str | None,
+                 "created_at": iso str | None,
+                 "completed_at": iso str | None,
+                 "notes": str | None},
+                ...
+              ],
+              "total": int,         # full filter match count
+              "page": int,          # clamped page number
+              "per_page": int,      # clamped per-page
+              "total_pages": int,   # 0 when total == 0
+            }
+        """
+        if gateway is not None and gateway not in self.TRANSACTIONS_GATEWAY_VALUES:
+            raise ValueError(f"unknown gateway filter: {gateway!r}")
+        if status is not None and status not in self.TRANSACTIONS_STATUS_VALUES:
+            raise ValueError(f"unknown status filter: {status!r}")
+
+        per_page = max(1, min(int(per_page), self.TRANSACTIONS_MAX_PER_PAGE))
+        page = max(1, int(page))
+
+        where_clauses: list[str] = []
+        params: list = []
+        if gateway is not None:
+            params.append(gateway)
+            where_clauses.append(f"gateway = ${len(params)}")
+        if status is not None:
+            params.append(status)
+            where_clauses.append(f"status = ${len(params)}")
+        if telegram_id is not None:
+            params.append(int(telegram_id))
+            where_clauses.append(f"telegram_id = ${len(params)}")
+
+        where_sql = (
+            "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+        )
+        count_sql = f"SELECT COUNT(*) FROM transactions {where_sql}"
+        # LIMIT / OFFSET come last so they're always the two trailing
+        # placeholders regardless of which filters ran above.
+        limit_param = len(params) + 1
+        offset_param = len(params) + 2
+        list_sql = f"""
+            SELECT transaction_id, telegram_id, gateway, currency_used,
+                   amount_crypto_or_rial, amount_usd_credited, status,
+                   gateway_invoice_id, created_at, completed_at, notes
+            FROM transactions
+            {where_sql}
+            ORDER BY transaction_id DESC
+            LIMIT ${limit_param} OFFSET ${offset_param}
+        """
+
+        async with self.pool.acquire() as connection:
+            total = await connection.fetchval(count_sql, *params)
+            rows = await connection.fetch(
+                list_sql,
+                *params,
+                per_page,
+                (page - 1) * per_page,
+            )
+
+        total = int(total or 0)
+        total_pages = (total + per_page - 1) // per_page
+
+        return {
+            "rows": [
+                {
+                    "id": int(r["transaction_id"]),
+                    "telegram_id": (
+                        int(r["telegram_id"])
+                        if r["telegram_id"] is not None else None
+                    ),
+                    "gateway": r["gateway"],
+                    "currency": r["currency_used"],
+                    "amount_crypto_or_rial": (
+                        float(r["amount_crypto_or_rial"])
+                        if r["amount_crypto_or_rial"] is not None else None
+                    ),
+                    "amount_usd": float(r["amount_usd_credited"]),
+                    "status": r["status"],
+                    "gateway_invoice_id": r["gateway_invoice_id"],
+                    "created_at": (
+                        r["created_at"].isoformat()
+                        if r["created_at"] is not None else None
+                    ),
+                    "completed_at": (
+                        r["completed_at"].isoformat()
+                        if r["completed_at"] is not None else None
+                    ),
+                    "notes": r["notes"],
+                }
+                for r in rows
+            ],
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages,
+        }
 
     async def get_system_metrics(self) -> dict:
         """Aggregate counters for the admin metrics panel.

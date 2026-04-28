@@ -581,6 +581,36 @@ def test_parse_broadcast_args_unicode_persian():
     assert out == {"only_active_days": None, "text": "سلام به همه"}
 
 
+def test_parse_broadcast_args_active_too_large():
+    """Stage-8-Part-6 guard: ``--active=9999999999`` would overflow
+    PG's 32-bit interval column downstream. Reject up-front with a
+    friendly error key instead of letting a generic "DB query failed"
+    banner surface.
+    """
+    from admin import _BROADCAST_ACTIVE_DAYS_MAX
+
+    # Exactly at the cap is allowed.
+    out = parse_broadcast_args(
+        f"/admin_broadcast --active={_BROADCAST_ACTIVE_DAYS_MAX} hello"
+    )
+    assert isinstance(out, dict)
+    assert out["only_active_days"] == _BROADCAST_ACTIVE_DAYS_MAX
+
+    # One past the cap is rejected.
+    assert (
+        parse_broadcast_args(
+            f"/admin_broadcast --active={_BROADCAST_ACTIVE_DAYS_MAX + 1} hi"
+        )
+        == "active_too_large"
+    )
+
+    # A real admin typo ("let's use all of history") also rejected.
+    assert (
+        parse_broadcast_args("/admin_broadcast --active=9999999999 hi")
+        == "active_too_large"
+    )
+
+
 def test_admin_broadcast_router_decorator_present():
     import inspect
     src = inspect.getsource(admin)

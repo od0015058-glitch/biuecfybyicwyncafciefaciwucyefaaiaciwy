@@ -1,0 +1,225 @@
+{% extends "_layout.html" %}
+
+{% block title %}Transactions{% endblock %}
+
+{% block extra_head %}
+<style>
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: flex-end;
+    margin-bottom: 16px;
+  }
+  .filters .field {
+    margin-bottom: 0;
+    min-width: 140px;
+  }
+  .filters .field.wide { min-width: 200px; }
+  .filters button.primary {
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 6px;
+    padding: 9px 18px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  .filters button.primary:hover { background: var(--accent-hover); }
+  .filters a.reset {
+    padding: 9px 14px;
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+  .explainer {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 14px;
+    margin-bottom: 16px;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  code.mono {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  td.amount, th.amount { text-align: right; font-variant-numeric: tabular-nums; }
+  .status-pill {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+  .status-SUCCESS { background: rgba(74, 222, 128, 0.15); color: #4ade80; }
+  .status-PARTIAL { background: rgba(251, 191, 36, 0.15); color: #fbbf24; }
+  .status-PENDING { background: rgba(79, 140, 255, 0.15); color: #4f8cff; }
+  .status-EXPIRED,
+  .status-FAILED,
+  .status-REFUNDED { background: rgba(248, 113, 113, 0.15); color: #f87171; }
+  .gateway-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+  .pager {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    margin-top: 16px;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  .pager a {
+    padding: 6px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+  }
+  .pager .disabled {
+    padding: 6px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    opacity: 0.4;
+    pointer-events: none;
+  }
+  .notes {
+    color: var(--text-muted);
+    font-size: 12px;
+    max-width: 300px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .empty {
+    color: var(--text-muted);
+    font-size: 13px;
+    margin: 0;
+    text-align: center;
+    padding: 40px 20px;
+  }
+</style>
+{% endblock %}
+
+{% block main %}
+<h2>Transactions</h2>
+
+<div class="explainer">
+  Read-only ledger view. Shows every row in the <code class="mono">transactions</code>
+  table, newest first. Use the filters to narrow by gateway, status, or
+  telegram id. For <strong>credit / debit</strong> adjustments, open a user
+  from <a href="/admin/users">Users</a>.
+</div>
+
+<div class="panel">
+  <form class="filters" method="get" action="/admin/transactions">
+    <div class="field">
+      <label for="gateway">Gateway</label>
+      <select id="gateway" name="gateway">
+        <option value="">(all)</option>
+        {% for g in gateway_choices %}
+        <option value="{{ g }}" {% if filters.gateway == g %}selected{% endif %}>{{ g }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label for="status">Status</label>
+      <select id="status" name="status">
+        <option value="">(all)</option>
+        {% for s in status_choices %}
+        <option value="{{ s }}" {% if filters.status == s %}selected{% endif %}>{{ s }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field wide">
+      <label for="telegram_id">Telegram id</label>
+      <input type="text" id="telegram_id" name="telegram_id"
+             placeholder="e.g. 12345678"
+             value="{% if filters.telegram_id is not none %}{{ filters.telegram_id }}{% endif %}">
+    </div>
+    <div class="field">
+      <label for="per_page">Per page</label>
+      <select id="per_page" name="per_page">
+        {% for c in per_page_choices %}
+        <option value="{{ c }}" {% if filters.per_page == c %}selected{% endif %}>{{ c }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <button type="submit" class="primary">Apply</button>
+    <a class="reset" href="/admin/transactions">Reset</a>
+  </form>
+
+  {% if result.rows %}
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Created</th>
+        <th>Gateway</th>
+        <th>User</th>
+        <th>Currency</th>
+        <th class="amount">Amount (USD)</th>
+        <th>Status</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in result.rows %}
+      <tr>
+        <td><code class="mono">{{ r.id }}</code></td>
+        <td>
+          {% if r.created_at %}
+          <code class="mono">{{ r.created_at[:19].replace("T", " ") }}</code>
+          {% else %}—{% endif %}
+        </td>
+        <td><span class="gateway-badge">{{ r.gateway }}</span></td>
+        <td>
+          {% if r.telegram_id is not none %}
+          <a href="/admin/users/{{ r.telegram_id }}"><code class="mono">{{ r.telegram_id }}</code></a>
+          {% else %}—{% endif %}
+        </td>
+        <td><code class="mono">{{ r.currency }}</code></td>
+        <td class="amount">
+          {% if r.amount_usd < 0 %}
+          <span style="color:#f87171">-${{ "{:,.4f}".format(-r.amount_usd) }}</span>
+          {% else %}
+          ${{ "{:,.4f}".format(r.amount_usd) }}
+          {% endif %}
+        </td>
+        <td><span class="status-pill status-{{ r.status }}">{{ r.status }}</span></td>
+        <td class="notes" title="{{ r.notes or '' }}">
+          {{ r.notes or '—' }}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <div class="pager">
+    {% if prev_url %}
+    <a href="{{ prev_url }}">← Prev</a>
+    {% else %}
+    <span class="disabled">← Prev</span>
+    {% endif %}
+    <span>
+      Page {{ result.page }} of {{ result.total_pages or 1 }} · {{ result.total }} row(s)
+    </span>
+    {% if next_url %}
+    <a href="{{ next_url }}">Next →</a>
+    {% else %}
+    <span class="disabled">Next →</span>
+    {% endif %}
+  </div>
+  {% else %}
+  <p class="empty">No transactions match the current filters.</p>
+  {% endif %}
+</div>
+{% endblock %}
