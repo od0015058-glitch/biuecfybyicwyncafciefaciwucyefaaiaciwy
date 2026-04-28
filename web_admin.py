@@ -1172,6 +1172,324 @@ async def gifts_revoke(request: web.Request) -> web.StreamResponse:
 
 
 # ---------------------------------------------------------------------
+# Users (Stage-8-Part-4)
+# ---------------------------------------------------------------------
+#
+# Routes:
+#   GET  /admin/users                         — search form + results
+#   GET  /admin/users/{telegram_id}           — detail page (balance,
+#                                               recent transactions,
+#                                               credit/debit form)
+#   POST /admin/users/{telegram_id}/adjust    — credit or debit
+#
+# Admin attribution:
+#   The telegram-side /admin_credit flow passes ``message.from_user.id``
+#   into ``admin_adjust_balance(admin_telegram_id=...)`` — that id is
+#   baked into ``transactions.gateway_invoice_id`` as
+#   ``admin-<id>-<ms>-<rand>``. The web panel has no such id (auth is
+#   a shared password, not a per-telegram-admin login), so we pass
+#   ``0`` as a sentinel and prepend ``[web]`` to the stored ``notes``
+#   so the audit trail is unambiguous about the source. ``0`` is safe
+#   because real Telegram ids are strictly positive, and the UNIQUE
+#   constraint on ``gateway_invoice_id`` still holds (timestamp + 4
+#   bytes of randomness give plenty of headroom).
+
+ADMIN_WEB_SENTINEL_ID = 0
+
+# Upper bound on a single adjustment. DB column is DECIMAL(10,4), but
+# a six-figure wallet adjustment is almost certainly a fat-fingered
+# extra zero — reject loudly so the admin notices before it commits.
+# Override via ``WEB_ADMIN_ADJUST_MAX_USD`` if you really do need to
+# move more in one shot.
+ADJUST_MAX_USD = 100_000.0
+
+
+def parse_adjust_form(form) -> dict | str:
+    """Parse the /admin/users/<id>/adjust form.
+
+    Returns a dict shaped::
+
+        {
+          "action": "credit" | "debit",
+          "amount_usd": 1.23,
+          "reason": "stuck invoice refund",
+        }
+
+    On failure returns one of the error keys: ``"bad_action"``,
+    ``"missing_amount"``, ``"bad_amount"``, ``"amount_too_large"``,
+    ``"missing_reason"``, ``"bad_reason"``.
+    """
+    action = (form.get("action") or "").strip().lower()
+    if action not in ("credit", "debit"):
+        return "bad_action"
+
+    raw_amount = (form.get("amount_usd") or "").strip()
+    if not raw_amount:
+        return "missing_amount"
+    cleaned = raw_amount.lstrip("$").strip()
+    try:
+        amount = float(cleaned)
+    except ValueError:
+        return "bad_amount"
+    if not (amount == amount) or amount in (
+        float("inf"), float("-inf")
+    ) or amount <= 0:
+        return "bad_amount"
+    if amount > ADJUST_MAX_USD:
+        return "amount_too_large"
+
+    reason = (form.get("reason") or "").strip()
+    if not reason:
+        return "missing_reason"
+    if len(reason) > 500:
+        return "bad_reason"
+
+    return {
+        "action": action,
+        "amount_usd": round(amount, 4),
+        "reason": reason,
+    }
+
+
+_ADJUST_FORM_ERR_TEXT = {
+    "bad_action": "Pick credit or debit.",
+    "missing_amount": "Enter a USD amount.",
+    "bad_amount": "Amount must be a positive number (USD).",
+    "amount_too_large": (
+        f"Amount must be at most ${ADJUST_MAX_USD:,.2f} per adjustment."
+    ),
+    "missing_reason": "A reason is required (stored in the ledger).",
+    "bad_reason": "Reason must be 500 characters or fewer.",
+}
+
+
+async def users_get(request: web.Request) -> web.StreamResponse:
+    """GET /admin/users — render the search form + results."""
+    db = request.app.get(APP_KEY_DB)
+    query = (request.query.get("q") or "").strip()
+    rows: list = []
+    db_error: str | None = None
+    searched = bool(query)
+    if searched:
+        if db is None:
+            db_error = "No database wired up (development mode)."
+        else:
+            try:
+                rows = await db.search_users(query, limit=50)
+            except Exception:
+                log.exception("users_get: search_users failed")
+                db_error = "Database query failed — see logs."
+
+    response = aiohttp_jinja2.render_template(
+        "users.html",
+        request,
+        {
+            "query": query,
+            "rows": rows,
+            "searched": searched,
+            "db_error": db_error,
+            "active_page": "users",
+            "flash": None,
+        },
+    )
+    flash = pop_flash(request, response)
+    if flash is not None:
+        response = aiohttp_jinja2.render_template(
+            "users.html",
+            request,
+            {
+                "query": query,
+                "rows": rows,
+                "searched": searched,
+                "db_error": db_error,
+                "active_page": "users",
+                "flash": flash,
+            },
+        )
+        response.del_cookie(FLASH_COOKIE, path="/admin/")
+    return response
+
+
+async def user_detail_get(request: web.Request) -> web.StreamResponse:
+    """GET /admin/users/{telegram_id} — detail + adjust form."""
+    raw_id = request.match_info.get("telegram_id", "")
+    try:
+        user_id = int(raw_id)
+    except ValueError:
+        return web.HTTPFound(location="/admin/users")
+
+    db = request.app.get(APP_KEY_DB)
+    summary: dict | None = None
+    db_error: str | None = None
+    if db is None:
+        db_error = "No database wired up (development mode)."
+    else:
+        try:
+            summary = await db.get_user_admin_summary(
+                user_id, recent_tx_limit=20
+            )
+        except Exception:
+            log.exception("user_detail_get: get_user_admin_summary failed")
+            db_error = "Database query failed — see logs."
+
+    context = {
+        "user_id": user_id,
+        "summary": summary,
+        "db_error": db_error,
+        "active_page": "users",
+        "csrf_token": csrf_token_for(request),
+        "flash": None,
+    }
+    response = aiohttp_jinja2.render_template(
+        "user_detail.html", request, context
+    )
+    flash = pop_flash(request, response)
+    if flash is not None:
+        context["flash"] = flash
+        response = aiohttp_jinja2.render_template(
+            "user_detail.html", request, context
+        )
+        response.del_cookie(FLASH_COOKIE, path="/admin/")
+    return response
+
+
+async def user_adjust_post(request: web.Request) -> web.StreamResponse:
+    """POST /admin/users/{telegram_id}/adjust — credit or debit.
+
+    Redirects back to the detail page with a signed flash banner
+    describing the outcome, mirroring the promos / gifts flows.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+
+    raw_id = request.match_info.get("telegram_id", "")
+    try:
+        user_id = int(raw_id)
+    except ValueError:
+        return web.HTTPFound(location="/admin/users")
+
+    form = await request.post()
+    detail_url = f"/admin/users/{user_id}"
+    response = web.HTTPFound(location=detail_url)
+
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning(
+            "user_adjust_post: CSRF token mismatch from %s", request.remote
+        )
+        set_flash(
+            response,
+            kind="error",
+            message=(
+                "Form submission was rejected (CSRF). "
+                "Refresh and try again."
+            ),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    parsed = parse_adjust_form(form)
+    if isinstance(parsed, str):
+        set_flash(
+            response,
+            kind="error",
+            message=_ADJUST_FORM_ERR_TEXT.get(
+                parsed, f"Invalid input ({parsed})."
+            ),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    db = request.app.get(APP_KEY_DB)
+    if db is None:
+        set_flash(
+            response,
+            kind="error",
+            message="No database wired up — cannot adjust.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    sign = +1 if parsed["action"] == "credit" else -1
+    delta = sign * parsed["amount_usd"]
+    # Prepend "[web]" so the stored audit note makes the source clear
+    # even if someone later grep's transactions.notes looking for
+    # telegram-admin activity.
+    note = f"[web] {parsed['reason']}"
+
+    try:
+        result = await db.admin_adjust_balance(
+            telegram_id=user_id,
+            delta_usd=delta,
+            reason=note,
+            admin_telegram_id=ADMIN_WEB_SENTINEL_ID,
+        )
+    except Exception:
+        log.exception("user_adjust_post: admin_adjust_balance failed")
+        set_flash(
+            response,
+            kind="error",
+            message="Database write failed — see logs.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    if result is None:
+        # Same disambiguation dance as admin._handle_balance_op: one
+        # extra read on the failure path tells us whether the user
+        # doesn't exist or the debit would take them below zero.
+        try:
+            summary = await db.get_user_admin_summary(user_id)
+        except Exception:
+            log.exception(
+                "user_adjust_post: get_user_admin_summary follow-up failed"
+            )
+            summary = None
+        if summary is None:
+            set_flash(
+                response,
+                kind="error",
+                message=f"No user with id {user_id}.",
+                secret=secret,
+                cookie_secure=cookie_secure,
+            )
+        else:
+            set_flash(
+                response,
+                kind="error",
+                message=(
+                    f"Refused — debit of ${parsed['amount_usd']:.4f} "
+                    f"would take user {user_id} below zero "
+                    f"(current balance: ${summary['balance_usd']:.4f})."
+                ),
+                secret=secret,
+                cookie_secure=cookie_secure,
+            )
+        return response
+
+    log.info(
+        "web_admin user_adjust: user=%s delta=$%.4f tx=%d reason=%r",
+        user_id, delta, result["transaction_id"], parsed["reason"],
+    )
+    verb = "Credited" if sign > 0 else "Debited"
+    set_flash(
+        response,
+        kind="success",
+        message=(
+            f"{verb} user {user_id} ${parsed['amount_usd']:.4f}. "
+            f"New balance: ${result['new_balance']:.4f}. "
+            f"Tx #{result['transaction_id']}."
+        ),
+        secret=secret,
+        cookie_secure=cookie_secure,
+    )
+    return response
+
+
+# ---------------------------------------------------------------------
 # App wiring
 # ---------------------------------------------------------------------
 
@@ -1263,6 +1581,17 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/gifts/{code}/revoke",
         _require_auth(gifts_revoke),
+    )
+
+    # Stage-8-Part-4: users.
+    app.router.add_get("/admin/users", _require_auth(users_get))
+    app.router.add_get(
+        "/admin/users/{telegram_id}",
+        _require_auth(user_detail_get),
+    )
+    app.router.add_post(
+        "/admin/users/{telegram_id}/adjust",
+        _require_auth(user_adjust_post),
     )
 
     app[APP_KEY_INSTALLED] = True

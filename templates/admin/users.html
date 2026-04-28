@@ -1,0 +1,123 @@
+{% extends "_layout.html" %}
+
+{% block title %}Users{% endblock %}
+
+{% block extra_head %}
+<style>
+  .search-form {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+    margin-bottom: 16px;
+  }
+  .search-form .field { margin-bottom: 0; flex: 1; max-width: 420px; }
+  .search-form button.primary {
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 6px;
+    padding: 9px 18px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  .search-form button.primary:hover { background: var(--accent-hover); }
+  code.id {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  .alert-success {
+    background: rgba(74, 222, 128, 0.1);
+    border: 1px solid var(--success);
+    color: var(--success);
+  }
+  .alert-info {
+    background: rgba(79, 140, 255, 0.1);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+  }
+  .explainer {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 14px;
+    margin-bottom: 16px;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  .explainer strong { color: var(--text); }
+  .empty {
+    color: var(--text-muted);
+    font-size: 13px;
+    margin: 0;
+  }
+</style>
+{% endblock %}
+
+{% block main %}
+<h2>Users</h2>
+
+<div class="explainer">
+  Search by <strong>Telegram id</strong> (exact match) or <strong>username</strong>
+  (case-insensitive substring). Click a row to view wallet details and
+  credit or debit the user's balance.
+</div>
+
+{% if flash %}
+<div class="alert alert-{{ flash.kind }}">{{ flash.message }}</div>
+{% endif %}
+
+{% if db_error %}
+<div class="alert alert-warn">{{ db_error }}</div>
+{% endif %}
+
+<div class="panel">
+  <form class="search-form" method="get" action="/admin/users">
+    <div class="field">
+      <label for="q">Search</label>
+      <input type="text" id="q" name="q"
+             placeholder="12345678 or @username"
+             value="{{ query }}" autofocus>
+    </div>
+    <button type="submit" class="primary">Search</button>
+  </form>
+
+  {% if searched %}
+    {% if rows %}
+    <table>
+      <thead>
+        <tr>
+          <th>Telegram id</th>
+          <th>Username</th>
+          <th>Balance</th>
+          <th>Free messages</th>
+          <th>Lang</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+        <tr>
+          <td><code class="id">{{ r.telegram_id }}</code></td>
+          <td>
+            {% if r.username %}@{{ r.username }}{% else %}—{% endif %}
+          </td>
+          <td>${{ "{:,.4f}".format(r.balance_usd) }}</td>
+          <td>{{ r.free_messages_left }}</td>
+          <td>{{ r.language_code }}</td>
+          <td>
+            <a href="/admin/users/{{ r.telegram_id }}">Open →</a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="empty">No users match <code class="id">{{ query }}</code>.</p>
+    {% endif %}
+  {% else %}
+  <p class="empty">Enter a Telegram id or username to search.</p>
+  {% endif %}
+</div>
+{% endblock %}

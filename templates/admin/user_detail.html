@@ -1,0 +1,205 @@
+{% extends "_layout.html" %}
+
+{% block title %}User {{ user_id }}{% endblock %}
+
+{% block extra_head %}
+<style>
+  .detail-grid {
+    display: grid;
+    grid-template-columns: 1fr 360px;
+    gap: 24px;
+    align-items: start;
+  }
+  @media (max-width: 1100px) {
+    .detail-grid { grid-template-columns: 1fr; }
+  }
+  .kv {
+    display: grid;
+    grid-template-columns: 160px 1fr;
+    gap: 8px 16px;
+    font-size: 13px;
+  }
+  .kv dt {
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    font-size: 11px;
+    margin: 0;
+  }
+  .kv dd { margin: 0; }
+  code.id, code.code {
+    background: var(--bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+  }
+  .radio-row { display: flex; gap: 16px; margin-bottom: 10px; }
+  .radio-row label {
+    display: flex; align-items: center; gap: 6px;
+    text-transform: none; letter-spacing: 0;
+    font-size: 13px; color: var(--text);
+  }
+  button.primary {
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 6px;
+    padding: 9px 18px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  button.primary:hover { background: var(--accent-hover); }
+  .hint {
+    color: var(--text-muted);
+    font-size: 11px;
+    margin-top: 4px;
+  }
+  .alert-success {
+    background: rgba(74, 222, 128, 0.1);
+    border: 1px solid var(--success);
+    color: var(--success);
+  }
+  .alert-info {
+    background: rgba(79, 140, 255, 0.1);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+  }
+  .tx-sign-pos { color: var(--success); }
+  .tx-sign-neg { color: var(--danger); }
+  .back-link {
+    display: inline-block;
+    margin-bottom: 16px;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  .back-link:hover { color: var(--text); }
+</style>
+{% endblock %}
+
+{% block main %}
+<a class="back-link" href="/admin/users">← Back to users</a>
+
+<h2>
+  User
+  {% if summary and summary.username %}
+    @{{ summary.username }}
+  {% else %}
+    <code class="id">{{ user_id }}</code>
+  {% endif %}
+</h2>
+
+{% if flash %}
+<div class="alert alert-{{ flash.kind }}">{{ flash.message }}</div>
+{% endif %}
+
+{% if db_error %}
+<div class="alert alert-warn">{{ db_error }}</div>
+{% endif %}
+
+{% if summary is none and not db_error %}
+<div class="panel">
+  <p style="margin: 0; color: var(--text-muted);">
+    No user with id <code class="id">{{ user_id }}</code>.
+  </p>
+</div>
+{% elif summary %}
+<div class="detail-grid">
+  <div>
+    <div class="panel">
+      <h3>Wallet</h3>
+      <dl class="kv">
+        <dt>Telegram id</dt>
+        <dd><code class="id">{{ summary.telegram_id }}</code></dd>
+        <dt>Username</dt>
+        <dd>
+          {% if summary.username %}@{{ summary.username }}{% else %}—{% endif %}
+        </dd>
+        <dt>Balance</dt>
+        <dd><strong>${{ "{:,.4f}".format(summary.balance_usd) }}</strong></dd>
+        <dt>Free messages left</dt>
+        <dd>{{ summary.free_messages_left }}</dd>
+        <dt>Active model</dt>
+        <dd><code class="code">{{ summary.active_model }}</code></dd>
+        <dt>Language</dt>
+        <dd><code class="code">{{ summary.language_code }}</code></dd>
+        <dt>Lifetime credited</dt>
+        <dd>${{ "{:,.4f}".format(summary.total_credited_usd) }}</dd>
+        <dt>Lifetime spent</dt>
+        <dd>${{ "{:,.4f}".format(summary.total_spent_usd) }}</dd>
+      </dl>
+    </div>
+
+    <div class="panel">
+      <h3>Recent transactions ({{ summary.recent_transactions|length }})</h3>
+      {% if summary.recent_transactions %}
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Gateway</th>
+            <th>Amount USD</th>
+            <th>Status</th>
+            <th>When</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for t in summary.recent_transactions %}
+          <tr>
+            <td><code class="id">{{ t.id }}</code></td>
+            <td><code class="code">{{ t.gateway }}</code></td>
+            <td class="{% if t.amount_usd >= 0 %}tx-sign-pos{% else %}tx-sign-neg{% endif %}">
+              {% if t.amount_usd >= 0 %}+{% else %}−{% endif %}${{ "{:,.4f}".format(t.amount_usd|abs) }}
+            </td>
+            <td>{{ t.status }}</td>
+            <td>{% if t.created_at %}{{ t.created_at[:19] }}Z{% else %}—{% endif %}</td>
+            <td>{% if t.notes %}{{ t.notes }}{% else %}—{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p style="margin: 0; color: var(--text-muted);">No transactions yet.</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>Credit / debit wallet</h3>
+    <form method="post" action="/admin/users/{{ summary.telegram_id }}/adjust">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+      <div class="field">
+        <label>Action</label>
+        <div class="radio-row">
+          <label>
+            <input type="radio" name="action" value="credit" checked> Credit
+          </label>
+          <label>
+            <input type="radio" name="action" value="debit"> Debit
+          </label>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="amount_usd">Amount (USD)</label>
+        <input type="text" id="amount_usd" name="amount_usd"
+               placeholder="5.00" required>
+        <div class="hint">Positive number. Debit won't take the user below zero.</div>
+      </div>
+
+      <div class="field">
+        <label for="reason">Reason (audit note)</label>
+        <input type="text" id="reason" name="reason"
+               placeholder="stuck invoice refund" required maxlength="500">
+        <div class="hint">Stored in <code class="code">transactions.notes</code> with a <code class="code">[web]</code> prefix.</div>
+      </div>
+
+      <button type="submit" class="primary">Apply adjustment</button>
+    </form>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

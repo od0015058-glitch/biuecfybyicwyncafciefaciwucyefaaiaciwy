@@ -134,6 +134,9 @@ def _stub_db(
     gift_rows: list | None = None,
     create_gift_result: bool | Exception = True,
     revoke_gift_result: bool | Exception = True,
+    search_users_result: list | Exception | None = None,
+    user_summary_result: dict | None | Exception = None,
+    adjust_balance_result: dict | None | Exception = None,
 ):
     """A minimal Database stub that exposes the methods web_admin uses.
 
@@ -184,6 +187,20 @@ def _stub_db(
         db.revoke_gift_code = AsyncMock(side_effect=revoke_gift_result)
     else:
         db.revoke_gift_code = AsyncMock(return_value=revoke_gift_result)
+    if isinstance(search_users_result, Exception):
+        db.search_users = AsyncMock(side_effect=search_users_result)
+    else:
+        db.search_users = AsyncMock(
+            return_value=search_users_result if search_users_result is not None else []
+        )
+    if isinstance(user_summary_result, Exception):
+        db.get_user_admin_summary = AsyncMock(side_effect=user_summary_result)
+    else:
+        db.get_user_admin_summary = AsyncMock(return_value=user_summary_result)
+    if isinstance(adjust_balance_result, Exception):
+        db.admin_adjust_balance = AsyncMock(side_effect=adjust_balance_result)
+    else:
+        db.admin_adjust_balance = AsyncMock(return_value=adjust_balance_result)
     return db
 
 
@@ -1828,3 +1845,653 @@ async def test_gifts_revoke_invalid_url_code(aiohttp_client, make_admin_app):
     )
     assert resp.status == 302
     db.revoke_gift_code.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------
+# Users page — Stage-8-Part-4
+# ---------------------------------------------------------------------
+
+
+from web_admin import (  # noqa: E402  (keep Part-4 imports grouped)
+    ADJUST_MAX_USD,
+    ADMIN_WEB_SENTINEL_ID,
+    parse_adjust_form,
+)
+
+
+# parse_adjust_form unit tests -----------------------------------------
+
+
+def test_parse_adjust_form_credit_happy():
+    parsed = parse_adjust_form(
+        {"action": "credit", "amount_usd": "5.25", "reason": "refund"}
+    )
+    assert parsed == {
+        "action": "credit",
+        "amount_usd": 5.25,
+        "reason": "refund",
+    }
+
+
+def test_parse_adjust_form_debit_happy():
+    parsed = parse_adjust_form(
+        {"action": "debit", "amount_usd": "$12", "reason": "chargeback"}
+    )
+    assert parsed == {
+        "action": "debit",
+        "amount_usd": 12.0,
+        "reason": "chargeback",
+    }
+
+
+def test_parse_adjust_form_bad_action_missing():
+    assert parse_adjust_form(
+        {"amount_usd": "1", "reason": "x"}
+    ) == "bad_action"
+
+
+def test_parse_adjust_form_bad_action_unknown():
+    assert parse_adjust_form(
+        {"action": "nuke", "amount_usd": "1", "reason": "x"}
+    ) == "bad_action"
+
+
+def test_parse_adjust_form_missing_amount():
+    assert parse_adjust_form(
+        {"action": "credit", "amount_usd": "", "reason": "x"}
+    ) == "missing_amount"
+
+
+def test_parse_adjust_form_bad_amount_non_number():
+    assert parse_adjust_form(
+        {"action": "credit", "amount_usd": "abc", "reason": "x"}
+    ) == "bad_amount"
+
+
+def test_parse_adjust_form_bad_amount_negative():
+    assert parse_adjust_form(
+        {"action": "credit", "amount_usd": "-5", "reason": "x"}
+    ) == "bad_amount"
+
+
+def test_parse_adjust_form_bad_amount_zero():
+    assert parse_adjust_form(
+        {"action": "credit", "amount_usd": "0", "reason": "x"}
+    ) == "bad_amount"
+
+
+def test_parse_adjust_form_bad_amount_nan():
+    assert parse_adjust_form(
+        {"action": "credit", "amount_usd": "nan", "reason": "x"}
+    ) == "bad_amount"
+
+
+def test_parse_adjust_form_bad_amount_inf():
+    assert parse_adjust_form(
+        {"action": "credit", "amount_usd": "inf", "reason": "x"}
+    ) == "bad_amount"
+
+
+def test_parse_adjust_form_amount_too_large():
+    assert parse_adjust_form(
+        {
+            "action": "credit",
+            "amount_usd": str(ADJUST_MAX_USD + 1),
+            "reason": "x",
+        }
+    ) == "amount_too_large"
+
+
+def test_parse_adjust_form_amount_at_cap_passes():
+    parsed = parse_adjust_form(
+        {
+            "action": "credit",
+            "amount_usd": str(ADJUST_MAX_USD),
+            "reason": "x",
+        }
+    )
+    assert isinstance(parsed, dict)
+    assert parsed["amount_usd"] == ADJUST_MAX_USD
+
+
+def test_parse_adjust_form_missing_reason():
+    assert parse_adjust_form(
+        {"action": "credit", "amount_usd": "5", "reason": ""}
+    ) == "missing_reason"
+
+
+def test_parse_adjust_form_reason_whitespace_only():
+    assert parse_adjust_form(
+        {"action": "credit", "amount_usd": "5", "reason": "   "}
+    ) == "missing_reason"
+
+
+def test_parse_adjust_form_reason_too_long():
+    assert parse_adjust_form(
+        {
+            "action": "credit",
+            "amount_usd": "5",
+            "reason": "x" * 501,
+        }
+    ) == "bad_reason"
+
+
+def test_parse_adjust_form_action_case_insensitive():
+    parsed = parse_adjust_form(
+        {"action": "CREDIT", "amount_usd": "1", "reason": "x"}
+    )
+    assert isinstance(parsed, dict)
+    assert parsed["action"] == "credit"
+
+
+# Integration tests -----------------------------------------------------
+
+
+async def _login(client, password: str) -> None:
+    resp = await client.post(
+        "/admin/login", data={"password": password}, allow_redirects=False
+    )
+    assert resp.status == 302
+
+
+async def _login_and_get_user_csrf(client, password: str, user_id: int) -> str:
+    await _login(client, password)
+    resp = await client.get(f"/admin/users/{user_id}")
+    body = await resp.text()
+    import re
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+    assert m, "Expected CSRF token on user detail page"
+    return m.group(1)
+
+
+async def test_users_page_requires_auth(aiohttp_client, make_admin_app):
+    client = await aiohttp_client(make_admin_app())
+    resp = await client.get("/admin/users", allow_redirects=False)
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/login"
+
+
+async def test_users_page_empty_query_shows_prompt(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Enter a Telegram id or username to search" in body
+    db.search_users.assert_not_awaited()
+
+
+async def test_users_page_search_by_username_renders_rows(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        search_users_result=[
+            {
+                "telegram_id": 11111111,
+                "username": "kashlev",
+                "balance_usd": 2.3456,
+                "free_messages_left": 4,
+                "language_code": "fa",
+            },
+            {
+                "telegram_id": 22222222,
+                "username": "kash2",
+                "balance_usd": 0.0,
+                "free_messages_left": 10,
+                "language_code": "en",
+            },
+        ]
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users?q=kash")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "@kashlev" in body
+    assert "@kash2" in body
+    # Currency is formatted with 4dp (matches OpenRouter precision).
+    assert "$2.3456" in body
+    db.search_users.assert_awaited_once_with("kash", limit=50)
+
+
+async def test_users_page_search_by_id(aiohttp_client, make_admin_app):
+    db = _stub_db(
+        search_users_result=[
+            {
+                "telegram_id": 12345,
+                "username": None,
+                "balance_usd": 0.0,
+                "free_messages_left": 10,
+                "language_code": "fa",
+            }
+        ]
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users?q=12345")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "12345" in body
+    db.search_users.assert_awaited_once_with("12345", limit=50)
+
+
+async def test_users_page_search_no_results(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(search_users_result=[])
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users?q=ghost")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "No users match" in body
+    assert "ghost" in body
+
+
+async def test_users_page_db_error_renders_banner(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(search_users_result=RuntimeError("boom"))
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users?q=anything")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Database query failed" in body
+
+
+async def test_user_detail_requires_auth(aiohttp_client, make_admin_app):
+    client = await aiohttp_client(make_admin_app())
+    resp = await client.get("/admin/users/123", allow_redirects=False)
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/login"
+
+
+async def test_user_detail_bad_id_redirects_to_list(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/not-an-int", allow_redirects=False)
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/users"
+    db.get_user_admin_summary.assert_not_awaited()
+
+
+async def test_user_detail_unknown_user_shows_empty_state(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(user_summary_result=None)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/999")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "No user with id" in body
+
+
+async def test_user_detail_renders_summary(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        user_summary_result={
+            "telegram_id": 777,
+            "username": "alice",
+            "balance_usd": 42.5000,
+            "free_messages_left": 3,
+            "active_model": "openai/gpt-4o",
+            "language_code": "en",
+            "total_credited_usd": 100.0,
+            "total_spent_usd": 57.5,
+            "recent_transactions": [
+                {
+                    "id": 501,
+                    "gateway": "nowpayments",
+                    "currency": "USD",
+                    "amount_usd": 10.0,
+                    "status": "SUCCESS",
+                    "created_at": "2026-04-28T09:00:00+00:00",
+                    "notes": None,
+                },
+                {
+                    "id": 502,
+                    "gateway": "admin",
+                    "currency": "USD",
+                    "amount_usd": -5.0,
+                    "status": "SUCCESS",
+                    "created_at": "2026-04-28T10:00:00+00:00",
+                    "notes": "[web] overcharge fix",
+                },
+            ],
+        }
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/777")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "@alice" in body
+    assert "$42.5000" in body
+    assert "openai/gpt-4o" in body
+    # Positive and negative sign rendering with abs magnitude.
+    assert "+$10.0000" in body
+    assert "−$5.0000" in body
+    assert "[web] overcharge fix" in body
+    # CSRF token is injected into the adjust form.
+    assert 'name="csrf_token"' in body
+    db.get_user_admin_summary.assert_awaited_once_with(
+        777, recent_tx_limit=20
+    )
+
+
+async def test_user_detail_db_error_shows_banner(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(user_summary_result=RuntimeError("boom"))
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/888")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Database query failed" in body
+
+
+async def test_user_adjust_requires_auth(aiohttp_client, make_admin_app):
+    client = await aiohttp_client(make_admin_app())
+    resp = await client.post(
+        "/admin/users/1/adjust",
+        data={"csrf_token": "x", "action": "credit", "amount_usd": "1", "reason": "x"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+
+
+async def test_user_adjust_bad_id_in_url(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.post(
+        "/admin/users/abc/adjust",
+        data={"csrf_token": "x", "action": "credit", "amount_usd": "1", "reason": "x"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/users"
+    db.admin_adjust_balance.assert_not_awaited()
+
+
+async def test_user_adjust_rejects_missing_csrf(
+    aiohttp_client, make_admin_app
+):
+    # Need the get_user_admin_summary stub because the login bootstrap
+    # navigates via /admin/users/{id} to grab the CSRF token first.
+    db = _stub_db(
+        user_summary_result={
+            "telegram_id": 500,
+            "username": "bob",
+            "balance_usd": 10.0,
+            "free_messages_left": 0,
+            "active_model": "x",
+            "language_code": "en",
+            "total_credited_usd": 10.0,
+            "total_spent_usd": 0.0,
+            "recent_transactions": [],
+        },
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.post(
+        "/admin/users/500/adjust",
+        data={"action": "credit", "amount_usd": "5", "reason": "x"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.admin_adjust_balance.assert_not_awaited()
+    # Redirect target is the detail page; follow to see the flash.
+    resp2 = await client.get("/admin/users/500")
+    body = await resp2.text()
+    assert "CSRF" in body
+
+
+async def test_user_adjust_validation_error_shows_flash(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        user_summary_result={
+            "telegram_id": 500,
+            "username": None,
+            "balance_usd": 10.0,
+            "free_messages_left": 0,
+            "active_model": "x",
+            "language_code": "en",
+            "total_credited_usd": 10.0,
+            "total_spent_usd": 0.0,
+            "recent_transactions": [],
+        },
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_user_csrf(client, "pw", 500)
+    resp = await client.post(
+        "/admin/users/500/adjust",
+        data={
+            "csrf_token": csrf,
+            "action": "credit",
+            "amount_usd": "-1",
+            "reason": "x",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.admin_adjust_balance.assert_not_awaited()
+    resp2 = await client.get("/admin/users/500")
+    body = await resp2.text()
+    assert "alert-error" in body
+    assert "positive number" in body
+
+
+async def test_user_adjust_credit_happy_path(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        user_summary_result={
+            "telegram_id": 500,
+            "username": "bob",
+            "balance_usd": 10.0,
+            "free_messages_left": 0,
+            "active_model": "x",
+            "language_code": "en",
+            "total_credited_usd": 10.0,
+            "total_spent_usd": 0.0,
+            "recent_transactions": [],
+        },
+        adjust_balance_result={
+            "new_balance": 15.0,
+            "transaction_id": 99,
+            "delta": 5.0,
+        },
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_user_csrf(client, "pw", 500)
+    resp = await client.post(
+        "/admin/users/500/adjust",
+        data={
+            "csrf_token": csrf,
+            "action": "credit",
+            "amount_usd": "5",
+            "reason": "refund",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/users/500"
+    db.admin_adjust_balance.assert_awaited_once()
+    kwargs = db.admin_adjust_balance.await_args.kwargs
+    assert kwargs["telegram_id"] == 500
+    assert kwargs["delta_usd"] == 5.0
+    assert kwargs["reason"] == "[web] refund"
+    assert kwargs["admin_telegram_id"] == ADMIN_WEB_SENTINEL_ID
+    # Follow the redirect → success flash rendered.
+    resp2 = await client.get("/admin/users/500")
+    body = await resp2.text()
+    assert "alert-success" in body
+    assert "Credited" in body
+    assert "Tx #99" in body
+
+
+async def test_user_adjust_debit_sends_negative_delta(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        user_summary_result={
+            "telegram_id": 500,
+            "username": None,
+            "balance_usd": 10.0,
+            "free_messages_left": 0,
+            "active_model": "x",
+            "language_code": "en",
+            "total_credited_usd": 10.0,
+            "total_spent_usd": 0.0,
+            "recent_transactions": [],
+        },
+        adjust_balance_result={
+            "new_balance": 7.5,
+            "transaction_id": 100,
+            "delta": -2.5,
+        },
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_user_csrf(client, "pw", 500)
+    resp = await client.post(
+        "/admin/users/500/adjust",
+        data={
+            "csrf_token": csrf,
+            "action": "debit",
+            "amount_usd": "2.50",
+            "reason": "chargeback",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    kwargs = db.admin_adjust_balance.await_args.kwargs
+    assert kwargs["delta_usd"] == -2.5
+    assert kwargs["reason"] == "[web] chargeback"
+
+
+async def test_user_adjust_debit_insufficient_funds(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        user_summary_result={
+            "telegram_id": 500,
+            "username": None,
+            "balance_usd": 1.0,
+            "free_messages_left": 0,
+            "active_model": "x",
+            "language_code": "en",
+            "total_credited_usd": 1.0,
+            "total_spent_usd": 0.0,
+            "recent_transactions": [],
+        },
+        adjust_balance_result=None,
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_user_csrf(client, "pw", 500)
+    resp = await client.post(
+        "/admin/users/500/adjust",
+        data={
+            "csrf_token": csrf,
+            "action": "debit",
+            "amount_usd": "500",
+            "reason": "oops",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    resp2 = await client.get("/admin/users/500")
+    body = await resp2.text()
+    assert "Refused" in body
+    assert "below zero" in body
+
+
+async def test_user_adjust_nonexistent_user(aiohttp_client, make_admin_app):
+    # First GET for CSRF uses summary=<bob>, then adjust + follow-up
+    # lookup both see None — we flip the mock's return_value mid-test.
+    summary = {
+        "telegram_id": 500,
+        "username": None,
+        "balance_usd": 0.0,
+        "free_messages_left": 0,
+        "active_model": "x",
+        "language_code": "en",
+        "total_credited_usd": 0.0,
+        "total_spent_usd": 0.0,
+        "recent_transactions": [],
+    }
+    db = _stub_db(
+        user_summary_result=summary,
+        adjust_balance_result=None,
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_user_csrf(client, "pw", 500)
+    # From now on pretend the user was deleted between the CSRF fetch
+    # and the form submit — admin_adjust_balance returns None AND the
+    # follow-up summary returns None.
+    db.get_user_admin_summary.return_value = None
+    resp = await client.post(
+        "/admin/users/500/adjust",
+        data={
+            "csrf_token": csrf,
+            "action": "credit",
+            "amount_usd": "1",
+            "reason": "x",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    # Follow redirect — now the detail page also sees None → empty state
+    # with the "No user with id" banner plus the flash banner.
+    resp2 = await client.get("/admin/users/500")
+    body = await resp2.text()
+    assert "No user with id 500" in body
+
+
+async def test_user_adjust_db_exception_shows_flash(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        user_summary_result={
+            "telegram_id": 500,
+            "username": None,
+            "balance_usd": 1.0,
+            "free_messages_left": 0,
+            "active_model": "x",
+            "language_code": "en",
+            "total_credited_usd": 1.0,
+            "total_spent_usd": 0.0,
+            "recent_transactions": [],
+        },
+        adjust_balance_result=RuntimeError("boom"),
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_user_csrf(client, "pw", 500)
+    resp = await client.post(
+        "/admin/users/500/adjust",
+        data={
+            "csrf_token": csrf,
+            "action": "credit",
+            "amount_usd": "1",
+            "reason": "x",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    resp2 = await client.get("/admin/users/500")
+    body = await resp2.text()
+    assert "Database write failed" in body

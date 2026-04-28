@@ -205,8 +205,8 @@ updated, full tests:
 | --- | --- | --- |
 | **Stage-8-Part-1** | Web admin scaffold — login + dashboard with system metrics. `web_admin.py` + `templates/admin/`. Auth via `ADMIN_PASSWORD` + `ADMIN_SESSION_SECRET` HMAC-signed cookie. | ✅ shipped (PR #54) |
 | **Stage-8-Part-2** | Promo codes page — table view + create form + revoke action. Reuses `Database.list_promo_codes` + `create_promo_code` + `revoke_promo_code`. CSRF + flash messaging primitives added to `web_admin.py`. | ✅ shipped (PR #55) |
-| **Stage-8-Part-3** | **Gift codes** — alembic 0003 (`gift_codes` + `gift_redemptions`), DB methods, `/redeem CODE` user-facing flow, admin UI for create/list/revoke. **(Wallet-menu button + redemption stats page deferred to Part-3.5 if user asks.)** | ✅ this PR |
-| **Stage-8-Part-4** | Users page — search by id/username, view balance + recent transactions, credit/debit form. Reuses `admin_adjust_balance`. | ⏳ |
+| **Stage-8-Part-3** | **Gift codes** — alembic 0003 (`gift_codes` + `gift_redemptions`), DB methods, `/redeem CODE` user-facing flow, admin UI for create/list/revoke. **(Wallet-menu button + redemption stats page deferred to Part-3.5 if user asks.)** | ✅ shipped (PR #56) |
+| **Stage-8-Part-4** (this PR) | Users page — `/admin/users` search-by-id-or-username, `/admin/users/{id}` detail page (balance, lifetime totals, last 20 transactions), credit/debit form posting to `/admin/users/{id}/adjust`. Reuses `admin_adjust_balance`; web calls pass `admin_telegram_id=0` sentinel and `[web]` -prefixed reason into `transactions.notes` for unambiguous audit trail. New `Database.search_users(query, limit)` with int-lookup / escaped ILIKE dispatch; `get_user_admin_summary` now takes `recent_tx_limit` kwarg (default 5, clamped [1..200]). **Bug fix bundled:** `Database.get_system_metrics` now excludes both `gateway='admin'` AND `gateway='gift'` from `revenue_usd` — latent since PR #56 shipped gift redemptions with `gateway='gift'`, which inflated the dashboard's "revenue" figure every time an admin minted a gift code. Regression test pins the filter. 45 new tests (331 total). | ✅ this PR |
 | **Stage-8-Part-5** | Broadcast page (live progress via HTMX polling) + Transactions browser (paginated). | ⏳ |
 
 ---
@@ -311,7 +311,7 @@ Two tables added by **Stage-8-Part-3** (alembic 0003, this PR):
 
 ## 9. Test suite
 
-**286 tests across 10 modules** as of Stage-8-Part-3:
+**331 tests across 11 modules** as of Stage-8-Part-4:
 
 ```
 tests/
@@ -319,15 +319,18 @@ tests/
 ├── test_admin.py                          # 86 cases (gate, parsers, formatters, broadcast, _escape_md)
 ├── test_alembic_env.py                    # 12 cases (DB_URL building w/ special chars in password)
 ├── test_custom_amount_validation.py       # 21 cases (NaN/Inf/bounds)
+├── test_database_queries.py               # 11 cases (revenue filter regression,
+                                           #            search_users dispatch, summary limit clamp)
 ├── test_fsm_storage.py                    # 3 cases (build_fsm_storage selection)
 ├── test_handlers_from_user_guard.py       # 4 cases (promo, custom_amount, cmd_start, _route_legacy_text_to_hub)
 ├── test_ipn_signature.py                  # 11 cases (raw + canonical paths, persian descr regression)
 ├── test_pricing.py                        # 11 cases (per-model lookup, markup, fallback)
 ├── test_rate_limit.py                     # 15 cases (token bucket + LRU + middleware)
 ├── test_redeem_handler.py                 # 15 cases (cmd_redeem usage / status branches)
-└── test_web_admin.py                      # 108 cases (cookie sign/verify, login, dashboard,
-                                          #             promo + gift list/create/revoke, CSRF,
-                                          #             flash cookies, expires_in_days bounds)
+└── test_web_admin.py                      # 142 cases (cookie sign/verify, login, dashboard,
+                                          #             promo + gift + user list/create/revoke,
+                                          #             CSRF, flash cookies, adjust-form parser,
+                                          #             credit/debit happy-path + edge cases)
 ```
 
 CI runs the full suite on Python 3.11 + 3.12, plus an alembic
@@ -347,8 +350,8 @@ assumption.
 | `database.py` | Clean. All money-touching methods use `SELECT … FOR UPDATE`. `finalize_partial_payment` already uses `max(already_credited, actually_paid_usd)`. `admin_adjust_balance` writes `transactions` row + updates wallet in one tx with FOR UPDATE on the user row. |
 | `payments.py` | Clean. Two-pass IPN verifier (raw → canonical fallback). Idempotent finalize, partial-delta crediting. |
 | `handlers.py` | Clean. `cmd_start`, `_route_legacy_text_to_hub`, `process_chat`, `process_promo_input`, and `process_custom_amount_input` all guard `from_user is None` and `text is None`. |
-| `web_admin.py` | aiohttp+jinja2 panel mounted under `/admin/`. HMAC-signed cookies (`ADMIN_PASSWORD` + `ADMIN_SESSION_SECRET`). Login + dashboard (Part-1). Promos page with CSRF tokens + flash banners (Part-2). Gift codes page (Part-3) with `parse_gift_form` + `EXPIRES_IN_DAYS_MAX` bound. Future parts add users / broadcast / transactions pages. |
-| `templates/admin/` | jinja2 templates. `base.html` = global CSS + `<head>`; `_layout.html` = sidebar shell (extended by content pages); `login.html`, `dashboard.html`, `promos.html`, `gifts.html`. |
+| `web_admin.py` | aiohttp+jinja2 panel mounted under `/admin/`. HMAC-signed cookies (`ADMIN_PASSWORD` + `ADMIN_SESSION_SECRET`). Login + dashboard (Part-1). Promos page with CSRF tokens + flash banners (Part-2). Gift codes page (Part-3) with `parse_gift_form` + `EXPIRES_IN_DAYS_MAX` bound. Users page + credit/debit form (Part-4) with `parse_adjust_form`, `ADJUST_MAX_USD` bound, `ADMIN_WEB_SENTINEL_ID=0` audit attribution. Future parts add broadcast / transactions pages. |
+| `templates/admin/` | jinja2 templates. `base.html` = global CSS + `<head>`; `_layout.html` = sidebar shell (extended by content pages); `login.html`, `dashboard.html`, `promos.html`, `gifts.html`, `users.html`, `user_detail.html`. |
 | `ai_engine.py` | Clean. `aiohttp.ClientTimeout(total=60, connect=10, sock_read=50)` on OpenRouter. Defensive guard for malformed responses. |
 | `pricing.py` | Clean. Conservative fallback for unmapped models, markup ≥ 1.0. |
 | `rate_limit.py` | `consume_chat_token(user_id)` per-user (called *inside* `handlers.process_chat`, not as a `dp.message` middleware — see PR #47/#48 history). `webhook_rate_limit_middleware` per-IP. |
@@ -449,16 +452,19 @@ The user's process for this project — **do not deviate**:
 ## 13. TL;DR
 
 1. **All P0 / P1 / P2 / P3-Op / Stage-7 + Cleanup are shipped and merged.**
-2. **Stage-8 Parts 1, 2, 3 are shipped.** Web panel reachable at
+2. **Stage-8 Parts 1, 2, 3, 4 are shipped.** Web panel reachable at
    `${WEBHOOK_BASE_URL}/admin/login` once `ADMIN_PASSWORD` +
-   `ADMIN_SESSION_SECRET` are set in the live deploy. Promo codes and
-   gift codes both manageable from `/admin/promos` and `/admin/gifts`.
-   Users redeem gift codes with `/redeem CODE` in the bot.
+   `ADMIN_SESSION_SECRET` are set in the live deploy. Promo codes at
+   `/admin/promos`, gift codes at `/admin/gifts`, users at
+   `/admin/users` (search → detail → credit/debit). Web-initiated
+   balance adjustments are attributed with `admin_telegram_id=0`
+   sentinel and a `[web]` prefix in `transactions.notes` so the audit
+   trail distinguishes web vs Telegram-DM adjustments. Users redeem
+   gift codes with `/redeem CODE` in the bot.
 3. **The IPN signature bug is fixed on `main`** (PRs #39 + #41). User
    confirmed clean log on 2026-04-28.
-4. **Stage-8 queue remaining:** Part-4 (users page — search/balance/
-   credit/debit), Part-5 (broadcast + transactions browser). One PR each,
-   sequential, bug fix bundled in each.
+4. **Stage-8 queue remaining:** Part-5 (broadcast page with live
+   progress + transactions browser paginated). One PR, bug fix bundled.
 5. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
    update this doc + README in each, do NOT block on user approval. The
    user merges them when they wake up.

@@ -1236,7 +1236,9 @@ class Database:
             "delta": delta_usd,
         }
 
-    async def get_user_admin_summary(self, telegram_id: int) -> dict | None:
+    async def get_user_admin_summary(
+        self, telegram_id: int, *, recent_tx_limit: int = 5
+    ) -> dict | None:
         """Read-only snapshot of a user's wallet for ``/admin_balance``.
 
         Returns a dict shaped::
@@ -1286,14 +1288,18 @@ class Database:
                 """,
                 telegram_id,
             )
+            # Cap the ``recent_tx_limit`` defensively — callers that
+            # forget to bound it shouldn't be able to stream the entire
+            # ledger for one user in a single query.
+            limit = max(1, min(int(recent_tx_limit), 200))
             recent = await connection.fetch(
                 """
                 SELECT transaction_id, gateway, currency_used,
                        amount_usd_credited, status, created_at, notes
                 FROM transactions WHERE telegram_id = $1
-                ORDER BY transaction_id DESC LIMIT 5
+                ORDER BY transaction_id DESC LIMIT $2
                 """,
-                telegram_id,
+                telegram_id, limit,
             )
         return {
             "telegram_id": int(user_row["telegram_id"]),
@@ -1320,6 +1326,90 @@ class Database:
                 for r in recent
             ],
         }
+
+    async def search_users(
+        self, query: str, *, limit: int = 20
+    ) -> list[dict]:
+        """Search the ``users`` table for admin lookup.
+
+        Dispatches on the shape of *query*:
+
+        * If *query* parses as an integer, look up by ``telegram_id``
+          (exact match — Telegram ids are unique and there's no
+          business need to prefix-match a numeric id).
+        * Otherwise, treat *query* as a username fragment and do a
+          case-insensitive ``ILIKE`` match. The literal ``@`` prefix
+          (as seen in Telegram mentions) is stripped so admins can
+          paste either ``kashlev`` or ``@kashlev``.
+        * Empty / whitespace-only *query* returns ``[]`` — the caller
+          (web handler) uses that to distinguish "no search yet" from
+          "searched and got nothing" in the UI.
+
+        Returns a list of dicts shaped::
+
+            {
+              "telegram_id": int,
+              "username": str | None,
+              "balance_usd": float,
+              "free_messages_left": int,
+              "language_code": str,
+            }
+
+        Results are ordered by ``telegram_id DESC`` so the most
+        recently-registered user matching the query comes first. The
+        *limit* is clamped to ``[1, 100]`` to guard against a UI bug
+        that sends a huge value.
+        """
+        q = (query or "").strip().lstrip("@").strip()
+        if not q:
+            return []
+        effective_limit = max(1, min(int(limit), 100))
+        async with self.pool.acquire() as connection:
+            try:
+                user_id = int(q)
+            except ValueError:
+                # Username search. Use ILIKE with a trailing wildcard
+                # so admins get prefix-match-style results; escape
+                # SQL-LIKE metacharacters (``%`` / ``_``) in the
+                # user-supplied fragment so a username fragment like
+                # ``bob_`` doesn't silently match ``bobX``.
+                safe = (
+                    q.replace("\\", "\\\\")
+                    .replace("%", "\\%")
+                    .replace("_", "\\_")
+                )
+                rows = await connection.fetch(
+                    """
+                    SELECT telegram_id, username, balance_usd,
+                           free_messages_left, language_code
+                    FROM users
+                    WHERE username ILIKE $1 ESCAPE '\\'
+                    ORDER BY telegram_id DESC
+                    LIMIT $2
+                    """,
+                    f"%{safe}%", effective_limit,
+                )
+            else:
+                rows = await connection.fetch(
+                    """
+                    SELECT telegram_id, username, balance_usd,
+                           free_messages_left, language_code
+                    FROM users
+                    WHERE telegram_id = $1
+                    LIMIT $2
+                    """,
+                    user_id, effective_limit,
+                )
+        return [
+            {
+                "telegram_id": int(r["telegram_id"]),
+                "username": r["username"],
+                "balance_usd": float(r["balance_usd"]),
+                "free_messages_left": int(r["free_messages_left"]),
+                "language_code": r["language_code"],
+            }
+            for r in rows
+        ]
 
     async def get_system_metrics(self) -> dict:
         """Aggregate counters for the admin metrics panel.
@@ -1357,15 +1447,21 @@ class Database:
                 WHERE created_at >= NOW() - INTERVAL '7 days'
                 """
             )
-            # NB: filter out gateway='admin' so admin debits/credits
-            # don't pollute the revenue figure — those are internal
-            # ledger adjustments, not gateway income.
+            # NB: filter out gateway='admin' AND gateway='gift' so
+            # internal ledger adjustments (admin credit/debit, gift-code
+            # redemptions) don't pollute the revenue figure. "Revenue"
+            # here means money that flowed in from a real payment
+            # gateway, i.e. NowPayments. Gift redemptions are free
+            # credit issued from nowhere — adding them to revenue would
+            # make the dashboard look like we earned money every time
+            # an admin mints a gift code. (Latent since PR #56 shipped
+            # gateway='gift' rows; fixed in Stage-8-Part-4.)
             revenue_usd = await connection.fetchval(
                 """
                 SELECT COALESCE(SUM(amount_usd_credited), 0)
                 FROM transactions
                 WHERE status IN ('SUCCESS', 'PARTIAL')
-                  AND gateway <> 'admin'
+                  AND gateway NOT IN ('admin', 'gift')
                 """
             )
             spend_usd = await connection.fetchval(
