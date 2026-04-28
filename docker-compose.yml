@@ -36,6 +36,23 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  redis:
+    # Backing store for aiogram FSM. Without this, a bot restart
+    # while a user is in waiting_custom_amount / waiting_promo_code
+    # would forget their state and they'd be stuck — see
+    # main.build_fsm_storage().
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
   bot:
     build:
       context: .
@@ -47,6 +64,9 @@ services:
       # compose network, the postgres container is reachable as the
       # service name.
       DB_HOST: postgres
+      # Same idea for Redis: regardless of what (if anything) is in
+      # .env, the compose network always uses the service name.
+      REDIS_URL: redis://redis:6379/0
       # Force the listener to 8080 inside the container; published port
       # below maps it to whatever the operator wants on the host.
       WEBHOOK_PORT: "8080"
@@ -58,7 +78,10 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
   postgres_data:
+  redis_data:

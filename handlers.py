@@ -1190,8 +1190,25 @@ async def process_custom_amount_input(message: Message, state: FSMContext):
         await message.answer(t(lang, "charge_custom_invalid"))
         return
 
+    # Reject NaN / Inf — float() happily parses 'nan' and 'inf', and
+    # NaN comparisons silently return False so any naive `amount < 5`
+    # check would let it through and then explode downstream when
+    # NowPayments rejects the JSON or our DECIMAL(20,8) column trips.
+    # `not (amount > 0)` is True for NaN and -Inf simultaneously, but
+    # we still want a clean upper bound, so cap explicitly too.
+    if not (amount == amount) or amount in (float("inf"), float("-inf")):
+        await message.answer(t(lang, "charge_custom_invalid"))
+        return
+
     if amount < 5:
         await message.answer(t(lang, "charge_custom_min_error"))
+        return
+
+    # Hard upper bound — we don't want a fat-fingered $9999999999 to
+    # create a NowPayments invoice we'd never close out. $10k is well
+    # above any real top-up; flag and reject.
+    if amount > 10_000:
+        await message.answer(t(lang, "charge_custom_invalid"))
         return
 
     # Drop the waiting_custom_amount state so the user can chat freely

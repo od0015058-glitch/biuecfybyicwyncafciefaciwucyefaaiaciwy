@@ -8,3 +8,9 @@ aiohttp>=3.9.3      # Asynchronous HTTP requests (for OpenRouter & NowPayments)
 # talks to Postgres exclusively through asyncpg.
 alembic>=1.13.0
 psycopg2-binary>=2.9.9
+
+# FSM storage backend — used by aiogram's RedisStorage when REDIS_URL
+# is set, so a bot restart doesn't trap users mid-checkout. main.py
+# falls back to in-memory storage (with a WARNING log) when REDIS_URL
+# is unset, so this dependency is "always installed, sometimes used".
+redis>=5.0.0

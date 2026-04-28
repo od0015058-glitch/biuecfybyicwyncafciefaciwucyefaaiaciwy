@@ -16,11 +16,21 @@ docker compose up -d --build
 docker compose logs -f bot
 ```
 
-Compose boots Postgres + the bot together. Schema and `migrations/*.sql`
-auto-apply on first boot of an empty Postgres volume. The bot's webhook
-listener is published to `127.0.0.1:8080` only — put nginx/Caddy/Cloudflare
-Tunnel in front for TLS so NowPayments can reach
-`${WEBHOOK_BASE_URL}/nowpayments-webhook` over HTTPS.
+Compose boots Postgres + Redis + the bot together. The bot's `entrypoint.sh`
+runs `alembic upgrade head` on every container start so schema migrations
+are applied automatically (idempotent — no-op when already at head).
+Redis backs aiogram's FSM so a bot restart doesn't trap users
+mid-checkout. The webhook listener is published to `127.0.0.1:8080`
+only — put nginx/Caddy/Cloudflare Tunnel in front for TLS so NowPayments
+can reach `${WEBHOOK_BASE_URL}/nowpayments-webhook` over HTTPS.
+
+First-time deploy on an existing prod DB (one that already has the
+schema before Alembic was introduced)? Stamp it once before bringing
+everything up so the auto-upgrade is a no-op:
+```bash
+docker compose run --rm bot alembic stamp head
+docker compose up -d
+```
 
 To roll back: `docker compose down && git checkout <previous-sha> && docker compose up -d --build`.
 
@@ -56,6 +66,10 @@ To roll back: `docker compose down && git checkout <previous-sha> && docker comp
    - `WEBHOOK_BASE_URL` — public HTTPS URL where this bot is reachable
      (NowPayments will POST IPNs to `${WEBHOOK_BASE_URL}/nowpayments-webhook`)
    - DB credentials, `ADMIN_USER_IDS` if you have them
+   - `REDIS_URL` (e.g. `redis://localhost:6379/0`) for production. If
+     unset, the bot logs a WARNING and uses in-memory FSM storage —
+     fine for local dev but a bot restart loses every user's
+     mid-checkout state.
 
 4. **Run**
    ```bash
