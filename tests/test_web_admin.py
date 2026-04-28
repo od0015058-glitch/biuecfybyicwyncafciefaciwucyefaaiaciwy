@@ -297,6 +297,8 @@ def make_admin_app():
         db=None,
         cookie_secure: bool = False,
         bot=None,
+        totp_secret: str = "",
+        totp_issuer: str = "Meowassist Admin",
     ):
         app = web.Application()
         setup_admin_routes(
@@ -307,6 +309,8 @@ def make_admin_app():
             ttl_hours=24,
             cookie_secure=cookie_secure,
             bot=bot,
+            totp_secret=totp_secret,
+            totp_issuer=totp_issuer,
         )
         return app
 
@@ -485,6 +489,412 @@ async def test_unconfigured_session_secret_refuses_login(
     assert resp.status == 500
     body = await resp.text()
     assert "not configured" in body
+
+
+# ---------------------------------------------------------------------
+# Stage-9-Step-3: bundled bug fix — whitespace-only credentials
+# ---------------------------------------------------------------------
+
+
+def test_setup_admin_routes_rejects_whitespace_password(make_admin_app):
+    """Whitespace-only ADMIN_PASSWORD is the documented deploy typo.
+
+    Pre-fix the value would be stored verbatim and every login attempt
+    silently rejected as "Wrong password" — operators could spend
+    hours debugging a stray space in their .env. Now it raises at
+    boot with a clear message.
+    """
+    with pytest.raises(ValueError, match="ADMIN_PASSWORD"):
+        make_admin_app(password="   ")
+
+
+def test_setup_admin_routes_rejects_whitespace_session_secret(
+    make_admin_app,
+):
+    """Same fail-fast rule for ADMIN_SESSION_SECRET."""
+    with pytest.raises(ValueError, match="ADMIN_SESSION_SECRET"):
+        make_admin_app(password="letmein", session_secret="\t\n ")
+
+
+def test_setup_admin_routes_accepts_truly_empty_credentials(
+    make_admin_app,
+):
+    """Empty (not whitespace) creds keep the documented dev path:
+    panel installs, login refuses. This pins the back-compat boundary.
+    """
+    # Should not raise.
+    app = make_admin_app(password="", session_secret="")
+    from web_admin import APP_KEY_PASSWORD, APP_KEY_SESSION_SECRET
+    assert app[APP_KEY_PASSWORD] == ""
+    assert app[APP_KEY_SESSION_SECRET] == ""
+
+
+# ---------------------------------------------------------------------
+# Stage-9-Step-3: TOTP / 2FA pure-helper tests
+# ---------------------------------------------------------------------
+
+
+def test_validate_totp_secret_empty_returns_empty():
+    from web_admin import validate_totp_secret
+
+    assert validate_totp_secret("") == ""
+    assert validate_totp_secret("   ") == ""
+    assert validate_totp_secret("\t\n") == ""
+
+
+def test_validate_totp_secret_normalizes_whitespace_and_case():
+    """A copy-pasted authenticator-app secret like
+    ``"abcd efgh ijkl mnop"`` should validate and uppercase cleanly.
+    """
+    from web_admin import validate_totp_secret
+
+    norm = validate_totp_secret("abcd efgh ijkl mnop")
+    assert norm == "ABCDEFGHIJKLMNOP"
+
+
+def test_validate_totp_secret_rejects_short_input():
+    """< 16 base32 chars = < 80 bits of entropy = brute-forceable."""
+    from web_admin import validate_totp_secret
+
+    with pytest.raises(ValueError, match="at least 16"):
+        validate_totp_secret("ABCDEFG")
+
+
+def test_validate_totp_secret_rejects_invalid_base32():
+    """Non-base32 chars (1, 8, 9, 0, lowercase l, etc) must fail."""
+    from web_admin import validate_totp_secret
+
+    with pytest.raises(ValueError, match="not a valid base32"):
+        # 16 chars but '!' is not in the base32 alphabet.
+        validate_totp_secret("ABCDEFGHIJKLMNO!")
+
+
+def test_verify_totp_code_accepts_current():
+    import pyotp
+    from web_admin import verify_totp_code
+
+    secret = pyotp.random_base32()
+    code = pyotp.TOTP(secret).now()
+    assert verify_totp_code(secret, code) is True
+
+
+def test_verify_totp_code_strips_whitespace():
+    """Authenticators show codes as ``"123 456"`` for readability;
+    we should accept that.
+    """
+    import pyotp
+    from web_admin import verify_totp_code
+
+    secret = pyotp.random_base32()
+    code = pyotp.TOTP(secret).now()
+    assert verify_totp_code(secret, f"{code[:3]} {code[3:]}") is True
+
+
+def test_verify_totp_code_rejects_empty():
+    from web_admin import verify_totp_code
+
+    assert verify_totp_code("ABCDEFGHIJKLMNOP", "") is False
+    assert verify_totp_code("ABCDEFGHIJKLMNOP", "   ") is False
+
+
+def test_verify_totp_code_rejects_non_digits():
+    from web_admin import verify_totp_code
+
+    assert verify_totp_code("ABCDEFGHIJKLMNOP", "abc123") is False
+    assert verify_totp_code("ABCDEFGHIJKLMNOP", "12345") is False  # 5 digits
+    assert verify_totp_code("ABCDEFGHIJKLMNOP", "1234567") is False  # 7 digits
+
+
+def test_verify_totp_code_rejects_wrong_code():
+    import pyotp
+    from web_admin import verify_totp_code
+
+    secret = pyotp.random_base32()
+    # 000000 is statistically unlikely to be the current code; if it is,
+    # 999999 won't be — try both.
+    now = pyotp.TOTP(secret).now()
+    bad = "000000" if now != "000000" else "999999"
+    assert verify_totp_code(secret, bad) is False
+
+
+def test_verify_totp_code_swallows_pyotp_errors_returns_false(monkeypatch):
+    """If pyotp raises, we refuse the code (don't 500 the request)."""
+    import pyotp
+    from web_admin import verify_totp_code
+
+    class _Boom:
+        def verify(self, *_a, **_k):
+            raise RuntimeError("simulated pyotp failure")
+
+    monkeypatch.setattr(pyotp, "TOTP", lambda secret: _Boom())
+    assert verify_totp_code("ABCDEFGHIJKLMNOP", "123456") is False
+
+
+def test_setup_admin_routes_rejects_invalid_totp_secret(make_admin_app):
+    """Invalid base32 in ADMIN_2FA_SECRET fails at boot — the app must
+    not start with a half-broken 2FA config.
+    """
+    with pytest.raises(ValueError, match="ADMIN_2FA_SECRET"):
+        make_admin_app(totp_secret="not-base32!!!")
+
+
+def test_setup_admin_routes_normalizes_totp_secret(make_admin_app):
+    """A copy-pasted spaced secret is normalized at boot, so the
+    ``APP_KEY_TOTP_SECRET`` value is the canonical base32 string
+    every downstream consumer expects.
+    """
+    from web_admin import APP_KEY_TOTP_SECRET
+
+    app = make_admin_app(totp_secret="abcd efgh ijkl mnop")
+    assert app[APP_KEY_TOTP_SECRET] == "ABCDEFGHIJKLMNOP"
+
+
+# ---------------------------------------------------------------------
+# Stage-9-Step-3: TOTP / 2FA login flow integration
+# ---------------------------------------------------------------------
+
+
+async def test_login_form_omits_2fa_field_when_disabled(
+    aiohttp_client, make_admin_app,
+):
+    """No ADMIN_2FA_SECRET → login form is password-only."""
+    client = await aiohttp_client(make_admin_app())
+    resp = await client.get("/admin/login")
+    body = await resp.text()
+    assert 'name="password"' in body
+    assert 'name="code"' not in body
+
+
+async def test_login_form_includes_2fa_field_when_enabled(
+    aiohttp_client, make_admin_app,
+):
+    """Configured ADMIN_2FA_SECRET → login form prompts for a code."""
+    client = await aiohttp_client(
+        make_admin_app(totp_secret="ABCDEFGHIJKLMNOP")
+    )
+    resp = await client.get("/admin/login")
+    body = await resp.text()
+    assert 'name="password"' in body
+    assert 'name="code"' in body
+    # Hint to mobile keyboards / password managers so the right
+    # autofill kicks in.
+    assert 'autocomplete="one-time-code"' in body
+
+
+async def test_login_with_2fa_rejects_missing_code(
+    aiohttp_client, make_admin_app,
+):
+    """Right password but no code → 401 with no cookie."""
+    client = await aiohttp_client(
+        make_admin_app(password="letmein", totp_secret="ABCDEFGHIJKLMNOP")
+    )
+    resp = await client.post(
+        "/admin/login",
+        data={"password": "letmein"},
+        allow_redirects=False,
+    )
+    assert resp.status == 401
+    body = await resp.text()
+    assert "Invalid 2FA code" in body
+    assert COOKIE_NAME not in resp.cookies
+
+
+async def test_login_with_2fa_rejects_bad_code(
+    aiohttp_client, make_admin_app,
+):
+    """Right password + obviously wrong 6-digit → 401."""
+    client = await aiohttp_client(
+        make_admin_app(password="letmein", totp_secret="ABCDEFGHIJKLMNOP")
+    )
+    resp = await client.post(
+        "/admin/login",
+        data={"password": "letmein", "code": "000000"},
+        allow_redirects=False,
+    )
+    # 000000 is overwhelmingly unlikely to be the current TOTP for a
+    # fixed secret — the test depends on that probabilistic argument.
+    # In the ~1-in-a-million case it passes, the test is harmless.
+    assert resp.status == 401
+    assert COOKIE_NAME not in resp.cookies
+
+
+async def test_login_with_2fa_accepts_valid_code(
+    aiohttp_client, make_admin_app,
+):
+    """Right password + the live TOTP code → 302 + cookie set."""
+    import pyotp
+
+    secret = "ABCDEFGHIJKLMNOP"
+    client = await aiohttp_client(
+        make_admin_app(password="letmein", totp_secret=secret)
+    )
+    code = pyotp.TOTP(secret).now()
+    resp = await client.post(
+        "/admin/login",
+        data={"password": "letmein", "code": code},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/"
+    assert COOKIE_NAME in resp.cookies
+
+
+async def test_login_with_2fa_runs_after_password_compare(
+    aiohttp_client, make_admin_app,
+):
+    """Wrong password + valid code → 401 "Wrong password" (NOT
+    "Invalid 2FA code"). This pins the deliberate ordering: an
+    attacker without the password can't probe the 2FA code in
+    isolation.
+    """
+    import pyotp
+
+    secret = "ABCDEFGHIJKLMNOP"
+    client = await aiohttp_client(
+        make_admin_app(password="letmein", totp_secret=secret)
+    )
+    code = pyotp.TOTP(secret).now()
+    resp = await client.post(
+        "/admin/login",
+        data={"password": "WRONG", "code": code},
+        allow_redirects=False,
+    )
+    assert resp.status == 401
+    body = await resp.text()
+    assert "Wrong password" in body
+    # The form still includes the "2FA code" label (the field is
+    # always rendered when 2FA is enabled), but the error banner
+    # itself must NOT mention 2FA — that would tell an attacker the
+    # password was right.
+    assert "Invalid 2FA code" not in body
+
+
+async def test_login_without_2fa_ignores_submitted_code(
+    aiohttp_client, make_admin_app,
+):
+    """When ADMIN_2FA_SECRET is unset, an extra ``code`` form field
+    is silently ignored — back-compat for legacy form posts.
+    """
+    client = await aiohttp_client(make_admin_app(password="letmein"))
+    resp = await client.post(
+        "/admin/login",
+        data={"password": "letmein", "code": "anything"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert COOKIE_NAME in resp.cookies
+
+
+# ---------------------------------------------------------------------
+# Stage-9-Step-3: /admin/enroll_2fa
+# ---------------------------------------------------------------------
+
+
+async def test_enroll_2fa_requires_auth(aiohttp_client, make_admin_app):
+    client = await aiohttp_client(make_admin_app())
+    resp = await client.get("/admin/enroll_2fa", allow_redirects=False)
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/login"
+
+
+async def test_enroll_2fa_renders_qr_when_disabled(
+    aiohttp_client, make_admin_app,
+):
+    """No configured secret → page suggests a fresh one + renders QR."""
+    client = await aiohttp_client(make_admin_app(password="letmein"))
+    await client.post(
+        "/admin/login",
+        data={"password": "letmein"},
+        allow_redirects=False,
+    )
+    resp = await client.get("/admin/enroll_2fa")
+    assert resp.status == 200
+    body = await resp.text()
+    # Suggestion banner is shown.
+    assert "currently disabled" in body
+    # SVG QR is inlined.
+    assert "<svg" in body
+    # otpauth URI is rendered for manual import.
+    assert "otpauth://totp/" in body
+
+
+async def test_enroll_2fa_shows_configured_secret(
+    aiohttp_client, make_admin_app,
+):
+    """Configured secret → page shows it (operator re-pairing a device)
+    rather than generating a new suggestion.
+    """
+    secret = "ABCDEFGHIJKLMNOP"
+    client = await aiohttp_client(
+        make_admin_app(password="letmein", totp_secret=secret)
+    )
+    await client.post(
+        "/admin/login",
+        data={
+            "password": "letmein",
+            "code": __import__("pyotp").TOTP(secret).now(),
+        },
+        allow_redirects=False,
+    )
+    resp = await client.get("/admin/enroll_2fa")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "currently enabled" in body
+    # The configured secret is rendered (chunked for readability) so
+    # check for any 4-char chunk of it.
+    assert "ABCD" in body
+
+
+async def test_enroll_2fa_suggestion_changes_each_load(
+    aiohttp_client, make_admin_app,
+):
+    """Each load with no secret gets a fresh suggestion — pins the
+    "don't cache the suggestion server-side" property.
+    """
+    import re
+
+    client = await aiohttp_client(make_admin_app(password="letmein"))
+    await client.post(
+        "/admin/login",
+        data={"password": "letmein"},
+        allow_redirects=False,
+    )
+    resp1 = await client.get("/admin/enroll_2fa")
+    resp2 = await client.get("/admin/enroll_2fa")
+    body1 = await resp1.text()
+    body2 = await resp2.text()
+    # Pull the otpauth secret= query param out of each URI.
+    sec1 = re.search(r"otpauth://totp/[^?]+\?secret=([A-Z0-9]+)", body1)
+    sec2 = re.search(r"otpauth://totp/[^?]+\?secret=([A-Z0-9]+)", body2)
+    assert sec1 and sec2
+    assert sec1.group(1) != sec2.group(1)
+
+
+async def test_login_2fa_audit_trail_records_deny_reason(
+    aiohttp_client, make_admin_app,
+):
+    """A bad/missing 2FA code records ``login_deny`` with the reason
+    in ``meta`` so an operator reading /admin/audit can tell apart
+    rate-limited / bad-password / missing-2fa / bad-2fa.
+    """
+    db = _stub_db()
+    client = await aiohttp_client(
+        make_admin_app(
+            password="letmein",
+            totp_secret="ABCDEFGHIJKLMNOP",
+            db=db,
+        )
+    )
+    await client.post(
+        "/admin/login",
+        data={"password": "letmein"},  # no code
+        allow_redirects=False,
+    )
+    db.record_admin_audit.assert_awaited()
+    # Find the call that recorded the deny — most recent kwargs.
+    last = db.record_admin_audit.await_args
+    assert last.kwargs["action"] == "login_deny"
+    assert last.kwargs["meta"] == {"reason": "missing_2fa"}
 
 
 # ---------------------------------------------------------------------
