@@ -5731,3 +5731,88 @@ async def test_do_broadcast_retry_after_no_should_cancel_uses_single_sleep():
         f"path, got {sleeps}"
     )
     assert stats["sent"] == 1
+
+
+# ---------------------------------------------------------------------
+# Bug-fix sweep: ``max_uses`` field overflow on promo / gift create.
+#
+# Pre-fix the parsers had an upper bound of "whatever Python's int can
+# hold" (i.e. arbitrary precision). PostgreSQL's INTEGER column tops
+# out at 2_147_483_647; an admin pasting ``max_uses=2147483648`` (or
+# any larger value) would crash the INSERT with a
+# ``NumericValueOutOfRangeError`` from asyncpg, which the route
+# handlers caught with the generic ``"DB write failed — see logs."``
+# flash. The admin had no way to know the cause was a fat-fingered
+# extra digit. New cap: ``MAX_USES_CAP = 1_000_000`` — well clear of
+# the PG INT max, and already implausibly large for any real promo
+# or gift code campaign.
+# ---------------------------------------------------------------------
+def test_parse_promo_form_max_uses_at_cap_accepted():
+    from web_admin import MAX_USES_CAP, parse_promo_form
+    out = parse_promo_form({
+        "code": "FOO",
+        "discount_kind": "percent",
+        "discount_value": "10",
+        "max_uses": str(MAX_USES_CAP),
+    })
+    assert out["max_uses"] == MAX_USES_CAP
+
+
+def test_parse_promo_form_max_uses_above_cap_rejected():
+    from web_admin import MAX_USES_CAP, parse_promo_form
+    out = parse_promo_form({
+        "code": "FOO",
+        "discount_kind": "percent",
+        "discount_value": "10",
+        "max_uses": str(MAX_USES_CAP + 1),
+    })
+    assert out == "max_uses_too_large"
+
+
+def test_parse_promo_form_max_uses_int_overflow_rejected():
+    """The original crash repro: 2_147_483_648 would overflow PG
+    INTEGER. Now caught up-front."""
+    from web_admin import parse_promo_form
+    out = parse_promo_form({
+        "code": "FOO",
+        "discount_kind": "percent",
+        "discount_value": "10",
+        "max_uses": "2147483648",
+    })
+    assert out == "max_uses_too_large"
+
+
+def test_parse_gift_form_max_uses_at_cap_accepted():
+    from web_admin import MAX_USES_CAP, parse_gift_form
+    out = parse_gift_form({
+        "code": "FOO",
+        "amount_usd": "5",
+        "max_uses": str(MAX_USES_CAP),
+    })
+    assert out["max_uses"] == MAX_USES_CAP
+
+
+def test_parse_gift_form_max_uses_above_cap_rejected():
+    from web_admin import MAX_USES_CAP, parse_gift_form
+    out = parse_gift_form({
+        "code": "FOO",
+        "amount_usd": "5",
+        "max_uses": str(MAX_USES_CAP + 1),
+    })
+    assert out == "max_uses_too_large"
+
+
+def test_promo_form_err_text_has_max_uses_too_large_key():
+    """The flash dispatcher in ``promos_create`` looks up the error
+    key in ``_PROMO_FORM_ERR_TEXT``. A missing key falls through to
+    the generic ``f"Invalid input ({key})."`` branch — pin that the
+    new key has a hand-written friendly message."""
+    from web_admin import _PROMO_FORM_ERR_TEXT, MAX_USES_CAP
+    assert "max_uses_too_large" in _PROMO_FORM_ERR_TEXT
+    assert f"{MAX_USES_CAP:,}" in _PROMO_FORM_ERR_TEXT["max_uses_too_large"]
+
+
+def test_gift_form_err_text_has_max_uses_too_large_key():
+    from web_admin import _GIFT_FORM_ERR_TEXT, MAX_USES_CAP
+    assert "max_uses_too_large" in _GIFT_FORM_ERR_TEXT
+    assert f"{MAX_USES_CAP:,}" in _GIFT_FORM_ERR_TEXT["max_uses_too_large"]
