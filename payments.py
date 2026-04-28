@@ -464,6 +464,67 @@ _TERMINAL_FAILURE_MESSAGE_KEYS = {
     "refunded": ("pay_refunded_pending", "pay_refunded_partial"),
 }
 
+# Stage-9-Step-4: IPN statuses that trigger state mutation. The handler
+# splits cleanly into three buckets — actionable (finalize_payment /
+# finalize_partial_payment / mark_transaction_terminal),
+# in-flight observability (already declared above as
+# ``_IN_FLIGHT_STATUSES``), and unhandled (logged loudly, audited,
+# no state change). Listed explicitly so a future NowPayments status
+# addition lands in ``"unhandled"`` rather than being silently swallowed.
+_ACTIONABLE_IPN_STATUSES = frozenset(
+    {"finished", "partially_paid", "expired", "failed", "refunded"}
+)
+
+# Stage-9-Step-4 bug-fix bundle: per-process counters for IPN deliveries
+# we drop *before* state mutation. Surfaced via
+# ``get_ipn_drop_counters()`` so future ops dashboards can read the same
+# values without scraping logs. The four reasons cover the legitimate
+# fail-safe paths (bad signature, malformed body, missing payment_id,
+# replayed (invoice, status) pair) — every increment is also logged at
+# ``error`` level so a misconfigured sandbox hitting the prod webhook
+# is immediately visible without grep-fu.
+_IPN_DROP_COUNTERS: dict[str, int] = {
+    "bad_signature": 0,
+    "bad_json": 0,
+    "missing_payment_id": 0,
+    "replay": 0,
+}
+
+
+def _bump_ipn_drop_counter(reason: str) -> None:
+    """Bump the named drop counter by 1, defensively creating the bucket
+    if a future code path passes a new reason string. The dict is
+    process-local — restarting the bot resets all four counters to 0."""
+    _IPN_DROP_COUNTERS[reason] = _IPN_DROP_COUNTERS.get(reason, 0) + 1
+
+
+def get_ipn_drop_counters() -> dict[str, int]:
+    """Return a snapshot copy of the IPN drop counters so callers can
+    surface them via /admin/payment_health (queued) or via tests
+    without touching the module-private dict."""
+    return dict(_IPN_DROP_COUNTERS)
+
+
+def _classify_ipn_outcome(status: str | None) -> str:
+    """Map an IPN ``payment_status`` to the audit-trail outcome we'll
+    record at observation time.
+
+    * ``"applied"`` for statuses the handler will mutate state on.
+    * ``"noop"`` for in-flight / informational statuses we deliberately
+      ignore.
+    * ``"unhandled"`` for everything else — logged loudly so a new
+      NowPayments status doesn't get lost in the void.
+
+    The dedupe contract on ``payment_status_transitions`` is the
+    ``UNIQUE(gateway_invoice_id, payment_status)`` index, NOT this
+    classification; outcome is purely audit-trail enrichment.
+    """
+    if status in _ACTIONABLE_IPN_STATUSES:
+        return "applied"
+    if status in _IN_FLIGHT_STATUSES:
+        return "noop"
+    return "unhandled"
+
 
 async def payment_webhook(request: web.Request):
     try:
@@ -471,16 +532,94 @@ async def payment_webhook(request: web.Request):
         signature = request.headers.get("x-nowpayments-sig")
 
         if not verify_ipn_signature(raw_body, signature):
+            _bump_ipn_drop_counter("bad_signature")
             log.warning(
                 "IPN signature verification failed (remote=%s)", request.remote
             )
             return web.Response(status=401, text="Invalid signature")
 
-        data = json.loads(raw_body)
+        try:
+            data = json.loads(raw_body)
+        except (ValueError, TypeError):
+            # Bug-fix bundle: a malformed-JSON body that happens to pass
+            # signature verification (because ``verify_ipn_signature``
+            # takes raw bytes) used to be swallowed by the outer
+            # ``except Exception`` as a generic 500. Surface the real
+            # reason — it almost always means a misconfigured sandbox
+            # client posting form-encoded data to the prod webhook.
+            _bump_ipn_drop_counter("bad_json")
+            log.error(
+                "IPN body is not valid JSON (remote=%s, len=%d); ignoring",
+                request.remote,
+                len(raw_body),
+            )
+            return web.Response(status=200, text="OK")
+
         status = data.get("payment_status")
         payment_id = data.get("payment_id")
         if payment_id is None:
-            log.warning("Webhook missing payment_id; ignoring (status=%s)", status)
+            # Bug-fix bundle: pre-fix this was a *warning*-level log
+            # with no counter, so a misconfigured sandbox hitting the
+            # prod webhook was effectively invisible. Bump the level
+            # to ``error`` (deploy alerts hook on ``error`` and above)
+            # AND increment the per-process drop counter so
+            # /admin/payment_health (queued) can surface it without
+            # scraping logs.
+            _bump_ipn_drop_counter("missing_payment_id")
+            log.error(
+                "IPN missing payment_id; ignoring (status=%s, remote=%s, "
+                "body_len=%d) — likely a misconfigured NowPayments "
+                "sandbox callback URL",
+                status,
+                request.remote,
+                len(raw_body),
+            )
+            return web.Response(status=200, text="OK")
+
+        # Stage-9-Step-4: schema-level replay-dedupe. Insert the
+        # observed (invoice, status) pair into
+        # ``payment_status_transitions``; ``ON CONFLICT DO NOTHING``
+        # means a duplicate delivery returns ``None`` and we bail
+        # *before* calling ``finalize_payment`` /
+        # ``finalize_partial_payment`` / ``mark_transaction_terminal``.
+        # The downstream row-status guards still catch out-of-order
+        # deliveries against an already-terminal row (e.g. PARTIAL
+        # arriving after SUCCESS), but the transitions table makes the
+        # dedupe explicit and observable in /admin/audit.
+        intended_outcome = _classify_ipn_outcome(status)
+        try:
+            transition_id = await db.record_payment_status_transition(
+                str(payment_id),
+                str(status) if status is not None else "",
+                outcome=intended_outcome,
+                meta={
+                    "remote": request.remote,
+                    "body_len": len(raw_body),
+                },
+            )
+        except Exception:
+            # Fail-open on a transient DB blip: we'd rather process the
+            # IPN and rely on the existing row-status dedupe than 500
+            # back to NowPayments and trigger their retry storm. The
+            # ``except`` is narrow to keep this well-behaved — anything
+            # the asyncpg pool itself raises is already in the outer
+            # ``Exception`` branch below if it happens later.
+            log.exception(
+                "record_payment_status_transition failed for "
+                "payment_id=%s status=%s; falling through to row-level "
+                "dedupe",
+                payment_id,
+                status,
+            )
+            transition_id = "deferred"  # truthy sentinel so we proceed
+        if transition_id is None:
+            _bump_ipn_drop_counter("replay")
+            log.info(
+                "IPN replay dropped: payment_id=%s status=%s already "
+                "observed (deduped at payment_status_transitions)",
+                payment_id,
+                status,
+            )
             return web.Response(status=200, text="OK")
 
         bot: Bot = request.app["bot"]
