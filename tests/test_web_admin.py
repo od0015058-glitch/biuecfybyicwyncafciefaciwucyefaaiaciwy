@@ -138,6 +138,7 @@ def _stub_db(
     user_summary_result: dict | None | Exception = None,
     adjust_balance_result: dict | None | Exception = None,
     broadcast_recipients: list | Exception | None = None,
+    list_transactions_result: dict | Exception | None = None,
 ):
     """A minimal Database stub that exposes the methods web_admin uses.
 
@@ -211,6 +212,24 @@ def _stub_db(
             return_value=broadcast_recipients
             if broadcast_recipients is not None
             else []
+        )
+    # Stage-8-Part-6: transactions browser.
+    default_list_tx = {
+        "rows": [],
+        "total": 0,
+        "page": 1,
+        "per_page": 50,
+        "total_pages": 0,
+    }
+    if isinstance(list_transactions_result, Exception):
+        db.list_transactions = AsyncMock(
+            side_effect=list_transactions_result
+        )
+    else:
+        db.list_transactions = AsyncMock(
+            return_value=list_transactions_result
+            if list_transactions_result is not None
+            else default_list_tx
         )
     return db
 
@@ -2592,6 +2611,46 @@ def test_parse_broadcast_form_limit_aligns_with_telegram_cmd():
     assert BROADCAST_TEXT_MAX_LEN == _BROADCAST_MAX_TEXT_LEN
 
 
+def test_parse_broadcast_form_active_too_large():
+    """Stage-8-Part-6 guard: mirrors the Telegram command — an
+    active-days filter above ``BROADCAST_ACTIVE_DAYS_MAX`` would
+    overflow PG's interval column. Reject at the form boundary.
+    """
+    from web_admin import BROADCAST_ACTIVE_DAYS_MAX
+
+    # Exactly at the cap is allowed.
+    out = parse_broadcast_web_form(
+        {"text": "hi", "only_active_days": str(BROADCAST_ACTIVE_DAYS_MAX)}
+    )
+    assert isinstance(out, dict)
+    assert out["only_active_days"] == BROADCAST_ACTIVE_DAYS_MAX
+
+    # One past is rejected with the new error key.
+    assert (
+        parse_broadcast_web_form(
+            {"text": "hi", "only_active_days": str(BROADCAST_ACTIVE_DAYS_MAX + 1)}
+        )
+        == "active_too_large"
+    )
+    # Nonsensical huge value also rejected (not silently dropped).
+    assert (
+        parse_broadcast_web_form(
+            {"text": "hi", "only_active_days": "9999999999"}
+        )
+        == "active_too_large"
+    )
+
+
+def test_parse_broadcast_form_active_cap_aligns_with_telegram_cmd():
+    """Sanity: the two parsers must cap at the same value or an admin
+    could craft a filter that passes one and is refused by the other.
+    """
+    from admin import _BROADCAST_ACTIVE_DAYS_MAX
+    from web_admin import BROADCAST_ACTIVE_DAYS_MAX
+
+    assert BROADCAST_ACTIVE_DAYS_MAX == _BROADCAST_ACTIVE_DAYS_MAX
+
+
 # ---- in-memory job lifecycle (unit tests) -------------------------------
 
 
@@ -3011,3 +3070,361 @@ async def test_broadcast_status_returns_job_snapshot(
     assert data["total"] == 0
     # The preview is persisted (not the full text).
     assert data["text_preview"] == "snapshot"
+
+
+# ---------------------------------------------------------------------
+# Stage-8-Part-6 — transactions browser
+# ---------------------------------------------------------------------
+
+
+from web_admin import (  # noqa: E402  (keep Part-6 imports grouped)
+    TRANSACTIONS_PER_PAGE_CHOICES,
+    TRANSACTIONS_PER_PAGE_DEFAULT,
+    TRANSACTIONS_PER_PAGE_MAX,
+    _encode_tx_query,
+    parse_transactions_query,
+)
+from multidict import MultiDict  # noqa: E402
+
+
+# ---- parse_transactions_query (unit tests) ---------------------------
+
+
+def test_parse_tx_query_defaults():
+    out = parse_transactions_query(MultiDict())
+    assert out == {
+        "gateway": None,
+        "status": None,
+        "telegram_id": None,
+        "page": 1,
+        "per_page": TRANSACTIONS_PER_PAGE_DEFAULT,
+    }
+
+
+def test_parse_tx_query_happy_path():
+    q = MultiDict(
+        [
+            ("gateway", "nowpayments"),
+            ("status", "SUCCESS"),
+            ("telegram_id", "42"),
+            ("page", "3"),
+            ("per_page", "100"),
+        ]
+    )
+    out = parse_transactions_query(q)
+    assert out == {
+        "gateway": "nowpayments",
+        "status": "SUCCESS",
+        "telegram_id": 42,
+        "page": 3,
+        "per_page": 100,
+    }
+
+
+def test_parse_tx_query_drops_unknown_gateway_and_status():
+    """Unknown enum values silently become ``None`` rather than
+    bubbling a 500 — the handler re-renders as unfiltered. Tested
+    with an SQL-injection-ish string to pin the allow-list.
+    """
+    q = MultiDict(
+        [
+            ("gateway", "paypal"),
+            ("status", "x' OR 1=1 --"),
+        ]
+    )
+    out = parse_transactions_query(q)
+    assert out["gateway"] is None
+    assert out["status"] is None
+
+
+def test_parse_tx_query_drops_non_integer_telegram_id():
+    q = MultiDict([("telegram_id", "not-a-number")])
+    out = parse_transactions_query(q)
+    assert out["telegram_id"] is None
+
+
+def test_parse_tx_query_clamps_page_and_per_page():
+    q = MultiDict([("page", "-10"), ("per_page", "9999")])
+    out = parse_transactions_query(q)
+    assert out["page"] == 1
+    assert out["per_page"] == TRANSACTIONS_PER_PAGE_MAX
+
+    q = MultiDict([("page", "garbage"), ("per_page", "junk")])
+    out = parse_transactions_query(q)
+    assert out["page"] == 1
+    assert out["per_page"] == TRANSACTIONS_PER_PAGE_DEFAULT
+
+
+def test_parse_tx_query_strips_whitespace_on_enum_values():
+    q = MultiDict([("gateway", "  nowpayments  "), ("status", "  SUCCESS  ")])
+    out = parse_transactions_query(q)
+    assert out["gateway"] == "nowpayments"
+    assert out["status"] == "SUCCESS"
+
+
+def test_encode_tx_query_omits_defaults():
+    """Default filters shouldn't pollute the URL — makes the
+    "Reset" link compare equal to the unfiltered landing page.
+    """
+    filters = {
+        "gateway": None,
+        "status": None,
+        "telegram_id": None,
+        "page": 1,
+        "per_page": TRANSACTIONS_PER_PAGE_DEFAULT,
+    }
+    assert _encode_tx_query(filters) == ""
+
+
+def test_encode_tx_query_round_trips_filters():
+    filters = {
+        "gateway": "nowpayments",
+        "status": "SUCCESS",
+        "telegram_id": 42,
+        "page": 2,
+        "per_page": 100,
+    }
+    encoded = _encode_tx_query(filters)
+    # The re-parse must produce an equivalent filter dict.
+    from urllib.parse import parse_qsl
+
+    re_parsed = parse_transactions_query(MultiDict(parse_qsl(encoded)))
+    assert re_parsed["gateway"] == "nowpayments"
+    assert re_parsed["status"] == "SUCCESS"
+    assert re_parsed["telegram_id"] == 42
+    assert re_parsed["page"] == 2
+    assert re_parsed["per_page"] == 100
+
+
+def test_encode_tx_query_page_override():
+    filters = {"gateway": None, "status": None, "telegram_id": None,
+               "page": 5, "per_page": 50}
+    assert "page=3" in _encode_tx_query(filters, page=3)
+    # page=1 is the default — should be dropped by the encoder.
+    assert "page=" not in _encode_tx_query(filters, page=1)
+
+
+# ---- transactions handler (integration) ------------------------------
+
+
+async def test_transactions_requires_auth(aiohttp_client, make_admin_app):
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    resp = await client.get("/admin/transactions", allow_redirects=False)
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+
+
+async def test_transactions_renders_empty_state(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        list_transactions_result={
+            "rows": [],
+            "total": 0,
+            "page": 1,
+            "per_page": 50,
+            "total_pages": 0,
+        }
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/transactions")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "No transactions match" in body
+    # Sidebar link is now enabled + active.
+    assert 'href="/admin/transactions"' in body
+    # Filter dropdowns are populated.
+    for gw in ("nowpayments", "admin", "gift"):
+        assert f'value="{gw}"' in body
+    for st in ("PENDING", "SUCCESS", "PARTIAL", "FAILED", "EXPIRED", "REFUNDED"):
+        assert f'value="{st}"' in body
+
+
+async def test_transactions_renders_rows_and_pagination(
+    aiohttp_client, make_admin_app
+):
+    rows = [
+        {
+            "id": 101,
+            "telegram_id": 7,
+            "gateway": "nowpayments",
+            "currency": "USDT",
+            "amount_crypto_or_rial": 1.0,
+            "amount_usd": 9.99,
+            "status": "SUCCESS",
+            "gateway_invoice_id": "inv-1",
+            "created_at": "2026-04-28T12:00:00+00:00",
+            "completed_at": "2026-04-28T12:05:00+00:00",
+            "notes": None,
+        },
+        {
+            "id": 102,
+            "telegram_id": 8,
+            "gateway": "admin",
+            "currency": "USD",
+            "amount_crypto_or_rial": None,
+            "amount_usd": -2.5,
+            "status": "SUCCESS",
+            "gateway_invoice_id": None,
+            "created_at": "2026-04-28T11:00:00+00:00",
+            "completed_at": "2026-04-28T11:00:00+00:00",
+            "notes": "[web] refund for stuck invoice",
+        },
+    ]
+    db = _stub_db(
+        list_transactions_result={
+            "rows": rows,
+            "total": 120,
+            "page": 2,
+            "per_page": 50,
+            "total_pages": 3,  # 120 / 50 → 3 pages
+        }
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/transactions?page=2")
+    assert resp.status == 200
+    body = await resp.text()
+    # Both rows rendered.
+    assert ">101<" in body and ">102<" in body
+    # Debit styling: negative amount.
+    assert "-$2.5000" in body
+    # Positive amount formatted to 4 decimals.
+    assert "$9.9900" in body
+    # Pager shows current position + total.
+    assert "Page 2 of 3" in body
+    assert "120 row(s)" in body
+    # Prev link points to page 1 (param dropped → bare URL), next to page 3.
+    assert 'href="/admin/transactions"' in body
+    assert "page=3" in body
+
+
+async def test_transactions_forwards_filters_to_db(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get(
+        "/admin/transactions"
+        "?gateway=nowpayments&status=SUCCESS&telegram_id=42&page=2&per_page=25"
+    )
+    assert resp.status == 200
+    db.list_transactions.assert_awaited_once_with(
+        gateway="nowpayments",
+        status="SUCCESS",
+        telegram_id=42,
+        page=2,
+        per_page=25,
+    )
+
+
+async def test_transactions_handles_list_transactions_value_error(
+    aiohttp_client, make_admin_app
+):
+    """Belt-and-suspenders: if list_transactions raises ValueError
+    (e.g. a future DB-layer validation catches what the parser
+    missed), the page renders as empty rather than 500ing.
+    """
+    db = _stub_db(list_transactions_result=ValueError("boom"))
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/transactions")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "No transactions match" in body
+
+
+async def test_transactions_bad_filter_values_ignored_not_500(
+    aiohttp_client, make_admin_app
+):
+    """Unknown enum values in the query string must not crash —
+    the handler re-renders as unfiltered (matching the pattern
+    documented on ``parse_transactions_query``).
+    """
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get(
+        "/admin/transactions?gateway=bogus&status=nope&telegram_id=abc"
+    )
+    assert resp.status == 200
+    # Filters were dropped before reaching the DB layer.
+    db.list_transactions.assert_awaited_once_with(
+        gateway=None,
+        status=None,
+        telegram_id=None,
+        page=1,
+        per_page=TRANSACTIONS_PER_PAGE_DEFAULT,
+    )
+
+
+async def test_transactions_per_page_choices_are_dropdown_values():
+    """Every value shipped in ``TRANSACTIONS_PER_PAGE_CHOICES`` must
+    satisfy the per-page clamp — otherwise the dropdown would
+    silently render an option that down-clamps when submitted.
+    """
+    assert all(
+        1 <= c <= TRANSACTIONS_PER_PAGE_MAX
+        for c in TRANSACTIONS_PER_PAGE_CHOICES
+    )
+    # The default is one of the options (otherwise selecting it
+    # doesn't round-trip through the form).
+    assert TRANSACTIONS_PER_PAGE_DEFAULT in TRANSACTIONS_PER_PAGE_CHOICES
+
+
+async def test_transactions_links_user_column_to_user_detail(
+    aiohttp_client, make_admin_app
+):
+    """The telegram_id column must link through to /admin/users/{id}
+    so the admin can jump from a tx row to the full wallet view and
+    credit/debit form.
+    """
+    db = _stub_db(
+        list_transactions_result={
+            "rows": [
+                {
+                    "id": 1, "telegram_id": 5555, "gateway": "nowpayments",
+                    "currency": "USDT", "amount_crypto_or_rial": 1.0,
+                    "amount_usd": 5.0, "status": "SUCCESS",
+                    "gateway_invoice_id": "inv",
+                    "created_at": "2026-04-28T00:00:00+00:00",
+                    "completed_at": None, "notes": None,
+                }
+            ],
+            "total": 1, "page": 1, "per_page": 50, "total_pages": 1,
+        }
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/transactions")
+    body = await resp.text()
+    assert 'href="/admin/users/5555"' in body
+
+
+async def test_transactions_null_telegram_id_renders_em_dash(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        list_transactions_result={
+            "rows": [
+                {
+                    "id": 1, "telegram_id": None, "gateway": "nowpayments",
+                    "currency": "USDT", "amount_crypto_or_rial": None,
+                    "amount_usd": 0.0, "status": "PENDING",
+                    "gateway_invoice_id": None, "created_at": None,
+                    "completed_at": None, "notes": None,
+                }
+            ],
+            "total": 1, "page": 1, "per_page": 50, "total_pages": 1,
+        }
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/transactions")
+    body = await resp.text()
+    # No crash + orphaned row renders with dash rather than a
+    # broken link.
+    assert "/admin/users/None" not in body
+

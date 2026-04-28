@@ -670,6 +670,17 @@ _BROADCAST_PROGRESS_EVERY = 25
 # Cap to avoid letting an admin DoS Telegram via a broadcast text
 # longer than a single Telegram message can carry.
 _BROADCAST_MAX_TEXT_LEN = 3500
+# Upper bound on ``--active=N`` / ``only_active_days=``. PostgreSQL's
+# ``interval`` stores days in a 32-bit int; an admin typing
+# ``--active=9999999999`` (ten digits) would overflow the
+# ``f"{N} days"`` string we format in
+# :meth:`Database.iter_broadcast_recipients`, crashing the query with
+# an opaque "DB query failed" banner instead of a friendly validation
+# error up-front. 36_500 days (≈100 years) matches the bound already
+# in place for promo/gift-code expiry — no real admin has "active in
+# the last century" as a meaningful filter and the cap keeps the
+# interval well clear of the PG overflow surface.
+_BROADCAST_ACTIVE_DAYS_MAX = 36_500
 
 
 def parse_broadcast_args(text: str) -> dict | str:
@@ -681,7 +692,9 @@ def parse_broadcast_args(text: str) -> dict | str:
 
     on success, or a string error key on failure: ``"missing"``
     (no body), ``"bad_active"`` (``--active`` parse failed),
-    ``"too_long"`` (body > _BROADCAST_MAX_TEXT_LEN).
+    ``"active_too_large"`` (``--active`` > ``_BROADCAST_ACTIVE_DAYS_MAX``,
+    which would otherwise overflow PG's interval column downstream),
+    ``"too_long"`` (body > ``_BROADCAST_MAX_TEXT_LEN``).
 
     The body is everything after the command (and after the optional
     ``--active=N`` flag). Newlines are preserved so the admin can
@@ -703,6 +716,8 @@ def parse_broadcast_args(text: str) -> dict | str:
             return "bad_active"
         if only_active_days <= 0:
             return "bad_active"
+        if only_active_days > _BROADCAST_ACTIVE_DAYS_MAX:
+            return "active_too_large"
         body = body[m.end():]
 
     body = body.strip()
@@ -723,6 +738,10 @@ _BROADCAST_ERR_TEXT = {
     ),
     "bad_active": (
         "❌ `--active=N` must be a positive integer (days)."
+    ),
+    "active_too_large": (
+        f"❌ `--active=N` must be ≤ {_BROADCAST_ACTIVE_DAYS_MAX:,} "
+        "days (≈100 years)."
     ),
     "too_long": (
         f"❌ Broadcast body too long (limit "
