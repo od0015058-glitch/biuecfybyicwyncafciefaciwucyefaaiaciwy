@@ -243,3 +243,188 @@ def test_get_compiled_default_returns_none_for_missing_key():
 
 def test_get_compiled_default_returns_none_for_unknown_lang():
     assert strings.get_compiled_default("zh", "hub_btn_wallet") is None
+
+
+# ----- extract_format_fields ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "template,expected",
+    [
+        ("plain text", set()),
+        ("Hello, {name}!", {"name"}),
+        ("{a}{b}{c}", {"a", "b", "c"}),
+        ("Balance: ${balance:.2f}", {"balance"}),
+        ("Active: {user.name}, ID: {user.id}", {"user"}),
+        ("First: {items[0]}", {"items"}),
+        ("Mix {a} {b!r:>10} {c:.0f}", {"a", "b", "c"}),
+        # Repeated names collapse to one entry — set semantics.
+        ("{x} {x} {x}", {"x"}),
+        # Escaped braces are literal text, not placeholders.
+        ("Use {{braces}} like this", set()),
+    ],
+)
+def test_extract_format_fields_named(template, expected):
+    """Named placeholders are extracted by their top-level kwarg name."""
+    assert strings.extract_format_fields(template) == expected
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "{",                # unclosed brace
+        "}",                # unmatched close
+        "{unclosed",        # unclosed named
+        "{:>10",            # unclosed format spec
+    ],
+)
+def test_extract_format_fields_rejects_invalid_syntax(bad):
+    """Malformed format strings raise ValueError so the validator can
+    surface a clear error message."""
+    with pytest.raises(ValueError):
+        strings.extract_format_fields(bad)
+
+
+@pytest.mark.parametrize(
+    "positional",
+    [
+        "{}",
+        "{0}",
+        "{0} and {1}",
+        "Mix {0} {name}",
+    ],
+)
+def test_extract_format_fields_rejects_positional(positional):
+    """Positional placeholders aren't usable from kwarg-only callers."""
+    with pytest.raises(ValueError, match="positional"):
+        strings.extract_format_fields(positional)
+
+
+# ----- validate_override ----------------------------------------------
+
+
+def test_validate_override_accepts_subset_of_default_fields():
+    """An override using only fields the compiled default declares is
+    valid — even if it drops some of them."""
+    # ``hub_title`` uses {active_model}, {balance}, {lang_label}.
+    err = strings.validate_override("en", "hub_title", "Balance: {balance}")
+    assert err is None
+
+
+def test_validate_override_accepts_no_placeholders():
+    """An override that drops every placeholder is fine — caller's
+    extra kwargs are silently ignored by ``str.format``."""
+    err = strings.validate_override(
+        "en", "hub_title", "Static text with no placeholders"
+    )
+    assert err is None
+
+
+def test_validate_override_accepts_full_default_field_set():
+    """The compiled default itself, fed back as an override, validates."""
+    default = strings.get_compiled_default("en", "hub_title")
+    assert default is not None
+    err = strings.validate_override("en", "hub_title", default)
+    assert err is None
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        "Balance: {bal}",                 # typo of {balance}
+        "Model: {model}",                 # not in default
+        "{nonexistent}",                  # entirely unknown
+        "{active_model} and {extra}",     # mix valid + invalid
+    ],
+)
+def test_validate_override_rejects_unknown_placeholder(bad_value):
+    """Pre-fix this would crash ``t()`` with KeyError on every render
+    of the slug. Now we reject at save time."""
+    err = strings.validate_override("en", "hub_title", bad_value)
+    assert err is not None
+    assert "Unknown placeholder" in err
+
+
+@pytest.mark.parametrize(
+    "bad_syntax",
+    [
+        "Balance: {balance",         # unclosed
+        "Balance: balance}",         # unmatched close
+        "{}",                        # positional
+        "{0}",                       # positional indexed
+    ],
+)
+def test_validate_override_rejects_invalid_syntax(bad_syntax):
+    err = strings.validate_override("en", "hub_title", bad_syntax)
+    assert err is not None
+
+
+def test_validate_override_unknown_slug_returns_error():
+    err = strings.validate_override("en", "no_such_slug_zzz", "anything")
+    assert err is not None
+    assert "Unknown slug" in err
+
+
+# ----- t() runtime fallback for broken overrides ----------------------
+
+
+def test_t_falls_back_to_compiled_default_on_broken_override(caplog):
+    """A legacy override with an unknown placeholder must NOT crash —
+    fall back to the compiled default which is known-good."""
+    # Force a broken override directly into the cache, bypassing the
+    # validator. Simulates a legacy DB row from before validation
+    # existed.
+    strings.set_overrides(
+        {("en", "hub_title"): "Bad override: {nope_this_kwarg_is_unknown}"}
+    )
+    with caplog.at_level(logging.WARNING, logger="bot.strings"):
+        out = strings.t(
+            "en", "hub_title",
+            active_model="x", balance=1.0,
+            lang_label="EN", memory_label="off",
+        )
+    # Fallback render uses the compiled default which formats balance
+    # as ``${balance:.2f}`` ⇒ contains "1.00".
+    assert "1.00" in out
+    # Rendered string is not the override (we discarded it).
+    assert "Bad override" not in out
+
+
+def test_t_falls_back_to_bare_slug_when_override_has_invalid_syntax(caplog):
+    """A legacy override with literal ``{`` that isn't a valid format
+    placeholder must not crash. Fall back to the compiled default."""
+    # Force a broken override with unclosed brace + a kwarg the
+    # default doesn't have. ``hub_title`` requires 4 named kwargs so
+    # we pass them — the compiled-default fallback then succeeds.
+    strings.set_overrides({("en", "hub_title"): "Bad: {balance"})
+    with caplog.at_level(logging.WARNING, logger="bot.strings"):
+        out = strings.t(
+            "en", "hub_title",
+            active_model="x", balance=1.0,
+            lang_label="EN", memory_label="off",
+        )
+    # Compiled default rendered (contains balance formatted to 2dp).
+    assert "1.00" in out
+    assert "Bad:" not in out
+
+
+def test_t_unicode_kwarg_value_renders_unchanged():
+    """Regression pin: a kwarg whose value is a Unicode string must
+    render verbatim (no encoding round-trip, no replacement
+    chars). The default locale is fa with Persian text."""
+    out = strings.t(
+        "fa", "hub_title",
+        active_model="مدل-تستی", balance=1.0,
+        lang_label="فارسی", memory_label="خاموش",
+    )
+    assert "مدل-تستی" in out
+    assert "فارسی" in out
+
+
+def test_t_no_kwargs_path_does_not_crash_for_static_keys():
+    """Regression: the no-kwargs branch must not invoke .format(),
+    so an override that happens to contain literal ``{`` characters
+    (e.g. a Python expression in a help string) still renders."""
+    strings.set_overrides({("en", "btn_back"): "{"})
+    out = strings.t("en", "btn_back")
+    assert out == "{"

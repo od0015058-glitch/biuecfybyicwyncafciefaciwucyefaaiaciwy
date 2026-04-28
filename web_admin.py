@@ -3127,6 +3127,24 @@ async def string_save_post(request: web.Request) -> web.StreamResponse:
         )
         return response
 
+    # Validate the override's ``str.format`` placeholders against the
+    # compiled default's allowed kwarg names. Pre-fix, a typo like
+    # ``{bal}`` (when the default is ``{balance}``) silently saved
+    # into the DB and then every ``t()`` call rendering this slug
+    # crashed with ``KeyError: 'bal'`` until an admin reverted the
+    # override. With this check the admin gets immediate feedback at
+    # save time and the broken value never reaches the override cache.
+    validation_error = bot_strings_module.validate_override(lang, key, value)
+    if validation_error is not None:
+        set_flash(
+            response,
+            kind="error",
+            message=validation_error,
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
     db = request.app.get(APP_KEY_DB)
     if db is None:
         set_flash(
