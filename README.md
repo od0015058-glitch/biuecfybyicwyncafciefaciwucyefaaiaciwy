@@ -153,7 +153,7 @@ pytest tests/
 | `main.py` | Entrypoint. Boots aiogram dispatcher, registers middleware, calls `bot_commands.publish_bot_commands` to overwrite BotFather's slash-command list, starts the IPN HTTP listener. |
 | `bot_commands.py` | Canonical Telegram slash-command publisher. `PUBLIC_COMMANDS` (everyone sees) + `ADMIN_COMMANDS` (per-admin via `BotCommandScopeChat`). Idempotent; errors are logged and swallowed so a transient network blip during startup doesn't take the bot down. |
 | `database.py` | asyncpg pool + every SQL query. Money methods use `SELECT … FOR UPDATE` inside connection-scoped transactions. |
-| `payments.py` | NowPayments invoice creation, IPN verification (HMAC-SHA512), idempotent finalize, partial-payment crediting. |
+| `payments.py` | NowPayments invoice creation, IPN verification (HMAC-SHA512), idempotent finalize, partial-payment crediting. IPN replay-dedupe via `payment_status_transitions` (`UNIQUE(gateway_invoice_id, payment_status)`) — duplicate `(invoice, status)` deliveries drop with a 200 before any state mutation. Per-process drop counters (`bad_signature`, `bad_json`, `missing_payment_id`, `replay`) exposed via `get_ipn_drop_counters()` for ops dashboards. |
 | `handlers.py` | All aiogram handlers — `/start`, hub UI, charge flow, model picker, language picker, support. |
 | `ai_engine.py` | OpenRouter call, cost calc, balance deduct, optional conversation memory. |
 | `pricing.py` | Per-model price table + `COST_MARKUP` env var (default 1.5×). |

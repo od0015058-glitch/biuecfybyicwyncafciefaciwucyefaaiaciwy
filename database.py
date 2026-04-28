@@ -1876,6 +1876,96 @@ class Database:
             for r in rows
         ]
 
+    async def record_payment_status_transition(
+        self,
+        gateway_invoice_id: str,
+        payment_status: str,
+        *,
+        outcome: str,
+        meta: dict | None = None,
+    ) -> int | None:
+        """Append one row to ``payment_status_transitions``, deduping on
+        ``(gateway_invoice_id, payment_status)``.
+
+        Returns the new ``id`` if the insert took, or ``None`` if the
+        row already existed (i.e. this exact ``(invoice, status)`` pair
+        was previously observed — the caller should treat that as a
+        replayed IPN and bail before mutating state).
+
+        ``outcome`` should be one of:
+          * ``"applied"`` — handler actually mutated state in response
+          * ``"replay"`` — handler observed but bailed early because
+            the row dedupe upstream had already finalized the invoice
+          * ``"noop"`` — handler intentionally did nothing (e.g.
+            ``confirming`` / ``waiting`` informational IPN)
+
+        ``meta`` is free-form structured detail stored as JSONB.
+
+        Best-effort: any DB exception is logged and re-raised — the
+        caller MUST decide whether to fail-closed (e.g. signature
+        verification path) or fail-open (e.g. a transient pool blip
+        for an idempotent IPN).
+        """
+        import json as _json
+        meta_json = _json.dumps(meta) if meta is not None else None
+        async with self.pool.acquire() as connection:
+            row_id = await connection.fetchval(
+                """
+                INSERT INTO payment_status_transitions
+                    (gateway_invoice_id, payment_status, outcome, meta)
+                VALUES ($1, $2, $3, $4::jsonb)
+                ON CONFLICT (gateway_invoice_id, payment_status)
+                DO NOTHING
+                RETURNING id
+                """,
+                gateway_invoice_id,
+                payment_status,
+                outcome,
+                meta_json,
+            )
+        return int(row_id) if row_id is not None else None
+
+    async def list_payment_status_transitions(
+        self,
+        *,
+        limit: int = 200,
+        gateway_invoice_id: str | None = None,
+    ) -> list[dict]:
+        """Most recent IPN transitions, newest first. Optional filter
+        narrows to a single invoice (forensics: "show me everything we
+        observed for this invoice")."""
+        params: list[object] = []
+        where = ""
+        if gateway_invoice_id is not None:
+            params.append(gateway_invoice_id)
+            where = f"WHERE gateway_invoice_id = ${len(params)}"
+        params.append(int(limit))
+        sql = f"""
+            SELECT id, gateway_invoice_id, payment_status,
+                   recorded_at, outcome, meta
+              FROM payment_status_transitions
+              {where}
+             ORDER BY recorded_at DESC, id DESC
+             LIMIT ${len(params)}
+        """
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(sql, *params)
+        return [
+            {
+                "id": int(r["id"]),
+                "gateway_invoice_id": r["gateway_invoice_id"],
+                "payment_status": r["payment_status"],
+                "recorded_at": (
+                    r["recorded_at"].isoformat()
+                    if r["recorded_at"] is not None
+                    else None
+                ),
+                "outcome": r["outcome"],
+                "meta": dict(r["meta"]) if r["meta"] is not None else None,
+            }
+            for r in rows
+        ]
+
     async def update_user_admin_fields(
         self,
         telegram_id: int,
