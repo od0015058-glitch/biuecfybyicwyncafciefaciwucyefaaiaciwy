@@ -5816,3 +5816,107 @@ def test_gift_form_err_text_has_max_uses_too_large_key():
     from web_admin import _GIFT_FORM_ERR_TEXT, MAX_USES_CAP
     assert "max_uses_too_large" in _GIFT_FORM_ERR_TEXT
     assert f"{MAX_USES_CAP:,}" in _GIFT_FORM_ERR_TEXT["max_uses_too_large"]
+
+
+# ---------------------------------------------------------------------
+# Bug-fix sweep: username "@" -> "" collapse in parse_user_edit_form.
+#
+# Pre-fix a raw value of "@" / "@@@" / etc. lstripped to "" and the
+# subsequent ``all(c.isalnum() or c == "_" for c in cleaned)`` check
+# returned ``True`` for the empty iterable, so the empty string was
+# stored in ``users.username``. Empty string is distinct from NULL at
+# the SQL level — a follow-up ``WHERE username IS NULL`` query would
+# treat that user as having a username and skip the fallback path.
+# ---------------------------------------------------------------------
+
+
+_USER_EDIT_BASE_CURRENT = {
+    "language_code": "en",
+    "active_model": "google/gemini-pro",
+    "memory_enabled": False,
+    "username": "alice",
+    "free_messages_left": 0,
+}
+
+
+def test_parse_user_edit_form_username_at_only_rejected():
+    """The original repro: a single ``@`` collapses to ``""`` after
+    ``lstrip("@")`` — pre-fix this passed validation and got stored as
+    the empty string. Now rejected with ``"bad_username"``."""
+    from web_admin import parse_user_edit_form
+    result = parse_user_edit_form(
+        {"username": "@"}, current=_USER_EDIT_BASE_CURRENT
+    )
+    assert result == "bad_username"
+
+
+def test_parse_user_edit_form_username_only_at_signs_rejected():
+    """Same shape as the first test — multiple leading @s also collapse
+    to empty after ``lstrip("@")``."""
+    from web_admin import parse_user_edit_form
+    for raw in ("@@", "@@@", "@@@@@@@@@@"):
+        result = parse_user_edit_form(
+            {"username": raw}, current=_USER_EDIT_BASE_CURRENT
+        )
+        assert result == "bad_username", f"raw={raw!r}"
+
+
+def test_parse_user_edit_form_username_with_leading_at_still_accepted():
+    """Regression pin: a normal ``@alice`` is still stripped to
+    ``alice`` and accepted (not rejected as ``bad_username``)."""
+    from web_admin import parse_user_edit_form
+    current = {**_USER_EDIT_BASE_CURRENT, "username": "bob"}
+    result = parse_user_edit_form({"username": "@alice"}, current=current)
+    assert result == {"username": "alice"}
+
+
+def test_parse_user_edit_form_username_no_at_still_accepted():
+    """Regression pin: a username submitted without the leading @ is
+    still accepted unchanged."""
+    from web_admin import parse_user_edit_form
+    current = {**_USER_EDIT_BASE_CURRENT, "username": "bob"}
+    result = parse_user_edit_form({"username": "alice"}, current=current)
+    assert result == {"username": "alice"}
+
+
+def test_parse_user_edit_form_username_empty_clears_to_none():
+    """Regression pin: an explicit empty value clears the field to
+    ``None`` (NULL in the DB), not the empty string. This is the
+    INTENDED clearing path — the ``"@"`` repro abused the same
+    collapse to do this implicitly without setting NULL."""
+    from web_admin import parse_user_edit_form
+    current = {**_USER_EDIT_BASE_CURRENT, "username": "alice"}
+    result = parse_user_edit_form({"username": ""}, current=current)
+    assert result == {"username": None}
+
+
+def test_parse_user_edit_form_username_whitespace_clears_to_none():
+    """Regression pin: whitespace-only input is also treated as a
+    clear (matches the existing comment)."""
+    from web_admin import parse_user_edit_form
+    current = {**_USER_EDIT_BASE_CURRENT, "username": "alice"}
+    result = parse_user_edit_form({"username": "   "}, current=current)
+    assert result == {"username": None}
+
+
+def test_parse_user_edit_form_username_with_space_inside_rejected():
+    """Regression pin: a space inside the username is still rejected
+    by the alphanumeric-or-underscore check (the all() check that
+    pre-fix was vacuously True on the ``@`` collapse)."""
+    from web_admin import parse_user_edit_form
+    result = parse_user_edit_form(
+        {"username": "bad name"}, current=_USER_EDIT_BASE_CURRENT
+    )
+    assert result == "bad_username"
+
+
+def test_parse_user_edit_form_username_too_long_distinct_error_key():
+    """Regression pin: the length cap returns ``"username_too_long"``
+    (a distinct error key from the ``"@"``-collapse rejection so the
+    flash banner can render different friendly text)."""
+    from web_admin import parse_user_edit_form, USER_FIELD_USERNAME_MAX_CHARS
+    raw = "a" * (USER_FIELD_USERNAME_MAX_CHARS + 1)
+    result = parse_user_edit_form(
+        {"username": raw}, current=_USER_EDIT_BASE_CURRENT
+    )
+    assert result == "username_too_long"
