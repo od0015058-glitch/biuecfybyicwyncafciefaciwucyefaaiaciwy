@@ -4,3 +4,11 @@
 # Kept separate so production deploys don't pull pytest + friends.
 
 pytest>=8.0.0
+# pytest-asyncio drives the @pytest.mark.asyncio decorator used by
+# tests/test_rate_limit.py and tests/test_fsm_storage.py shouldn't
+# need it, but having it in dev installs gives every test free
+# access to the asyncio event loop fixture.
+pytest-asyncio>=0.23.0
+# pytest-aiohttp ships the `aiohttp_client` fixture used to spin up
+# a real aiohttp test server for the webhook rate-limit middleware.
+pytest-aiohttp>=1.0.5

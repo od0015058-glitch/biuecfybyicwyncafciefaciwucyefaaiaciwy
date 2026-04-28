@@ -12,6 +12,7 @@ from database import db
 from handlers import router
 from middlewares import UserUpsertMiddleware
 from payments import payment_webhook
+from rate_limit import ChatRateLimitMiddleware, install_webhook_rate_limit
 
 load_dotenv()
 
@@ -25,6 +26,11 @@ log = logging.getLogger("bot.main")
 async def start_webhook_server(bot: Bot) -> web.AppRunner:
     """Spins up a background web server to listen for payment IPNs."""
     app = web.Application()
+    # Per-IP token-bucket middleware first so a flood can't even reach
+    # the JSON parsing / signature verification step. NowPayments'
+    # legitimate retry rhythm is well under the cap (30 tokens, 5/sec
+    # refill); see rate_limit.install_webhook_rate_limit.
+    install_webhook_rate_limit(app)
     app["bot"] = bot  # Give the server access to the bot so it can send messages
     app.router.add_post("/nowpayments-webhook", payment_webhook)
 
@@ -74,6 +80,13 @@ async def main():
     upsert = UserUpsertMiddleware()
     dp.message.outer_middleware(upsert)
     dp.callback_query.outer_middleware(upsert)
+
+    # Per-user token-bucket on chat messages — caps how fast a single
+    # Telegram user can fire OpenRouter-billed prompts. Registered as
+    # an *inner* middleware on dp.message only so callback button
+    # taps and FSM-state handlers don't get throttled. See
+    # rate_limit.ChatRateLimitMiddleware.
+    dp.message.middleware(ChatRateLimitMiddleware())
 
     dp.include_router(router)
 
