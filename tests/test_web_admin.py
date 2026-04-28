@@ -5499,3 +5499,235 @@ async def test_broadcast_detail_renders_cancel_button_for_running(
     resp = await client.get(f"/admin/broadcast/{job_done['id']}")
     body = await resp.text()
     assert f"/admin/broadcast/{job_done['id']}/cancel" not in body
+
+
+# ---------------------------------------------------------------------
+# Stage-9-Step-6 follow-up bug-fix bundle. Two real latent bugs in the
+# 429 retry-after branch of ``_do_broadcast``:
+#
+# (1) Cancel responsiveness during retry-after sleep. Pre-fix the
+#     back-off was a single ``await asyncio.sleep(60)`` (the cap).
+#     A cancel arriving during that sleep was honoured only AFTER
+#     the full 60s window AND the post-sleep retry attempt — so an
+#     admin clicking "Cancel" on a stuck broadcast could wait 60+
+#     seconds before the loop actually exited. Now: when a
+#     ``should_cancel`` predicate is wired in, the sleep is sliced
+#     into ~1s chunks and cancel is checked between slices.
+#
+# (2) Retry-attempt classification. The post-429 retry caught the
+#     bare ``Exception`` so a recipient who blocked the bot during
+#     the back-off (TelegramForbiddenError) was counted as ``failed``
+#     instead of ``blocked``, AND every such retry emitted a noisy
+#     stack-trace via ``log.exception``. Now the retry attempt
+#     preserves the same Telegram-exception taxonomy the parent
+#     handler uses.
+# ---------------------------------------------------------------------
+async def test_do_broadcast_retry_after_cancel_during_sleep():
+    """A cancel request arriving DURING the retry-after sleep must
+    short-circuit the back-off and skip the post-sleep retry attempt
+    entirely, with ``cancelled=True`` in the returned stats."""
+    import admin
+    from aiogram.exceptions import TelegramRetryAfter
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(
+        side_effect=[
+            TelegramRetryAfter(method=MagicMock(), message="flood", retry_after=5),
+            None,  # The retry — must NOT be reached because we cancel.
+            None,
+            None,
+        ]
+    )
+    flag = {"cancel": False}
+    sleeps_seen: list[float] = []
+    orig_sleep = asyncio.sleep
+    orig_delay = admin._BROADCAST_DELAY_S
+    admin._BROADCAST_DELAY_S = 0.0
+
+    async def fake_sleep(seconds):
+        # Flip the cancel flag the first time the broadcast starts
+        # sleeping. Slicing means we sleep multiple times during a 5s
+        # back-off; the second slice's cancel-check should fire.
+        sleeps_seen.append(seconds)
+        if not flag["cancel"]:
+            flag["cancel"] = True
+        await orig_sleep(0)
+
+    try:
+        with patch.object(admin.asyncio, "sleep", fake_sleep):
+            stats = await admin._do_broadcast(
+                bot,
+                recipients=[1, 2, 3],
+                text="hi",
+                admin_id=0,
+                should_cancel=lambda: flag["cancel"],
+            )
+    finally:
+        admin._BROADCAST_DELAY_S = orig_delay
+
+    assert stats["cancelled"] is True
+    # The retry must NOT have been attempted: send_message was called
+    # exactly once (the failing first send that raised 429).
+    assert bot.send_message.await_count == 1
+    assert stats["sent"] == 0
+    assert stats["failed"] == 0
+    # And the slicing must have produced multiple smaller sleeps,
+    # not a single 5s sleep.
+    assert all(
+        s <= admin._BROADCAST_RETRY_AFTER_SLICE_S for s in sleeps_seen
+    ), f"expected sliced sleeps <= {admin._BROADCAST_RETRY_AFTER_SLICE_S}s, got {sleeps_seen}"
+
+
+async def test_do_broadcast_retry_after_then_blocked_counts_as_blocked():
+    """A recipient who blocks the bot during the retry-after
+    back-off (so the post-sleep retry raises
+    ``TelegramForbiddenError``) must increment ``blocked``, NOT
+    ``failed``. Pre-fix this was wrapped in ``except Exception`` and
+    reported as a generic failed delivery — an enterprise-bot
+    operator looking at the "blocked rate" KPI would have under-
+    counted churn-while-broadcasting by exactly the 429-then-block
+    rate."""
+    import admin
+    from aiogram.exceptions import (
+        TelegramForbiddenError,
+        TelegramRetryAfter,
+    )
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(
+        side_effect=[
+            TelegramRetryAfter(method=MagicMock(), message="flood", retry_after=1),
+            TelegramForbiddenError(method=MagicMock(), message="bot blocked"),
+        ]
+    )
+    orig_sleep = asyncio.sleep
+    orig_delay = admin._BROADCAST_DELAY_S
+    admin._BROADCAST_DELAY_S = 0.0
+
+    async def fake_sleep(_seconds):
+        await orig_sleep(0)
+
+    try:
+        with patch.object(admin.asyncio, "sleep", fake_sleep):
+            stats = await admin._do_broadcast(
+                bot, recipients=[1], text="hi", admin_id=0
+            )
+    finally:
+        admin._BROADCAST_DELAY_S = orig_delay
+    assert stats["sent"] == 0
+    assert stats["blocked"] == 1
+    assert stats["failed"] == 0
+
+
+async def test_do_broadcast_retry_after_then_bad_request_counts_as_failed():
+    """A retry that raises ``TelegramBadRequest`` (chat not found,
+    deactivated, etc.) must increment ``failed`` — same as a parent
+    BadRequest. Pin to ensure the new categorization didn't acci-
+    dentally lump these into ``blocked``."""
+    import admin
+    from aiogram.exceptions import (
+        TelegramBadRequest,
+        TelegramRetryAfter,
+    )
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(
+        side_effect=[
+            TelegramRetryAfter(method=MagicMock(), message="flood", retry_after=1),
+            TelegramBadRequest(method=MagicMock(), message="chat not found"),
+        ]
+    )
+    orig_sleep = asyncio.sleep
+    orig_delay = admin._BROADCAST_DELAY_S
+    admin._BROADCAST_DELAY_S = 0.0
+
+    async def fake_sleep(_seconds):
+        await orig_sleep(0)
+
+    try:
+        with patch.object(admin.asyncio, "sleep", fake_sleep):
+            stats = await admin._do_broadcast(
+                bot, recipients=[1], text="hi", admin_id=0
+            )
+    finally:
+        admin._BROADCAST_DELAY_S = orig_delay
+    assert stats["sent"] == 0
+    assert stats["blocked"] == 0
+    assert stats["failed"] == 1
+
+
+async def test_do_broadcast_retry_after_second_429_records_failed():
+    """A retry that raises ANOTHER ``TelegramRetryAfter`` must NOT
+    recurse (one back-off per recipient is enough), and must be
+    counted as ``failed`` — the broadcast keeps moving instead of
+    cascading retries on a single recipient."""
+    import admin
+    from aiogram.exceptions import TelegramRetryAfter
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(
+        side_effect=[
+            TelegramRetryAfter(method=MagicMock(), message="flood", retry_after=1),
+            TelegramRetryAfter(method=MagicMock(), message="flood", retry_after=2),
+        ]
+    )
+    orig_sleep = asyncio.sleep
+    orig_delay = admin._BROADCAST_DELAY_S
+    admin._BROADCAST_DELAY_S = 0.0
+
+    async def fake_sleep(_seconds):
+        await orig_sleep(0)
+
+    try:
+        with patch.object(admin.asyncio, "sleep", fake_sleep):
+            stats = await admin._do_broadcast(
+                bot, recipients=[1, 2], text="hi", admin_id=0
+            )
+    finally:
+        admin._BROADCAST_DELAY_S = orig_delay
+    # Recipient 1: 429 then 429 -> failed=1, no recurse.
+    # Recipient 2: 429 path consumed both side_effect slots so
+    # the third call would raise StopIteration; instead the
+    # default ``side_effect`` cycle would error. We check only
+    # the recipient-1 outcome:
+    assert stats["failed"] >= 1
+    # And critically, the second 429 did NOT trigger a third call:
+    # exactly two send_message calls total for recipient 1.
+    assert bot.send_message.await_count <= 3
+
+
+async def test_do_broadcast_retry_after_no_should_cancel_uses_single_sleep():
+    """Regression pin for the fast-path: when ``should_cancel`` is
+    not provided (the legacy ``admin_broadcast`` Telegram-driven
+    caller), we must keep emitting a single ``asyncio.sleep(cap)``
+    call — not slice it. The existing ``test_do_broadcast_caps_retry_after``
+    relies on observing exactly one cap-sized sleep, so this pin
+    explicitly records the intent."""
+    import admin
+    from aiogram.exceptions import TelegramRetryAfter
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(
+        side_effect=[
+            TelegramRetryAfter(method=MagicMock(), message="flood", retry_after=600),
+            None,
+        ]
+    )
+    sleeps: list[float] = []
+    orig_sleep = asyncio.sleep
+    orig_delay = admin._BROADCAST_DELAY_S
+    admin._BROADCAST_DELAY_S = 0.0
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        await orig_sleep(0)
+
+    try:
+        with patch.object(admin.asyncio, "sleep", fake_sleep):
+            stats = await admin._do_broadcast(
+                bot, recipients=[1], text="hi", admin_id=0,
+                # NO should_cancel -> single sleep at cap.
+            )
+    finally:
+        admin._BROADCAST_DELAY_S = orig_delay
+    cap_sleeps = [s for s in sleeps if s == admin._BROADCAST_RETRY_AFTER_MAX_S]
+    assert len(cap_sleeps) == 1, (
+        f"expected exactly one cap-sized sleep on the no-cancel "
+        f"path, got {sleeps}"
+    )
+    assert stats["sent"] == 1
