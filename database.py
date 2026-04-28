@@ -1668,6 +1668,98 @@ class Database:
             ],
         }
 
+    # ---- bot_strings (Stage-9-Step-1.6) ---------------------------
+    # Per-(lang, key) overrides for the compiled string table in
+    # ``strings.py``. Surface area is intentionally small: full-table
+    # load on boot, single-row upsert on admin save, single-row delete
+    # on revert. The runtime ``t()`` helper consults an in-memory cache
+    # populated by ``strings.set_overrides`` so we don't round-trip
+    # the DB on every message.
+
+    async def load_all_string_overrides(self) -> dict[tuple[str, str], str]:
+        """Snapshot every (lang, key) override → value pair.
+
+        Called once at startup to seed the in-memory cache, and again
+        after each admin write to refresh the cache. The table is
+        bounded by the size of ``strings._STRINGS`` × 2 langs (~600
+        rows max), so ``SELECT *`` is cheap.
+        """
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                "SELECT lang, key, value FROM bot_strings"
+            )
+        return {(r["lang"], r["key"]): r["value"] for r in rows}
+
+    async def list_string_overrides(self, *, limit: int = 200) -> list[dict]:
+        """Return the most recently edited overrides for the admin
+        "What did the team change?" view. Each row carries lang, key,
+        the override value, who set it, and when."""
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT lang, key, value, updated_at, updated_by
+                FROM bot_strings
+                ORDER BY updated_at DESC
+                LIMIT $1
+                """,
+                int(limit),
+            )
+        return [
+            {
+                "lang": r["lang"],
+                "key": r["key"],
+                "value": r["value"],
+                "updated_at": (
+                    r["updated_at"].isoformat()
+                    if r["updated_at"] is not None else None
+                ),
+                "updated_by": r["updated_by"],
+            }
+            for r in rows
+        ]
+
+    async def upsert_string_override(
+        self,
+        lang: str,
+        key: str,
+        value: str,
+        *,
+        updated_by: str | None,
+    ) -> None:
+        """Insert-or-replace a single override. The ``updated_by``
+        field is freeform text — typically the admin's telegram id
+        for /admin_* slash commands or ``"web"`` for browser edits."""
+        async with self.pool.acquire() as connection:
+            await connection.execute(
+                """
+                INSERT INTO bot_strings (lang, key, value, updated_at, updated_by)
+                VALUES ($1, $2, $3, NOW(), $4)
+                ON CONFLICT (lang, key) DO UPDATE
+                  SET value = EXCLUDED.value,
+                      updated_at = NOW(),
+                      updated_by = EXCLUDED.updated_by
+                """,
+                lang,
+                key,
+                value,
+                updated_by,
+            )
+
+    async def delete_string_override(self, lang: str, key: str) -> bool:
+        """Revert to the compiled default for *(lang, key)*. Returns
+        True iff a row was deleted (False = there was no override
+        to begin with — caller may want to flash that as info)."""
+        async with self.pool.acquire() as connection:
+            result = await connection.execute(
+                "DELETE FROM bot_strings WHERE lang = $1 AND key = $2",
+                lang,
+                key,
+            )
+        # ``DELETE 0`` vs ``DELETE 1`` — asyncpg returns the raw
+        # status string. Anything other than ``"DELETE 0"`` means at
+        # least one row went.
+        return not result.endswith(" 0")
+
 
 # Export a single instance to be used across the app
 db = Database()

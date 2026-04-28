@@ -1,0 +1,168 @@
+{% extends "_layout.html" %}
+
+{% block title %}Bot text{% endblock %}
+
+{% block extra_head %}
+<style>
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: flex-end;
+    margin-bottom: 16px;
+  }
+  .filters .field { margin-bottom: 0; min-width: 140px; }
+  .filters .field.wide { min-width: 280px; }
+  .filters button.primary {
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 6px;
+    padding: 9px 18px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  .filters button.primary:hover { background: var(--accent-hover); }
+  .filters a.reset {
+    padding: 9px 14px;
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+  .explainer {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 14px;
+    margin-bottom: 16px;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  code.slug {
+    background: var(--bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+  }
+  .lang-badge {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 4px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+  }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 500;
+  }
+  .badge-override {
+    background: rgba(79, 140, 255, 0.12);
+    color: var(--accent);
+    border: 1px solid rgba(79, 140, 255, 0.3);
+  }
+  .badge-default {
+    background: rgba(160, 160, 160, 0.12);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+  }
+  .preview {
+    max-width: 540px;
+    word-break: break-word;
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.4;
+  }
+  .preview.muted { color: var(--text-muted); }
+  a.row-edit {
+    color: var(--accent);
+    font-size: 13px;
+  }
+</style>
+{% endblock %}
+
+{% block main %}
+<h2>Bot text</h2>
+
+{% if flash %}
+<div class="alert alert-{{ flash.kind }}">{{ flash.message }}</div>
+{% endif %}
+
+{% if db_error %}
+<div class="alert alert-warn">{{ db_error }}</div>
+{% endif %}
+
+<div class="explainer">
+  Every user-facing label in the bot is editable here. Type a search to filter
+  by slug or by current text; pick a locale to narrow to one language. Saving
+  an override updates the in-memory cache immediately — the next message the
+  user receives uses the new text. <strong>{{ override_count }}</strong>
+  override{{ '' if override_count == 1 else 's' }} match the current filter.
+</div>
+
+<form method="get" action="/admin/strings" class="filters">
+  <div class="field wide">
+    <label for="q">Search</label>
+    <input type="text" id="q" name="q" value="{{ search }}"
+           placeholder="slug or text fragment">
+  </div>
+  <div class="field">
+    <label for="lang">Locale</label>
+    <select id="lang" name="lang">
+      <option value="" {% if not lang_filter %}selected{% endif %}>All</option>
+      {% for code in supported_langs %}
+      <option value="{{ code }}" {% if lang_filter == code %}selected{% endif %}>{{ code }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <button class="primary" type="submit">Filter</button>
+  {% if search or lang_filter %}
+  <a class="reset" href="/admin/strings">Reset</a>
+  {% endif %}
+</form>
+
+<div class="panel">
+  <h3>{{ rows|length }} string{{ '' if rows|length == 1 else 's' }}</h3>
+  {% if rows %}
+  <table>
+    <thead>
+      <tr>
+        <th>Lang</th>
+        <th>Key</th>
+        <th>Current text</th>
+        <th>Status</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td><span class="lang-badge">{{ r.lang }}</span></td>
+        <td><code class="slug">{{ r.key }}</code></td>
+        <td>
+          <div class="preview {% if not r.has_override %}muted{% endif %}">{{ r.current }}</div>
+        </td>
+        <td>
+          {% if r.has_override %}
+            <span class="badge badge-override">override</span>
+          {% else %}
+            <span class="badge badge-default">default</span>
+          {% endif %}
+        </td>
+        <td><a class="row-edit" href="{{ r.edit_url }}">Edit →</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p style="color: var(--text-muted); margin: 0;">No strings match this filter.</p>
+  {% endif %}
+</div>
+{% endblock %}

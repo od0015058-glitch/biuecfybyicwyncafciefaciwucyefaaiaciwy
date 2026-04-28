@@ -55,11 +55,11 @@ entrypoint.sh       runs `alembic upgrade head` then exec's main.py
 Dockerfile          python:3.12-slim + requirements
 docker-compose.yml  postgres + redis + bot
 .env.example        every required env var
-tests/              pytest, ~435 cases
+tests/              pytest, ~473 cases
 .github/workflows/ci.yml   3.11/3.12 matrix + alembic roundtrip + docker build
 ```
 
-Total: ~6.4k LoC, 435 tests, full CI on every push.
+Total: ~6.7k LoC, 473 tests, full CI on every push.
 
 ---
 
@@ -217,7 +217,8 @@ Sorted by the same §3 priority framework — money/security first, product surf
 | # | Title | Priority | Status |
 | --- | --- | --- | --- |
 | **Stage-9-Step-1** | Per-IP token-bucket throttle on `/admin/login`. New `install_login_rate_limit` + `consume_login_token` helpers in `rate_limit.py`; `login_post` now consumes a token BEFORE the password compare so a spraying attacker can't get constant-time feedback on every guess. Defaults: 10-token burst, 1 token / 30 s refill — combined with `ADMIN_PASSWORD` being a 32-char secret this makes brute force infeasible. **Bug fix bundled:** the existing `request.remote` keying collapses every reverse-proxy deploy onto one bucket IP, which either (a) silently disables the new login throttle (the tunnel IP is fine, bucket never drains) or (b) self-DoSes (one attacker locks every admin out of the same tunnel). New `rate_limit.client_ip_for_rate_limit(request)` helper reads `X-Forwarded-For` leftmost IP iff `TRUST_PROXY_HEADERS=1` env var is set (defaults off so direct-exposure deploys don't trust a spoofable header). Retrofitted the existing webhook middleware to use the same helper so the two limiters gain real-client granularity together. 12 new tests (406 total). | P0 security | ✅ shipped (PR #60) |
-| **Stage-9-Step-1.5** (this PR) | **User-side bot UX cleanup** (P2 product, taken out of order at user request 2026-04-28). New `bot_commands.py` module + boot-time `Bot.set_my_commands(...)` call so Telegram's `/` popup matches the handlers we actually ship — `/start`, `/redeem` for everyone; admin commands per-admin via `BotCommandScopeChat`. Pre-fix the bot never published its commands so the popup served whatever was last typed into BotFather's "Edit Commands" panel (the user reported `/new`, `/redo`, `/img`, `/version` ghosts). Hub keyboard split: dedicated `🆕 New Chat` button now wipes the conversation buffer immediately (free) and a separate `🧠 Memory: ON/OFF` button opens the memory settings screen with the cost trade-off explainer. Wallet keyboard gained a `🎁 Redeem gift code` button that arms a new `UserStates.waiting_gift_code` and reuses the same `_redeem_code_for_user` helper as `cmd_redeem` — gift redemption is now reachable from buttons, not just the slash command. **Bug fix bundled:** `_render_memory_screen`'s `try/except Exception` around `edit_text` was swallowing every exception including DB drops, `TelegramForbiddenError` (bot blocked), and unrelated network blips — masking real bugs as a single `log.debug`. Tightened to `except TelegramBadRequest:` so only the legitimate "message is not modified" / parse-mode no-op cases are silenced. 29 new tests (435 total). | P2 product | ✅ this PR |
+| **Stage-9-Step-1.5** | **User-side bot UX cleanup** (P2 product, taken out of order at user request 2026-04-28). New `bot_commands.py` module + boot-time `Bot.set_my_commands(...)` call so Telegram's `/` popup matches the handlers we actually ship — `/start`, `/redeem` for everyone; admin commands per-admin via `BotCommandScopeChat`. Pre-fix the bot never published its commands so the popup served whatever was last typed into BotFather's "Edit Commands" panel (the user reported `/new`, `/redo`, `/img`, `/version` ghosts). Hub keyboard split: dedicated `🆕 New Chat` button now wipes the conversation buffer immediately (free) and a separate `🧠 Memory: ON/OFF` button opens the memory settings screen with the cost trade-off explainer. Wallet keyboard gained a `🎁 Redeem gift code` button that arms a new `UserStates.waiting_gift_code` and reuses the same `_redeem_code_for_user` helper as `cmd_redeem` — gift redemption is now reachable from buttons, not just the slash command. **Bug fix bundled:** `_render_memory_screen`'s `try/except Exception` around `edit_text` was swallowing every exception including DB drops, `TelegramForbiddenError` (bot blocked), and unrelated network blips — masking real bugs as a single `log.debug`. Tightened to `except TelegramBadRequest:` so only the legitimate "message is not modified" / parse-mode no-op cases are silenced. 29 new tests (435 total). | P2 product | ✅ this PR |
+| **Stage-9-Step-1.6** (this PR) | **Editable bot text** (P2 product, second of three out-of-order PRs requested by the user 2026-04-28). New `bot_strings(lang, key, value, updated_at, updated_by)` table + alembic migration `0004_bot_strings`. The runtime `t()` helper grew an in-memory override cache (`strings._OVERRIDES`) populated at boot from `Database.load_all_string_overrides` and refreshed after every successful admin write — so the next message a user receives uses the new text without any process restart. New `/admin/strings` page lists every `(lang, key)` slug with its compiled default and current override (if any), filterable by lang + free-text search. New `/admin/strings/{lang}/{key}` editor: textarea pre-filled with the override-or-default, save / revert buttons, length cap of 2 KB to keep the operator from pasting megabyte JSON into a button label, CSRF-protected. Reverting deletes the row and resurrects the compiled default. **Bug fix bundled:** `t()` previously returned the bare slug silently when a key was missing in both the requested locale and the `DEFAULT_LANGUAGE` fallback — translator typos shipped to users invisibly. Now logs a one-shot WARNING per `(lang, key)` per process so dictionary drift surfaces in ops logs. 38 new tests (473 total): 19 in `tests/test_strings_overrides.py`, 19 added to `tests/test_web_admin.py`. | P2 product | ✅ this PR |
 | **Stage-9-Step-2** | `admin_audit_log` append-only table — one row per admin action (login success/fail, promo + gift create/revoke, credit/debit, broadcast start) with `ts, actor_telegram_id_or_web, action, ip, target, outcome, meta_json`. Viewable at `/admin/audit`. **Bug fix bundled:** `Database.admin_adjust_balance` buries the acting admin id inside a formatted `gateway_invoice_id` string instead of a real column — surface an explicit `admin_telegram_id` column on the wallet-adjustment transaction row so forensics don't require string parsing. | P0 security | ⏳ pending |
 | **Stage-9-Step-3** | TOTP / 2FA on admin login. New env var `ADMIN_2FA_SECRET` enables enforcement; enrollment via QR at `/admin/enroll_2fa`. Backwards compatible — if env var missing, login works exactly as today. **Bug fix bundled:** a config where `ADMIN_PASSWORD` is set but empty string (common deploy typo) currently refuses logins with a confusing `TypeError` under one code path; tighten the config guard to a single "must be non-empty" assertion at startup. | P0 security | ⏳ pending |
 | **Stage-9-Step-4** | IPN webhook replay-dedupe. New `payment_status_transitions` table keyed by `(gateway_invoice_id, payment_status)` so a backdated PARTIAL arriving after SUCCESS is dropped rather than writing a stray ledger row. **Bug fix bundled:** `parse_ipn_body` silently drops IPNs with missing `payment_id` — log LOUDLY and expose a counter so a misconfigured sandbox hitting the prod webhook is immediately visible. | P1 correctness | ⏳ pending |
@@ -330,7 +331,7 @@ Two tables added by **Stage-8-Part-3** (alembic 0003, this PR):
 
 ## 9. Test suite
 
-**435 tests across 13 modules** as of Stage-9-Step-1.5:
+**473 tests across 14 modules** as of Stage-9-Step-1.6:
 
 ```
 tests/
@@ -350,6 +351,10 @@ tests/
                                            #            client_ip_for_rate_limit / TRUST_PROXY_HEADERS +
                                            #            login-throttle install/consume helpers)
 ├── test_redeem_handler.py                 # 15 cases (cmd_redeem usage / status branches)
+├── test_strings_overrides.py              # 19 cases (override cache replace/clear/copy,
+│                                          #          t() resolution order, missing-key WARNING
+│                                          #          one-shot suppression, iter_compiled_strings
+│                                          #          determinism + ignores overrides)
 ├── test_bot_commands.py                   # 9 cases (PUBLIC/ADMIN scope shape, set_my_commands
 │                                          #          per-admin scoping, swallowed-failure semantics)
 ├── test_hub_ux.py                         # 20 cases (6-button hub layout, hub_newchat wipes,
@@ -357,7 +362,7 @@ tests/
 │                                          #          waiting_gift_code FSM input handler,
 │                                          #          _render_memory_screen exception tightening,
 │                                          #          shared _redeem_code_for_user helper status branches)
-└── test_web_admin.py                      # 200 cases (cookie sign/verify, login, dashboard,
+└── test_web_admin.py                      # 219 cases (cookie sign/verify, login, dashboard,
                                           #             promo + gift + user list/create/revoke,
                                           #             CSRF, flash cookies, adjust-form parser,
                                           #             credit/debit happy-path + edge cases,
