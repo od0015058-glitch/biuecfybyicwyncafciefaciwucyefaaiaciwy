@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 
 import asyncpg
@@ -8,6 +9,29 @@ from dotenv import load_dotenv
 load_dotenv()
 
 log = logging.getLogger("bot.database")
+
+
+def _is_finite_amount(value) -> bool:
+    """Defense-in-depth: return ``True`` iff *value* is a finite real
+    number (not ``NaN``, ``+Infinity``, or ``-Infinity``).
+
+    Why this exists at the DB layer in addition to the upstream form
+    parsers: NaN and Infinity slipping into a money-handling SQL path
+    is *silent* — PostgreSQL accepts ``'NaN'::numeric`` (it's a valid
+    IEEE-754 value) and INSERTs it without error, but every subsequent
+    comparison on the wallet column (``balance_usd >= $1``,
+    ``balance_usd < 0``, etc.) becomes a no-op (every comparison
+    against ``NaN`` returns ``False`` in SQL just as in Python) which
+    effectively bricks the user's wallet without any obvious error in
+    logs. PR #75 closed the same hole at the IPN layer; this helper is
+    the matching belt-and-suspenders at the DB layer so any future
+    caller that bypasses the form parsers (a new internal call site, a
+    refactor, a test stub) still can't quietly poison a row.
+    """
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
 
 class Database:
     def __init__(self):
@@ -196,7 +220,25 @@ class Database:
         Returns True iff the user had enough balance and the row was updated.
         Returns False if the user does not exist or has insufficient funds;
         in that case no balance change is made.
+
+        Defense-in-depth: refuses to attempt the SQL when ``cost_usd`` is
+        ``NaN`` / ``±Infinity``. The pre-fix WHERE clause
+        ``balance_usd >= $1`` is already a silent no-op for ``NaN`` (every
+        comparison against ``NaN`` is ``False``), but a negative-Infinity
+        cost would *match* for any finite balance and try to write
+        ``balance_usd - (-inf) = inf`` into the row, bricking the wallet
+        the same way PR #75 prevented at the IPN layer. Returning
+        ``False`` here mirrors the "insufficient funds" path the caller
+        already handles.
         """
+        if not _is_finite_amount(cost_usd):
+            log.error(
+                "deduct_balance refused for telegram_id=%s: non-finite "
+                "cost_usd=%r (NaN / Infinity)",
+                telegram_id,
+                cost_usd,
+            )
+            return False
         query = """
             UPDATE users
             SET balance_usd = balance_usd - $1
@@ -443,7 +485,25 @@ class Database:
         or already in a non-PENDING/non-PARTIAL terminal state. Idempotent:
         a replayed IPN with the same actually_paid_usd will return the row
         with delta_credited == 0.
+
+        Defense-in-depth: refuses (returns ``None``) when
+        ``actually_paid_usd`` is ``NaN`` / ``±Infinity`` / non-positive.
+        The IPN handler already filters these out via
+        ``payments._finite_positive_float`` (PR #75), but the DB layer
+        re-checks so a future internal caller / test stub / refactor that
+        bypasses the IPN path can't poison a wallet either. ``max(0.0,
+        NaN - x)`` is undefined behaviour in CPython (it depends on
+        argument order) and a finite-but-Infinity input would propagate
+        straight into the wallet UPDATE.
         """
+        if not _is_finite_amount(actually_paid_usd) or actually_paid_usd <= 0:
+            log.error(
+                "finalize_partial_payment refused for invoice=%s: "
+                "non-finite or non-positive actually_paid_usd=%r",
+                gateway_invoice_id,
+                actually_paid_usd,
+            )
+            return None
         async with self.pool.acquire() as connection:
             async with connection.transaction():
                 row = await connection.fetchrow(
@@ -536,7 +596,20 @@ class Database:
         transaction: otherwise a crash or DB error between them would mark
         the ledger SUCCESS but leave the user uncredited, and webhook
         retries would forever skip crediting (status is no longer PENDING).
+
+        Defense-in-depth: refuses (returns ``None``) when
+        ``full_price_usd`` is ``NaN`` / ``±Infinity`` / non-positive.
+        Same rationale as ``finalize_partial_payment``: PR #75 closes
+        the hole at the IPN layer, this is the matching DB-layer guard.
         """
+        if not _is_finite_amount(full_price_usd) or full_price_usd <= 0:
+            log.error(
+                "finalize_payment refused for invoice=%s: non-finite or "
+                "non-positive full_price_usd=%r",
+                gateway_invoice_id,
+                full_price_usd,
+            )
+            return None
         async with self.pool.acquire() as connection:
             async with connection.transaction():
                 row = await connection.fetchrow(
@@ -1318,6 +1391,18 @@ class Database:
         """
         if delta_usd == 0:
             raise ValueError("delta_usd must be non-zero")
+        # Defense-in-depth: refuse NaN / ±Infinity. Both the web admin
+        # form parser (``parse_adjust_form``) and the Telegram parser
+        # (``parse_balance_args``) already reject these, but a future
+        # internal caller / refactor / test stub could bypass them. A
+        # ``NaN`` delta would slip past the ``new_balance < 0`` check
+        # (``NaN < 0`` is ``False``) and write ``NaN`` straight into
+        # ``users.balance_usd``, bricking the wallet exactly the way
+        # PR #75 prevented at the IPN layer.
+        if not _is_finite_amount(delta_usd):
+            raise ValueError(
+                f"delta_usd must be finite (got NaN or Infinity: {delta_usd!r})"
+            )
         import secrets
         import time
 
