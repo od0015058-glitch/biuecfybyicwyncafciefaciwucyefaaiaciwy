@@ -54,11 +54,11 @@ entrypoint.sh       runs `alembic upgrade head` then exec's main.py
 Dockerfile          python:3.12-slim + requirements
 docker-compose.yml  postgres + redis + bot
 .env.example        every required env var
-tests/              pytest, ~394 cases
+tests/              pytest, ~406 cases
 .github/workflows/ci.yml   3.11/3.12 matrix + alembic roundtrip + docker build
 ```
 
-Total: ~6.0k LoC, 394 tests, full CI on every push.
+Total: ~6.1k LoC, 406 tests, full CI on every push.
 
 ---
 
@@ -210,6 +210,22 @@ updated, full tests:
 | **Stage-8-Part-5** (this PR) | Broadcast page — `/admin/broadcast` form (text + optional `only_active_days` filter) that kicks off a background `asyncio.Task`, plus `/admin/broadcast/{job_id}` detail page with a live progress bar and a polling `/admin/broadcast/{job_id}/status` JSON endpoint (vanilla JS, no HTMX). In-memory job registry on the aiohttp app (bounded to 50 entries, never evicts live jobs). Shares `admin._do_broadcast` with the Telegram `/admin_broadcast` command via a `progress_callback` refactor, so pacing / 429 handling / error bucketing is identical for both callers. **Bug fix bundled:** `rate_limit.webhook_rate_limit_middleware` is now scoped to `/nowpayments-webhook` only — it was previously installed globally and consumed a token on **every** request, so admin-panel traffic (and the new broadcast status-polling page) would eat from the NowPayments bucket and vice-versa. 33 new tests (364 total). | ✅ this PR |
 | **Stage-8-Part-6** (this PR) | Transactions browser — paginated `/admin/transactions` list, filter by gateway / status / user, link through to existing user-detail page. Read-only ledger view; credit/debit still lives on the user-detail page so the write-path audit trail has one canonical entry point. New `Database.list_transactions(gateway, status, telegram_id, page, per_page)` with allow-listed enum filters and parameterised SQL; clamps `per_page` to `TRANSACTIONS_MAX_PER_PAGE=200`. Sidebar link is now enabled — the whole Stage-8 nav is complete. **Bug fix bundled:** both `parse_broadcast_args` (Telegram) and `parse_broadcast_web_form` (web) now reject `only_active_days > 36_500` up-front — pre-fix an admin typing `--active=9999999999` would overflow PG's 32-bit-int interval column when `iter_broadcast_recipients` formatted it as `f"{N} days"`, surfacing as an opaque "DB query failed" banner instead of a friendly validation error. Defensive cap also added inside `Database.iter_broadcast_recipients` itself so a direct REPL caller can't hit the overflow either. 30 new tests (394 total). | ✅ this PR |
 
+### Stage-9 queue (next 10 steps)
+Sorted by the same §3 priority framework — money/security first, product surface last, operational hardening last. Each step is one PR with a real bundled bug fix (never invented), HANDOFF.md + README.md updated per §11.
+
+| # | Title | Priority | Status |
+| --- | --- | --- | --- |
+| **Stage-9-Step-1** (this PR) | Per-IP token-bucket throttle on `/admin/login`. New `install_login_rate_limit` + `consume_login_token` helpers in `rate_limit.py`; `login_post` now consumes a token BEFORE the password compare so a spraying attacker can't get constant-time feedback on every guess. Defaults: 10-token burst, 1 token / 30 s refill — combined with `ADMIN_PASSWORD` being a 32-char secret this makes brute force infeasible. **Bug fix bundled:** the existing `request.remote` keying collapses every reverse-proxy deploy onto one bucket IP, which either (a) silently disables the new login throttle (the tunnel IP is fine, bucket never drains) or (b) self-DoSes (one attacker locks every admin out of the same tunnel). New `rate_limit.client_ip_for_rate_limit(request)` helper reads `X-Forwarded-For` leftmost IP iff `TRUST_PROXY_HEADERS=1` env var is set (defaults off so direct-exposure deploys don't trust a spoofable header). Retrofitted the existing webhook middleware to use the same helper so the two limiters gain real-client granularity together. 12 new tests (406 total). | P0 security | ✅ this PR |
+| **Stage-9-Step-2** | `admin_audit_log` append-only table — one row per admin action (login success/fail, promo + gift create/revoke, credit/debit, broadcast start) with `ts, actor_telegram_id_or_web, action, ip, target, outcome, meta_json`. Viewable at `/admin/audit`. **Bug fix bundled:** `Database.admin_adjust_balance` buries the acting admin id inside a formatted `gateway_invoice_id` string instead of a real column — surface an explicit `admin_telegram_id` column on the wallet-adjustment transaction row so forensics don't require string parsing. | P0 security | ⏳ pending |
+| **Stage-9-Step-3** | TOTP / 2FA on admin login. New env var `ADMIN_2FA_SECRET` enables enforcement; enrollment via QR at `/admin/enroll_2fa`. Backwards compatible — if env var missing, login works exactly as today. **Bug fix bundled:** a config where `ADMIN_PASSWORD` is set but empty string (common deploy typo) currently refuses logins with a confusing `TypeError` under one code path; tighten the config guard to a single "must be non-empty" assertion at startup. | P0 security | ⏳ pending |
+| **Stage-9-Step-4** | IPN webhook replay-dedupe. New `payment_status_transitions` table keyed by `(gateway_invoice_id, payment_status)` so a backdated PARTIAL arriving after SUCCESS is dropped rather than writing a stray ledger row. **Bug fix bundled:** `parse_ipn_body` silently drops IPNs with missing `payment_id` — log LOUDLY and expose a counter so a misconfigured sandbox hitting the prod webhook is immediately visible. | P1 correctness | ⏳ pending |
+| **Stage-9-Step-5** | Background task: expire stuck `PENDING` transactions (> 24h) so the ledger doesn't accumulate dead invoices forever. `Database.expire_stale_pending()` + a `asyncio.create_task` scheduled every 15 min. **Bug fix bundled:** `mark_transaction_terminal` has a branch that silently re-updates `updated_at` on a PENDING→PENDING no-op; tighten the FSM so only real state transitions bump the timestamp. | P1 correctness | ⏳ pending |
+| **Stage-9-Step-6** | Soft-cancel running broadcasts. Cancel button on `/admin/broadcast/{id}` sets `job["cancel_requested"]`; `_do_broadcast` checks between sends. **Bug fix bundled:** the in-memory job registry's 50-entry cap evicts oldest-first without checking state — an admin spamming the form could push a live `running` job off the end of the dict. Guard eviction on `state ∈ {completed, failed}`. | P1 correctness | ⏳ pending |
+| **Stage-9-Step-7** | CSV export from `/admin/transactions?format=csv` for quarterly audits. Streams via aiohttp `StreamResponse` so large exports don't blow memory. **Bug fix bundled:** USD precision is inconsistent across the admin UI (`${:,.4f}` in the transactions browser vs `${:,.2f}` in `/admin_balance`); unify to a single `format_usd` helper. | P2 product | ⏳ pending |
+| **Stage-9-Step-8** | Per-user usage log browser — `/admin/users/{id}/usage` with last N AI calls (model, tokens, cost). **Bug fix bundled:** `usage_logs.cost_usd` is nullable for legacy reasons but modern code always populates it; add Alembic migration + backfill + NOT NULL constraint so the new report can trust the column. | P2 product | ⏳ pending |
+| **Stage-9-Step-9** | Dashboard tile: "Pending payments: N (oldest: Xh ago)" so stuck invoices are visible at a glance. **Bug fix bundled:** the existing `spend_usd` dashboard tile sums the absolute value of everything — including a rare class of refund rows that were inserted with positive `amount_usd_credited` by a legacy migration; scope the sum to `amount_usd < 0`. | P2 product | ⏳ pending |
+| **Stage-9-Step-10** | Durable broadcast job registry — move the in-memory `APP_KEY_BROADCAST_JOBS` dict to a `broadcast_jobs` table so a restart mid-broadcast can resume. **Bug fix bundled:** `_run_broadcast_job` catches `asyncio.CancelledError` and re-raises before setting `completed_at`; the operator sees the cancelled job with a `None` completion timestamp forever. Set the timestamp before `raise`. | P3 operational | ⏳ pending |
+
 ---
 
 ## 6. The IPN signature bug we were stuck on (kept for context)
@@ -312,7 +328,7 @@ Two tables added by **Stage-8-Part-3** (alembic 0003, this PR):
 
 ## 9. Test suite
 
-**394 tests across 11 modules** as of Stage-8-Part-6:
+**406 tests across 11 modules** as of Stage-9-Step-1:
 
 ```
 tests/
@@ -328,16 +344,19 @@ tests/
 ├── test_handlers_from_user_guard.py       # 4 cases (promo, custom_amount, cmd_start, _route_legacy_text_to_hub)
 ├── test_ipn_signature.py                  # 11 cases (raw + canonical paths, persian descr regression)
 ├── test_pricing.py                        # 11 cases (per-model lookup, markup, fallback)
-├── test_rate_limit.py                     # 15 cases (token bucket + LRU + middleware)
+├── test_rate_limit.py                     # 23 cases (token bucket + LRU + middleware +
+                                           #            client_ip_for_rate_limit / TRUST_PROXY_HEADERS +
+                                           #            login-throttle install/consume helpers)
 ├── test_redeem_handler.py                 # 15 cases (cmd_redeem usage / status branches)
-└── test_web_admin.py                      # 196 cases (cookie sign/verify, login, dashboard,
+└── test_web_admin.py                      # 200 cases (cookie sign/verify, login, dashboard,
                                           #             promo + gift + user list/create/revoke,
                                           #             CSRF, flash cookies, adjust-form parser,
                                           #             credit/debit happy-path + edge cases,
                                           #             broadcast form parser, job lifecycle,
                                           #             detail page polling endpoint,
                                           #             transactions query parser + handler,
-                                          #             active-days cap mirror test)
+                                          #             active-days cap mirror test,
+                                          #             login rate-limit + trust-proxy-headers)
 ```
 
 CI runs the full suite on Python 3.11 + 3.12, plus an alembic
@@ -361,7 +380,7 @@ assumption.
 | `templates/admin/` | jinja2 templates. `base.html` = global CSS + `<head>`; `_layout.html` = sidebar shell (extended by content pages); `login.html`, `dashboard.html`, `promos.html`, `gifts.html`, `users.html`, `user_detail.html`, `broadcast.html`, `broadcast_detail.html`, `transactions.html`. |
 | `ai_engine.py` | Clean. `aiohttp.ClientTimeout(total=60, connect=10, sock_read=50)` on OpenRouter. Defensive guard for malformed responses. |
 | `pricing.py` | Clean. Conservative fallback for unmapped models, markup ≥ 1.0. |
-| `rate_limit.py` | `consume_chat_token(user_id)` per-user (called *inside* `handlers.process_chat`, not as a `dp.message` middleware — see PR #47/#48 history). `webhook_rate_limit_middleware` per-IP — scoped to `WEBHOOK_PATH = "/nowpayments-webhook"` only (Part-5 bundled fix) so admin panel traffic doesn't eat the same bucket. |
+| `rate_limit.py` | `consume_chat_token(user_id)` per-user (called *inside* `handlers.process_chat`, not as a `dp.message` middleware — see PR #47/#48 history). `webhook_rate_limit_middleware` per-IP — scoped to `WEBHOOK_PATH = "/nowpayments-webhook"` only (Part-5 bundled fix) so admin panel traffic doesn't eat the same bucket. Stage-9-Step-1 added `install_login_rate_limit` + `consume_login_token` for the admin-login throttle, plus `client_ip_for_rate_limit(request)` helper that reads `X-Forwarded-For` leftmost when `TRUST_PROXY_HEADERS=1` is set (defaults off; both webhook and login limiters share the helper). |
 | `admin.py` | `parse_admin_user_ids`, `is_admin`, `_escape_md`, `/admin`, `/admin_metrics`, `/admin_balance`, `/admin_credit`, `/admin_debit`, `/admin_promo_create`, `/admin_promo_list`, `/admin_promo_revoke`, `/admin_broadcast`. Part-6 added `_BROADCAST_ACTIVE_DAYS_MAX=36_500` cap in `parse_broadcast_args`. 87 unit tests. |
 | `alembic/` | Clean. Baseline = consolidated current schema. `env.py` URL-encodes credentials. |
 | `entrypoint.sh` | Idempotent `alembic upgrade head` then `exec python -m main`. |
@@ -474,10 +493,10 @@ The user's process for this project — **do not deviate**:
    `/redeem CODE` in the bot.
 3. **The IPN signature bug is fixed on `main`** (PRs #39 + #41). User
    confirmed clean log on 2026-04-28.
-4. **Stage-8 queue is empty** — all six parts shipped. Next direction is
-   up to the user (ideas: CSV export of `/admin/transactions`, durable
-   broadcast job registry via a new `broadcast_jobs` table, per-user
-   usage log browser, soft-cancel button on running broadcasts).
+4. **Stage-9 queue is set** — next 10 steps prioritised per §3
+   (money/security first, product surface last, operational
+   hardening last). See §5 "Stage-9 queue" table. Starts with
+   rate-limiting `/admin/login`.
 5. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
    update this doc + README in each, do NOT block on user approval. The
    user merges them when they wake up.
