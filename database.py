@@ -259,6 +259,15 @@ class Database:
             )
         return row is not None
 
+    # Stage-9-Step-5: explicit allow-list for terminal-failure statuses.
+    # Lifted out of the function body so callers (and tests) can refer to
+    # the canonical set without grepping. SUCCESS is its own ledger
+    # status reached via ``finalize_payment``, NOT
+    # ``mark_transaction_terminal``.
+    TERMINAL_FAILURE_STATUSES: frozenset[str] = frozenset(
+        {"EXPIRED", "FAILED", "REFUNDED"}
+    )
+
     async def mark_transaction_terminal(
         self, gateway_invoice_id: str, new_status: str
     ):
@@ -279,7 +288,22 @@ class Database:
         previous_status) if the close happened, or None if the row was
         unknown or already in a different terminal state. Idempotent against
         retries via the WHERE-status guard.
+
+        Stage-9-Step-5 bug-fix bundle: ``new_status`` MUST be in
+        ``TERMINAL_FAILURE_STATUSES`` — passing anything else (including
+        the row's own current status, e.g. PENDING -> PENDING) raises
+        ``ValueError`` at the API surface. Pre-fix, a same-status call
+        would silently bump ``completed_at`` on a row that hadn't actually
+        transitioned, polluting forensics queries. The UPDATE's WHERE
+        clause now also checks ``status != $2`` as belt-and-suspenders so
+        a future caller sneaking past the entry guard still can't bump
+        the timestamp on a real no-op.
         """
+        if new_status not in self.TERMINAL_FAILURE_STATUSES:
+            raise ValueError(
+                f"new_status must be one of {sorted(self.TERMINAL_FAILURE_STATUSES)}; "
+                f"got {new_status!r}"
+            )
         # We need the *previous* status to let the caller choose the right
         # user notification text (a PARTIAL -> terminal close means the user
         # already received some credit). Wrap the read-then-update in one DB
@@ -303,6 +327,7 @@ class Database:
                     UPDATE transactions
                     SET status = $2, completed_at = CURRENT_TIMESTAMP
                     WHERE gateway_invoice_id = $1
+                      AND status != $2
                     """,
                     gateway_invoice_id,
                     new_status,
@@ -313,6 +338,87 @@ class Database:
                     "amount_usd_credited": row["amount_usd_credited"],
                     "previous_status": previous_status,
                 }
+
+    async def expire_stale_pending(
+        self,
+        *,
+        threshold_hours: int = 24,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """Atomically mark stuck PENDING transactions as EXPIRED.
+
+        Used by the background reaper task (see
+        ``pending_expiration.start_pending_expiration_task``) to flush
+        invoices the user abandoned mid-checkout — without it the
+        ledger accumulates dead PENDING rows forever, polluting
+        ``/admin/transactions`` and the dashboard "pending payments"
+        tile.
+
+        Only PENDING rows older than ``threshold_hours`` are touched;
+        PARTIAL rows are left alone because the user actually paid
+        something and the IPN may still upgrade them to SUCCESS via
+        ``finalize_payment``. NowPayments invoices time out at
+        20-30 minutes by default but operators may legitimately leave
+        a long-tail open for high-value payments — 24 h is the
+        documented default and configurable via
+        ``PENDING_EXPIRATION_HOURS``.
+
+        Returns a list of expired rows (telegram_id, currency_used,
+        amount_usd_credited, gateway_invoice_id, created_at-ish) so
+        the caller can fire user notifications and audit-log entries.
+        ``limit`` caps the number of rows returned to avoid an
+        unbounded UPDATE on a backlog (the reaper runs every 15 min
+        so leftovers get caught the next tick anyway).
+
+        Idempotent: rerunning is a no-op once the backlog is drained.
+        Concurrency-safe: the UPDATE … WHERE status='PENDING' guard
+        means two reapers running in parallel can't double-process the
+        same row (the second one's WHERE returns 0 rows).
+        """
+        if threshold_hours <= 0:
+            raise ValueError("threshold_hours must be positive")
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                UPDATE transactions
+                SET status = 'EXPIRED',
+                    completed_at = CURRENT_TIMESTAMP
+                WHERE transaction_id IN (
+                    SELECT transaction_id
+                    FROM transactions
+                    WHERE status = 'PENDING'
+                      AND created_at < NOW() - ($1 || ' hours')::interval
+                    ORDER BY created_at
+                    LIMIT $2
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING transaction_id,
+                          telegram_id,
+                          currency_used,
+                          amount_usd_credited,
+                          gateway_invoice_id,
+                          created_at
+                """,
+                str(int(threshold_hours)),
+                int(limit),
+            )
+        return [
+            {
+                "transaction_id": int(r["transaction_id"]),
+                "telegram_id": r["telegram_id"],
+                "currency_used": r["currency_used"],
+                "amount_usd_credited": float(r["amount_usd_credited"]),
+                "gateway_invoice_id": r["gateway_invoice_id"],
+                "created_at": (
+                    r["created_at"].isoformat()
+                    if r["created_at"] is not None
+                    else None
+                ),
+            }
+            for r in rows
+        ]
 
     async def finalize_partial_payment(
         self, gateway_invoice_id: str, actually_paid_usd: float

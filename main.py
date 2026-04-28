@@ -15,6 +15,7 @@ from database import db
 from handlers import router
 from middlewares import UserUpsertMiddleware
 from payments import payment_webhook
+from pending_expiration import start_pending_expiration_task
 from rate_limit import install_webhook_rate_limit
 from web_admin import setup_admin_routes
 
@@ -155,9 +156,24 @@ async def main():
 
     runner = await start_webhook_server(bot)
 
+    # Stage-9-Step-5: background reaper for stuck PENDING transactions.
+    # Wakes every PENDING_EXPIRATION_INTERVAL_MIN minutes (default 15)
+    # and flips PENDING rows older than PENDING_EXPIRATION_HOURS
+    # (default 24) to EXPIRED. Without this, abandoned NowPayments
+    # invoices accumulate forever in the ledger. See
+    # pending_expiration.py for the full contract.
+    expiration_task = start_pending_expiration_task(bot)
+
     try:
         await dp.start_polling(bot)
     finally:
+        expiration_task.cancel()
+        try:
+            await expiration_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("pending-expiration reaper exited with error")
         await runner.cleanup()
         await db.close()
         await bot.session.close()
