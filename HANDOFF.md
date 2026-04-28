@@ -43,8 +43,8 @@ middlewares.py      user-upsert middleware                 ~60 LoC
 strings.py          fa/en string table                    ~540 LoC
 admin.py            Telegram-side admin commands          ~870 LoC
 rate_limit.py       chat + webhook rate limiters          ~270 LoC
-web_admin.py        web admin panel (aiohttp+jinja2)      ~360 LoC
-templates/admin/    jinja2 templates (base, login, dashboard, _layout)
+web_admin.py        web admin panel (aiohttp+jinja2)      ~910 LoC
+templates/admin/    jinja2 templates (base, _layout, login, dashboard, promos)
 alembic/            schema migrations (owns schema)
   env.py
   versions/0001_baseline.py
@@ -53,11 +53,11 @@ entrypoint.sh       runs `alembic upgrade head` then exec's main.py
 Dockerfile          python:3.12-slim + requirements
 docker-compose.yml  postgres + redis + bot
 .env.example        every required env var
-tests/              pytest, ~190 cases
+tests/              pytest, ~230 cases
 .github/workflows/ci.yml   3.11/3.12 matrix + alembic roundtrip + docker build
 ```
 
-Total: ~5.0k LoC, 191 tests, full CI on every push.
+Total: ~5.4k LoC, 230 tests, full CI on every push.
 
 ---
 
@@ -145,7 +145,8 @@ The original "Stage 7 CLI panel" was reframed as Telegram commands (gated by
 ### Stage-8 — Web admin panel (in progress)
 | PR | Title |
 | --- | --- |
-| **Stage-8-Part-1** (this PR) | Web admin scaffold — aiohttp+jinja2 mounted under `/admin/` on the same server as the IPN webhook. HMAC-signed-cookie auth via `ADMIN_PASSWORD` + `ADMIN_SESSION_SECRET`. Login + dashboard with system metrics. + `from_user is None` guard added to `cmd_start` and `_route_legacy_text_to_hub` (the two remaining handlers reachable from anonymous-group-admin posts). 27 new tests. |
+| **Stage-8-Part-1** | Web admin scaffold — aiohttp+jinja2 mounted under `/admin/` on the same server as the IPN webhook. HMAC-signed-cookie auth via `ADMIN_PASSWORD` + `ADMIN_SESSION_SECRET`. Login + dashboard with system metrics. + `from_user is None` guard added to `cmd_start` and `_route_legacy_text_to_hub` (the two remaining handlers reachable from anonymous-group-admin posts). 30 new tests. |
+| **Stage-8-Part-2** (this PR) | Promo codes web UI — `/admin/promos` page with table view + create form + per-row revoke. CSRF-protected POSTs (HMAC tokens derived from session cookie). Signed flash-cookie banners (10s TTL) survive the post-redirect-get cycle without a server-side store. **Bug fix bundled:** `Database.create_promo_code` + `parse_promo_form` now reject `discount_amount > 999_999.9999` up-front so admins get a friendly error instead of PG `numeric field overflow` (column is `DECIMAL(10,4)`). 39 new tests. |
 
 ---
 
@@ -200,8 +201,8 @@ updated, full tests:
 
 | # | Title | Status |
 | --- | --- | --- |
-| **Stage-8-Part-1** | Web admin scaffold — login + dashboard with system metrics. `web_admin.py` + `templates/admin/`. Auth via `ADMIN_PASSWORD` + `ADMIN_SESSION_SECRET` HMAC-signed cookie. | ✅ this PR |
-| **Stage-8-Part-2** | Promo codes page — table view + create form + revoke action. Reuses `Database.list_promo_codes` + `create_promo_code` + `revoke_promo_code`. | ⏳ next |
+| **Stage-8-Part-1** | Web admin scaffold — login + dashboard with system metrics. `web_admin.py` + `templates/admin/`. Auth via `ADMIN_PASSWORD` + `ADMIN_SESSION_SECRET` HMAC-signed cookie. | ✅ shipped (PR #54) |
+| **Stage-8-Part-2** | Promo codes page — table view + create form + revoke action. Reuses `Database.list_promo_codes` + `create_promo_code` + `revoke_promo_code`. CSRF + flash messaging primitives added to `web_admin.py`. | ✅ this PR |
 | **Stage-8-Part-3** | **Gift codes** — full feature: alembic 0003 (`gift_codes` + `gift_redemptions`), DB methods, `/redeem CODE` user-facing flow + wallet menu button, admin UI for create/list/revoke + redemption stats. | ⏳ |
 | **Stage-8-Part-4** | Users page — search by id/username, view balance + recent transactions, credit/debit form. Reuses `admin_adjust_balance`. | ⏳ |
 | **Stage-8-Part-5** | Broadcast page (live progress via HTMX polling) + Transactions browser (paginated). | ⏳ |
@@ -308,7 +309,7 @@ Two new tables coming in **Stage-8-Part-3** (alembic 0003):
 
 ## 9. Test suite
 
-**191 tests across 9 modules** as of Stage-8-Part-1:
+**230 tests across 9 modules** as of Stage-8-Part-2:
 
 ```
 tests/
@@ -321,7 +322,8 @@ tests/
 ├── test_ipn_signature.py                  # 11 cases (raw + canonical paths, persian descr regression)
 ├── test_pricing.py                        # 11 cases (per-model lookup, markup, fallback)
 ├── test_rate_limit.py                     # 15 cases (token bucket + LRU + middleware)
-└── test_web_admin.py                      # 25 cases (cookie sign/verify, login flow, dashboard render, idempotency)
+└── test_web_admin.py                      # 67 cases (cookie sign/verify, login, dashboard,
+                                          #            promo list/create/revoke, CSRF, flash cookies)
 ```
 
 CI runs the full suite on Python 3.11 + 3.12, plus an alembic
@@ -341,8 +343,8 @@ assumption.
 | `database.py` | Clean. All money-touching methods use `SELECT … FOR UPDATE`. `finalize_partial_payment` already uses `max(already_credited, actually_paid_usd)`. `admin_adjust_balance` writes `transactions` row + updates wallet in one tx with FOR UPDATE on the user row. |
 | `payments.py` | Clean. Two-pass IPN verifier (raw → canonical fallback). Idempotent finalize, partial-delta crediting. |
 | `handlers.py` | Clean. `cmd_start`, `_route_legacy_text_to_hub`, `process_chat`, `process_promo_input`, and `process_custom_amount_input` all guard `from_user is None` and `text is None`. |
-| `web_admin.py` | aiohttp+jinja2 panel mounted under `/admin/`. HMAC-signed cookies (`ADMIN_PASSWORD` + `ADMIN_SESSION_SECRET`). Stage-8-Part-1: login + dashboard. Future parts add promo / gift / users / broadcast / transactions pages. |
-| `templates/admin/` | jinja2 templates. `base.html` = global CSS + `<head>`; `_layout.html` = sidebar shell (extended by content pages); `login.html`, `dashboard.html`. |
+| `web_admin.py` | aiohttp+jinja2 panel mounted under `/admin/`. HMAC-signed cookies (`ADMIN_PASSWORD` + `ADMIN_SESSION_SECRET`). Login + dashboard (Part-1). Promos page with CSRF tokens + flash banners (Part-2). Future parts add gift / users / broadcast / transactions pages. |
+| `templates/admin/` | jinja2 templates. `base.html` = global CSS + `<head>`; `_layout.html` = sidebar shell (extended by content pages); `login.html`, `dashboard.html`, `promos.html`. |
 | `ai_engine.py` | Clean. `aiohttp.ClientTimeout(total=60, connect=10, sock_read=50)` on OpenRouter. Defensive guard for malformed responses. |
 | `pricing.py` | Clean. Conservative fallback for unmapped models, markup ≥ 1.0. |
 | `rate_limit.py` | `consume_chat_token(user_id)` per-user (called *inside* `handlers.process_chat`, not as a `dp.message` middleware — see PR #47/#48 history). `webhook_rate_limit_middleware` per-IP. |
@@ -352,7 +354,7 @@ assumption.
 | `docker-compose.yml` | postgres + redis + bot. |
 | `strings.py` | Clean. Every `t()` slug exists in fa + en. |
 | `.env.example` | Documents every required env var including `REDIS_URL`, `ADMIN_USER_IDS`, `COST_MARKUP`. |
-| `tests/` | 161 cases. Strict-warnings pytest config + 3-job CI matrix. |
+| `tests/` | 230 cases. Strict-warnings pytest config + 3-job CI matrix. |
 | ~~`schema.sql`, `migrations/*.sql`~~ | **Deleted in cleanup PR.** Alembic owns schema. |
 
 ---

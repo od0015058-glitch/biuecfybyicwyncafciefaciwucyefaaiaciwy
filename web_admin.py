@@ -23,15 +23,33 @@ Why HMAC cookies instead of server-side sessions:
       until their cookie expires.
     * One person, low concurrency, no need for revocation primitives.
 
-Pages (this PR / Stage-8-Part-1):
-    * ``GET /admin/login``       login form
-    * ``POST /admin/login``      check password, set cookie
-    * ``GET /admin/logout``      clear cookie, redirect to login
-    * ``GET /admin/``            dashboard with system metrics (auth required)
+Pages so far:
+    * ``GET  /admin/login``           login form               (Part-1)
+    * ``POST /admin/login``           check password           (Part-1)
+    * ``GET  /admin/logout``          clear cookie             (Part-1)
+    * ``GET  /admin/``                dashboard / metrics      (Part-1)
+    * ``GET  /admin/promos``          list + create form       (Part-2)
+    * ``POST /admin/promos``          create new promo         (Part-2)
+    * ``POST /admin/promos/{code}/revoke``  soft-delete a code (Part-2)
 
-Subsequent Stage-8-Part-* PRs add /admin/promos, /admin/gifts,
-/admin/users, /admin/broadcast, /admin/transactions on top of this
-scaffold.
+CSRF defence (Part-2):
+    Even though the session cookie is ``SameSite=Lax`` (which already
+    blocks cross-site form-POSTs in modern browsers), every POST form
+    additionally carries a hidden ``csrf_token`` field. The token is
+    derived from ``HMAC-SHA256(session_secret, "csrf:" + session_cookie)``
+    and validated via constant-time compare. This is belt-and-suspenders
+    defence — older browsers, proxy quirks, future cookie-attribute
+    changes — and means we don't have to assume browser SameSite
+    enforcement to keep the admin panel safe.
+
+Flash messages (Part-2):
+    A short-lived ``meow_flash`` cookie (10s TTL, signed) carries a
+    one-shot status banner across the redirect after a POST. Server
+    reads + clears on next render. Survives the redirect cycle without
+    needing a server-side session store.
+
+Subsequent Stage-8-Part-* PRs add /admin/gifts, /admin/users,
+/admin/broadcast, /admin/transactions on top of this scaffold.
 """
 
 from __future__ import annotations
@@ -324,6 +342,484 @@ async def dashboard(request: web.Request) -> web.StreamResponse:
 
 
 # ---------------------------------------------------------------------
+# CSRF + flash helpers (Stage-8-Part-2)
+# ---------------------------------------------------------------------
+
+
+FLASH_COOKIE = "meow_flash"
+FLASH_TTL_SECONDS = 10  # one redirect hop is plenty
+
+
+def csrf_token_for(request: web.Request) -> str:
+    """Return the CSRF token for this request's logged-in session.
+
+    Derived deterministically from the session cookie value via
+    ``HMAC-SHA256(secret, "csrf:" + cookie_value)`` so we don't need
+    a server-side store. A new login produces a new cookie produces
+    a new token, so logging out invalidates pending form tokens
+    automatically.
+
+    Returns "" when there is no logged-in session — handlers that
+    render forms (which always require auth) won't hit this path.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_value = request.cookies.get(COOKIE_NAME, "")
+    if not secret or not cookie_value:
+        return ""
+    digest = hmac.new(
+        secret.encode("utf-8"),
+        b"csrf:" + cookie_value.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    return _b64url_encode(digest)
+
+
+def verify_csrf_token(request: web.Request, submitted: str) -> bool:
+    """Constant-time compare of *submitted* against the expected token."""
+    expected = csrf_token_for(request)
+    if not expected or not submitted:
+        return False
+    return hmac.compare_digest(expected, submitted)
+
+
+def set_flash(
+    response: web.StreamResponse,
+    *,
+    kind: str,
+    message: str,
+    secret: str,
+    cookie_secure: bool = True,
+) -> None:
+    """Stash a one-shot status banner in a short-lived signed cookie.
+
+    The next request to render a page reads + clears it via
+    :func:`pop_flash`. Survives the post-redirect-get cycle without a
+    server-side session store. Signed so a malicious user can't inject
+    arbitrary banner text via cookie tampering.
+
+    *kind* is one of "success" / "error" / "info" — controls the CSS
+    class on the rendered banner. *message* is plain text (no HTML).
+    """
+    if not secret:
+        return  # half-configured deploy — silently skip the banner
+    payload = f"{kind}|{message}".encode("utf-8")
+    sig = hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).digest()
+    value = f"{_b64url_encode(payload)}.{_b64url_encode(sig)}"
+    response.set_cookie(
+        FLASH_COOKIE,
+        value,
+        max_age=FLASH_TTL_SECONDS,
+        httponly=True,
+        secure=cookie_secure,
+        samesite="Lax",
+        path="/admin/",
+    )
+
+
+def pop_flash(
+    request: web.Request, response: web.StreamResponse
+) -> dict | None:
+    """Read and clear the flash cookie. Returns ``{kind, message}`` or None.
+
+    Called by GET handlers right before rendering. The mutation on
+    *response* (``del_cookie``) is what makes it one-shot — the
+    browser's next request won't carry it.
+    """
+    raw = request.cookies.get(FLASH_COOKIE)
+    if not raw:
+        return None
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    if not secret:
+        # Can't verify, so don't trust. Clear it anyway so a stale
+        # cookie doesn't haunt the user.
+        response.del_cookie(FLASH_COOKIE, path="/admin/")
+        return None
+    try:
+        payload_b64, sig_b64 = raw.split(".", 1)
+        payload = _b64url_decode(payload_b64)
+        provided_sig = _b64url_decode(sig_b64)
+    except (ValueError, base64.binascii.Error):
+        response.del_cookie(FLASH_COOKIE, path="/admin/")
+        return None
+    expected_sig = hmac.new(
+        secret.encode("utf-8"), payload, hashlib.sha256
+    ).digest()
+    if not hmac.compare_digest(expected_sig, provided_sig):
+        response.del_cookie(FLASH_COOKIE, path="/admin/")
+        return None
+    try:
+        text = payload.decode("utf-8")
+        kind, message = text.split("|", 1)
+    except (UnicodeDecodeError, ValueError):
+        response.del_cookie(FLASH_COOKIE, path="/admin/")
+        return None
+    response.del_cookie(FLASH_COOKIE, path="/admin/")
+    return {"kind": kind, "message": message}
+
+
+# ---------------------------------------------------------------------
+# Promo codes (Stage-8-Part-2)
+# ---------------------------------------------------------------------
+
+
+# Discount upper bound — DECIMAL(10,4) max is 999_999.9999 (alembic
+# 0001 / promo_codes.discount_amount). We cap a touch lower so the
+# parser never produces a value that would crash the INSERT with
+# "numeric field overflow". This also guards the Telegram-side
+# /admin_promo_create command via the shared validator.
+DISCOUNT_AMOUNT_MAX = 999_999.0
+
+
+def parse_promo_form(form) -> dict | str:
+    """Parse the /admin/promos create form. Mirror of
+    :func:`admin.parse_promo_create_args` for the Telegram-side
+    command but takes named form fields instead of positional CLI args.
+
+    Returns a dict shaped::
+
+        {
+          "code": "WELCOME20",
+          "discount_percent": 20 | None,
+          "discount_amount": None | float,
+          "max_uses": int | None,
+          "expires_in_days": int | None,
+        }
+
+    On failure returns a short error key the caller can render:
+    ``"missing_code"``, ``"bad_code"``, ``"missing_discount"``,
+    ``"bad_discount_kind"``, ``"bad_percent"``, ``"bad_amount"``,
+    ``"discount_too_large"``, ``"bad_max_uses"``, ``"bad_days"``.
+    """
+    code_raw = (form.get("code") or "").strip()
+    if not code_raw:
+        return "missing_code"
+    code = code_raw.upper()
+    if len(code) > 64 or not all(c.isalnum() or c in "_-" for c in code):
+        return "bad_code"
+
+    kind = (form.get("discount_kind") or "").strip().lower()
+    if kind not in ("percent", "amount"):
+        return "bad_discount_kind"
+
+    raw_value = (form.get("discount_value") or "").strip()
+    if not raw_value:
+        return "missing_discount"
+
+    discount_percent: int | None = None
+    discount_amount: float | None = None
+    if kind == "percent":
+        # Strip a trailing % so admins can paste "20%" or "20" both.
+        cleaned = raw_value.rstrip("%").strip()
+        try:
+            pct = int(cleaned)
+        except ValueError:
+            return "bad_percent"
+        if not (1 <= pct <= 100):
+            return "bad_percent"
+        discount_percent = pct
+    else:
+        cleaned = raw_value.lstrip("$").strip()
+        try:
+            amount = float(cleaned)
+        except ValueError:
+            return "bad_amount"
+        # NaN / Inf / non-positive
+        if not (amount == amount) or amount in (
+            float("inf"), float("-inf")
+        ) or amount <= 0:
+            return "bad_amount"
+        if amount > DISCOUNT_AMOUNT_MAX:
+            return "discount_too_large"
+        discount_amount = round(amount, 4)
+
+    raw_max = (form.get("max_uses") or "").strip()
+    max_uses: int | None = None
+    if raw_max:
+        try:
+            max_uses = int(raw_max)
+        except ValueError:
+            return "bad_max_uses"
+        if max_uses <= 0:
+            return "bad_max_uses"
+
+    raw_days = (form.get("expires_in_days") or "").strip()
+    expires_in_days: int | None = None
+    if raw_days:
+        try:
+            expires_in_days = int(raw_days)
+        except ValueError:
+            return "bad_days"
+        if expires_in_days <= 0:
+            return "bad_days"
+
+    return {
+        "code": code,
+        "discount_percent": discount_percent,
+        "discount_amount": discount_amount,
+        "max_uses": max_uses,
+        "expires_in_days": expires_in_days,
+    }
+
+
+_PROMO_FORM_ERR_TEXT = {
+    "missing_code": "Enter a code.",
+    "bad_code": "Code must be 1-64 chars, letters/numbers/_/- only.",
+    "missing_discount": "Enter a discount value.",
+    "bad_discount_kind": "Pick a discount type (percent or amount).",
+    "bad_percent": "Percent must be a whole number between 1 and 100.",
+    "bad_amount": "Amount must be a positive number (USD).",
+    "discount_too_large": (
+        f"Amount must be at most ${DISCOUNT_AMOUNT_MAX:,.2f} (DB limit)."
+    ),
+    "bad_max_uses": "Max uses must be a positive integer (or leave blank).",
+    "bad_days": "Days-until-expiry must be a positive integer (or leave blank).",
+}
+
+
+async def promos_get(request: web.Request) -> web.StreamResponse:
+    """List promo codes + render the create form."""
+    db = request.app.get(APP_KEY_DB)
+    rows: list = []
+    db_error: str | None = None
+    if db is None:
+        db_error = "No database wired up (development mode)."
+    else:
+        try:
+            rows = await db.list_promo_codes(limit=100)
+        except Exception:
+            log.exception("promos_get: list_promo_codes failed")
+            db_error = "Database query failed — see logs."
+
+    response = aiohttp_jinja2.render_template(
+        "promos.html",
+        request,
+        {
+            "rows": rows,
+            "db_error": db_error,
+            "active_page": "promos",
+            "csrf_token": csrf_token_for(request),
+            "flash": None,  # filled in below
+        },
+    )
+    flash = pop_flash(request, response)
+    if flash is not None:
+        # Re-render with the flash. Doing it this way keeps pop_flash
+        # cheap (one HMAC) and idempotent (always clears the cookie
+        # exactly once per page load).
+        response = aiohttp_jinja2.render_template(
+            "promos.html",
+            request,
+            {
+                "rows": rows,
+                "db_error": db_error,
+                "active_page": "promos",
+                "csrf_token": csrf_token_for(request),
+                "flash": flash,
+            },
+        )
+        # Re-emit the cleared cookie on the new response.
+        response.del_cookie(FLASH_COOKIE, path="/admin/")
+    return response
+
+
+async def promos_create(request: web.Request) -> web.StreamResponse:
+    """Handle POST /admin/promos — create a new promo code.
+
+    Always 302s back to /admin/promos with a flash message describing
+    the outcome. We never re-render the form with errors inline because
+    that would mean the URL `/admin/promos` would look like a state
+    machine rather than a stable list view; flash messages keep nav
+    predictable.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+
+    form = await request.post()
+
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning("promos_create: CSRF token mismatch from %s", request.remote)
+        response = web.HTTPFound(location="/admin/promos")
+        set_flash(
+            response,
+            kind="error",
+            message="Form submission was rejected (CSRF). Refresh and try again.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    parsed = parse_promo_form(form)
+    response = web.HTTPFound(location="/admin/promos")
+    if isinstance(parsed, str):
+        set_flash(
+            response,
+            kind="error",
+            message=_PROMO_FORM_ERR_TEXT.get(parsed, f"Invalid input ({parsed})."),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    db = request.app.get(APP_KEY_DB)
+    if db is None:
+        set_flash(
+            response,
+            kind="error",
+            message="No database wired up — cannot create.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    expires_at = None
+    if parsed["expires_in_days"] is not None:
+        expires_at = datetime.now(timezone.utc) + timedelta(
+            days=parsed["expires_in_days"]
+        )
+
+    try:
+        ok = await db.create_promo_code(
+            code=parsed["code"],
+            discount_percent=parsed["discount_percent"],
+            discount_amount=parsed["discount_amount"],
+            max_uses=parsed["max_uses"],
+            expires_at=expires_at,
+        )
+    except ValueError as exc:
+        set_flash(
+            response,
+            kind="error",
+            message=str(exc),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+    except Exception:
+        log.exception("promos_create: create_promo_code failed")
+        set_flash(
+            response,
+            kind="error",
+            message="Database write failed — see logs.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    if not ok:
+        set_flash(
+            response,
+            kind="error",
+            message=f"Code '{parsed['code']}' already exists. Pick another or revoke the existing one first.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    if parsed["discount_percent"] is not None:
+        disc = f"{parsed['discount_percent']}%"
+    else:
+        disc = f"${parsed['discount_amount']:.2f}"
+    cap_label = (
+        f"{parsed['max_uses']} uses"
+        if parsed["max_uses"] is not None
+        else "unlimited uses"
+    )
+    exp_label = (
+        f", expires in {parsed['expires_in_days']} days"
+        if parsed["expires_in_days"] is not None
+        else ""
+    )
+    log.info(
+        "web_admin promos_create: code=%s disc=%s cap=%s",
+        parsed["code"], disc, parsed["max_uses"],
+    )
+    set_flash(
+        response,
+        kind="success",
+        message=f"Created '{parsed['code']}': {disc}, {cap_label}{exp_label}.",
+        secret=secret,
+        cookie_secure=cookie_secure,
+    )
+    return response
+
+
+async def promos_revoke(request: web.Request) -> web.StreamResponse:
+    """POST /admin/promos/{code}/revoke — soft-delete a promo code."""
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+
+    form = await request.post()
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning("promos_revoke: CSRF token mismatch from %s", request.remote)
+        response = web.HTTPFound(location="/admin/promos")
+        set_flash(
+            response,
+            kind="error",
+            message="Form submission was rejected (CSRF). Refresh and try again.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    code = request.match_info.get("code", "").upper()
+    response = web.HTTPFound(location="/admin/promos")
+    if not code or len(code) > 64 or not all(
+        c.isalnum() or c in "_-" for c in code
+    ):
+        set_flash(
+            response,
+            kind="error",
+            message="Invalid code in URL.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    db = request.app.get(APP_KEY_DB)
+    if db is None:
+        set_flash(
+            response,
+            kind="error",
+            message="No database wired up — cannot revoke.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        ok = await db.revoke_promo_code(code)
+    except Exception:
+        log.exception("promos_revoke: revoke_promo_code failed")
+        set_flash(
+            response,
+            kind="error",
+            message="Database write failed — see logs.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    if ok:
+        log.info("web_admin promos_revoke: code=%s", code)
+        set_flash(
+            response,
+            kind="success",
+            message=f"Revoked '{code}'.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+    else:
+        set_flash(
+            response,
+            kind="info",
+            message=f"'{code}' was already revoked or doesn't exist.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+    return response
+
+
+# ---------------------------------------------------------------------
 # App wiring
 # ---------------------------------------------------------------------
 
@@ -399,6 +895,14 @@ def setup_admin_routes(
     app.router.add_get(
         "/admin",
         lambda r: web.HTTPFound(location="/admin/"),
+    )
+
+    # Stage-8-Part-2: promo codes.
+    app.router.add_get("/admin/promos", _require_auth(promos_get))
+    app.router.add_post("/admin/promos", _require_auth(promos_create))
+    app.router.add_post(
+        "/admin/promos/{code}/revoke",
+        _require_auth(promos_revoke),
     )
 
     app[APP_KEY_INSTALLED] = True
