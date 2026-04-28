@@ -17,6 +17,20 @@ NowPayments crypto invoices.
   transactions browser with gateway / status / user filters).
 - Telegram-side admin commands (`/admin`, `/admin_metrics`,
   `/admin_credit`, `/admin_broadcast`, …) for ops via DMs.
+- **Canonical slash-command menu** — on every startup the bot
+  publishes its user-facing command list (`/start`, `/redeem`) via
+  `Bot.set_my_commands` so Telegram's `/` popup never shows stale
+  entries left over from BotFather's "Edit Commands" panel. Admin
+  commands are scoped per-admin via `BotCommandScopeChat` so
+  non-admins don't see them.
+- **Wallet-menu redemption** — alongside the existing `/redeem CODE`
+  command, the wallet inline menu now exposes a "🎁 Redeem gift code"
+  button that prompts for the code and reuses the same eligibility
+  pipeline.
+- **Hub buttons** — top-level menu has `Wallet · Models · New Chat ·
+  Memory: ON/OFF · Support · Language`. Tapping "🆕 New Chat" wipes
+  the conversation buffer immediately; tapping "🧠 Memory" opens
+  the memory settings screen with the cost trade-off explainer.
 
 For the full project history, file map, and roadmap **read [HANDOFF.md](./HANDOFF.md)**.
 
@@ -120,7 +134,8 @@ pytest tests/
 
 | File | Purpose |
 | --- | --- |
-| `main.py` | Entrypoint. Boots aiogram dispatcher, registers middleware, starts the IPN HTTP listener. |
+| `main.py` | Entrypoint. Boots aiogram dispatcher, registers middleware, calls `bot_commands.publish_bot_commands` to overwrite BotFather's slash-command list, starts the IPN HTTP listener. |
+| `bot_commands.py` | Canonical Telegram slash-command publisher. `PUBLIC_COMMANDS` (everyone sees) + `ADMIN_COMMANDS` (per-admin via `BotCommandScopeChat`). Idempotent; errors are logged and swallowed so a transient network blip during startup doesn't take the bot down. |
 | `database.py` | asyncpg pool + every SQL query. Money methods use `SELECT … FOR UPDATE` inside connection-scoped transactions. |
 | `payments.py` | NowPayments invoice creation, IPN verification (HMAC-SHA512), idempotent finalize, partial-payment crediting. |
 | `handlers.py` | All aiogram handlers — `/start`, hub UI, charge flow, model picker, language picker, support. |

@@ -8,7 +8,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp import web
 from dotenv import load_dotenv
 
-from admin import router as admin_router
+from admin import parse_admin_user_ids, router as admin_router
+from bot_commands import publish_bot_commands
 from database import db
 from handlers import router
 from middlewares import UserUpsertMiddleware
@@ -121,6 +122,13 @@ async def main():
 
     await db.connect()
     log.info("Proxy bot is online.")
+
+    # Overwrite BotFather's cached slash-command list with the
+    # canonical one. Without this, Telegram shows whatever was last
+    # typed into the BotFather "Edit Commands" panel — including
+    # leftover entries the bot has no handlers for. See bot_commands.
+    admin_ids = parse_admin_user_ids(os.getenv("ADMIN_USER_IDS"))
+    await publish_bot_commands(bot, admin_ids)
 
     runner = await start_webhook_server(bot)
 

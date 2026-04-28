@@ -1,6 +1,7 @@
 import logging
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -28,6 +29,7 @@ router = Router()
 class UserStates(StatesGroup):
     waiting_custom_amount = State()
     waiting_promo_code = State()
+    waiting_gift_code = State()
 
 
 # Pre-compute the set of all main-keyboard button labels (across every
@@ -147,10 +149,22 @@ async def _hub_text_and_kb(
     kb = InlineKeyboardBuilder()
     kb.button(text=t(lang, "hub_btn_wallet"), callback_data="hub_wallet")
     kb.button(text=t(lang, "hub_btn_models"), callback_data="hub_models")
+    # Two distinct actions: tapping "🆕 New Chat" wipes the
+    # conversation buffer immediately (free, no confirmation
+    # screen). The "🧠 Memory: ON/OFF" button opens the memory
+    # settings screen with the cost trade-off explanation. They
+    # used to be a single "🆕 New Chat" button that opened the
+    # memory screen — confusing because the user expected the
+    # button to *do* something every time, not show a settings
+    # page that does nothing when memory is OFF.
     kb.button(text=t(lang, "hub_btn_new_chat"), callback_data="hub_newchat")
+    kb.button(
+        text=t(lang, "hub_btn_memory", state=memory_label),
+        callback_data="hub_memory",
+    )
     kb.button(text=t(lang, "hub_btn_support"), callback_data="hub_support")
     kb.button(text=t(lang, "hub_btn_language"), callback_data="hub_language")
-    kb.adjust(2, 2, 1)
+    kb.adjust(2, 2, 2)
     return text, kb
 
 
@@ -248,20 +262,41 @@ async def cmd_redeem(message: Message, state: FSMContext):
         await message.answer(t(lang, "redeem_usage"))
         return
     code_arg = parts[1].strip()
+    reply = await _redeem_code_for_user(user_id, code_arg, lang)
+    await message.answer(reply)
+
+
+# Shared by ``cmd_redeem`` (slash command) and the wallet-menu redeem
+# flow (FSM ``waiting_gift_code`` handler). Returns the localized text
+# to send back to the user; never raises. ``redeem_bad_code`` covers
+# both bad format and over-length input. The DB layer is the source
+# of truth for status semantics — we just translate them.
+_REDEEM_ERR_KEY_MAP: dict[str, str] = {
+    "not_found": "redeem_not_found",
+    "inactive": "redeem_inactive",
+    "expired": "redeem_expired",
+    "exhausted": "redeem_exhausted",
+    "already_redeemed": "redeem_already_redeemed",
+    "user_unknown": "redeem_user_unknown",
+}
+
+
+async def _redeem_code_for_user(
+    user_id: int, code_arg: str, lang: str
+) -> str:
+    """Validate + redeem *code_arg* and return the localized response."""
     # Cap on length matches the DB column / parser bound — anything
     # longer is definitely junk, no need to round-trip the DB.
     if len(code_arg) > 64 or not all(
         c.isalnum() or c in "_-" for c in code_arg
     ):
-        await message.answer(t(lang, "redeem_bad_code"))
-        return
+        return t(lang, "redeem_bad_code")
 
     try:
         result = await db.redeem_gift_code(code_arg, user_id)
     except Exception:
-        log.exception("cmd_redeem: redeem_gift_code crashed")
-        await message.answer(t(lang, "redeem_error"))
-        return
+        log.exception("redeem_gift_code crashed")
+        return t(lang, "redeem_error")
 
     status = result.get("status")
     if status == "ok":
@@ -271,28 +306,14 @@ async def cmd_redeem(message: Message, state: FSMContext):
             "redeem ok telegram_id=%s code=%s amount=%s new_balance=%s",
             user_id, code_arg.upper(), amount, new_balance,
         )
-        await message.answer(
-            t(lang, "redeem_ok", amount=amount, balance=new_balance)
-        )
-        return
+        return t(lang, "redeem_ok", amount=amount, balance=new_balance)
 
-    # Map every other status to a friendly localized message. Keep
-    # the messages distinct so a confused user can copy/paste the
-    # error and the admin can tell whether the code was wrong vs
-    # already used vs expired.
-    err_key = {
-        "not_found": "redeem_not_found",
-        "inactive": "redeem_inactive",
-        "expired": "redeem_expired",
-        "exhausted": "redeem_exhausted",
-        "already_redeemed": "redeem_already_redeemed",
-        "user_unknown": "redeem_user_unknown",
-    }.get(status, "redeem_error")
+    err_key = _REDEEM_ERR_KEY_MAP.get(status, "redeem_error")
     log.info(
         "redeem fail telegram_id=%s code=%s status=%s",
         user_id, code_arg.upper(), status,
     )
-    await message.answer(t(lang, err_key))
+    return t(lang, err_key)
 
 
 # ==========================================
@@ -436,22 +457,58 @@ async def _render_memory_screen(callback: CallbackQuery, lang: str) -> None:
     # ``TelegramBadRequest: Message is not modified`` for that, which
     # propagates up the dispatcher as an error log line. The toast was
     # already shown, so the UX is fine — just swallow the no-op.
+    #
+    # Bundled bug fix (Stage-9-Step-1.5): pre-fix this swallowed every
+    # ``Exception`` here including DB drops, network blips on the
+    # Telegram session, and bot-was-blocked errors (``TelegramForbiddenError``)
+    # — masking real bugs as a single ``log.debug`` line. Tighten to
+    # ``TelegramBadRequest`` so only the legitimate "message is not
+    # modified" / parse-mode no-op cases are silenced.
     try:
         await callback.message.edit_text(
             text, parse_mode="Markdown", reply_markup=builder.as_markup()
         )
-    except Exception:
+    except TelegramBadRequest:
         log.debug("memory screen edit_text was a no-op", exc_info=True)
 
 
 @router.callback_query(F.data == "hub_newchat")
 async def hub_newchat_handler(callback: CallbackQuery, state: FSMContext):
-    """Open the conversation-memory settings screen.
+    """Wipe the user's conversation buffer immediately.
 
-    The hub button is labelled "🆕 New Chat" because that's the most
-    common operation users want here (start a fresh conversation),
-    but the screen also exposes the memory toggle since the two
-    concepts are tied — "new chat" only matters when memory is on.
+    Tapping "🆕 New Chat" on the hub used to open the memory settings
+    screen — confusing because the button sounded like an action but
+    behaved like navigation. Now it does the obvious thing: clear the
+    conversation buffer (free), confirm via toast, leave the user on
+    the hub. Memory toggling lives behind a separate "🧠 Memory:
+    ON/OFF" hub button.
+    """
+    await state.clear()
+    lang = await _get_user_language(callback.from_user.id)
+    deleted = await db.clear_conversation(callback.from_user.id)
+    if deleted == 0:
+        # Nothing to clear — surface that explicitly so the user
+        # doesn't think the button is broken. Also nudge them toward
+        # the memory toggle if they expected memory to be on.
+        memory_on = await db.get_memory_enabled(callback.from_user.id)
+        if memory_on:
+            await callback.answer(t(lang, "memory_reset_empty"))
+        else:
+            await callback.answer(
+                t(lang, "newchat_no_memory_hint"), show_alert=True
+            )
+        return
+    await callback.answer(t(lang, "memory_reset_done", count=deleted))
+
+
+@router.callback_query(F.data == "hub_memory")
+async def hub_memory_handler(callback: CallbackQuery, state: FSMContext):
+    """Open the memory settings screen with the cost trade-off explainer.
+
+    Reachable from the dedicated "🧠 Memory: ON/OFF" hub button. The
+    screen shows the user's current memory state, a toggle, and (when
+    memory is on) a "Start new chat" button — the latter is also
+    available directly from the hub via ``hub_newchat``.
     """
     await state.clear()
     lang = await _get_user_language(callback.from_user.id)
@@ -1017,11 +1074,61 @@ async def set_active_model_handler(callback: CallbackQuery):
     await callback.answer()
 
 
+# ==========================================
+# Wallet → Redeem gift code (button-driven flow). The slash command
+# ``/redeem CODE`` still works; this is the discoverability twin so
+# users can find redemption from the wallet menu without typing.
+# ==========================================
+@router.callback_query(F.data == "hub_redeem_gift")
+async def hub_redeem_gift_handler(callback: CallbackQuery, state: FSMContext):
+    """Prompt the user for a gift code; arm the ``waiting_gift_code`` state."""
+    lang = await _get_user_language(callback.from_user.id)
+    await state.set_state(UserStates.waiting_gift_code)
+    builder = InlineKeyboardBuilder()
+    builder.button(text=t(lang, "btn_back_to_wallet"), callback_data="back_to_wallet")
+    builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+    builder.adjust(2)
+    await callback.message.edit_text(
+        t(lang, "redeem_input_prompt"),
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.message(UserStates.waiting_gift_code)
+async def process_gift_code_input(message: Message, state: FSMContext):
+    """Read the typed gift code, redeem it, surface the result.
+
+    Same defensive ``from_user is None`` guard as the other
+    waiting_* handlers (see PR #51 / cleanup PR comments). On any
+    outcome — success or error — we drop the FSM state so the next
+    message routes back to the AI chat handler.
+    """
+    if message.from_user is None:
+        return
+    user_id = message.from_user.id
+    lang = await _get_user_language(user_id)
+    code_arg = (message.text or "").strip()
+    await state.set_state(None)
+    if not code_arg:
+        await message.answer(t(lang, "redeem_bad_code"))
+        return
+    reply = await _redeem_code_for_user(user_id, code_arg, lang)
+    await message.answer(reply)
+
+
 def _build_wallet_keyboard(lang: str) -> InlineKeyboardBuilder:
     builder = InlineKeyboardBuilder()
     builder.button(text=t(lang, "btn_add_crypto"), callback_data="add_crypto")
+    # HANDOFF Stage-8-Part-3 deferred this button: gift codes shipped
+    # only as a slash command (``/redeem CODE``), which most users
+    # don't discover. Surface a real wallet-menu button alongside
+    # "Add crypto" so the redemption flow is reachable through buttons.
+    builder.button(
+        text=t(lang, "btn_redeem_gift"), callback_data="hub_redeem_gift"
+    )
     _back_to_menu_button(builder, lang)
-    builder.adjust(1, 1)
+    builder.adjust(1, 1, 1)
     return builder
 
 

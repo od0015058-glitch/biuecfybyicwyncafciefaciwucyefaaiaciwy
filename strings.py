@@ -51,9 +51,13 @@ _STRINGS: dict[str, dict[str, str]] = {
         "hub_btn_wallet": "💰 کیف پول",
         "hub_btn_models": "🤖 مدل‌های هوش مصنوعی",
         "hub_btn_new_chat": "🆕 گفتگوی جدید",
+        "hub_btn_memory": "🧠 حافظه: {state}",
         "hub_btn_support": "💬 پشتیبانی",
         "hub_btn_language": "🌍 تغییر زبان",
         "hub_no_active_model": "—",
+        "newchat_no_memory_hint": (
+            "💡 حافظه خاموش است؛ دکمه «حافظه» در منوی اصلی را باز کنید تا فعال بشود."
+        ),
         "hub_lang_label_fa": "🇮🇷 فارسی",
         "hub_lang_label_en": "🇬🇧 English",
         # ---- Memory toggle / new-chat screen (P3-5) ----
@@ -74,6 +78,13 @@ _STRINGS: dict[str, dict[str, str]] = {
         "memory_toggled_on": "✅ حافظه فعال شد",
         "memory_toggled_off": "⚪ حافظه خاموش شد",
         "memory_reset_done": "🆕 گفتگو پاک شد ({count} پیام)",
+        "memory_reset_empty": "💭 گفتگویی برای پاک کردن وجود ندارد.",
+        # ---- Wallet redeem button (Stage-8-Part-3.5) ----
+        "btn_redeem_gift": "🎁 استفاده از کد هدیه",
+        "redeem_input_prompt": (
+            "📥 لطفاً کد هدیه خود را ارسال کنید.\n"
+            "برای انصراف دکمهٔ بازگشت را بزنید."
+        ),
         # ---- /start ----
         "start_greeting": (
             "سلام {first_name}!\n\n"
@@ -314,9 +325,13 @@ _STRINGS: dict[str, dict[str, str]] = {
         "hub_btn_wallet": "💰 Wallet",
         "hub_btn_models": "🤖 AI Models",
         "hub_btn_new_chat": "🆕 New Chat",
+        "hub_btn_memory": "🧠 Memory: {state}",
         "hub_btn_support": "💬 Support",
         "hub_btn_language": "🌍 Change language",
         "hub_no_active_model": "—",
+        "newchat_no_memory_hint": (
+            "💡 Memory is OFF — turn it on from the Memory button on the main menu first."
+        ),
         "hub_lang_label_fa": "🇮🇷 فارسی",
         "hub_lang_label_en": "🇬🇧 English",
         # ---- Memory toggle / new-chat screen (P3-5) ----
@@ -338,6 +353,13 @@ _STRINGS: dict[str, dict[str, str]] = {
         "memory_toggled_on": "✅ Memory enabled",
         "memory_toggled_off": "⚪ Memory disabled",
         "memory_reset_done": "🆕 Conversation cleared ({count} messages)",
+        "memory_reset_empty": "💭 No conversation to clear.",
+        # ---- Wallet redeem button (Stage-8-Part-3.5) ----
+        "btn_redeem_gift": "🎁 Redeem gift code",
+        "redeem_input_prompt": (
+            "📥 Send your gift code now.\n"
+            "Tap Back to cancel."
+        ),
         # ---- /start ----
         "start_greeting": (
             "Hi {first_name}!\n\n"
