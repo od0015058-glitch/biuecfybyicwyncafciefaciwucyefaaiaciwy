@@ -41,7 +41,6 @@ import hashlib
 import hmac
 import logging
 import os
-import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -354,15 +353,24 @@ def setup_admin_routes(
             "unreachable (login will refuse all attempts)."
         )
     if not session_secret:
-        # Generate a per-process random secret so the cookie is at
-        # least valid within a single boot. This still triggers the
-        # "not configured" branch on login_post (so logins fail), but
-        # nothing else explodes if someone hits /admin/login.
-        session_secret = secrets.token_urlsafe(32)
+        # Intentionally leave session_secret empty so the "not
+        # configured" guard in ``login_post`` (``not expected or
+        # not secret``) correctly refuses every attempt.
+        #
+        # Earlier versions of this branch auto-generated a random
+        # per-process secret on the theory that it was harmless —
+        # but auto-generating made the secret non-empty, which
+        # bypassed the guard and let a sysadmin who set
+        # ADMIN_PASSWORD but forgot ADMIN_SESSION_SECRET silently
+        # log in (Devin Review caught this on PR #54). Refusing
+        # to start with a half-configured admin panel is the safer
+        # default — surface the misconfig at log time, not by
+        # accident at runtime.
         log.warning(
-            "ADMIN_SESSION_SECRET is not set — using a random per-process "
-            "secret. Logins will be rejected by login_post until you set "
-            "this; existing cookies will be invalidated on every restart."
+            "ADMIN_SESSION_SECRET is not set — login_post will refuse "
+            "every attempt until it's configured. Set ADMIN_SESSION_SECRET "
+            "(any random 32+ char string) in your environment to enable "
+            "the admin panel."
         )
 
     app[APP_KEY_PASSWORD] = password

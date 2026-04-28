@@ -329,6 +329,32 @@ async def test_unconfigured_password_refuses_login(
     assert "not configured" in body
 
 
+async def test_unconfigured_session_secret_refuses_login(
+    aiohttp_client, make_admin_app
+):
+    """Empty ADMIN_SESSION_SECRET must reject all login attempts even
+    if ADMIN_PASSWORD is set.
+
+    Devin Review caught a bug on PR #54 where ``setup_admin_routes``
+    auto-generated a random secret when the env var was missing,
+    which silently bypassed the ``not expected or not secret`` guard
+    in ``login_post`` and let a half-configured deploy log in. Pin
+    the new behaviour: empty secret = guard fires = 500 with
+    "not configured" body.
+    """
+    client = await aiohttp_client(
+        make_admin_app(password="letmein", session_secret="")
+    )
+    resp = await client.post(
+        "/admin/login",
+        data={"password": "letmein"},
+        allow_redirects=False,
+    )
+    assert resp.status == 500
+    body = await resp.text()
+    assert "not configured" in body
+
+
 async def test_admin_bare_path_redirects_to_slash(
     aiohttp_client, make_admin_app
 ):
