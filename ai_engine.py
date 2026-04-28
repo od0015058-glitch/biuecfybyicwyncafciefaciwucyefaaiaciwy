@@ -83,9 +83,27 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
                     return t(lang, "ai_provider_unavailable")
                 
                 data = await response.json()
-                reply_text = data['choices'][0]['message']['content']
-                prompt_tokens = data['usage']['prompt_tokens']
-                completion_tokens = data['usage']['completion_tokens']
+                # OpenRouter occasionally returns a 200 with a body
+                # shaped like ``{"error": {...}}`` (rate-limit info,
+                # safety-policy block, model-specific provider error)
+                # instead of the OpenAI-style chat completion shape.
+                # Indexing ``data['choices'][0]['message']['content']``
+                # on those bodies raises KeyError / IndexError and
+                # bubbles up as a 'Run polling' crash visible only in
+                # logs — the user sees nothing back. Guard explicitly
+                # and surface the existing 'provider unavailable'
+                # i18n message instead.
+                try:
+                    reply_text = data["choices"][0]["message"]["content"]
+                    prompt_tokens = data["usage"]["prompt_tokens"]
+                    completion_tokens = data["usage"]["completion_tokens"]
+                except (KeyError, IndexError, TypeError):
+                    log.error(
+                        "OpenRouter 200 with unexpected body for user %d "
+                        "model=%s: %.500r",
+                        telegram_id, active_model, data,
+                    )
+                    return t(lang, "ai_provider_unavailable")
                 
                 # 4. Economic Settlement
                 if free_msgs > 0:
