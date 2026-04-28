@@ -137,6 +137,7 @@ def _stub_db(
     search_users_result: list | Exception | None = None,
     user_summary_result: dict | None | Exception = None,
     adjust_balance_result: dict | None | Exception = None,
+    broadcast_recipients: list | Exception | None = None,
 ):
     """A minimal Database stub that exposes the methods web_admin uses.
 
@@ -201,6 +202,16 @@ def _stub_db(
         db.admin_adjust_balance = AsyncMock(side_effect=adjust_balance_result)
     else:
         db.admin_adjust_balance = AsyncMock(return_value=adjust_balance_result)
+    if isinstance(broadcast_recipients, Exception):
+        db.iter_broadcast_recipients = AsyncMock(
+            side_effect=broadcast_recipients
+        )
+    else:
+        db.iter_broadcast_recipients = AsyncMock(
+            return_value=broadcast_recipients
+            if broadcast_recipients is not None
+            else []
+        )
     return db
 
 
@@ -213,6 +224,7 @@ def make_admin_app():
         session_secret: str = "x" * 32,
         db=None,
         cookie_secure: bool = False,
+        bot=None,
     ):
         app = web.Application()
         setup_admin_routes(
@@ -222,6 +234,7 @@ def make_admin_app():
             session_secret=session_secret,
             ttl_hours=24,
             cookie_secure=cookie_secure,
+            bot=bot,
         )
         return app
 
@@ -2495,3 +2508,506 @@ async def test_user_adjust_db_exception_shows_flash(
     resp2 = await client.get("/admin/users/500")
     body = await resp2.text()
     assert "Database write failed" in body
+
+
+# =========================================================================
+# Stage-8-Part-5: broadcast page tests
+# =========================================================================
+
+from web_admin import (  # noqa: E402  (keep Part-5 imports grouped)
+    APP_KEY_BOT,
+    APP_KEY_BROADCAST_JOBS,
+    APP_KEY_BROADCAST_TASKS,
+    BROADCAST_MAX_HISTORY,
+    BROADCAST_TEXT_MAX_LEN,
+    _new_broadcast_job,
+    _run_broadcast_job,
+    _store_broadcast_job,
+    parse_broadcast_web_form,
+)
+
+
+# ---- parse_broadcast_web_form (unit tests) ------------------------------
+
+
+def test_parse_broadcast_form_happy_path():
+    out = parse_broadcast_web_form(
+        {"text": "hello everyone", "only_active_days": ""}
+    )
+    assert out == {"text": "hello everyone", "only_active_days": None}
+
+
+def test_parse_broadcast_form_strips_whitespace():
+    out = parse_broadcast_web_form(
+        {"text": "  hello  \n", "only_active_days": "  "}
+    )
+    assert out == {"text": "hello", "only_active_days": None}
+
+
+def test_parse_broadcast_form_with_active_days():
+    out = parse_broadcast_web_form(
+        {"text": "tap tap", "only_active_days": "7"}
+    )
+    assert out == {"text": "tap tap", "only_active_days": 7}
+
+
+def test_parse_broadcast_form_missing_text_returns_key():
+    assert parse_broadcast_web_form(
+        {"text": "", "only_active_days": ""}
+    ) == "missing_text"
+    assert parse_broadcast_web_form(
+        {"text": "   ", "only_active_days": ""}
+    ) == "missing_text"
+
+
+def test_parse_broadcast_form_too_long_returns_key():
+    big = "x" * (BROADCAST_TEXT_MAX_LEN + 1)
+    assert parse_broadcast_web_form(
+        {"text": big, "only_active_days": ""}
+    ) == "text_too_long"
+
+
+def test_parse_broadcast_form_at_max_length_passes():
+    """Boundary test: exactly BROADCAST_TEXT_MAX_LEN chars must still pass."""
+    msg = "x" * BROADCAST_TEXT_MAX_LEN
+    out = parse_broadcast_web_form(
+        {"text": msg, "only_active_days": ""}
+    )
+    assert out == {"text": msg, "only_active_days": None}
+
+
+@pytest.mark.parametrize("bad", ["abc", "0", "-5", "1.5"])
+def test_parse_broadcast_form_bad_active(bad):
+    assert parse_broadcast_web_form(
+        {"text": "hi", "only_active_days": bad}
+    ) == "bad_active"
+
+
+def test_parse_broadcast_form_limit_aligns_with_telegram_cmd():
+    """The web form and the Telegram ``/admin_broadcast`` command must
+    agree on the body-length ceiling so an admin can't craft a message
+    that passes one validator and is rejected by the other. Caught a
+    real drift risk — the constants live in different modules."""
+    from admin import _BROADCAST_MAX_TEXT_LEN
+    assert BROADCAST_TEXT_MAX_LEN == _BROADCAST_MAX_TEXT_LEN
+
+
+# ---- in-memory job lifecycle (unit tests) -------------------------------
+
+
+def test_new_broadcast_job_shape():
+    job = _new_broadcast_job(text="hello", only_active_days=None)
+    # id is opaque but non-empty and URL-safe.
+    assert isinstance(job["id"], str) and job["id"]
+    assert job["state"] == "queued"
+    assert job["total"] == 0
+    assert job["sent"] == 0 and job["blocked"] == 0 and job["failed"] == 0
+    assert job["text_preview"] == "hello"
+    assert job["full_text_len"] == 5
+    assert job["only_active_days"] is None
+    assert job["error"] is None
+
+
+def test_new_broadcast_job_truncates_preview_for_long_text():
+    msg = "x" * 500
+    job = _new_broadcast_job(text=msg, only_active_days=30)
+    assert job["full_text_len"] == 500
+    assert len(job["text_preview"]) == 118  # 117 chars + ellipsis
+    assert job["text_preview"].endswith("…")
+    assert job["only_active_days"] == 30
+
+
+def test_new_broadcast_job_ids_are_unique():
+    ids = {
+        _new_broadcast_job(text="x", only_active_days=None)["id"]
+        for _ in range(50)
+    }
+    assert len(ids) == 50  # overwhelmingly likely with 6 bytes of randomness
+
+
+def test_store_broadcast_job_never_evicts_live_jobs():
+    """Running / queued jobs must survive eviction even past the cap.
+    Otherwise a backlog of pending broadcasts could be silently dropped
+    mid-run — a correctness bug, not just a UX bug."""
+    app = web.Application()
+    app[APP_KEY_BROADCAST_JOBS] = {}
+    # Fill with terminal jobs.
+    for _ in range(BROADCAST_MAX_HISTORY):
+        j = _new_broadcast_job(text="done", only_active_days=None)
+        j["state"] = "completed"
+        _store_broadcast_job(app, j)
+    # Now add a running job past the cap.
+    live = _new_broadcast_job(text="active", only_active_days=None)
+    live["state"] = "running"
+    _store_broadcast_job(app, live)
+    assert live["id"] in app[APP_KEY_BROADCAST_JOBS]
+    # Stays present even under further pressure.
+    for _ in range(5):
+        extra = _new_broadcast_job(text="more", only_active_days=None)
+        extra["state"] = "completed"
+        _store_broadcast_job(app, extra)
+    assert live["id"] in app[APP_KEY_BROADCAST_JOBS]
+    assert len(app[APP_KEY_BROADCAST_JOBS]) <= BROADCAST_MAX_HISTORY
+
+
+def test_store_broadcast_job_evicts_oldest_terminal_first():
+    app = web.Application()
+    app[APP_KEY_BROADCAST_JOBS] = {}
+    ordered_ids: list[str] = []
+    for _ in range(BROADCAST_MAX_HISTORY):
+        j = _new_broadcast_job(text="done", only_active_days=None)
+        j["state"] = "completed"
+        _store_broadcast_job(app, j)
+        ordered_ids.append(j["id"])
+    # One more terminal pushes the cap — oldest must be evicted.
+    newest = _new_broadcast_job(text="next", only_active_days=None)
+    newest["state"] = "completed"
+    _store_broadcast_job(app, newest)
+    assert ordered_ids[0] not in app[APP_KEY_BROADCAST_JOBS]
+    assert newest["id"] in app[APP_KEY_BROADCAST_JOBS]
+    assert len(app[APP_KEY_BROADCAST_JOBS]) == BROADCAST_MAX_HISTORY
+
+
+async def test_run_broadcast_job_marks_failed_without_bot(make_admin_app):
+    """Defence in depth: the background task must surface a failure
+    rather than silently 'complete' when the bot is missing."""
+    app = make_admin_app()  # bot=None by default
+    job = _new_broadcast_job(text="hi", only_active_days=None)
+    _store_broadcast_job(app, job)
+    await _run_broadcast_job(app=app, job=job, text="hi")
+    assert job["state"] == "failed"
+    assert "Background task launched without" in job["error"]
+    assert job["completed_at"] is not None
+
+
+async def test_run_broadcast_job_completes_empty_recipients(make_admin_app):
+    """No recipients ⇒ job transitions to 'completed' without calling
+    the bot. Exercises the early-return path in _run_broadcast_job."""
+    db = _stub_db(broadcast_recipients=[])
+    bot = AsyncMock()
+    app = make_admin_app(db=db, bot=bot)
+    job = _new_broadcast_job(text="hi", only_active_days=None)
+    _store_broadcast_job(app, job)
+    await _run_broadcast_job(app=app, job=job, text="hi")
+    assert job["state"] == "completed"
+    assert job["total"] == 0
+    # Bot was never touched.
+    bot.send_message.assert_not_called()
+
+
+async def test_run_broadcast_job_db_failure_marks_failed(make_admin_app):
+    db = _stub_db(broadcast_recipients=RuntimeError("pool closed"))
+    bot = AsyncMock()
+    app = make_admin_app(db=db, bot=bot)
+    job = _new_broadcast_job(text="hi", only_active_days=None)
+    _store_broadcast_job(app, job)
+    await _run_broadcast_job(app=app, job=job, text="hi")
+    assert job["state"] == "failed"
+    assert "pool closed" in job["error"]
+
+
+async def test_run_broadcast_job_happy_path_sends_all(make_admin_app):
+    """End-to-end in-process: the background task should hand each
+    recipient id to bot.send_message and update the job counters as
+    admin._do_broadcast progresses."""
+    recipients = [100, 200, 300]
+    db = _stub_db(broadcast_recipients=recipients)
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(return_value=None)
+    app = make_admin_app(db=db, bot=bot)
+    job = _new_broadcast_job(text="hello", only_active_days=None)
+    _store_broadcast_job(app, job)
+
+    # Patch the delay so the test isn't stuck in 40ms sleeps.
+    import admin
+    orig_delay = admin._BROADCAST_DELAY_S
+    admin._BROADCAST_DELAY_S = 0.0
+    try:
+        await _run_broadcast_job(app=app, job=job, text="hello")
+    finally:
+        admin._BROADCAST_DELAY_S = orig_delay
+
+    assert job["state"] == "completed"
+    assert job["total"] == 3
+    assert job["sent"] == 3
+    assert job["blocked"] == 0
+    assert job["failed"] == 0
+    assert bot.send_message.await_count == 3
+    # Recipients are passed positionally by chat_id kwarg — assert the
+    # set, not the order, since _do_broadcast preserves the DB order.
+    called_ids = {
+        c.kwargs["chat_id"] for c in bot.send_message.await_args_list
+    }
+    assert called_ids == {100, 200, 300}
+
+
+# ---- /admin/broadcast page integration ----------------------------------
+
+
+async def _login_and_get_broadcast_csrf(client, password: str) -> str:
+    await _login(client, password)
+    resp = await client.get("/admin/broadcast")
+    body = await resp.text()
+    import re
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+    assert m, "Expected CSRF token on broadcast page"
+    return m.group(1)
+
+
+async def test_broadcast_page_requires_auth(aiohttp_client, make_admin_app):
+    client = await aiohttp_client(make_admin_app())
+    resp = await client.get("/admin/broadcast", allow_redirects=False)
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/login"
+
+
+async def test_broadcast_page_renders_form_and_empty_list(
+    aiohttp_client, make_admin_app
+):
+    client = await aiohttp_client(
+        make_admin_app(password="pw", bot=AsyncMock())
+    )
+    await _login(client, "pw")
+    resp = await client.get("/admin/broadcast")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "New broadcast" in body
+    assert "No broadcasts sent yet" in body
+    # Form fields
+    assert 'name="text"' in body
+    assert 'name="only_active_days"' in body
+    assert 'name="csrf_token"' in body
+
+
+async def test_broadcast_post_rejects_missing_csrf(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(
+        make_admin_app(password="pw", db=db, bot=AsyncMock())
+    )
+    await _login(client, "pw")
+    resp = await client.post(
+        "/admin/broadcast",
+        data={"text": "hi"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    # Flash redirect back to /admin/broadcast (not the detail page).
+    assert resp.headers["Location"] == "/admin/broadcast"
+    db.iter_broadcast_recipients.assert_not_awaited()
+    # Follow the redirect and confirm the banner.
+    resp2 = await client.get("/admin/broadcast")
+    body = await resp2.text()
+    assert "CSRF" in body
+
+
+async def test_broadcast_post_empty_text_flashes_error(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(
+        make_admin_app(password="pw", db=db, bot=AsyncMock())
+    )
+    csrf = await _login_and_get_broadcast_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/broadcast",
+        data={"csrf_token": csrf, "text": "   "},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/broadcast"
+    db.iter_broadcast_recipients.assert_not_awaited()
+    resp2 = await client.get("/admin/broadcast")
+    body = await resp2.text()
+    assert "Broadcast body is required" in body
+
+
+async def test_broadcast_post_too_long_flashes_error(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(
+        make_admin_app(password="pw", db=db, bot=AsyncMock())
+    )
+    csrf = await _login_and_get_broadcast_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/broadcast",
+        data={
+            "csrf_token": csrf,
+            "text": "x" * (BROADCAST_TEXT_MAX_LEN + 1),
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    resp2 = await client.get("/admin/broadcast")
+    body = await resp2.text()
+    assert f"at most {BROADCAST_TEXT_MAX_LEN} characters" in body
+
+
+async def test_broadcast_post_bad_active_flashes_error(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(
+        make_admin_app(password="pw", db=db, bot=AsyncMock())
+    )
+    csrf = await _login_and_get_broadcast_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/broadcast",
+        data={
+            "csrf_token": csrf,
+            "text": "hi",
+            "only_active_days": "abc",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    resp2 = await client.get("/admin/broadcast")
+    body = await resp2.text()
+    assert "positive integer" in body
+
+
+async def test_broadcast_post_without_bot_flashes_error(
+    aiohttp_client, make_admin_app
+):
+    """bot=None (misconfigured deploy) must refuse to start a job."""
+    db = _stub_db(broadcast_recipients=[1, 2, 3])
+    client = await aiohttp_client(
+        make_admin_app(password="pw", db=db, bot=None)
+    )
+    csrf = await _login_and_get_broadcast_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/broadcast",
+        data={"csrf_token": csrf, "text": "hello"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/broadcast"
+    db.iter_broadcast_recipients.assert_not_awaited()
+    resp2 = await client.get("/admin/broadcast")
+    body = await resp2.text()
+    assert "Bot is not wired up" in body
+
+
+async def test_broadcast_post_happy_path_redirects_to_detail(
+    aiohttp_client, make_admin_app
+):
+    """A valid POST should 302 to /admin/broadcast/<job_id> and leave
+    a job dict in the app registry."""
+    # No recipients so the background task completes immediately and
+    # doesn't stick around polluting later tests.
+    db = _stub_db(broadcast_recipients=[])
+    bot = AsyncMock()
+    app = make_admin_app(password="pw", db=db, bot=bot)
+    client = await aiohttp_client(app)
+    csrf = await _login_and_get_broadcast_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/broadcast",
+        data={
+            "csrf_token": csrf,
+            "text": "hello world",
+            "only_active_days": "7",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    location = resp.headers["Location"]
+    assert location.startswith("/admin/broadcast/")
+    job_id = location.rsplit("/", 1)[-1]
+
+    # Allow the background task to run to completion (no recipients
+    # so this is effectively instant).
+    task = app[APP_KEY_BROADCAST_TASKS].get(job_id)
+    assert task is not None
+    await task
+
+    jobs = app[APP_KEY_BROADCAST_JOBS]
+    assert job_id in jobs
+    job = jobs[job_id]
+    assert job["only_active_days"] == 7
+    assert job["state"] == "completed"
+    assert job["total"] == 0
+
+
+async def test_broadcast_detail_page_renders_for_known_job(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(broadcast_recipients=[])
+    bot = AsyncMock()
+    app = make_admin_app(password="pw", db=db, bot=bot)
+    client = await aiohttp_client(app)
+    csrf = await _login_and_get_broadcast_csrf(client, "pw")
+
+    post = await client.post(
+        "/admin/broadcast",
+        data={"csrf_token": csrf, "text": "hi there"},
+        allow_redirects=False,
+    )
+    job_id = post.headers["Location"].rsplit("/", 1)[-1]
+    await app[APP_KEY_BROADCAST_TASKS][job_id]
+
+    resp = await client.get(f"/admin/broadcast/{job_id}")
+    assert resp.status == 200
+    body = await resp.text()
+    assert job_id in body
+    # State pill contains the final state somewhere in the page.
+    assert "completed" in body
+    assert "hi there" in body  # preview is rendered
+
+
+async def test_broadcast_detail_unknown_job_redirects_with_flash(
+    aiohttp_client, make_admin_app
+):
+    client = await aiohttp_client(
+        make_admin_app(password="pw", bot=AsyncMock())
+    )
+    await _login(client, "pw")
+    resp = await client.get(
+        "/admin/broadcast/does-not-exist", allow_redirects=False
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/broadcast"
+    resp2 = await client.get("/admin/broadcast")
+    body = await resp2.text()
+    assert "Unknown broadcast job" in body
+
+
+async def test_broadcast_status_unknown_job_returns_404_json(
+    aiohttp_client, make_admin_app
+):
+    client = await aiohttp_client(
+        make_admin_app(password="pw", bot=AsyncMock())
+    )
+    await _login(client, "pw")
+    resp = await client.get("/admin/broadcast/nope/status")
+    assert resp.status == 404
+    data = await resp.json()
+    assert data == {"error": "unknown_job", "job_id": "nope"}
+
+
+async def test_broadcast_status_returns_job_snapshot(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(broadcast_recipients=[])
+    bot = AsyncMock()
+    app = make_admin_app(password="pw", db=db, bot=bot)
+    client = await aiohttp_client(app)
+    csrf = await _login_and_get_broadcast_csrf(client, "pw")
+
+    post = await client.post(
+        "/admin/broadcast",
+        data={"csrf_token": csrf, "text": "snapshot"},
+        allow_redirects=False,
+    )
+    job_id = post.headers["Location"].rsplit("/", 1)[-1]
+    await app[APP_KEY_BROADCAST_TASKS][job_id]
+
+    resp = await client.get(f"/admin/broadcast/{job_id}/status")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["id"] == job_id
+    assert data["state"] == "completed"
+    assert data["total"] == 0
+    # The preview is persisted (not the full text).
+    assert data["text_preview"] == "snapshot"

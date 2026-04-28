@@ -736,14 +736,19 @@ async def _do_broadcast(
     *,
     recipients: list[int],
     text: str,
-    progress_message,
     admin_id: int,
+    progress_callback=None,
 ) -> dict:
     """Send *text* to each id in *recipients*, paced + error-counted.
 
     Returns a stats dict ``{sent, blocked, failed, total}``. Logs
-    every failure for forensics. Edits *progress_message* every
-    ``_BROADCAST_PROGRESS_EVERY`` recipients.
+    every failure for forensics. Calls *progress_callback* — an
+    ``async (stats: dict) -> None`` — every
+    ``_BROADCAST_PROGRESS_EVERY`` recipients (and once at the end)
+    with a snapshot dict ``{i, total, sent, blocked, failed}`` so
+    the caller can surface progress however it wants (Telegram
+    ``edit_text``, web-panel in-memory job dict, structured log,
+    …). Passing ``None`` disables progress reporting entirely.
     """
     # Lazy import so the ``aiogram.exceptions`` symbol load doesn't
     # happen at module import time (and so test code that patches
@@ -797,18 +802,19 @@ async def _do_broadcast(
                 "broadcast: unexpected error for chat_id=%d", chat_id
             )
 
-        if i % _BROADCAST_PROGRESS_EVERY == 0 or i == total:
+        if progress_callback is not None and (
+            i % _BROADCAST_PROGRESS_EVERY == 0 or i == total
+        ):
             try:
-                await progress_message.edit_text(
-                    f"📣 Broadcasting…\n"
-                    f"Progress: {i}/{total}\n"
-                    f"Sent: {sent}  Blocked: {blocked}  Failed: {failed}"
-                )
+                await progress_callback({
+                    "i": i, "total": total,
+                    "sent": sent, "blocked": blocked, "failed": failed,
+                })
             except Exception:
-                # Progress edits are best-effort; never let one
+                # Progress callbacks are best-effort; never let one
                 # failure abort the whole broadcast.
                 log.debug(
-                    "broadcast: progress edit failed (i=%d)", i,
+                    "broadcast: progress callback raised (i=%d)", i,
                     exc_info=True,
                 )
 
@@ -856,12 +862,22 @@ async def admin_broadcast(message: Message) -> None:
         f"(ETA ~{eta_seconds}s)…\n"
         f"Progress: 0/{len(recipients)}"
     )
+
+    async def _edit_progress(stats: dict) -> None:
+        await progress.edit_text(
+            f"📣 Broadcasting…\n"
+            f"Progress: {stats['i']}/{stats['total']}\n"
+            f"Sent: {stats['sent']}  "
+            f"Blocked: {stats['blocked']}  "
+            f"Failed: {stats['failed']}"
+        )
+
     stats = await _do_broadcast(
         message.bot,
         recipients=recipients,
         text=parsed["text"],
-        progress_message=progress,
         admin_id=message.from_user.id,
+        progress_callback=_edit_progress,
     )
     await message.answer(
         "✅ Broadcast complete.\n"

@@ -156,21 +156,41 @@ async def consume_chat_token(user_id: int) -> bool:
     return await _chat_rate_limiter.consume(user_id)
 
 
+# The NowPayments IPN path. Exported so tests — and the middleware —
+# agree on the single URL whose traffic this limiter is meant to bound.
+# Kept as a module-level constant rather than inlined so a future
+# rename of the endpoint only has to change in one place.
+WEBHOOK_PATH = "/nowpayments-webhook"
+
+
 @web.middleware
 async def webhook_rate_limit_middleware(
     request: web.Request,
     handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
 ) -> web.StreamResponse:
-    """aiohttp middleware: per-IP token bucket on POSTs.
+    """Per-IP token bucket on the NowPayments IPN endpoint only.
 
-    Reasonable cap: 30 tokens, refilling at 5/sec. That's well above
+    Reasonable cap: 30 tokens, refilling at 5/sec. Well above
     NowPayments' real IPN retry rhythm (a handful per minute per
-    payment) but bounds DoS bursts. We deliberately rate-limit BEFORE
-    the body is read so a flood of 1MB POSTs can't pin the loop.
+    payment) but bounds DoS bursts. We rate-limit BEFORE the body is
+    read so a flood of 1MB POSTs can't pin the loop.
+
+    Only the webhook path is rate-limited. Other routes mounted on the
+    same aiohttp app — notably the Stage-8 web admin panel under
+    ``/admin/`` — pass through untouched. Previously this middleware
+    consumed a token for **every** request, so an admin browsing the
+    panel (or the broadcast-progress page polling for status, added in
+    Stage-8-Part-5) could exhaust the bucket and lock NowPayments IPNs
+    out of the webhook — or, conversely, a legitimate IPN burst could
+    throttle the admin UI. The scope is now narrowed to the endpoint
+    whose DoS exposure this limiter was designed to defend.
 
     The bucket cache lives on the application itself so it survives
     request boundaries.
     """
+    if request.path != WEBHOOK_PATH:
+        return await handler(request)
+
     # Cache is pre-seeded by ``install_webhook_rate_limit`` before the
     # app is started. We don't lazy-init here because aiohttp freezes
     # the app on startup and modifying app state after that raises.

@@ -1,0 +1,180 @@
+{% extends "_layout.html" %}
+
+{% block title %}Broadcast{% endblock %}
+
+{% block extra_head %}
+<style>
+  .bcast-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 16px;
+  }
+  @media (max-width: 900px) {
+    .bcast-grid { grid-template-columns: 1fr; }
+  }
+  .bcast-form textarea {
+    width: 100%;
+    min-height: 160px;
+    font-family: inherit;
+    font-size: 14px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--panel-2);
+    color: var(--text);
+    box-sizing: border-box;
+    resize: vertical;
+  }
+  .bcast-form .inline {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+    flex-wrap: wrap;
+  }
+  .bcast-form .field { flex: 1; min-width: 180px; }
+  .bcast-form button.primary {
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 6px;
+    padding: 10px 22px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  .bcast-form button.primary:hover { background: var(--accent-hover); }
+  .bcast-form .hint {
+    color: var(--text-muted);
+    font-size: 12px;
+    margin-top: 4px;
+  }
+  .bcast-form .warn {
+    color: var(--warn, #e4a94c);
+    font-weight: 600;
+  }
+  .state-pill {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .state-queued    { background: rgba(148,148,148,0.15); color: #9c9c9c; }
+  .state-running   { background: rgba(79,140,255,0.15);  color: var(--accent); }
+  .state-completed { background: rgba(74,222,128,0.15);  color: var(--success); }
+  .state-failed    { background: rgba(244,93,93,0.18);   color: var(--danger, #f45d5d); }
+  code.id {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  .alert-success {
+    background: rgba(74, 222, 128, 0.1);
+    border: 1px solid var(--success);
+    color: var(--success);
+  }
+  .empty {
+    color: var(--text-muted);
+    font-size: 13px;
+    margin: 0;
+  }
+</style>
+{% endblock %}
+
+{% block main %}
+<h2>Broadcast</h2>
+
+<div class="explainer">
+  Send a plain-text message to every user (or only those active in the
+  last N days). Delivery is paced below Telegram's per-bot rate cap —
+  expect roughly <strong>25 sends / second</strong>. Jobs are tracked
+  in memory and are lost if the bot process restarts.
+</div>
+
+{% if flash %}
+<div class="alert alert-{{ flash.kind }}">{{ flash.message }}</div>
+{% endif %}
+
+<div class="bcast-grid">
+  <div class="panel">
+    <h3 style="margin-top:0">New broadcast</h3>
+    <form class="bcast-form" method="post" action="/admin/broadcast">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+      <div class="field">
+        <label for="text">Message</label>
+        <textarea id="text" name="text" maxlength="{{ text_max_len }}"
+                  placeholder="Hello everyone! Heads-up: &hellip;"
+                  required autofocus></textarea>
+        <div class="hint">
+          Plain text. Max <strong>{{ text_max_len }}</strong> characters.
+          Newlines are preserved.
+        </div>
+      </div>
+
+      <div class="inline" style="margin-top:10px">
+        <div class="field" style="max-width:220px">
+          <label for="only_active_days">
+            Only users active in the last
+          </label>
+          <div class="inline" style="gap:6px">
+            <input type="number" id="only_active_days"
+                   name="only_active_days" min="1"
+                   placeholder="(everyone)" style="max-width:110px">
+            <span class="hint" style="margin:0">days</span>
+          </div>
+          <div class="hint">
+            Leave empty to broadcast to every registered user.
+          </div>
+        </div>
+        <button type="submit" class="primary">Start broadcast</button>
+      </div>
+
+      <p class="hint warn" style="margin-top:12px">
+        This cannot be cancelled from the web UI once it starts —
+        double-check the text before clicking.
+      </p>
+    </form>
+  </div>
+
+  <div class="panel">
+    <h3 style="margin-top:0">Recent jobs</h3>
+    {% if recent %}
+      <table>
+        <thead>
+          <tr>
+            <th>Id</th>
+            <th>State</th>
+            <th>Progress</th>
+            <th>Preview</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for j in recent %}
+          <tr>
+            <td><code class="id">{{ j.id }}</code></td>
+            <td>
+              <span class="state-pill state-{{ j.state }}">{{ j.state }}</span>
+            </td>
+            <td>
+              {% if j.total %}
+                {{ j.i }}/{{ j.total }}
+              {% else %}
+                —
+              {% endif %}
+            </td>
+            <td>
+              <a href="/admin/broadcast/{{ j.id }}">{{ j.text_preview }}</a>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty">No broadcasts sent yet.</p>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

@@ -58,7 +58,7 @@ tests/              pytest, ~286 cases
 .github/workflows/ci.yml   3.11/3.12 matrix + alembic roundtrip + docker build
 ```
 
-Total: ~5.7k LoC, 286 tests, full CI on every push.
+Total: ~6.0k LoC, 364 tests, full CI on every push.
 
 ---
 
@@ -148,7 +148,7 @@ The original "Stage 7 CLI panel" was reframed as Telegram commands (gated by
 | --- | --- |
 | **Stage-8-Part-1** | Web admin scaffold — aiohttp+jinja2 mounted under `/admin/` on the same server as the IPN webhook. HMAC-signed-cookie auth via `ADMIN_PASSWORD` + `ADMIN_SESSION_SECRET`. Login + dashboard with system metrics. + `from_user is None` guard added to `cmd_start` and `_route_legacy_text_to_hub` (the two remaining handlers reachable from anonymous-group-admin posts). 30 new tests. |
 | **Stage-8-Part-2** | Promo codes web UI — `/admin/promos` page with table view + create form + per-row revoke. CSRF-protected POSTs (HMAC tokens derived from session cookie). Signed flash-cookie banners (10s TTL) survive the post-redirect-get cycle without a server-side store. **Bug fix bundled:** `Database.create_promo_code` + `parse_promo_form` now reject `discount_amount > 999_999.9999` up-front so admins get a friendly error instead of PG `numeric field overflow` (column is `DECIMAL(10,4)`). 39 new tests. |
-| **Stage-8-Part-3** (this PR) | Gift codes — alembic `0003_gift_codes` (new `gift_codes` + `gift_redemptions` tables, distinct from `promo_codes`/`promo_usage`). Five new `Database` methods (`create_gift_code`, `list_gift_codes`, `revoke_gift_code`, `get_gift_redemptions`, atomic `redeem_gift_code` with `FOR UPDATE` locks). `/admin/gifts` web UI (list/create/revoke, CSRF + flash, mirroring promos). User-side `/redeem CODE` Telegram command with full localized error branches (not_found / inactive / expired / exhausted / already_redeemed / user_unknown / ok). **Bug fix bundled:** both `parse_gift_form` and `parse_promo_form` now cap `expires_in_days` at `EXPIRES_IN_DAYS_MAX = 36_500` (≈100 years) — without the cap, an admin pasting a giant integer would crash the create handler with an uncaught `OverflowError` from `timedelta(days=...)` → 500 instead of a friendly red banner. 56 new tests (286 total). |
+| **Stage-8-Part-3** | Gift codes — alembic `0003_gift_codes` (new `gift_codes` + `gift_redemptions` tables, distinct from `promo_codes`/`promo_usage`). Five new `Database` methods (`create_gift_code`, `list_gift_codes`, `revoke_gift_code`, `get_gift_redemptions`, atomic `redeem_gift_code` with `FOR UPDATE` locks). `/admin/gifts` web UI (list/create/revoke, CSRF + flash, mirroring promos). User-side `/redeem CODE` Telegram command with full localized error branches (not_found / inactive / expired / exhausted / already_redeemed / user_unknown / ok). **Bug fix bundled:** both `parse_gift_form` and `parse_promo_form` now cap `expires_in_days` at `EXPIRES_IN_DAYS_MAX = 36_500` (≈100 years) — without the cap, an admin pasting a giant integer would crash the create handler with an uncaught `OverflowError` from `timedelta(days=...)` → 500 instead of a friendly red banner. 56 new tests (286 total). |
 
 ---
 
@@ -206,8 +206,9 @@ updated, full tests:
 | **Stage-8-Part-1** | Web admin scaffold — login + dashboard with system metrics. `web_admin.py` + `templates/admin/`. Auth via `ADMIN_PASSWORD` + `ADMIN_SESSION_SECRET` HMAC-signed cookie. | ✅ shipped (PR #54) |
 | **Stage-8-Part-2** | Promo codes page — table view + create form + revoke action. Reuses `Database.list_promo_codes` + `create_promo_code` + `revoke_promo_code`. CSRF + flash messaging primitives added to `web_admin.py`. | ✅ shipped (PR #55) |
 | **Stage-8-Part-3** | **Gift codes** — alembic 0003 (`gift_codes` + `gift_redemptions`), DB methods, `/redeem CODE` user-facing flow, admin UI for create/list/revoke. **(Wallet-menu button + redemption stats page deferred to Part-3.5 if user asks.)** | ✅ shipped (PR #56) |
-| **Stage-8-Part-4** (this PR) | Users page — `/admin/users` search-by-id-or-username, `/admin/users/{id}` detail page (balance, lifetime totals, last 20 transactions), credit/debit form posting to `/admin/users/{id}/adjust`. Reuses `admin_adjust_balance`; web calls pass `admin_telegram_id=0` sentinel and `[web]` -prefixed reason into `transactions.notes` for unambiguous audit trail. New `Database.search_users(query, limit)` with int-lookup / escaped ILIKE dispatch; `get_user_admin_summary` now takes `recent_tx_limit` kwarg (default 5, clamped [1..200]). **Bug fix bundled:** `Database.get_system_metrics` now excludes both `gateway='admin'` AND `gateway='gift'` from `revenue_usd` — latent since PR #56 shipped gift redemptions with `gateway='gift'`, which inflated the dashboard's "revenue" figure every time an admin minted a gift code. Regression test pins the filter. 45 new tests (331 total). | ✅ this PR |
-| **Stage-8-Part-5** | Broadcast page (live progress via HTMX polling) + Transactions browser (paginated). | ⏳ |
+| **Stage-8-Part-4** | Users page — `/admin/users` search-by-id-or-username, `/admin/users/{id}` detail page (balance, lifetime totals, last 20 transactions), credit/debit form posting to `/admin/users/{id}/adjust`. Reuses `admin_adjust_balance`; web calls pass `admin_telegram_id=0` sentinel and `[web]` -prefixed reason into `transactions.notes` for unambiguous audit trail. New `Database.search_users(query, limit)` with int-lookup / escaped ILIKE dispatch; `get_user_admin_summary` now takes `recent_tx_limit` kwarg (default 5, clamped [1..200]). **Bug fix bundled:** `Database.get_system_metrics` now excludes both `gateway='admin'` AND `gateway='gift'` from `revenue_usd` — latent since PR #56 shipped gift redemptions with `gateway='gift'`, which inflated the dashboard's "revenue" figure every time an admin minted a gift code. Regression test pins the filter. 45 new tests (331 total). | ✅ this PR |
+| **Stage-8-Part-5** (this PR) | Broadcast page — `/admin/broadcast` form (text + optional `only_active_days` filter) that kicks off a background `asyncio.Task`, plus `/admin/broadcast/{job_id}` detail page with a live progress bar and a polling `/admin/broadcast/{job_id}/status` JSON endpoint (vanilla JS, no HTMX). In-memory job registry on the aiohttp app (bounded to 50 entries, never evicts live jobs). Shares `admin._do_broadcast` with the Telegram `/admin_broadcast` command via a `progress_callback` refactor, so pacing / 429 handling / error bucketing is identical for both callers. **Bug fix bundled:** `rate_limit.webhook_rate_limit_middleware` is now scoped to `/nowpayments-webhook` only — it was previously installed globally and consumed a token on **every** request, so admin-panel traffic (and the new broadcast status-polling page) would eat from the NowPayments bucket and vice-versa. 33 new tests (364 total). | ✅ this PR |
+| **Stage-8-Part-6** | Transactions browser — paginated `/admin/transactions` list, filter by gateway / status / user, link through to existing user detail page. | ⏳ pending |
 
 ---
 
@@ -311,7 +312,7 @@ Two tables added by **Stage-8-Part-3** (alembic 0003, this PR):
 
 ## 9. Test suite
 
-**331 tests across 11 modules** as of Stage-8-Part-4:
+**364 tests across 11 modules** as of Stage-8-Part-5:
 
 ```
 tests/
@@ -327,10 +328,12 @@ tests/
 ├── test_pricing.py                        # 11 cases (per-model lookup, markup, fallback)
 ├── test_rate_limit.py                     # 15 cases (token bucket + LRU + middleware)
 ├── test_redeem_handler.py                 # 15 cases (cmd_redeem usage / status branches)
-└── test_web_admin.py                      # 142 cases (cookie sign/verify, login, dashboard,
+└── test_web_admin.py                      # 174 cases (cookie sign/verify, login, dashboard,
                                           #             promo + gift + user list/create/revoke,
                                           #             CSRF, flash cookies, adjust-form parser,
-                                          #             credit/debit happy-path + edge cases)
+                                          #             credit/debit happy-path + edge cases,
+                                          #             broadcast form parser, job lifecycle,
+                                          #             detail page polling endpoint)
 ```
 
 CI runs the full suite on Python 3.11 + 3.12, plus an alembic
@@ -350,11 +353,11 @@ assumption.
 | `database.py` | Clean. All money-touching methods use `SELECT … FOR UPDATE`. `finalize_partial_payment` already uses `max(already_credited, actually_paid_usd)`. `admin_adjust_balance` writes `transactions` row + updates wallet in one tx with FOR UPDATE on the user row. |
 | `payments.py` | Clean. Two-pass IPN verifier (raw → canonical fallback). Idempotent finalize, partial-delta crediting. |
 | `handlers.py` | Clean. `cmd_start`, `_route_legacy_text_to_hub`, `process_chat`, `process_promo_input`, and `process_custom_amount_input` all guard `from_user is None` and `text is None`. |
-| `web_admin.py` | aiohttp+jinja2 panel mounted under `/admin/`. HMAC-signed cookies (`ADMIN_PASSWORD` + `ADMIN_SESSION_SECRET`). Login + dashboard (Part-1). Promos page with CSRF tokens + flash banners (Part-2). Gift codes page (Part-3) with `parse_gift_form` + `EXPIRES_IN_DAYS_MAX` bound. Users page + credit/debit form (Part-4) with `parse_adjust_form`, `ADJUST_MAX_USD` bound, `ADMIN_WEB_SENTINEL_ID=0` audit attribution. Future parts add broadcast / transactions pages. |
-| `templates/admin/` | jinja2 templates. `base.html` = global CSS + `<head>`; `_layout.html` = sidebar shell (extended by content pages); `login.html`, `dashboard.html`, `promos.html`, `gifts.html`, `users.html`, `user_detail.html`. |
+| `web_admin.py` | aiohttp+jinja2 panel mounted under `/admin/`. HMAC-signed cookies (`ADMIN_PASSWORD` + `ADMIN_SESSION_SECRET`). Login + dashboard (Part-1). Promos page with CSRF tokens + flash banners (Part-2). Gift codes page (Part-3) with `parse_gift_form` + `EXPIRES_IN_DAYS_MAX` bound. Users page + credit/debit form (Part-4) with `parse_adjust_form`, `ADJUST_MAX_USD` bound, `ADMIN_WEB_SENTINEL_ID=0` audit attribution. Broadcast page (Part-5) with in-memory job registry (`APP_KEY_BROADCAST_JOBS` + `APP_KEY_BROADCAST_TASKS`), `asyncio.create_task` background worker, JSON polling endpoint, shares `admin._do_broadcast` via `progress_callback`. Future parts add the transactions browser. |
+| `templates/admin/` | jinja2 templates. `base.html` = global CSS + `<head>`; `_layout.html` = sidebar shell (extended by content pages); `login.html`, `dashboard.html`, `promos.html`, `gifts.html`, `users.html`, `user_detail.html`, `broadcast.html`, `broadcast_detail.html`. |
 | `ai_engine.py` | Clean. `aiohttp.ClientTimeout(total=60, connect=10, sock_read=50)` on OpenRouter. Defensive guard for malformed responses. |
 | `pricing.py` | Clean. Conservative fallback for unmapped models, markup ≥ 1.0. |
-| `rate_limit.py` | `consume_chat_token(user_id)` per-user (called *inside* `handlers.process_chat`, not as a `dp.message` middleware — see PR #47/#48 history). `webhook_rate_limit_middleware` per-IP. |
+| `rate_limit.py` | `consume_chat_token(user_id)` per-user (called *inside* `handlers.process_chat`, not as a `dp.message` middleware — see PR #47/#48 history). `webhook_rate_limit_middleware` per-IP — scoped to `WEBHOOK_PATH = "/nowpayments-webhook"` only (Part-5 bundled fix) so admin panel traffic doesn't eat the same bucket. |
 | `admin.py` | `parse_admin_user_ids`, `is_admin`, `_escape_md`, `/admin`, `/admin_metrics`, `/admin_balance`, `/admin_credit`, `/admin_debit`, `/admin_promo_create`, `/admin_promo_list`, `/admin_promo_revoke`, `/admin_broadcast`. 86 unit tests. |
 | `alembic/` | Clean. Baseline = consolidated current schema. `env.py` URL-encodes credentials. |
 | `entrypoint.sh` | Idempotent `alembic upgrade head` then `exec python -m main`. |
@@ -452,19 +455,22 @@ The user's process for this project — **do not deviate**:
 ## 13. TL;DR
 
 1. **All P0 / P1 / P2 / P3-Op / Stage-7 + Cleanup are shipped and merged.**
-2. **Stage-8 Parts 1, 2, 3, 4 are shipped.** Web panel reachable at
+2. **Stage-8 Parts 1, 2, 3, 4, 5 are shipped.** Web panel reachable at
    `${WEBHOOK_BASE_URL}/admin/login` once `ADMIN_PASSWORD` +
    `ADMIN_SESSION_SECRET` are set in the live deploy. Promo codes at
    `/admin/promos`, gift codes at `/admin/gifts`, users at
-   `/admin/users` (search → detail → credit/debit). Web-initiated
+   `/admin/users` (search → detail → credit/debit), broadcast at
+   `/admin/broadcast` (form + live-polling detail page). Web-initiated
    balance adjustments are attributed with `admin_telegram_id=0`
    sentinel and a `[web]` prefix in `transactions.notes` so the audit
    trail distinguishes web vs Telegram-DM adjustments. Users redeem
    gift codes with `/redeem CODE` in the bot.
 3. **The IPN signature bug is fixed on `main`** (PRs #39 + #41). User
    confirmed clean log on 2026-04-28.
-4. **Stage-8 queue remaining:** Part-5 (broadcast page with live
-   progress + transactions browser paginated). One PR, bug fix bundled.
+4. **Stage-8 queue remaining:** Part-6 (transactions browser —
+   paginated `/admin/transactions`, filter by gateway/status/user,
+   link through to existing user-detail page). One PR, bug fix
+   bundled.
 5. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
    update this doc + README in each, do NOT block on user approval. The
    user merges them when they wake up.

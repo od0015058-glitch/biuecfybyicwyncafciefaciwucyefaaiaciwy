@@ -50,6 +50,13 @@ async def start_webhook_server(bot: Bot) -> web.AppRunner:
         # Default ON so cookies are HTTPS-only. Set ADMIN_COOKIE_SECURE=0
         # locally if you're running over plain HTTP for development.
         cookie_secure=os.getenv("ADMIN_COOKIE_SECURE", "1") != "0",
+        # Stage-8-Part-5: the broadcast page's background worker
+        # needs a ``Bot`` to send Telegram messages through. The
+        # webhook handler still reads ``app["bot"]`` directly, so we
+        # leave that legacy stash in place above — this kwarg just
+        # routes the same instance into the admin plumbing via a
+        # typed AppKey.
+        bot=bot,
     )
 
     port = int(os.getenv("WEBHOOK_PORT", "8080"))
