@@ -2,11 +2,15 @@
 
 Two consumers:
 
-* aiogram middleware on the chat handler — bounds how fast a single
-  Telegram user can fire prompts at OpenRouter (cost control + DoS).
-* aiohttp middleware on the NowPayments webhook — bounds per-IP
-  request rate (DoS defence; the legitimate IPN retry rhythm is well
-  under any sane cap).
+* ``consume_chat_token(user_id)`` called from the AI-chat handler —
+  bounds how fast a single Telegram user can fire prompts at OpenRouter
+  (cost control + DoS). Deliberately NOT a dispatcher-wide middleware,
+  because that would also throttle ``/start``, ``waiting_custom_amount``
+  input, promo-code input, and reply-keyboard handlers — none of which
+  cost OpenRouter money.
+* ``webhook_rate_limit_middleware`` mounted on the aiohttp app for the
+  NowPayments IPN endpoint — per-IP DoS defence. The legitimate IPN
+  retry rhythm is well under any sane cap.
 
 Both use a simple in-memory **token bucket** keyed by the caller's
 identity. We deliberately don't share the limiter across processes —
@@ -21,10 +25,8 @@ import asyncio
 import logging
 import time
 from collections import OrderedDict
-from typing import Any, Awaitable, Callable, Dict, Hashable
+from typing import Awaitable, Callable, Hashable
 
-from aiogram import BaseMiddleware
-from aiogram.types import Message, TelegramObject
 from aiohttp import web
 
 log = logging.getLogger("bot.rate_limit")
@@ -114,60 +116,44 @@ WEBHOOK_RATE_LIMIT_CACHE_KEY: web.AppKey = web.AppKey(
 )
 
 
-class ChatRateLimitMiddleware(BaseMiddleware):
-    """Aiogram middleware: per-user token bucket on chat messages.
+# Module-level chat limiter. Defaults: 5 message tokens, refilling at
+# 1/sec — burst 5 prompts, then ~1/sec sustained. Tweak via
+# ``configure_chat_rate_limiter()`` at startup if you need different
+# caps. Single shared instance because the bot is single-process.
+_chat_rate_limiter: _LRUBucketCache = _LRUBucketCache(
+    capacity=5.0, refill_rate=1.0
+)
 
-    Defaults: 5 message tokens, refilling at 1/sec. So a user can burst
-    5 messages, then has to wait ~1 sec for each subsequent prompt.
-    Anything else (callbacks, command handlers, FSM-state handlers)
-    is unaffected — only this exact catch-all chat path costs OpenRouter
-    money and so is worth gating.
 
-    Call site: ``dp.message.middleware(ChatRateLimitMiddleware())``
-    registered AFTER ``UserUpsertMiddleware`` so we still upsert the
-    user before potentially throttling their message.
+def configure_chat_rate_limiter(
+    capacity: float = 5.0, refill_rate: float = 1.0
+) -> None:
+    """Replace the module-level chat limiter with one configured to
+    the given capacity / refill_rate. Call at startup BEFORE any
+    request hits ``consume_chat_token``. Mostly useful for tests."""
+    global _chat_rate_limiter
+    _chat_rate_limiter = _LRUBucketCache(
+        capacity=capacity, refill_rate=refill_rate
+    )
+
+
+async def consume_chat_token(user_id: int) -> bool:
+    """Try to take 1 chat token for this Telegram user.
+
+    Returns True if the prompt should proceed, False if it should be
+    short-circuited with a "slow down" message. Call this at the very
+    top of the AI-chat handler ONLY — never on commands, FSM states,
+    or callback queries, because those don't cost OpenRouter money
+    and shouldn't be throttled.
+
+    Why this is a function and not a middleware: an inner middleware
+    on ``dp.message`` would fire for *every* matched message handler
+    (``/start``, ``waiting_custom_amount``, promo input, the legacy
+    reply-keyboard buttons), not just the AI catch-all. Putting the
+    check inside the chat handler scopes the throttle to the path
+    that actually costs money.
     """
-
-    def __init__(
-        self,
-        capacity: float = 5.0,
-        refill_rate: float = 1.0,
-        warn_text: str = (
-            "⏳ You're sending messages too quickly. Please wait a moment."
-        ),
-    ) -> None:
-        self._cache = _LRUBucketCache(capacity, refill_rate)
-        self._warn_text = warn_text
-
-    async def __call__(
-        self,
-        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
-        event: TelegramObject,
-        data: Dict[str, Any],
-    ) -> Any:
-        # Only gate generic Message events that look like real prompts.
-        # Callbacks (button taps) skip this entirely — they're cheap.
-        if not isinstance(event, Message):
-            return await handler(event, data)
-        from_user = getattr(event, "from_user", None)
-        if from_user is None or from_user.id is None:
-            return await handler(event, data)
-
-        ok = await self._cache.consume(from_user.id)
-        if ok:
-            return await handler(event, data)
-
-        log.info(
-            "chat rate-limited telegram_id=%s text=%r",
-            from_user.id,
-            (event.text or "")[:40],
-        )
-        try:
-            await event.answer(self._warn_text)
-        except Exception:
-            # Don't let a downstream Telegram error mask the throttle.
-            log.exception("failed to send rate-limit notice")
-        return None  # short-circuit — handler chain stops here.
+    return await _chat_rate_limiter.consume(user_id)
 
 
 @web.middleware

@@ -1,12 +1,10 @@
 """Tests for rate_limit.py.
 
-Covers TokenBucket math, the LRU bucket cache, the aiogram chat
-middleware, and the aiohttp webhook middleware.
+Covers TokenBucket math, the LRU bucket cache, the per-user
+``consume_chat_token`` helper, and the aiohttp webhook middleware.
 """
 
 from __future__ import annotations
-
-from unittest.mock import AsyncMock
 
 import pytest
 from aiohttp import web
@@ -14,9 +12,10 @@ from aiohttp import web
 import rate_limit as rl
 from rate_limit import (
     WEBHOOK_RATE_LIMIT_CACHE_KEY,
-    ChatRateLimitMiddleware,
     TokenBucket,
     _LRUBucketCache,
+    configure_chat_rate_limiter,
+    consume_chat_token,
     install_webhook_rate_limit,
 )
 
@@ -105,75 +104,71 @@ async def test_cache_lru_eviction(fake_clock):
     assert await cache.consume("a") is True
 
 
-# ---- ChatRateLimitMiddleware ---------------------------------------
+# ---- consume_chat_token ---------------------------------------------
 
 
-def _fake_message(user_id: int = 1, text: str = "hi"):
-    """Minimal stub that quacks like aiogram.types.Message."""
-    msg = AsyncMock()
-    msg.from_user = type("User", (), {"id": user_id})()
-    msg.text = text
-    return msg
-
-
-@pytest.mark.asyncio
-async def test_chat_middleware_lets_through_under_cap(monkeypatch, fake_clock):
-    mw = ChatRateLimitMiddleware(capacity=3, refill_rate=1)
-    handler = AsyncMock(return_value="ok")
-
-    msg = _fake_message()
-    monkeypatch.setattr(rl, "Message", type(msg))
-
-    for _ in range(3):
-        result = await mw(handler, msg, {})
-        assert result == "ok"
-    assert handler.await_count == 3
+@pytest.fixture
+def tight_chat_limiter(fake_clock):
+    """Replace the module-level chat limiter with a tight one for
+    testing, then restore the default afterwards so other tests aren't
+    affected."""
+    configure_chat_rate_limiter(capacity=2, refill_rate=0.001)
+    yield
+    configure_chat_rate_limiter()  # restore defaults
 
 
 @pytest.mark.asyncio
-async def test_chat_middleware_throttles_over_cap(monkeypatch, fake_clock):
-    mw = ChatRateLimitMiddleware(capacity=2, refill_rate=0.001)
-    handler = AsyncMock(return_value="ok")
-    msg = _fake_message()
-
-    monkeypatch.setattr(rl, "Message", type(msg))
-
-    assert await mw(handler, msg, {}) == "ok"
-    assert await mw(handler, msg, {}) == "ok"
-    # Third call: bucket empty, should short-circuit and call answer().
-    assert await mw(handler, msg, {}) is None
-    assert handler.await_count == 2  # not called the 3rd time
-    msg.answer.assert_awaited()
+async def test_consume_chat_token_under_cap(tight_chat_limiter):
+    assert await consume_chat_token(user_id=1) is True
+    assert await consume_chat_token(user_id=1) is True
 
 
 @pytest.mark.asyncio
-async def test_chat_middleware_separates_users(monkeypatch, fake_clock):
-    mw = ChatRateLimitMiddleware(capacity=1, refill_rate=0.001)
-    handler = AsyncMock(return_value="ok")
-
-    msg_a = _fake_message(user_id=1)
-    msg_b = _fake_message(user_id=2)
-
-    monkeypatch.setattr(rl, "Message", type(msg_a))
-
-    assert await mw(handler, msg_a, {}) == "ok"
-    assert await mw(handler, msg_a, {}) is None
-    assert await mw(handler, msg_b, {}) == "ok"  # b's bucket untouched
+async def test_consume_chat_token_throttles_over_cap(tight_chat_limiter):
+    assert await consume_chat_token(user_id=1) is True
+    assert await consume_chat_token(user_id=1) is True
+    assert await consume_chat_token(user_id=1) is False
 
 
 @pytest.mark.asyncio
-async def test_chat_middleware_passes_non_message(fake_clock):
-    """Callback queries / unknown event types skip the middleware
-    entirely (we left rate_limit.Message alone, so the mock isn't an
-    instance and the early-return path fires)."""
-    mw = ChatRateLimitMiddleware(capacity=1, refill_rate=0.001)
-    handler = AsyncMock(return_value="ok")
+async def test_consume_chat_token_separates_users(tight_chat_limiter):
+    assert await consume_chat_token(user_id=1) is True
+    assert await consume_chat_token(user_id=1) is True
+    assert await consume_chat_token(user_id=1) is False
+    # User 2 starts with a full bucket.
+    assert await consume_chat_token(user_id=2) is True
+    assert await consume_chat_token(user_id=2) is True
+    assert await consume_chat_token(user_id=2) is False
 
-    not_a_message = AsyncMock()
-    not_a_message.from_user = type("User", (), {"id": 1})()
 
+@pytest.mark.asyncio
+async def test_consume_chat_token_default_capacity(fake_clock):
+    """Defaults are (capacity=5, refill_rate=1) — burst 5 should pass,
+    6th should fail."""
+    configure_chat_rate_limiter()  # reset to defaults
+    user = 12345
     for _ in range(5):
-        assert await mw(handler, not_a_message, {}) == "ok"
+        assert await consume_chat_token(user) is True
+    assert await consume_chat_token(user) is False
+    configure_chat_rate_limiter()  # leave clean for siblings
+
+
+@pytest.mark.asyncio
+async def test_chat_handler_uses_consume_chat_token():
+    """Smoke test: the AI catch-all handler MUST call
+    ``consume_chat_token`` so commands / FSM state inputs aren't
+    throttled. Anchors the design decision in code (see Devin Review
+    feedback on PR #47)."""
+    import inspect
+
+    import handlers as h
+
+    src = inspect.getsource(h.process_chat)
+    assert "consume_chat_token" in src, (
+        "process_chat must call consume_chat_token directly. Do NOT "
+        "reintroduce a dp.message middleware — that throttles "
+        "unrelated handlers like /start and FSM state inputs."
+    )
 
 
 # ---- webhook_rate_limit_middleware ---------------------------------

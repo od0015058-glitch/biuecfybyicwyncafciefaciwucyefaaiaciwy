@@ -126,13 +126,13 @@ queued next.
 
 | File | Status |
 | --- | --- |
-| `main.py` | Clean. Env-driven port, FSM storage selection (`build_fsm_storage`), webhook rate-limiter installed via `install_webhook_rate_limit`, chat rate-limiter middleware on `dp.message`. |
+| `main.py` | Clean. Env-driven port, FSM storage selection (`build_fsm_storage`), webhook rate-limiter installed via `install_webhook_rate_limit`. The chat rate limiter is **not** registered as a dispatcher middleware (intentional — see `rate_limit.py`). |
 | `database.py` | Clean. All money-touching methods use `SELECT … FOR UPDATE` inside a connection-scoped transaction. `finalize_partial_payment` already uses `max(already_credited, actually_paid_usd)` (the GREATEST guard) — see code comment at lines 360–380. The "Bug A" line that used to live here has been retired; it was already fixed in an earlier PR but the doc lagged. |
 | `payments.py` | Clean. Two-pass IPN verifier (raw bytes first, canonicalized fallback). Idempotent finalize, partial-delta crediting, terminal closure on PENDING ∪ PARTIAL. |
 | `handlers.py` | Clean. `process_custom_amount_input` rejects NaN/Inf and amounts > $10k (P3-Op-5). Legacy reply-keyboard handlers all route through `_route_legacy_text_to_hub` which `state.clear()`s — the original Bug B is fixed in main. |
 | `ai_engine.py` | Clean. Pre-check on free messages + balance, atomic deduct, log_usage with the actual amount. **OpenRouter call now has a 60s `aiohttp.ClientTimeout` (10s connect / 50s sock_read)** so a stalled upstream can't pin a coroutine forever. |
 | `pricing.py` | Clean. Conservative fallback for unmapped models, guards markup ≥ 1.0. |
-| `rate_limit.py` | New in P3-Op-6. `TokenBucket` + `_LRUBucketCache` primitives, `ChatRateLimitMiddleware` (per-user, 5 tokens / 1 sec refill on `dp.message`), `webhook_rate_limit_middleware` (per-IP, 30 tokens / 5 sec refill). 14 unit tests. |
+| `rate_limit.py` | `TokenBucket` + `_LRUBucketCache` primitives, `consume_chat_token(user_id)` per-user limiter (called *inside* `handlers.process_chat` only — defaults 5 tokens / 1s refill), `webhook_rate_limit_middleware` (per-IP, 30 tokens / 5s refill on the IPN endpoint). 15 unit tests. NB: chat rate-limiting must be done in-handler, not as a `dp.message` middleware, otherwise commands / FSM state inputs get throttled too. See PR #47 / #48 history. |
 | `alembic/` | Clean. `env.py` URL-encodes credentials (PR #45). Baseline = consolidated current schema. |
 | `entrypoint.sh` | Runs idempotent `alembic upgrade head` before exec'ing the bot. |
 | `docker-compose.yml` | postgres + redis + bot. Redis backs FSM. |
@@ -305,7 +305,8 @@ Each is a separate PR, in this order:
 | **P3-Op-4** | Alembic migrations + entrypoint runs `upgrade head` | ✅ Shipped | [#44](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/44) |
 | **P3-Op-4-Hotfix** | URL-encode DB credentials in `alembic/env.py` (Devin Review catch) | ✅ Shipped | [#45](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/45) |
 | **P3-Op-5** | Redis-backed FSM storage **+ NaN/Inf/over-cap rejection in `process_custom_amount_input`** | ✅ Shipped | [#46](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/46) |
-| **P3-Op-6** | Rate limiting on `/chat` and `/nowpayments-webhook` **+ `aiohttp.ClientTimeout` on the OpenRouter call** | ✅ Shipped | this PR |
+| **P3-Op-6** | Rate limiting on `/chat` and `/nowpayments-webhook` **+ `aiohttp.ClientTimeout` on the OpenRouter call** | ✅ Shipped | [#47](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/47) |
+| **P3-Op-6-Hotfix** | Move chat rate limit OUT of `dp.message` middleware INTO `process_chat` so commands / FSM state inputs aren't incorrectly throttled (Devin Review catch on #47) | ✅ Shipped | this PR |
 
 Operational hardening queue is **complete**. Next: P2 product items (admin panel for promo creation; promo code creation UI).
 

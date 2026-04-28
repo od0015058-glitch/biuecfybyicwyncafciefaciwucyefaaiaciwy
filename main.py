@@ -12,7 +12,7 @@ from database import db
 from handlers import router
 from middlewares import UserUpsertMiddleware
 from payments import payment_webhook
-from rate_limit import ChatRateLimitMiddleware, install_webhook_rate_limit
+from rate_limit import install_webhook_rate_limit
 
 load_dotenv()
 
@@ -81,12 +81,12 @@ async def main():
     dp.message.outer_middleware(upsert)
     dp.callback_query.outer_middleware(upsert)
 
-    # Per-user token-bucket on chat messages — caps how fast a single
-    # Telegram user can fire OpenRouter-billed prompts. Registered as
-    # an *inner* middleware on dp.message only so callback button
-    # taps and FSM-state handlers don't get throttled. See
-    # rate_limit.ChatRateLimitMiddleware.
-    dp.message.middleware(ChatRateLimitMiddleware())
+    # Per-user chat rate limiting is implemented INSIDE the AI catch-all
+    # handler via ``rate_limit.consume_chat_token`` — not as a
+    # dispatcher-wide middleware, because a middleware on dp.message
+    # would also fire for /start, waiting_custom_amount input, promo
+    # code input, and reply-keyboard handlers, none of which cost
+    # OpenRouter money. See handlers.process_chat.
 
     dp.include_router(router)
 

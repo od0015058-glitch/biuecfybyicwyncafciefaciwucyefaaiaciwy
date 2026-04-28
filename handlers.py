@@ -17,6 +17,7 @@ from ai_engine import chat_with_model
 from database import db
 from models_catalog import CatalogModel, get_catalog
 from payments import MinAmountError, create_crypto_invoice
+from rate_limit import consume_chat_token
 from strings import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, all_button_labels, t
 
 log = logging.getLogger("bot.handlers")
@@ -1433,6 +1434,20 @@ async def process_chat(message: Message):
     # handler too because they're plain text. Drop them — there's a
     # dedicated handler for each, registered above.
     if message.text in _ALL_KBD_LABELS:
+        return
+
+    # Per-user chat rate limit. Scoped to *this* handler (not a
+    # dispatcher-wide middleware) so commands, FSM-state inputs
+    # (waiting_custom_amount / waiting_promo_code), and reply-keyboard
+    # buttons aren't throttled — they don't cost OpenRouter money.
+    if not await consume_chat_token(message.from_user.id):
+        lang = await _get_user_language(message.from_user.id)
+        log.info(
+            "chat rate-limited telegram_id=%s text=%r",
+            message.from_user.id,
+            (message.text or "")[:40],
+        )
+        await message.answer(t(lang, "ai_local_rate_limited"))
         return
 
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
