@@ -100,6 +100,7 @@ pytest tests/
 | `pricing.py` | Per-model price table + `COST_MARKUP` env var (default 1.5×). |
 | `models_catalog.py` | Live `/v1/models` fetch from OpenRouter with 24 h cache, provider whitelist, free/paid split. |
 | `middlewares.py` | `UserUpsertMiddleware` — ensures `users` row exists before any handler runs. |
+| `rate_limit.py` | Token-bucket primitives + `ChatRateLimitMiddleware` (per-user) and `webhook_rate_limit_middleware` (per-IP). Guards `/chat` against runaway OpenRouter spend and the `/nowpayments-webhook` endpoint against DoS bursts. |
 | `strings.py` | Two-locale (fa/en) string table + `t(lang, key, **kwargs)` helper. |
 | `schema.sql` | Initial schema. New tables/columns go in `migrations/NNN_*.sql`. |
 | `migrations/` | Numbered, append-only SQL migrations. Apply in order. |

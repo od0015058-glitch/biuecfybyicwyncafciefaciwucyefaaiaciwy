@@ -122,40 +122,40 @@ queued next.
 
 ---
 
-## 5. Status of every file (post-P3-Op-5)
+## 5. Status of every file (post-P3-Op-6)
 
 | File | Status |
 | --- | --- |
-| `main.py` | Clean. Env-driven port, single source of truth for the webhook listener. `build_fsm_storage()` picks Redis vs in-memory based on `REDIS_URL`. |
-| `database.py` | Clean. All money-touching methods use `SELECT … FOR UPDATE` inside a connection-scoped transaction. One latent low-severity issue, see Bug A below. |
-| `payments.py` | Clean for the threat model (HMAC verify → idempotent finalize → partial-delta crediting → terminal closure on PENDING ∪ PARTIAL). Two-pass verifier: raw bytes first, canonicalized fallback. |
-| `handlers.py` | Clean. `process_custom_amount_input` rejects NaN/Inf and amounts > $10k as of P3-Op-5. Legacy reply-keyboard handlers (`support_text_handler` etc.) all route through `_route_legacy_text_to_hub` which `state.clear()`s — i.e. the original Bug B is already fixed in main; this row used to flag it as latent. |
-| `ai_engine.py` | Clean. Pre-check on free messages + balance, atomic deduct, log_usage with the actual amount. |
+| `main.py` | Clean. Env-driven port, FSM storage selection (`build_fsm_storage`), webhook rate-limiter installed via `install_webhook_rate_limit`, chat rate-limiter middleware on `dp.message`. |
+| `database.py` | Clean. All money-touching methods use `SELECT … FOR UPDATE` inside a connection-scoped transaction. `finalize_partial_payment` already uses `max(already_credited, actually_paid_usd)` (the GREATEST guard) — see code comment at lines 360–380. The "Bug A" line that used to live here has been retired; it was already fixed in an earlier PR but the doc lagged. |
+| `payments.py` | Clean. Two-pass IPN verifier (raw bytes first, canonicalized fallback). Idempotent finalize, partial-delta crediting, terminal closure on PENDING ∪ PARTIAL. |
+| `handlers.py` | Clean. `process_custom_amount_input` rejects NaN/Inf and amounts > $10k (P3-Op-5). Legacy reply-keyboard handlers all route through `_route_legacy_text_to_hub` which `state.clear()`s — the original Bug B is fixed in main. |
+| `ai_engine.py` | Clean. Pre-check on free messages + balance, atomic deduct, log_usage with the actual amount. **OpenRouter call now has a 60s `aiohttp.ClientTimeout` (10s connect / 50s sock_read)** so a stalled upstream can't pin a coroutine forever. |
 | `pricing.py` | Clean. Conservative fallback for unmapped models, guards markup ≥ 1.0. |
-| `alembic/` | Clean. `env.py` URL-encodes credentials so passwords with `@`/`:`/`/` don't crash-loop the bot. Baseline = consolidated current schema. Stamp existing prod DBs once before redeploy. |
-| `entrypoint.sh` | Clean. Runs `alembic upgrade head` (idempotent) before exec'ing the bot. |
-| `docker-compose.yml` | Clean. postgres + redis + bot. Redis backs FSM. No init-script mounts (alembic owns schema). |
-| `schema.sql`, `migrations/*.sql` | Historical artifacts only. Not referenced by anything now — alembic owns schema. Safe to delete in a follow-up cleanup PR. |
+| `rate_limit.py` | New in P3-Op-6. `TokenBucket` + `_LRUBucketCache` primitives, `ChatRateLimitMiddleware` (per-user, 5 tokens / 1 sec refill on `dp.message`), `webhook_rate_limit_middleware` (per-IP, 30 tokens / 5 sec refill). 14 unit tests. |
+| `alembic/` | Clean. `env.py` URL-encodes credentials (PR #45). Baseline = consolidated current schema. |
+| `entrypoint.sh` | Runs idempotent `alembic upgrade head` before exec'ing the bot. |
+| `docker-compose.yml` | postgres + redis + bot. Redis backs FSM. |
+| `schema.sql`, `migrations/*.sql` | Historical artifacts only — alembic owns schema. Safe to delete in a follow-up cleanup PR. |
 | `strings.py` | Clean. Every `t()` call site has a slug in both locales. |
 | `.env.example`, `.gitignore` | Clean. `.env.example` documents `REDIS_URL`. |
-| `tests/` | 57 cases across IPN signature, pricing, alembic env URL building, FSM storage selection, and custom-amount validation. Strict-warnings pytest config + GitHub Actions CI on Python 3.11/3.12 + alembic upgrade/downgrade roundtrip + docker-build smoke. |
-
-### Bug A (low severity, latent) — `finalize_partial_payment` can lower `amount_usd_credited` on out-of-order replays
-Always overwrites with the new `actually_paid_usd` regardless of whether it's
-higher or lower than what's already there. If two `partially_paid` IPNs arrive
-out of order, the row is silently downgraded and a subsequent `finished` IPN
-double-counts the gap.
-
-**Fix:** `SET amount_usd_credited = GREATEST(amount_usd_credited, $2)`.
-Queued for P3-Op-6.
+| `tests/` | 6 modules, 60+ cases (signature, pricing, alembic env URL building, FSM storage selection, custom-amount validation, rate limiter). Strict-warnings pytest config + GitHub Actions CI on Python 3.11/3.12 + alembic upgrade/downgrade roundtrip + docker-build smoke. |
 
 ### Pre-existing minor issue (not blocking)
 `process_custom_amount_input` does `message.text.strip()` without first
 checking `message.text is not None`. Stickers / images / voice while in
 `waiting_custom_amount` raise `AttributeError`. Trivial: `text =
 (message.text or "").strip()`. (Mostly mooted by aiogram's `F.text` filter
-in newer registrations, but the dedicated state-filter handler doesn't have
-that gate.)
+in newer registrations.)
+
+### Note on the historical "Bug A" / "Bug B" rows
+The earlier handoff document called out two latent bugs — `finalize_partial_payment` overwriting `amount_usd_credited` (Bug A) and top-level reply-keyboard handlers not clearing FSM (Bug B). On a careful re-read of the current code on `main`, **both are already fixed**:
+- `database.finalize_partial_payment` uses `new_credited = max(already_credited, actually_paid_usd)` and a CASE-on-status base for `already_credited`. Out-of-order replays can't lower the stored cumulative.
+- All five reply-keyboard handlers (`support_text_handler`, `wallet_text_handler`, `models_text_handler_legacy`, `language_text_handler`, plus `set_language_handler`) either route through `_route_legacy_text_to_hub` (which calls `state.clear()`) or call `state.clear()` directly.
+
+The PRs in this session that were pitched as "fixing Bug A/B" instead bundled a *different* real bug each time:
+- **P3-Op-5 (#46)** — `process_custom_amount_input` silently accepting NaN/Inf and unbounded amounts.
+- **P3-Op-6 (this PR)** — `chat_with_model` had no `aiohttp.ClientTimeout`, so a stalled OpenRouter call would pin a coroutine forever.
 
 ---
 
@@ -304,8 +304,10 @@ Each is a separate PR, in this order:
 | **P3-Op-3** | pytest skeleton + GitHub Actions CI + pricing tests | ✅ Shipped | [#43](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/43) |
 | **P3-Op-4** | Alembic migrations + entrypoint runs `upgrade head` | ✅ Shipped | [#44](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/44) |
 | **P3-Op-4-Hotfix** | URL-encode DB credentials in `alembic/env.py` (Devin Review catch) | ✅ Shipped | [#45](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/45) |
-| **P3-Op-5** | Redis-backed FSM storage **+ NaN/Inf/over-cap rejection in `process_custom_amount_input`** | ✅ Shipped | this PR |
-| **P3-Op-6** | Rate limiting on `/chat` and `/nowpayments-webhook` **+ Bug A (`finalize_partial_payment` GREATEST guard)** | ⏳ Next | — |
+| **P3-Op-5** | Redis-backed FSM storage **+ NaN/Inf/over-cap rejection in `process_custom_amount_input`** | ✅ Shipped | [#46](https://github.com/od0015058-glitch/biuecfybyicwyncafciefaciwucyefaaiaciwy/pull/46) |
+| **P3-Op-6** | Rate limiting on `/chat` and `/nowpayments-webhook` **+ `aiohttp.ClientTimeout` on the OpenRouter call** | ✅ Shipped | this PR |
+
+Operational hardening queue is **complete**. Next: P2 product items (admin panel for promo creation; promo code creation UI).
 
 ### P2 product items still queued (lower priority than P3-Op)
 

@@ -53,8 +53,15 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
         "messages": messages,
     }
 
+    # Hard timeout on the upstream call. Without this, an OpenRouter
+    # stall pins the user's coroutine forever — the user thinks the
+    # bot is dead, no error is logged, and we leak event-loop slots
+    # under sustained slowness. 60s total, with separate connect /
+    # read budgets so a stuck TCP handshake is reported separately
+    # from a stuck stream.
+    timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=50)
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload) as response:
                 if response.status != 200:
                     body = await response.text()
