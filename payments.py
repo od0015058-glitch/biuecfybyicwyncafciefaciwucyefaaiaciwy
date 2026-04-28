@@ -57,59 +57,114 @@ if not WEBHOOK_BASE_URL:
 CALLBACK_URL = f"{WEBHOOK_BASE_URL}/nowpayments-webhook" if WEBHOOK_BASE_URL else ""
 
 
-def _verify_ipn_signature(raw_body: bytes, signature_header: str | None) -> bool:
+def _hmac_sha512_hex(secret: str, data: bytes) -> str:
+    """Lowercase hex digest of HMAC-SHA512 over ``data`` keyed by ``secret``."""
+    return hmac.new(secret.encode("utf-8"), data, hashlib.sha512).hexdigest()
+
+
+def _canonicalize_ipn_body(raw_body: bytes) -> bytes | None:
+    """Re-serialize the IPN body in NowPayments' canonical form.
+
+    Recursively sorted keys, no whitespace separators, and — critically —
+    ``ensure_ascii=False`` so non-ASCII characters (e.g. the Persian
+    ``order_description`` "شارژ کیف پول") stay as raw UTF-8 instead of
+    being escaped into ``\\uXXXX``. The default ``ensure_ascii=True``
+    inflated the canonical body by ~40 bytes vs. what NowPayments
+    actually signed, which is the bug PR #39 fixed.
+
+    Returns ``None`` if the body isn't valid JSON.
+    """
+    try:
+        payload = json.loads(raw_body)
+    except (ValueError, TypeError):
+        return None
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def verify_ipn_signature(
+    raw_body: bytes,
+    signature_header: str | None,
+    *,
+    secret: str | None = None,
+) -> bool:
     """Verify the x-nowpayments-sig HMAC-SHA512 signature.
 
-    NowPayments signs the IPN payload with the IPN secret using the
-    canonicalized JSON form (recursively sorted keys, no whitespace
-    separators) and sends the lowercase hex digest in the
-    'x-nowpayments-sig' header. We re-canonicalize the parsed body the
-    same way and compare in constant time.
+    Two-pass verifier (defense in depth against canonicalization drift):
+
+    1. **Raw-body pass.** HMAC the bytes exactly as they came off the
+       wire. Mature webhook handlers (Stripe, GitHub, Paddle) all sign
+       the raw request body so the receiver doesn't have to guess the
+       sender's canonicalization rules. This is the path that should
+       hit in production.
+
+    2. **Canonicalized pass.** If the raw-body HMAC doesn't match, fall
+       back to re-serializing the parsed JSON with sorted keys and no
+       whitespace and HMAC that. This matches NowPayments' historical
+       documented behaviour (their PHP example does ``ksort`` +
+       ``json_encode`` before signing) and protects us if anything
+       upstream of us — a reverse proxy, an HTTP client, an aiohttp
+       quirk — rewrote whitespace or key order between NowPayments and
+       us.
+
+    If neither matches we log diagnostics (first/last 8 hex chars of
+    each candidate digest plus body lengths — not enough to forge a
+    signature, enough to tell secret-mismatch from canonicalization
+    drift) and return False. The caller then 401s the request.
+
+    The ``secret`` kwarg exists so tests can inject a known IPN secret
+    without touching env vars; production callers should leave it
+    unset and let it resolve to ``NOWPAYMENTS_IPN_SECRET``.
     """
-    if not NOWPAYMENTS_IPN_SECRET:
+    secret = secret if secret is not None else NOWPAYMENTS_IPN_SECRET
+    if not secret:
         log.error("NOWPAYMENTS_IPN_SECRET is not set; refusing to process IPN.")
         return False
     if not signature_header:
         log.warning("IPN request had no x-nowpayments-sig header.")
         return False
-    try:
-        payload = json.loads(raw_body)
-    except (ValueError, TypeError):
-        log.warning("IPN body was not valid JSON; cannot verify signature.")
-        return False
-    # ensure_ascii=False is critical: NowPayments signs the raw UTF-8
-    # bytes they put on the wire. Python's json.dumps defaults to
-    # ensure_ascii=True, which escapes any non-ASCII char (e.g. our
-    # Persian order_description "شارژ کیف پول") into \uXXXX form,
-    # turning the canonical body 40+ chars longer than what NowPayments
-    # actually signed and breaking the HMAC compare.
-    canonical = json.dumps(
-        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    )
-    expected = hmac.new(
-        NOWPAYMENTS_IPN_SECRET.encode("utf-8"),
-        canonical.encode("utf-8"),
-        hashlib.sha512,
-    ).hexdigest()
+
     received = signature_header.lower()
-    ok = hmac.compare_digest(expected, received)
-    if not ok:
-        # Diagnostic logging only — first/last 8 chars of each digest plus
-        # canonical-body length. Not enough to forge a signature, but
-        # enough to tell whether we're computing a wildly-different sig
-        # (secret mismatch) vs. a close one (canonicalization drift).
-        log.warning(
-            "IPN sig mismatch: expected=%s..%s received=%s..%s "
-            "secret_len=%d body_len=%d canonical_len=%d",
-            expected[:8],
-            expected[-8:],
-            received[:8],
-            received[-8:],
-            len(NOWPAYMENTS_IPN_SECRET),
-            len(raw_body),
-            len(canonical),
-        )
-    return ok
+
+    raw_digest = _hmac_sha512_hex(secret, raw_body)
+    if hmac.compare_digest(raw_digest, received):
+        return True
+
+    canonical = _canonicalize_ipn_body(raw_body)
+    canonical_digest = (
+        _hmac_sha512_hex(secret, canonical) if canonical is not None else None
+    )
+    if canonical_digest is not None and hmac.compare_digest(
+        canonical_digest, received
+    ):
+        return True
+
+    # Diagnostics: which candidate were we computing, how do their
+    # short prefixes compare to what NowPayments sent, and how long
+    # were the bodies. Useful when the next deployment still mismatches
+    # and we need to know whether it's a secret problem or a
+    # canonicalization problem.
+    log.warning(
+        "IPN sig mismatch: raw=%s..%s canonical=%s received=%s..%s "
+        "secret_len=%d body_len=%d canonical_len=%s",
+        raw_digest[:8],
+        raw_digest[-8:],
+        f"{canonical_digest[:8]}..{canonical_digest[-8:]}"
+        if canonical_digest
+        else "n/a",
+        received[:8],
+        received[-8:],
+        len(secret),
+        len(raw_body),
+        len(canonical) if canonical is not None else "n/a",
+    )
+    return False
+
+
+# Backwards-compatible private alias retained for any callers that
+# still reach for the old name. New code should use the public name.
+_verify_ipn_signature = verify_ipn_signature
 
 
 async def _query_min_amount(
@@ -415,7 +470,7 @@ async def payment_webhook(request: web.Request):
         raw_body = await request.read()
         signature = request.headers.get("x-nowpayments-sig")
 
-        if not _verify_ipn_signature(raw_body, signature):
+        if not verify_ipn_signature(raw_body, signature):
             log.warning(
                 "IPN signature verification failed (remote=%s)", request.remote
             )

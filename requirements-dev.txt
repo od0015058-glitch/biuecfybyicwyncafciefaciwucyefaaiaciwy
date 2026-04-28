@@ -1,0 +1,6 @@
+# Dev / test dependencies. Installed on top of requirements.txt:
+#     pip install -r requirements.txt -r requirements-dev.txt
+#
+# Kept separate so production deploys don't pull pytest + friends.
+
+pytest>=8.0.0
