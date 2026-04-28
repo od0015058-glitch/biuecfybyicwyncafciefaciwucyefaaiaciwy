@@ -470,6 +470,16 @@ def pop_flash(
 DISCOUNT_AMOUNT_MAX = 999_999.0
 
 
+# Days-until-expiry upper bound. ``timedelta(days=N)`` raises
+# ``OverflowError`` for N > 999_999_999, and Postgres TIMESTAMPTZ
+# silently overflows beyond year 294276. 100 years is far longer
+# than any sane gift-code campaign and stays well below both limits.
+# Without this cap, an admin pasting a giant integer in the form
+# crashed the create handler with an uncaught OverflowError → 500
+# (instead of a friendly red banner).
+EXPIRES_IN_DAYS_MAX = 36_500
+
+
 def parse_promo_form(form) -> dict | str:
     """Parse the /admin/promos create form. Mirror of
     :func:`admin.parse_promo_create_args` for the Telegram-side
@@ -551,6 +561,8 @@ def parse_promo_form(form) -> dict | str:
             return "bad_days"
         if expires_in_days <= 0:
             return "bad_days"
+        if expires_in_days > EXPIRES_IN_DAYS_MAX:
+            return "days_too_large"
 
     return {
         "code": code,
@@ -573,6 +585,9 @@ _PROMO_FORM_ERR_TEXT = {
     ),
     "bad_max_uses": "Max uses must be a positive integer (or leave blank).",
     "bad_days": "Days-until-expiry must be a positive integer (or leave blank).",
+    "days_too_large": (
+        f"Days-until-expiry must be at most {EXPIRES_IN_DAYS_MAX:,} (≈100 years)."
+    ),
 }
 
 
@@ -820,6 +835,343 @@ async def promos_revoke(request: web.Request) -> web.StreamResponse:
 
 
 # ---------------------------------------------------------------------
+# Gift codes (Stage-8-Part-3)
+# ---------------------------------------------------------------------
+#
+# Distinct from promo codes: gift codes credit balance directly, no
+# purchase required. Admin sets "10 people can each redeem $5" → up to
+# 10 distinct telegram_ids each get $5 added to their wallet.
+#
+# Routes:
+#   GET  /admin/gifts                             — list + create form
+#   POST /admin/gifts                             — create
+#   POST /admin/gifts/{code}/revoke               — soft-delete
+
+
+# DB column is DECIMAL(10,4); cap a hair below the column max so the
+# parser never produces a value that would crash the INSERT.
+GIFT_AMOUNT_MAX = 999_999.0
+
+
+def parse_gift_form(form) -> dict | str:
+    """Parse the /admin/gifts create form.
+
+    Returns a dict shaped::
+
+        {
+          "code": "BIRTHDAY5",
+          "amount_usd": 5.0,
+          "max_uses": int | None,
+          "expires_in_days": int | None,
+        }
+
+    On failure returns one of the error keys: ``"missing_code"``,
+    ``"bad_code"``, ``"missing_amount"``, ``"bad_amount"``,
+    ``"amount_too_large"``, ``"bad_max_uses"``, ``"bad_days"``.
+    """
+    code_raw = (form.get("code") or "").strip()
+    if not code_raw:
+        return "missing_code"
+    code = code_raw.upper()
+    if len(code) > 64 or not all(c.isalnum() or c in "_-" for c in code):
+        return "bad_code"
+
+    raw_amount = (form.get("amount_usd") or "").strip()
+    if not raw_amount:
+        return "missing_amount"
+    cleaned = raw_amount.lstrip("$").strip()
+    try:
+        amount = float(cleaned)
+    except ValueError:
+        return "bad_amount"
+    # NaN / Inf / non-positive
+    if not (amount == amount) or amount in (
+        float("inf"), float("-inf")
+    ) or amount <= 0:
+        return "bad_amount"
+    if amount > GIFT_AMOUNT_MAX:
+        return "amount_too_large"
+
+    raw_max = (form.get("max_uses") or "").strip()
+    max_uses: int | None = None
+    if raw_max:
+        try:
+            max_uses = int(raw_max)
+        except ValueError:
+            return "bad_max_uses"
+        if max_uses <= 0:
+            return "bad_max_uses"
+
+    raw_days = (form.get("expires_in_days") or "").strip()
+    expires_in_days: int | None = None
+    if raw_days:
+        try:
+            expires_in_days = int(raw_days)
+        except ValueError:
+            return "bad_days"
+        if expires_in_days <= 0:
+            return "bad_days"
+        if expires_in_days > EXPIRES_IN_DAYS_MAX:
+            return "days_too_large"
+
+    return {
+        "code": code,
+        "amount_usd": round(amount, 4),
+        "max_uses": max_uses,
+        "expires_in_days": expires_in_days,
+    }
+
+
+_GIFT_FORM_ERR_TEXT = {
+    "missing_code": "Enter a code.",
+    "bad_code": "Code must be 1-64 chars, letters/numbers/_/- only.",
+    "missing_amount": "Enter a USD amount each redeemer should receive.",
+    "bad_amount": "Amount must be a positive number (USD).",
+    "amount_too_large": (
+        f"Amount must be at most ${GIFT_AMOUNT_MAX:,.2f} (DB limit)."
+    ),
+    "bad_max_uses": "Max redemptions must be a positive integer (or leave blank).",
+    "bad_days": "Days-until-expiry must be a positive integer (or leave blank).",
+    "days_too_large": (
+        f"Days-until-expiry must be at most {EXPIRES_IN_DAYS_MAX:,} (≈100 years)."
+    ),
+}
+
+
+async def gifts_get(request: web.Request) -> web.StreamResponse:
+    """List gift codes + render the create form."""
+    db = request.app.get(APP_KEY_DB)
+    rows: list = []
+    db_error: str | None = None
+    if db is None:
+        db_error = "No database wired up (development mode)."
+    else:
+        try:
+            rows = await db.list_gift_codes(limit=100)
+        except Exception:
+            log.exception("gifts_get: list_gift_codes failed")
+            db_error = "Database query failed — see logs."
+
+    response = aiohttp_jinja2.render_template(
+        "gifts.html",
+        request,
+        {
+            "rows": rows,
+            "db_error": db_error,
+            "active_page": "gifts",
+            "csrf_token": csrf_token_for(request),
+            "flash": None,
+        },
+    )
+    flash = pop_flash(request, response)
+    if flash is not None:
+        response = aiohttp_jinja2.render_template(
+            "gifts.html",
+            request,
+            {
+                "rows": rows,
+                "db_error": db_error,
+                "active_page": "gifts",
+                "csrf_token": csrf_token_for(request),
+                "flash": flash,
+            },
+        )
+        response.del_cookie(FLASH_COOKIE, path="/admin/")
+    return response
+
+
+async def gifts_create(request: web.Request) -> web.StreamResponse:
+    """POST /admin/gifts — create a new gift code."""
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+
+    form = await request.post()
+
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning("gifts_create: CSRF token mismatch from %s", request.remote)
+        response = web.HTTPFound(location="/admin/gifts")
+        set_flash(
+            response,
+            kind="error",
+            message="Form submission was rejected (CSRF). Refresh and try again.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    parsed = parse_gift_form(form)
+    response = web.HTTPFound(location="/admin/gifts")
+    if isinstance(parsed, str):
+        set_flash(
+            response,
+            kind="error",
+            message=_GIFT_FORM_ERR_TEXT.get(parsed, f"Invalid input ({parsed})."),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    db = request.app.get(APP_KEY_DB)
+    if db is None:
+        set_flash(
+            response,
+            kind="error",
+            message="No database wired up — cannot create.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    expires_at = None
+    if parsed["expires_in_days"] is not None:
+        expires_at = datetime.now(timezone.utc) + timedelta(
+            days=parsed["expires_in_days"]
+        )
+
+    try:
+        ok = await db.create_gift_code(
+            code=parsed["code"],
+            amount_usd=parsed["amount_usd"],
+            max_uses=parsed["max_uses"],
+            expires_at=expires_at,
+        )
+    except ValueError as exc:
+        set_flash(
+            response,
+            kind="error",
+            message=str(exc),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+    except Exception:
+        log.exception("gifts_create: create_gift_code failed")
+        set_flash(
+            response,
+            kind="error",
+            message="Database write failed — see logs.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    if not ok:
+        set_flash(
+            response,
+            kind="error",
+            message=(
+                f"Code '{parsed['code']}' already exists. "
+                "Pick another or revoke the existing one first."
+            ),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    cap_label = (
+        f"{parsed['max_uses']} redemptions"
+        if parsed["max_uses"] is not None
+        else "unlimited"
+    )
+    exp_label = (
+        f", expires in {parsed['expires_in_days']} days"
+        if parsed["expires_in_days"] is not None
+        else ""
+    )
+    log.info(
+        "web_admin gifts_create: code=%s amount=%s cap=%s",
+        parsed["code"], parsed["amount_usd"], parsed["max_uses"],
+    )
+    set_flash(
+        response,
+        kind="success",
+        message=(
+            f"Created '{parsed['code']}': "
+            f"${parsed['amount_usd']:.2f} per user, {cap_label}{exp_label}."
+        ),
+        secret=secret,
+        cookie_secure=cookie_secure,
+    )
+    return response
+
+
+async def gifts_revoke(request: web.Request) -> web.StreamResponse:
+    """POST /admin/gifts/{code}/revoke — soft-delete a gift code."""
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+
+    form = await request.post()
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning("gifts_revoke: CSRF token mismatch from %s", request.remote)
+        response = web.HTTPFound(location="/admin/gifts")
+        set_flash(
+            response,
+            kind="error",
+            message="Form submission was rejected (CSRF). Refresh and try again.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    code = request.match_info.get("code", "").upper()
+    response = web.HTTPFound(location="/admin/gifts")
+    if not code or len(code) > 64 or not all(
+        c.isalnum() or c in "_-" for c in code
+    ):
+        set_flash(
+            response,
+            kind="error",
+            message="Invalid code in URL.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    db = request.app.get(APP_KEY_DB)
+    if db is None:
+        set_flash(
+            response,
+            kind="error",
+            message="No database wired up — cannot revoke.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        ok = await db.revoke_gift_code(code)
+    except Exception:
+        log.exception("gifts_revoke: revoke_gift_code failed")
+        set_flash(
+            response,
+            kind="error",
+            message="Database write failed — see logs.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    if ok:
+        log.info("web_admin gifts_revoke: code=%s", code)
+        set_flash(
+            response,
+            kind="success",
+            message=f"Revoked '{code}'.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+    else:
+        set_flash(
+            response,
+            kind="info",
+            message=f"'{code}' was already revoked or doesn't exist.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+    return response
+
+
+# ---------------------------------------------------------------------
 # App wiring
 # ---------------------------------------------------------------------
 
@@ -903,6 +1255,14 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/promos/{code}/revoke",
         _require_auth(promos_revoke),
+    )
+
+    # Stage-8-Part-3: gift codes.
+    app.router.add_get("/admin/gifts", _require_auth(gifts_get))
+    app.router.add_post("/admin/gifts", _require_auth(gifts_create))
+    app.router.add_post(
+        "/admin/gifts/{code}/revoke",
+        _require_auth(gifts_revoke),
     )
 
     app[APP_KEY_INSTALLED] = True

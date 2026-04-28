@@ -871,6 +871,289 @@ class Database:
             )
         return row is not None
 
+    # ---------------------------------------------------------------
+    # Gift codes (Stage-8-Part-3)
+    # ---------------------------------------------------------------
+    #
+    # Distinct from promo codes — gift codes credit balance directly
+    # (no purchase required). One row per (code, telegram_id) pair so
+    # each user can redeem each code at most once. The ``redeem``
+    # method is the only money-touching primitive here; it locks the
+    # gift_codes row + user row, runs the eligibility checks, inserts
+    # the redemption + transaction, and bumps balance — all in one tx.
+
+    GIFT_AMOUNT_MAX = 999_999.9999  # DECIMAL(10,4) cap
+
+    async def create_gift_code(
+        self,
+        code: str,
+        *,
+        amount_usd: float,
+        max_uses: int | None = None,
+        expires_at=None,
+    ) -> bool:
+        """Insert a new gift code. Returns False on duplicate.
+
+        Validates the discount cap up-front (DECIMAL(10,4) max is
+        999_999.9999) so admins get a friendly ValueError instead of
+        a PG ``numeric field overflow`` on the INSERT.
+        """
+        code = code.upper()
+        if amount_usd is None or amount_usd <= 0:
+            raise ValueError("amount_usd must be positive")
+        if amount_usd > self.GIFT_AMOUNT_MAX:
+            raise ValueError(
+                f"amount_usd must be at most {self.GIFT_AMOUNT_MAX} "
+                "(DECIMAL(10,4) column limit)"
+            )
+        if max_uses is not None and max_uses <= 0:
+            raise ValueError("max_uses must be positive (or None for unlimited)")
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchval(
+                """
+                INSERT INTO gift_codes (
+                    code, amount_usd, max_uses, expires_at
+                )
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (code) DO NOTHING
+                RETURNING code
+                """,
+                code, amount_usd, max_uses, expires_at,
+            )
+        return row is not None
+
+    async def list_gift_codes(self, *, limit: int = 100) -> list[dict]:
+        """Return up to ``limit`` most recently created gift codes."""
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT code, amount_usd, max_uses, used_count,
+                       expires_at, is_active, created_at
+                FROM gift_codes
+                ORDER BY created_at DESC
+                LIMIT $1
+                """,
+                int(limit),
+            )
+        return [
+            {
+                "code": r["code"],
+                "amount_usd": float(r["amount_usd"]),
+                "max_uses": (
+                    int(r["max_uses"]) if r["max_uses"] is not None else None
+                ),
+                "used_count": int(r["used_count"]),
+                "expires_at": (
+                    r["expires_at"].isoformat()
+                    if r["expires_at"] is not None else None
+                ),
+                "is_active": bool(r["is_active"]),
+                "created_at": (
+                    r["created_at"].isoformat()
+                    if r["created_at"] is not None else None
+                ),
+            }
+            for r in rows
+        ]
+
+    async def revoke_gift_code(self, code: str) -> bool:
+        """Soft-delete a gift code. Returns True iff flipped active→inactive."""
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchval(
+                """
+                UPDATE gift_codes
+                SET is_active = FALSE
+                WHERE code = $1 AND is_active = TRUE
+                RETURNING code
+                """,
+                code.upper(),
+            )
+        return row is not None
+
+    async def get_gift_redemptions(
+        self, code: str, *, limit: int = 100
+    ) -> list[dict]:
+        """Return who redeemed *code*, newest first."""
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT r.telegram_id, r.redeemed_at, r.transaction_id,
+                       u.first_name, u.username
+                FROM gift_redemptions r
+                LEFT JOIN users u ON u.telegram_id = r.telegram_id
+                WHERE r.code = $1
+                ORDER BY r.redeemed_at DESC
+                LIMIT $2
+                """,
+                code.upper(), int(limit),
+            )
+        return [
+            {
+                "telegram_id": int(r["telegram_id"]),
+                "redeemed_at": (
+                    r["redeemed_at"].isoformat()
+                    if r["redeemed_at"] is not None else None
+                ),
+                "transaction_id": (
+                    int(r["transaction_id"])
+                    if r["transaction_id"] is not None else None
+                ),
+                "first_name": r["first_name"],
+                "username": r["username"],
+            }
+            for r in rows
+        ]
+
+    async def redeem_gift_code(
+        self, code: str, telegram_id: int
+    ) -> dict:
+        """Atomically redeem *code* for *telegram_id*.
+
+        Returns a dict shaped::
+
+            {
+              "status": "ok" | "not_found" | "inactive" | "expired"
+                        | "exhausted" | "already_redeemed" | "user_unknown",
+              "amount_usd": float | None,   # only on "ok"
+              "new_balance_usd": float | None,
+              "transaction_id": int | None,
+            }
+
+        All eligibility checks happen *inside* the transaction with
+        ``SELECT ... FOR UPDATE`` so concurrent redemptions race
+        deterministically — the (n+1)th caller of a max_uses=n code
+        sees ``"exhausted"``, not a quietly-overflowed counter.
+        """
+        code = code.upper()
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    """
+                    SELECT amount_usd, max_uses, used_count,
+                           expires_at, is_active
+                    FROM gift_codes
+                    WHERE code = $1
+                    FOR UPDATE
+                    """,
+                    code,
+                )
+                if row is None:
+                    return {
+                        "status": "not_found", "amount_usd": None,
+                        "new_balance_usd": None, "transaction_id": None,
+                    }
+                if not bool(row["is_active"]):
+                    return {
+                        "status": "inactive", "amount_usd": None,
+                        "new_balance_usd": None, "transaction_id": None,
+                    }
+                if row["expires_at"] is not None:
+                    expired = await connection.fetchval(
+                        "SELECT $1 < NOW()", row["expires_at"]
+                    )
+                    if expired:
+                        return {
+                            "status": "expired", "amount_usd": None,
+                            "new_balance_usd": None, "transaction_id": None,
+                        }
+                if (
+                    row["max_uses"] is not None
+                    and int(row["used_count"]) >= int(row["max_uses"])
+                ):
+                    return {
+                        "status": "exhausted", "amount_usd": None,
+                        "new_balance_usd": None, "transaction_id": None,
+                    }
+
+                # Per-user uniqueness — duplicate ⇒ already_redeemed.
+                already = await connection.fetchval(
+                    """
+                    SELECT 1 FROM gift_redemptions
+                    WHERE code = $1 AND telegram_id = $2
+                    """,
+                    code, telegram_id,
+                )
+                if already:
+                    return {
+                        "status": "already_redeemed", "amount_usd": None,
+                        "new_balance_usd": None, "transaction_id": None,
+                    }
+
+                # User row must exist. We don't auto-create — the
+                # UserUpsertMiddleware fires on every Telegram update,
+                # so by the time /redeem reaches here the row should
+                # already be there. If it isn't, signal it cleanly
+                # rather than crashing on the FK insert below.
+                user_exists = await connection.fetchval(
+                    "SELECT 1 FROM users WHERE telegram_id = $1 FOR UPDATE",
+                    telegram_id,
+                )
+                if not user_exists:
+                    return {
+                        "status": "user_unknown", "amount_usd": None,
+                        "new_balance_usd": None, "transaction_id": None,
+                    }
+
+                amount = float(row["amount_usd"])
+
+                # Bump the gift_codes counter first so a concurrent
+                # transaction blocked on FOR UPDATE will see the new
+                # value when it re-reads.
+                await connection.execute(
+                    """
+                    UPDATE gift_codes
+                    SET used_count = used_count + 1
+                    WHERE code = $1
+                    """,
+                    code,
+                )
+
+                # Audit ledger row first so we have the id to FK from
+                # the redemption record. status=SUCCESS is correct:
+                # the user actually got the credit.
+                tx_id = await connection.fetchval(
+                    """
+                    INSERT INTO transactions (
+                        telegram_id, gateway, gateway_invoice_id,
+                        amount_crypto_or_rial, amount_usd_credited,
+                        currency_code, status, notes
+                    ) VALUES (
+                        $1, 'gift', $2, NULL, $3, 'USD', 'SUCCESS', $4
+                    )
+                    RETURNING id
+                    """,
+                    telegram_id, f"gift:{code}", amount,
+                    f"redeemed gift code '{code}'",
+                )
+
+                # Insert redemption record (FK to transactions).
+                await connection.execute(
+                    """
+                    INSERT INTO gift_redemptions (
+                        code, telegram_id, transaction_id
+                    ) VALUES ($1, $2, $3)
+                    """,
+                    code, telegram_id, tx_id,
+                )
+
+                # Credit balance.
+                new_balance = await connection.fetchval(
+                    """
+                    UPDATE users
+                    SET balance_usd = balance_usd + $1
+                    WHERE telegram_id = $2
+                    RETURNING balance_usd
+                    """,
+                    amount, telegram_id,
+                )
+
+                return {
+                    "status": "ok",
+                    "amount_usd": amount,
+                    "new_balance_usd": float(new_balance),
+                    "transaction_id": int(tx_id),
+                }
+
     async def admin_adjust_balance(
         self,
         telegram_id: int,
