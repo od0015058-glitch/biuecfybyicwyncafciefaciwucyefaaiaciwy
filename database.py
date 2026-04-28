@@ -754,6 +754,171 @@ class Database:
             )
         return row is not None
 
+    async def admin_adjust_balance(
+        self,
+        telegram_id: int,
+        delta_usd: float,
+        reason: str,
+        admin_telegram_id: int,
+    ) -> dict | None:
+        """Admin-issued credit (positive ``delta_usd``) or debit
+        (negative ``delta_usd``) of a user's wallet.
+
+        Wraps the wallet update + ``transactions`` ledger row in one
+        DB transaction with ``SELECT ... FOR UPDATE`` so concurrent
+        ``deduct_balance`` calls can't sneak in between the read and
+        the write. A debit that would take the balance below zero is
+        refused (returns ``None``).
+
+        Returns ``None`` if the user does not exist OR if a debit
+        exceeds the available balance. Returns a dict shaped
+        ``{"new_balance": float, "transaction_id": int, "delta": float}``
+        on success.
+
+        The ``reason`` is stored in ``transactions.notes`` for audit;
+        the admin's telegram id is encoded into ``gateway_invoice_id``
+        as ``admin-<admin_id>-<timestamp>-<rand>`` (UNIQUE on the
+        column means we get a free duplicate-click guard).
+        """
+        if delta_usd == 0:
+            raise ValueError("delta_usd must be non-zero")
+        import secrets
+        import time
+
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                # Lock the user row so a concurrent deduct_balance
+                # can't race us between the balance check and the
+                # update below.
+                row = await connection.fetchrow(
+                    "SELECT balance_usd FROM users "
+                    "WHERE telegram_id = $1 FOR UPDATE",
+                    telegram_id,
+                )
+                if row is None:
+                    return None
+                current = float(row["balance_usd"])
+                new_balance = current + delta_usd
+                if new_balance < 0:
+                    # Insufficient funds for the debit. Don't write
+                    # anything — caller will surface a friendly error.
+                    return None
+                await connection.execute(
+                    "UPDATE users SET balance_usd = $1 "
+                    "WHERE telegram_id = $2",
+                    new_balance, telegram_id,
+                )
+                invoice_id = (
+                    f"admin-{admin_telegram_id}-{int(time.time() * 1000)}"
+                    f"-{secrets.token_hex(4)}"
+                )
+                tx_id = await connection.fetchval(
+                    """
+                    INSERT INTO transactions (
+                        telegram_id, gateway, currency_used,
+                        amount_crypto_or_rial, amount_usd_credited,
+                        status, gateway_invoice_id, completed_at, notes
+                    )
+                    VALUES (
+                        $1, 'admin', 'USD',
+                        NULL, $2,
+                        'SUCCESS', $3, NOW(), $4
+                    )
+                    RETURNING transaction_id
+                    """,
+                    telegram_id, delta_usd, invoice_id, reason,
+                )
+        return {
+            "new_balance": new_balance,
+            "transaction_id": int(tx_id),
+            "delta": delta_usd,
+        }
+
+    async def get_user_admin_summary(self, telegram_id: int) -> dict | None:
+        """Read-only snapshot of a user's wallet for ``/admin_balance``.
+
+        Returns a dict shaped::
+
+            {
+              "telegram_id": int,
+              "username": str | None,
+              "balance_usd": float,
+              "free_messages_left": int,
+              "active_model": str,
+              "language_code": str,
+              "total_credited_usd": float,   # sum SUCCESS|PARTIAL tx, signed
+              "total_spent_usd": float,      # sum usage_logs.cost
+              "recent_transactions": [
+                {"id": int, "gateway": str, "currency": str,
+                 "amount_usd": float, "status": str, "created_at": iso str,
+                 "notes": str | None}
+              ],
+            }
+
+        Returns ``None`` if the user doesn't exist.
+        """
+        async with self.pool.acquire() as connection:
+            user_row = await connection.fetchrow(
+                """
+                SELECT telegram_id, username, balance_usd,
+                       free_messages_left, active_model, language_code
+                FROM users WHERE telegram_id = $1
+                """,
+                telegram_id,
+            )
+            if user_row is None:
+                return None
+            credited = await connection.fetchval(
+                """
+                SELECT COALESCE(SUM(amount_usd_credited), 0)
+                FROM transactions
+                WHERE telegram_id = $1
+                  AND status IN ('SUCCESS', 'PARTIAL')
+                """,
+                telegram_id,
+            )
+            spent = await connection.fetchval(
+                """
+                SELECT COALESCE(SUM(cost_deducted_usd), 0)
+                FROM usage_logs WHERE telegram_id = $1
+                """,
+                telegram_id,
+            )
+            recent = await connection.fetch(
+                """
+                SELECT transaction_id, gateway, currency_used,
+                       amount_usd_credited, status, created_at, notes
+                FROM transactions WHERE telegram_id = $1
+                ORDER BY transaction_id DESC LIMIT 5
+                """,
+                telegram_id,
+            )
+        return {
+            "telegram_id": int(user_row["telegram_id"]),
+            "username": user_row["username"],
+            "balance_usd": float(user_row["balance_usd"]),
+            "free_messages_left": int(user_row["free_messages_left"]),
+            "active_model": user_row["active_model"],
+            "language_code": user_row["language_code"],
+            "total_credited_usd": float(credited or 0),
+            "total_spent_usd": float(spent or 0),
+            "recent_transactions": [
+                {
+                    "id": int(r["transaction_id"]),
+                    "gateway": r["gateway"],
+                    "currency": r["currency_used"],
+                    "amount_usd": float(r["amount_usd_credited"]),
+                    "status": r["status"],
+                    "created_at": (
+                        r["created_at"].isoformat()
+                        if r["created_at"] is not None else None
+                    ),
+                    "notes": r["notes"],
+                }
+                for r in recent
+            ],
+        }
+
     async def get_system_metrics(self) -> dict:
         """Aggregate counters for the admin metrics panel.
 
@@ -790,11 +955,15 @@ class Database:
                 WHERE created_at >= NOW() - INTERVAL '7 days'
                 """
             )
+            # NB: filter out gateway='admin' so admin debits/credits
+            # don't pollute the revenue figure — those are internal
+            # ledger adjustments, not gateway income.
             revenue_usd = await connection.fetchval(
                 """
                 SELECT COALESCE(SUM(amount_usd_credited), 0)
                 FROM transactions
                 WHERE status IN ('SUCCESS', 'PARTIAL')
+                  AND gateway <> 'admin'
                 """
             )
             spend_usd = await connection.fetchval(

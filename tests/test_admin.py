@@ -169,3 +169,145 @@ def test_admin_router_has_admin_command():
     src = inspect.getsource(admin)
     assert '@router.message(Command("admin"))' in src
     assert '@router.message(Command("admin_metrics"))' in src
+    assert '@router.message(Command("admin_balance"))' in src
+    assert '@router.message(Command("admin_credit"))' in src
+    assert '@router.message(Command("admin_debit"))' in src
+
+
+# ---- parse_balance_args ------------------------------------------
+
+
+from admin import _format_balance_summary, parse_balance_args  # noqa: E402
+
+
+def test_parse_balance_args_happy_path():
+    out = parse_balance_args("/admin_credit 12345 5.50 stuck invoice refund")
+    assert out == (12345, 5.50, "stuck invoice refund")
+
+
+def test_parse_balance_args_single_word_reason():
+    out = parse_balance_args("/admin_debit 12345 1 typo")
+    assert out == (12345, 1.0, "typo")
+
+
+def test_parse_balance_args_missing_everything():
+    assert parse_balance_args("/admin_credit") == "missing"
+    assert parse_balance_args("/admin_credit  ") == "missing"
+
+
+def test_parse_balance_args_no_amount():
+    assert parse_balance_args("/admin_credit 12345") == "bad_amount"
+
+
+def test_parse_balance_args_no_reason():
+    assert parse_balance_args("/admin_credit 12345 5") == "missing_reason"
+
+
+def test_parse_balance_args_bad_user_id():
+    assert parse_balance_args("/admin_credit foo 5 reason") == "bad_user_id"
+
+
+def test_parse_balance_args_bad_amount_text():
+    assert (
+        parse_balance_args("/admin_credit 12345 not_a_num reason")
+        == "bad_amount"
+    )
+
+
+@pytest.mark.parametrize(
+    "amount_str",
+    ["nan", "NaN", "inf", "-inf", "Infinity", "-1", "0"],
+)
+def test_parse_balance_args_rejects_nonpositive_or_special(amount_str):
+    out = parse_balance_args(f"/admin_credit 12345 {amount_str} reason")
+    assert out == "bad_amount"
+
+
+def test_parse_balance_args_accepts_decimal():
+    out = parse_balance_args("/admin_credit 12345 0.0001 micro adjustment")
+    assert out == (12345, 0.0001, "micro adjustment")
+
+
+# ---- _format_balance_summary ------------------------------------
+
+
+def _sample_summary() -> dict:
+    return {
+        "telegram_id": 12345,
+        "username": "alice",
+        "balance_usd": 7.5,
+        "free_messages_left": 3,
+        "active_model": "openai/gpt-4o-mini",
+        "language_code": "en",
+        "total_credited_usd": 25.0,
+        "total_spent_usd": 17.5,
+        "recent_transactions": [
+            {
+                "id": 7,
+                "gateway": "NowPayments",
+                "currency": "trx",
+                "amount_usd": 25.0,
+                "status": "SUCCESS",
+                "created_at": "2026-04-28T01:23:45+00:00",
+                "notes": None,
+            },
+            {
+                "id": 8,
+                "gateway": "admin",
+                "currency": "USD",
+                "amount_usd": -2.5,
+                "status": "SUCCESS",
+                "created_at": "2026-04-28T02:00:00+00:00",
+                "notes": "double-charged user",
+            },
+        ],
+    }
+
+
+def test_format_balance_summary_full():
+    out = _format_balance_summary(_sample_summary())
+    assert "@alice" in out
+    assert "12345" in out
+    assert "$7.5000" in out
+    assert "openai/gpt-4o-mini" in out
+    assert "$25.0000" in out  # NowPayments credit
+    assert "$2.5000" in out  # admin debit
+    assert "double-charged user" in out
+    assert "+$25.0000" in out
+    assert "−$2.5000" in out
+
+
+def test_format_balance_summary_no_username():
+    summary = _sample_summary()
+    summary["username"] = None
+    out = _format_balance_summary(summary)
+    assert "@" not in out.split("\n")[0]
+    assert "id=12345" in out
+
+
+def test_format_balance_summary_no_txs():
+    summary = _sample_summary()
+    summary["recent_transactions"] = []
+    out = _format_balance_summary(summary)
+    assert "Last 5 transactions" not in out
+
+
+def test_format_balance_summary_user_with_no_notes():
+    """Old NowPayments rows have notes=NULL — the formatter should
+    not crash and should not append a stray ' — _' to the line."""
+    summary = _sample_summary()
+    summary["recent_transactions"] = [
+        {
+            "id": 1,
+            "gateway": "NowPayments",
+            "currency": "btc",
+            "amount_usd": 5.0,
+            "status": "SUCCESS",
+            "created_at": "2026-04-28T00:00:00+00:00",
+            "notes": None,
+        }
+    ]
+    out = _format_balance_summary(summary)
+    assert "#1" in out
+    assert "$5.0000" in out
+    assert " — _" not in out
