@@ -5920,3 +5920,200 @@ def test_parse_user_edit_form_username_too_long_distinct_error_key():
         {"username": raw}, current=_USER_EDIT_BASE_CURRENT
     )
     assert result == "username_too_long"
+
+
+# ---------------------------------------------------------------------
+# Bug-fix sweep: active_model shape validation in parse_user_edit_form.
+#
+# Pre-fix the shape check was just:
+#     len(raw_model) > USER_FIELD_MODEL_MAX_CHARS or "/" not in raw_model
+#
+# That accepted "foo/" (provider + empty name), "/bar" (empty provider
+# + name), "/", "a/b/c" (ambiguous double-slash), and any string with
+# whitespace mid-id (e.g. "openai/ gpt-4"). Each of those wrote
+# garbage into users.active_model and the user's next chat 400'd at
+# OpenRouter, surfacing as ai_provider_unavailable with no hint that
+# an admin just bricked their model.
+# ---------------------------------------------------------------------
+
+
+_USER_EDIT_BASE_CURRENT_FOR_MODEL = {
+    "language_code": "en",
+    "active_model": "google/gemini-pro",
+    "memory_enabled": False,
+    "username": "alice",
+    "free_messages_left": 0,
+}
+
+
+def test_parse_user_edit_form_active_model_trailing_slash_rejected():
+    """``"openai/"`` lstripped fine pre-fix but is structurally
+    invalid — provider with no model name. OpenRouter 400s on this."""
+    from web_admin import parse_user_edit_form
+    result = parse_user_edit_form(
+        {"active_model": "openai/"},
+        current=_USER_EDIT_BASE_CURRENT_FOR_MODEL,
+    )
+    assert result == "bad_model"
+
+
+def test_parse_user_edit_form_active_model_leading_slash_rejected():
+    """``"/gpt-4"`` is structurally invalid — empty provider."""
+    from web_admin import parse_user_edit_form
+    result = parse_user_edit_form(
+        {"active_model": "/gpt-4"},
+        current=_USER_EDIT_BASE_CURRENT_FOR_MODEL,
+    )
+    assert result == "bad_model"
+
+
+def test_parse_user_edit_form_active_model_only_slash_rejected():
+    """``"/"`` — both sides empty."""
+    from web_admin import parse_user_edit_form
+    result = parse_user_edit_form(
+        {"active_model": "/"},
+        current=_USER_EDIT_BASE_CURRENT_FOR_MODEL,
+    )
+    assert result == "bad_model"
+
+
+def test_parse_user_edit_form_active_model_double_slash_rejected():
+    """Two slashes in a row — ambiguous, definitely not a real id."""
+    from web_admin import parse_user_edit_form
+    result = parse_user_edit_form(
+        {"active_model": "openai//gpt-4"},
+        current=_USER_EDIT_BASE_CURRENT_FOR_MODEL,
+    )
+    assert result == "bad_model"
+
+
+def test_parse_user_edit_form_active_model_three_part_rejected():
+    """``"a/b/c"`` — ambiguous: three-part path is not the
+    ``provider/name`` shape OpenRouter uses."""
+    from web_admin import parse_user_edit_form
+    result = parse_user_edit_form(
+        {"active_model": "openai/foo/bar"},
+        current=_USER_EDIT_BASE_CURRENT_FOR_MODEL,
+    )
+    assert result == "bad_model"
+
+
+def test_parse_user_edit_form_active_model_no_slash_rejected():
+    """Regression pin: the original ``"/" not in`` check still fires
+    for plain non-id text. ``"gpt-4"`` (without provider) is rejected.
+    """
+    from web_admin import parse_user_edit_form
+    result = parse_user_edit_form(
+        {"active_model": "gpt-4"},
+        current=_USER_EDIT_BASE_CURRENT_FOR_MODEL,
+    )
+    assert result == "bad_model"
+
+
+def test_parse_user_edit_form_active_model_inner_whitespace_rejected():
+    """``"openai/ gpt-4"`` survives ``.strip()`` (only outer ws is
+    stripped) but the inner space is a typo signal — no real model id
+    contains whitespace. Pre-fix this slipped through unchecked."""
+    from web_admin import parse_user_edit_form
+    result = parse_user_edit_form(
+        {"active_model": "openai/ gpt-4"},
+        current=_USER_EDIT_BASE_CURRENT_FOR_MODEL,
+    )
+    assert result == "bad_model"
+
+
+def test_parse_user_edit_form_active_model_inner_tab_rejected():
+    """Tabs are also whitespace and equally a typo signal."""
+    from web_admin import parse_user_edit_form
+    result = parse_user_edit_form(
+        {"active_model": "openai\t/gpt-4"},
+        current=_USER_EDIT_BASE_CURRENT_FOR_MODEL,
+    )
+    assert result == "bad_model"
+
+
+def test_parse_user_edit_form_active_model_canonical_id_accepted():
+    """Regression pin: canonical OpenRouter ids still pass."""
+    from web_admin import parse_user_edit_form
+    current = {
+        **_USER_EDIT_BASE_CURRENT_FOR_MODEL,
+        "active_model": "google/gemini-pro",
+    }
+    result = parse_user_edit_form(
+        {"active_model": "openai/gpt-4o"}, current=current
+    )
+    assert result == {"active_model": "openai/gpt-4o"}
+
+
+def test_parse_user_edit_form_active_model_id_with_dot_accepted():
+    """Regression pin: ``google/gemini-1.5-pro`` (dot in version) is
+    legitimate — the new shape check must not reject dots."""
+    from web_admin import parse_user_edit_form
+    current = {
+        **_USER_EDIT_BASE_CURRENT_FOR_MODEL,
+        "active_model": "google/gemini-pro",
+    }
+    result = parse_user_edit_form(
+        {"active_model": "google/gemini-1.5-pro"}, current=current
+    )
+    assert result == {"active_model": "google/gemini-1.5-pro"}
+
+
+def test_parse_user_edit_form_active_model_id_with_colon_free_tier_accepted():
+    """Regression pin: ``qwen/qwen-2.5-72b-instruct:free`` (colon for
+    free tier) is legitimate."""
+    from web_admin import parse_user_edit_form
+    current = {
+        **_USER_EDIT_BASE_CURRENT_FOR_MODEL,
+        "active_model": "google/gemini-pro",
+    }
+    result = parse_user_edit_form(
+        {"active_model": "qwen/qwen-2.5-72b-instruct:free"},
+        current=current,
+    )
+    assert result == {
+        "active_model": "qwen/qwen-2.5-72b-instruct:free"
+    }
+
+
+def test_parse_user_edit_form_active_model_id_with_hyphen_provider_accepted():
+    """Regression pin: ``meta-llama/...`` (hyphen in provider) is
+    legitimate. ``x-ai/...`` is the same shape."""
+    from web_admin import parse_user_edit_form
+    current = {
+        **_USER_EDIT_BASE_CURRENT_FOR_MODEL,
+        "active_model": "google/gemini-pro",
+    }
+    result = parse_user_edit_form(
+        {"active_model": "meta-llama/llama-3-70b-instruct"},
+        current=current,
+    )
+    assert result == {
+        "active_model": "meta-llama/llama-3-70b-instruct"
+    }
+
+
+def test_parse_user_edit_form_active_model_too_long_still_rejected():
+    """Regression pin: the length cap still fires (independent of the
+    new shape check). 200+ chars is way beyond any real model id."""
+    from web_admin import parse_user_edit_form, USER_FIELD_MODEL_MAX_CHARS
+    raw = "openai/" + "x" * USER_FIELD_MODEL_MAX_CHARS
+    assert len(raw) > USER_FIELD_MODEL_MAX_CHARS
+    result = parse_user_edit_form(
+        {"active_model": raw},
+        current=_USER_EDIT_BASE_CURRENT_FOR_MODEL,
+    )
+    assert result == "bad_model"
+
+
+def test_parse_user_edit_form_active_model_empty_is_treated_as_unchanged():
+    """Regression pin: an empty / whitespace-only ``active_model``
+    field falls through the ``if raw_model:`` guard — current model
+    stays. Same convention as the username field's empty path."""
+    from web_admin import parse_user_edit_form
+    result = parse_user_edit_form(
+        {"active_model": "   "},
+        current=_USER_EDIT_BASE_CURRENT_FOR_MODEL,
+    )
+    # No "active_model" key in result because the field was blank.
+    assert "active_model" not in result
