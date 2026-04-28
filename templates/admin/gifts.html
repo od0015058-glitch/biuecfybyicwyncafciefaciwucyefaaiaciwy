@@ -1,0 +1,206 @@
+{% extends "_layout.html" %}
+
+{% block title %}Gift codes{% endblock %}
+
+{% block extra_head %}
+<style>
+  .gift-grid {
+    display: grid;
+    grid-template-columns: 1fr 360px;
+    gap: 24px;
+    align-items: start;
+  }
+  @media (max-width: 1100px) {
+    .gift-grid { grid-template-columns: 1fr; }
+  }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 500;
+  }
+  .badge-active {
+    background: rgba(74, 222, 128, 0.12);
+    color: var(--success);
+    border: 1px solid rgba(74, 222, 128, 0.3);
+  }
+  .badge-revoked {
+    background: rgba(255, 107, 107, 0.12);
+    color: var(--danger);
+    border: 1px solid rgba(255, 107, 107, 0.3);
+  }
+  .badge-exhausted {
+    background: rgba(255, 200, 0, 0.12);
+    color: #f0c14b;
+    border: 1px solid rgba(255, 200, 0, 0.3);
+  }
+  code.code {
+    background: var(--bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+  }
+  button.danger {
+    background: transparent;
+    color: var(--danger);
+    border: 1px solid var(--danger);
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  button.danger:hover {
+    background: rgba(255, 107, 107, 0.1);
+  }
+  button.danger:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  form.inline { display: inline; margin: 0; }
+  .alert-success {
+    background: rgba(74, 222, 128, 0.1);
+    border: 1px solid var(--success);
+    color: var(--success);
+  }
+  .alert-info {
+    background: rgba(79, 140, 255, 0.1);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+  }
+  .hint {
+    color: var(--text-muted);
+    font-size: 11px;
+    margin-top: 4px;
+  }
+  .explainer {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 14px;
+    margin-bottom: 16px;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  .explainer strong { color: var(--text); }
+</style>
+{% endblock %}
+
+{% block main %}
+<h2>Gift codes</h2>
+
+<div class="explainer">
+  <strong>Gift codes</strong> credit balance directly — no purchase required.
+  Pick an amount and how many people can redeem it. Each Telegram user can
+  redeem each code at most once. Users redeem with <code class="code">/redeem CODE</code>
+  inside the bot.
+</div>
+
+{% if flash %}
+<div class="alert alert-{{ flash.kind }}">{{ flash.message }}</div>
+{% endif %}
+
+{% if db_error %}
+<div class="alert alert-warn">{{ db_error }}</div>
+{% endif %}
+
+<div class="gift-grid">
+  <div class="panel">
+    <h3>Existing gift codes ({{ rows|length }})</h3>
+    {% if rows %}
+    <table>
+      <thead>
+        <tr>
+          <th>Code</th>
+          <th>Per redemption</th>
+          <th>Used / cap</th>
+          <th>Expires</th>
+          <th>Status</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+        <tr>
+          <td><code class="code">{{ r.code }}</code></td>
+          <td>${{ "{:,.2f}".format(r.amount_usd) }}</td>
+          <td>
+            {{ r.used_count }} /
+            {% if r.max_uses is not none %}{{ r.max_uses }}{% else %}∞{% endif %}
+          </td>
+          <td>
+            {% if r.expires_at %}
+              {{ r.expires_at[:10] }}
+            {% else %}
+              —
+            {% endif %}
+          </td>
+          <td>
+            {% if not r.is_active %}
+              <span class="badge badge-revoked">revoked</span>
+            {% elif r.max_uses is not none and r.used_count >= r.max_uses %}
+              <span class="badge badge-exhausted">exhausted</span>
+            {% else %}
+              <span class="badge badge-active">active</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if r.is_active %}
+            <form class="inline" method="post"
+                  action="/admin/gifts/{{ r.code }}/revoke"
+                  onsubmit="return confirm('Revoke gift code {{ r.code }}?');">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button type="submit" class="danger">Revoke</button>
+            </form>
+            {% else %}
+            <button class="danger" disabled>Revoked</button>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p style="color: var(--text-muted); margin: 0;">No gift codes yet.</p>
+    {% endif %}
+  </div>
+
+  <div class="panel">
+    <h3>Create new</h3>
+    <form method="post" action="/admin/gifts">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+      <div class="field">
+        <label for="code">Code</label>
+        <input type="text" id="code" name="code"
+               placeholder="BIRTHDAY5" required maxlength="64"
+               pattern="[A-Za-z0-9_\-]+">
+        <div class="hint">Letters, digits, _ or -. Stored uppercase.</div>
+      </div>
+
+      <div class="field">
+        <label for="amount_usd">Amount per redemption (USD)</label>
+        <input type="text" id="amount_usd" name="amount_usd"
+               placeholder="5" required>
+        <div class="hint">Each redeemer gets this much added to their wallet.</div>
+      </div>
+
+      <div class="field">
+        <label for="max_uses">Max redemptions (optional)</label>
+        <input type="number" id="max_uses" name="max_uses"
+               placeholder="leave blank = unlimited" min="1">
+        <div class="hint">"10 people only" → enter 10.</div>
+      </div>
+
+      <div class="field">
+        <label for="expires_in_days">Expires in N days (optional)</label>
+        <input type="number" id="expires_in_days" name="expires_in_days"
+               placeholder="leave blank = never expires" min="1">
+      </div>
+
+      <button type="submit" class="primary">Create gift code</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

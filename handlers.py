@@ -222,6 +222,80 @@ async def cmd_start(message: Message, state: FSMContext):
 
 
 # ==========================================
+# /redeem — gift code redemption (Stage-8-Part-3)
+# ==========================================
+@router.message(Command("redeem"))
+async def cmd_redeem(message: Message, state: FSMContext):
+    """Redeem a gift code: ``/redeem CODE``.
+
+    Gift codes are admin-issued (via the web admin at /admin/gifts) and
+    credit balance directly — no purchase required. Each user can
+    redeem each code at most once. Code matching is case-insensitive
+    on the user side; the DB normalises to uppercase.
+    """
+    await state.clear()
+    if message.from_user is None:
+        # Same defensive guard pattern used in cmd_start / process_chat.
+        return
+    user_id = message.from_user.id
+    lang = await _get_user_language(user_id)
+
+    # Parse the code arg. ``aiogram``'s Command filter doesn't auto-split,
+    # so do it ourselves. Accept ``/redeem CODE`` and ``/redeem@bot CODE``.
+    text = (message.text or "").strip()
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer(t(lang, "redeem_usage"))
+        return
+    code_arg = parts[1].strip()
+    # Cap on length matches the DB column / parser bound — anything
+    # longer is definitely junk, no need to round-trip the DB.
+    if len(code_arg) > 64 or not all(
+        c.isalnum() or c in "_-" for c in code_arg
+    ):
+        await message.answer(t(lang, "redeem_bad_code"))
+        return
+
+    try:
+        result = await db.redeem_gift_code(code_arg, user_id)
+    except Exception:
+        log.exception("cmd_redeem: redeem_gift_code crashed")
+        await message.answer(t(lang, "redeem_error"))
+        return
+
+    status = result.get("status")
+    if status == "ok":
+        amount = float(result["amount_usd"])
+        new_balance = float(result["new_balance_usd"])
+        log.info(
+            "redeem ok telegram_id=%s code=%s amount=%s new_balance=%s",
+            user_id, code_arg.upper(), amount, new_balance,
+        )
+        await message.answer(
+            t(lang, "redeem_ok", amount=amount, balance=new_balance)
+        )
+        return
+
+    # Map every other status to a friendly localized message. Keep
+    # the messages distinct so a confused user can copy/paste the
+    # error and the admin can tell whether the code was wrong vs
+    # already used vs expired.
+    err_key = {
+        "not_found": "redeem_not_found",
+        "inactive": "redeem_inactive",
+        "expired": "redeem_expired",
+        "exhausted": "redeem_exhausted",
+        "already_redeemed": "redeem_already_redeemed",
+        "user_unknown": "redeem_user_unknown",
+    }.get(status, "redeem_error")
+    log.info(
+        "redeem fail telegram_id=%s code=%s status=%s",
+        user_id, code_arg.upper(), status,
+    )
+    await message.answer(t(lang, err_key))
+
+
+# ==========================================
 # Top-level reply-keyboard handlers (matched across all languages)
 # ==========================================
 # Legacy reply-keyboard handlers. P3-3 replaced the bottom keyboard

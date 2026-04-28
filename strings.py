@@ -262,6 +262,28 @@ _STRINGS: dict[str, dict[str, str]] = {
         "promo_invalid_expired": "❌ مهلت استفاده از این کد تخفیف به پایان رسیده.",
         "promo_invalid_exhausted": "❌ ظرفیت استفاده از این کد تخفیف تکمیل شده.",
         "promo_invalid_already_used": "❌ شما قبلاً از این کد تخفیف استفاده کرده‌اید.",
+
+        # /redeem — gift codes (Stage-8-Part-3). Distinct from promo
+        # codes: the "amount" is added directly to the wallet, no
+        # purchase required.
+        "redeem_usage": (
+            "📥 برای استفاده از کد هدیه:\n`/redeem CODE`\n"
+            "مثال: `/redeem WELCOME5`"
+        ),
+        "redeem_bad_code": "❌ فرمت کد نامعتبر است.",
+        "redeem_ok": (
+            "🎉 کد هدیه فعال شد! ${amount:.2f} به موجودی شما اضافه شد.\n"
+            "موجودی فعلی: ${balance:.2f}"
+        ),
+        "redeem_not_found": "❌ این کد هدیه پیدا نشد.",
+        "redeem_inactive": "❌ این کد هدیه غیرفعال است.",
+        "redeem_expired": "❌ مهلت این کد هدیه به پایان رسیده.",
+        "redeem_exhausted": "❌ ظرفیت استفاده از این کد هدیه تکمیل شده.",
+        "redeem_already_redeemed": "❌ شما قبلاً از این کد هدیه استفاده کرده‌اید.",
+        "redeem_user_unknown": (
+            "❌ ابتدا /start را ارسال کنید و سپس دوباره تلاش کنید."
+        ),
+        "redeem_error": "❌ خطایی رخ داد. لطفاً بعداً تلاش کنید.",
     },
     "en": {
         # ---- Legacy reply-keyboard labels (kept so old clients with a
@@ -502,6 +524,28 @@ _STRINGS: dict[str, dict[str, str]] = {
         "promo_invalid_expired": "❌ This promo code has expired.",
         "promo_invalid_exhausted": "❌ This promo code has been fully used up.",
         "promo_invalid_already_used": "❌ You've already used this promo code.",
+
+        # /redeem — gift codes (Stage-8-Part-3).
+        "redeem_usage": (
+            "📥 To use a gift code:\n`/redeem CODE`\n"
+            "Example: `/redeem WELCOME5`"
+        ),
+        "redeem_bad_code": "❌ Invalid code format.",
+        "redeem_ok": (
+            "🎉 Gift code redeemed! ${amount:.2f} was added to your wallet.\n"
+            "Current balance: ${balance:.2f}"
+        ),
+        "redeem_not_found": "❌ Gift code not found.",
+        "redeem_inactive": "❌ This gift code has been revoked.",
+        "redeem_expired": "❌ This gift code has expired.",
+        "redeem_exhausted": "❌ This gift code has been fully redeemed.",
+        "redeem_already_redeemed": (
+            "❌ You've already redeemed this gift code."
+        ),
+        "redeem_user_unknown": (
+            "❌ Please send /start first, then try again."
+        ),
+        "redeem_error": "❌ Something went wrong. Please try again later.",
     },
 }
 

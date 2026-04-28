@@ -6,8 +6,8 @@
     <h1>Meowassist Admin</h1>
     <nav>
       <a href="/admin/" class="{% if active_page == 'dashboard' %}active{% endif %}">📊 Dashboard</a>
-      <a class="disabled" title="Coming in Stage-8-Part-2">🎟️ Promo codes</a>
-      <a class="disabled" title="Coming in Stage-8-Part-3">🎁 Gift codes</a>
+      <a href="/admin/promos" class="{% if active_page == 'promos' %}active{% endif %}">🎟️ Promo codes</a>
+      <a href="/admin/gifts" class="{% if active_page == 'gifts' %}active{% endif %}">🎁 Gift codes</a>
       <a class="disabled" title="Coming in Stage-8-Part-4">👥 Users</a>
       <a class="disabled" title="Coming in Stage-8-Part-5">📣 Broadcast</a>
       <a class="disabled" title="Coming in Stage-8-Part-5">💸 Transactions</a>

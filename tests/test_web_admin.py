@@ -126,7 +126,15 @@ def test_signed_cookie_contains_no_secret():
 # ---------------------------------------------------------------------
 
 
-def _stub_db(metrics: dict | None = None):
+def _stub_db(
+    metrics: dict | None = None,
+    promo_rows: list | None = None,
+    create_promo_result: bool | Exception = True,
+    revoke_promo_result: bool | Exception = True,
+    gift_rows: list | None = None,
+    create_gift_result: bool | Exception = True,
+    revoke_gift_result: bool | Exception = True,
+):
     """A minimal Database stub that exposes the methods web_admin uses.
 
     The default ``metrics`` shape MUST match what
@@ -154,6 +162,28 @@ def _stub_db(metrics: dict | None = None):
             ],
         }
     )
+    db.list_promo_codes = AsyncMock(
+        return_value=promo_rows if promo_rows is not None else []
+    )
+    if isinstance(create_promo_result, Exception):
+        db.create_promo_code = AsyncMock(side_effect=create_promo_result)
+    else:
+        db.create_promo_code = AsyncMock(return_value=create_promo_result)
+    if isinstance(revoke_promo_result, Exception):
+        db.revoke_promo_code = AsyncMock(side_effect=revoke_promo_result)
+    else:
+        db.revoke_promo_code = AsyncMock(return_value=revoke_promo_result)
+    db.list_gift_codes = AsyncMock(
+        return_value=gift_rows if gift_rows is not None else []
+    )
+    if isinstance(create_gift_result, Exception):
+        db.create_gift_code = AsyncMock(side_effect=create_gift_result)
+    else:
+        db.create_gift_code = AsyncMock(return_value=create_gift_result)
+    if isinstance(revoke_gift_result, Exception):
+        db.revoke_gift_code = AsyncMock(side_effect=revoke_gift_result)
+    else:
+        db.revoke_gift_code = AsyncMock(return_value=revoke_gift_result)
     return db
 
 
@@ -496,3 +526,1305 @@ async def test_dashboard_fallback_dicts_match_template_keys(
     # match the template's reads, otherwise jinja would 500).
     assert "Total users" in body
     assert "Active (7d)" in body
+
+
+# ---------------------------------------------------------------------
+# Stage-8-Part-2: promo codes UI
+# ---------------------------------------------------------------------
+
+
+from web_admin import (
+    DISCOUNT_AMOUNT_MAX,
+    csrf_token_for,
+    parse_promo_form,
+    pop_flash,
+    set_flash,
+    verify_csrf_token,
+)
+
+
+# parse_promo_form (pure function)
+# ---------------------------------------------------------------------
+
+
+def _form(d: dict) -> dict:
+    """Form data is multidict-ish; plain dict is fine here since
+    parse_promo_form only does .get(name)."""
+    return d
+
+
+def test_parse_promo_form_percent_happy():
+    out = parse_promo_form(_form({
+        "code": "welcome20",
+        "discount_kind": "percent",
+        "discount_value": "20",
+    }))
+    assert out == {
+        "code": "WELCOME20",
+        "discount_percent": 20,
+        "discount_amount": None,
+        "max_uses": None,
+        "expires_in_days": None,
+    }
+
+
+def test_parse_promo_form_percent_with_sign():
+    out = parse_promo_form(_form({
+        "code": "BLACKFRI",
+        "discount_kind": "percent",
+        "discount_value": "30%",
+    }))
+    assert out["discount_percent"] == 30
+
+
+def test_parse_promo_form_amount_happy():
+    out = parse_promo_form(_form({
+        "code": "GIFT5",
+        "discount_kind": "amount",
+        "discount_value": "$5",
+    }))
+    assert out["discount_amount"] == 5.0
+    assert out["discount_percent"] is None
+
+
+def test_parse_promo_form_amount_with_max_uses_and_expiry():
+    out = parse_promo_form(_form({
+        "code": "BIRTHDAY",
+        "discount_kind": "amount",
+        "discount_value": "10.5",
+        "max_uses": "100",
+        "expires_in_days": "30",
+    }))
+    assert out["discount_amount"] == 10.5
+    assert out["max_uses"] == 100
+    assert out["expires_in_days"] == 30
+
+
+def test_parse_promo_form_missing_code():
+    assert parse_promo_form(_form({"discount_kind": "percent",
+                                    "discount_value": "10"})) == "missing_code"
+
+
+def test_parse_promo_form_bad_code_chars():
+    assert parse_promo_form(_form({
+        "code": "has spaces",
+        "discount_kind": "percent",
+        "discount_value": "10",
+    })) == "bad_code"
+
+
+def test_parse_promo_form_bad_discount_kind():
+    assert parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "free",
+        "discount_value": "1",
+    })) == "bad_discount_kind"
+
+
+def test_parse_promo_form_bad_percent_zero():
+    assert parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "percent",
+        "discount_value": "0",
+    })) == "bad_percent"
+
+
+def test_parse_promo_form_bad_percent_over_100():
+    assert parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "percent",
+        "discount_value": "101",
+    })) == "bad_percent"
+
+
+def test_parse_promo_form_bad_percent_non_int():
+    assert parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "percent",
+        "discount_value": "10.5",
+    })) == "bad_percent"
+
+
+def test_parse_promo_form_bad_amount_negative():
+    assert parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "amount",
+        "discount_value": "-5",
+    })) == "bad_amount"
+
+
+def test_parse_promo_form_bad_amount_nan():
+    assert parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "amount",
+        "discount_value": "nan",
+    })) == "bad_amount"
+
+
+def test_parse_promo_form_bad_amount_inf():
+    assert parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "amount",
+        "discount_value": "inf",
+    })) == "bad_amount"
+
+
+def test_parse_promo_form_amount_too_large():
+    """The bundled bug fix: discount_amount has no upper bound, so
+    creating a promo with $9_999_999 used to crash the INSERT with
+    PG ``numeric field overflow`` because the column is DECIMAL(10,4)
+    and the parser/db happily passed the giant value through. The
+    parser now rejects it client-side with a friendly error."""
+    out = parse_promo_form(_form({
+        "code": "MILLION",
+        "discount_kind": "amount",
+        "discount_value": str(DISCOUNT_AMOUNT_MAX + 1),
+    }))
+    assert out == "discount_too_large"
+
+
+def test_parse_promo_form_amount_at_cap_passes():
+    out = parse_promo_form(_form({
+        "code": "BIG",
+        "discount_kind": "amount",
+        "discount_value": str(DISCOUNT_AMOUNT_MAX),
+    }))
+    assert isinstance(out, dict)
+    assert out["discount_amount"] == DISCOUNT_AMOUNT_MAX
+
+
+def test_parse_promo_form_bad_max_uses_non_int():
+    assert parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "percent",
+        "discount_value": "10",
+        "max_uses": "many",
+    })) == "bad_max_uses"
+
+
+def test_parse_promo_form_bad_max_uses_zero():
+    assert parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "percent",
+        "discount_value": "10",
+        "max_uses": "0",
+    })) == "bad_max_uses"
+
+
+def test_parse_promo_form_bad_days():
+    assert parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "percent",
+        "discount_value": "10",
+        "expires_in_days": "-1",
+    })) == "bad_days"
+
+
+# create_promo_code DB upper-bound guard (pure unit test on the helper)
+# ---------------------------------------------------------------------
+
+
+def test_create_promo_code_rejects_amount_over_decimal_cap():
+    """Bundled bug fix mirrored on the DB layer.
+
+    Even if a future admin path bypasses parse_promo_form (e.g.
+    direct API integration, or a different web framework), the DB
+    method itself must reject discount_amount > DECIMAL(10,4)
+    capacity so we never get PG ``numeric field overflow``.
+    """
+    from database import Database
+    db = Database.__new__(Database)  # don't need a real connection
+    db.pool = None
+    import asyncio
+    with pytest.raises(ValueError, match="DECIMAL"):
+        asyncio.get_event_loop().run_until_complete(
+            db.create_promo_code(
+                code="X",
+                discount_amount=1_000_000.0,
+            )
+        )
+
+
+# CSRF helpers
+# ---------------------------------------------------------------------
+
+
+async def test_csrf_token_empty_when_not_logged_in(
+    aiohttp_client, make_admin_app
+):
+    """No session cookie = no CSRF token. Forms aren't reachable
+    without auth anyway, but the helper should fail closed."""
+    app = make_admin_app()
+    client = await aiohttp_client(app)
+    resp = await client.get("/admin/login", allow_redirects=False)
+    # We can't call csrf_token_for from outside a request context
+    # easily, so we instead verify the login page (unauthed) doesn't
+    # contain a csrf_token at all.
+    body = await resp.text()
+    assert 'name="csrf_token"' not in body
+
+
+async def test_csrf_token_consistent_within_a_session(
+    aiohttp_client, make_admin_app
+):
+    """Two GETs from the same session should embed the same token."""
+    client = await aiohttp_client(make_admin_app(password="letmein"))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False
+    )
+    r1 = await client.get("/admin/promos")
+    r2 = await client.get("/admin/promos")
+    body1, body2 = await r1.text(), await r2.text()
+
+    import re
+    m1 = re.search(r'name="csrf_token" value="([^"]+)"', body1)
+    m2 = re.search(r'name="csrf_token" value="([^"]+)"', body2)
+    assert m1 and m2
+    assert m1.group(1) == m2.group(1)
+
+
+async def test_csrf_token_changes_after_relogin(
+    aiohttp_client, make_admin_app
+):
+    """A new login = new session cookie = new derived CSRF token,
+    so old form tokens stop working."""
+    client = await aiohttp_client(make_admin_app(password="letmein"))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False
+    )
+    r1 = await client.get("/admin/promos")
+    body1 = await r1.text()
+
+    await client.get("/admin/logout", allow_redirects=False)
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False
+    )
+    r2 = await client.get("/admin/promos")
+    body2 = await r2.text()
+
+    import re
+    m1 = re.search(r'name="csrf_token" value="([^"]+)"', body1)
+    m2 = re.search(r'name="csrf_token" value="([^"]+)"', body2)
+    assert m1 and m2
+    assert m1.group(1) != m2.group(1)
+
+
+# /admin/promos GET
+# ---------------------------------------------------------------------
+
+
+async def test_promos_get_requires_auth(aiohttp_client, make_admin_app):
+    client = await aiohttp_client(make_admin_app())
+    resp = await client.get("/admin/promos", allow_redirects=False)
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+
+
+async def test_promos_get_lists_codes(aiohttp_client, make_admin_app):
+    rows = [
+        {
+            "code": "WELCOME20",
+            "discount_percent": 20,
+            "discount_amount": None,
+            "max_uses": 100,
+            "used_count": 5,
+            "expires_at": "2030-12-31T23:59:59+00:00",
+            "is_active": True,
+            "created_at": "2026-01-01T00:00:00+00:00",
+        },
+        {
+            "code": "REVOKED",
+            "discount_percent": None,
+            "discount_amount": 5.0,
+            "max_uses": None,
+            "used_count": 0,
+            "expires_at": None,
+            "is_active": False,
+            "created_at": "2025-01-01T00:00:00+00:00",
+        },
+    ]
+    client = await aiohttp_client(
+        make_admin_app(password="pw", db=_stub_db(promo_rows=rows))
+    )
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.get("/admin/promos")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert "WELCOME20" in body
+    assert "20%" in body
+    assert "REVOKED" in body
+    assert "$5.00" in body
+    assert "active" in body
+    assert "revoked" in body
+    # CSRF token embedded in revoke form (only for active rows).
+    assert 'action="/admin/promos/WELCOME20/revoke"' in body
+
+
+async def test_promos_get_db_error_renders_banner(
+    aiohttp_client, make_admin_app
+):
+    db = AsyncMock()
+    db.list_promo_codes = AsyncMock(side_effect=RuntimeError("boom"))
+    client = await aiohttp_client(
+        make_admin_app(password="pw", db=db)
+    )
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.get("/admin/promos")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert "Database query failed" in body
+
+
+# /admin/promos POST (create)
+# ---------------------------------------------------------------------
+
+
+async def _login_and_get_csrf(client, password: str = "pw") -> str:
+    """Log in, fetch the promos page, scrape its CSRF token."""
+    await client.post(
+        "/admin/login", data={"password": password}, allow_redirects=False
+    )
+    resp = await client.get("/admin/promos")
+    body = await resp.text()
+    import re
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+    assert m, "Expected CSRF token in /admin/promos form"
+    return m.group(1)
+
+
+async def test_promos_create_happy_path(aiohttp_client, make_admin_app):
+    db = _stub_db(create_promo_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+
+    resp = await client.post(
+        "/admin/promos",
+        data={
+            "csrf_token": csrf,
+            "code": "WELCOME20",
+            "discount_kind": "percent",
+            "discount_value": "20",
+            "max_uses": "10",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/promos"
+    db.create_promo_code.assert_awaited_once()
+    kwargs = db.create_promo_code.await_args.kwargs
+    assert kwargs["code"] == "WELCOME20"
+    assert kwargs["discount_percent"] == 20
+    assert kwargs["discount_amount"] is None
+    assert kwargs["max_uses"] == 10
+
+    # Follow the redirect, expect success flash.
+    resp2 = await client.get("/admin/promos")
+    body = await resp2.text()
+    assert "alert-success" in body
+    assert "Created" in body and "WELCOME20" in body
+
+
+async def test_promos_create_rejects_missing_csrf(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.post(
+        "/admin/promos",
+        data={
+            "code": "X",
+            "discount_kind": "percent",
+            "discount_value": "20",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.create_promo_code.assert_not_awaited()
+    resp2 = await client.get("/admin/promos")
+    body = await resp2.text()
+    assert "CSRF" in body
+
+
+async def test_promos_create_rejects_wrong_csrf(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login_and_get_csrf(client, "pw")  # establish session
+    resp = await client.post(
+        "/admin/promos",
+        data={
+            "csrf_token": "obviously-wrong",
+            "code": "X",
+            "discount_kind": "percent",
+            "discount_value": "20",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.create_promo_code.assert_not_awaited()
+
+
+async def test_promos_create_validation_error_shows_flash(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/promos",
+        data={
+            "csrf_token": csrf,
+            "code": "BAD",
+            "discount_kind": "amount",
+            "discount_value": "9999999",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.create_promo_code.assert_not_awaited()
+    resp2 = await client.get("/admin/promos")
+    body = await resp2.text()
+    assert "alert-error" in body
+    # Friendly message text.
+    assert "DB limit" in body or "999,999.00" in body
+
+
+async def test_promos_create_conflict_shows_flash(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(create_promo_result=False)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/promos",
+        data={
+            "csrf_token": csrf,
+            "code": "EXISTING",
+            "discount_kind": "percent",
+            "discount_value": "10",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    resp2 = await client.get("/admin/promos")
+    body = await resp2.text()
+    assert "already exists" in body
+
+
+async def test_promos_create_db_value_error_shows_flash(
+    aiohttp_client, make_admin_app
+):
+    """If create_promo_code raises ValueError (e.g., the DB-side
+    DECIMAL guard fired because the parser was bypassed), show the
+    raw message rather than 500."""
+    db = _stub_db(create_promo_result=ValueError("DECIMAL(10,4) limit"))
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/promos",
+        data={
+            "csrf_token": csrf,
+            "code": "X",
+            "discount_kind": "percent",
+            "discount_value": "10",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    resp2 = await client.get("/admin/promos")
+    body = await resp2.text()
+    assert "DECIMAL(10,4) limit" in body
+
+
+async def test_promos_create_with_expires_in_days_passes_datetime(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(create_promo_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/promos",
+        data={
+            "csrf_token": csrf,
+            "code": "FRIDAY",
+            "discount_kind": "percent",
+            "discount_value": "15",
+            "expires_in_days": "7",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    kwargs = db.create_promo_code.await_args.kwargs
+    assert kwargs["expires_at"] is not None
+    # 7 days +/- 1 minute (test-runtime slack).
+    delta = kwargs["expires_at"] - datetime.now(timezone.utc)
+    assert timedelta(days=6, hours=23, minutes=58) < delta < timedelta(days=7, minutes=2)
+
+
+# /admin/promos/{code}/revoke POST
+# ---------------------------------------------------------------------
+
+
+async def test_promos_revoke_happy_path(aiohttp_client, make_admin_app):
+    db = _stub_db(revoke_promo_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/promos/WELCOME20/revoke",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.revoke_promo_code.assert_awaited_once_with("WELCOME20")
+    resp2 = await client.get("/admin/promos")
+    body = await resp2.text()
+    assert "alert-success" in body
+    assert "Revoked" in body and "WELCOME20" in body
+
+
+async def test_promos_revoke_already_inactive_shows_info(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(revoke_promo_result=False)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/promos/GHOST/revoke",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    resp2 = await client.get("/admin/promos")
+    body = await resp2.text()
+    assert "alert-info" in body
+    # Apostrophe is HTML-escaped by Jinja's autoescape; tolerate
+    # either form so we don't couple to escape-style.
+    assert "already revoked" in body
+    assert ("doesn't exist" in body) or ("doesn&#39;t exist" in body) \
+        or ("doesn&#x27;t exist" in body)
+
+
+async def test_promos_revoke_rejects_missing_csrf(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(revoke_promo_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.post(
+        "/admin/promos/X/revoke",
+        data={},  # no csrf_token
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.revoke_promo_code.assert_not_awaited()
+
+
+async def test_promos_revoke_requires_auth(aiohttp_client, make_admin_app):
+    db = _stub_db(revoke_promo_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    resp = await client.post(
+        "/admin/promos/X/revoke",
+        data={"csrf_token": "anything"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+    db.revoke_promo_code.assert_not_awaited()
+
+
+async def test_promos_revoke_invalid_url_code(aiohttp_client, make_admin_app):
+    """Even with a valid CSRF token, junk in the URL must be rejected
+    rather than passed through to the DB."""
+    db = _stub_db(revoke_promo_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+    # 80-char code (above 64-char cap)
+    long_code = "A" * 80
+    resp = await client.post(
+        f"/admin/promos/{long_code}/revoke",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.revoke_promo_code.assert_not_awaited()
+
+
+# Flash cookie round-trip
+# ---------------------------------------------------------------------
+
+
+def test_flash_cookie_signed_round_trip():
+    """A flash cookie set with a secret must round-trip through the
+    sign + parse path. Pop should also clear the cookie."""
+    from aiohttp import web as _web
+    secret = "test-secret-1234567890"
+    response = _web.Response()
+    set_flash(response, kind="success", message="Hi", secret=secret)
+    cookie_header = response.cookies.get("meow_flash")
+    assert cookie_header is not None
+    raw_value = cookie_header.value
+
+    # Build a fake request whose cookies carry the flash cookie.
+    class _FakeApp(dict):
+        pass
+    app = _FakeApp()
+    from web_admin import APP_KEY_SESSION_SECRET
+    app[APP_KEY_SESSION_SECRET] = secret
+    req = _web.Request.__new__(_web.Request)
+    req.__dict__["_cookies"] = {"meow_flash": raw_value}
+    # Patch the _cookies property via a lambda — simpler: build a
+    # minimal stand-in object with the attributes we use.
+
+    class _R:
+        def __init__(self, cookies, app):
+            self.cookies = cookies
+            self.app = app
+
+    r = _R({"meow_flash": raw_value}, app)
+    response2 = _web.Response()
+    flash = pop_flash(r, response2)
+    assert flash == {"kind": "success", "message": "Hi"}
+    # Cookie cleared on response.
+    assert response2.cookies.get("meow_flash").value == ""
+
+
+def test_flash_cookie_rejects_tampered_signature():
+    secret = "test-secret-1234567890"
+    response = web.Response()
+    set_flash(response, kind="success", message="Hi", secret=secret)
+    raw = response.cookies.get("meow_flash").value
+    payload_b64, sig_b64 = raw.split(".", 1)
+    # Flip a byte in the signature.
+    tampered = payload_b64 + "." + ("A" + sig_b64[1:] if sig_b64[0] != "A" else "B" + sig_b64[1:])
+
+    class _FakeApp(dict):
+        pass
+    from web_admin import APP_KEY_SESSION_SECRET
+    app = _FakeApp()
+    app[APP_KEY_SESSION_SECRET] = secret
+
+    class _R:
+        def __init__(self):
+            self.cookies = {"meow_flash": tampered}
+            self.app = app
+
+    response2 = web.Response()
+    assert pop_flash(_R(), response2) is None
+
+
+# ---------------------------------------------------------------------
+# Stage-8-Part-3: gift codes UI
+# ---------------------------------------------------------------------
+
+
+from web_admin import (
+    EXPIRES_IN_DAYS_MAX,
+    GIFT_AMOUNT_MAX,
+    parse_gift_form,
+)
+
+
+# parse_gift_form (pure function)
+# ---------------------------------------------------------------------
+
+
+def test_parse_gift_form_happy_path():
+    out = parse_gift_form(_form({
+        "code": "birthday5",
+        "amount_usd": "5",
+    }))
+    assert out == {
+        "code": "BIRTHDAY5",
+        "amount_usd": 5.0,
+        "max_uses": None,
+        "expires_in_days": None,
+    }
+
+
+def test_parse_gift_form_with_dollar_sign_and_caps():
+    out = parse_gift_form(_form({
+        "code": "Welcome_Gift",
+        "amount_usd": "$10.50",
+        "max_uses": "10",
+        "expires_in_days": "30",
+    }))
+    assert out == {
+        "code": "WELCOME_GIFT",
+        "amount_usd": 10.5,
+        "max_uses": 10,
+        "expires_in_days": 30,
+    }
+
+
+def test_parse_gift_form_missing_code():
+    assert parse_gift_form(_form({
+        "amount_usd": "5",
+    })) == "missing_code"
+
+
+def test_parse_gift_form_bad_code():
+    assert parse_gift_form(_form({
+        "code": "has spaces",
+        "amount_usd": "5",
+    })) == "bad_code"
+
+
+def test_parse_gift_form_code_too_long():
+    assert parse_gift_form(_form({
+        "code": "A" * 65,
+        "amount_usd": "5",
+    })) == "bad_code"
+
+
+def test_parse_gift_form_missing_amount():
+    assert parse_gift_form(_form({"code": "X"})) == "missing_amount"
+
+
+def test_parse_gift_form_bad_amount_text():
+    assert parse_gift_form(_form({
+        "code": "X",
+        "amount_usd": "abc",
+    })) == "bad_amount"
+
+
+def test_parse_gift_form_negative_amount():
+    assert parse_gift_form(_form({
+        "code": "X",
+        "amount_usd": "-1",
+    })) == "bad_amount"
+
+
+def test_parse_gift_form_zero_amount():
+    assert parse_gift_form(_form({
+        "code": "X",
+        "amount_usd": "0",
+    })) == "bad_amount"
+
+
+def test_parse_gift_form_nan_amount():
+    assert parse_gift_form(_form({
+        "code": "X",
+        "amount_usd": "nan",
+    })) == "bad_amount"
+
+
+def test_parse_gift_form_inf_amount():
+    assert parse_gift_form(_form({
+        "code": "X",
+        "amount_usd": "inf",
+    })) == "bad_amount"
+
+
+def test_parse_gift_form_amount_at_cap_ok():
+    """Values exactly at GIFT_AMOUNT_MAX are accepted."""
+    out = parse_gift_form(_form({
+        "code": "X",
+        "amount_usd": str(GIFT_AMOUNT_MAX),
+    }))
+    assert isinstance(out, dict)
+    assert out["amount_usd"] == round(GIFT_AMOUNT_MAX, 4)
+
+
+def test_parse_gift_form_amount_over_cap():
+    assert parse_gift_form(_form({
+        "code": "X",
+        "amount_usd": "9999999",
+    })) == "amount_too_large"
+
+
+def test_parse_gift_form_bad_max_uses_text():
+    assert parse_gift_form(_form({
+        "code": "X",
+        "amount_usd": "5",
+        "max_uses": "abc",
+    })) == "bad_max_uses"
+
+
+def test_parse_gift_form_bad_max_uses_zero():
+    assert parse_gift_form(_form({
+        "code": "X",
+        "amount_usd": "5",
+        "max_uses": "0",
+    })) == "bad_max_uses"
+
+
+def test_parse_gift_form_bad_days_text():
+    assert parse_gift_form(_form({
+        "code": "X",
+        "amount_usd": "5",
+        "expires_in_days": "abc",
+    })) == "bad_days"
+
+
+def test_parse_gift_form_bad_days_negative():
+    assert parse_gift_form(_form({
+        "code": "X",
+        "amount_usd": "5",
+        "expires_in_days": "-3",
+    })) == "bad_days"
+
+
+# Bundled bug fix: oversize expires_in_days no longer crashes the
+# create handler with OverflowError; the parser rejects it cleanly.
+def test_parse_gift_form_days_too_large():
+    assert parse_gift_form(_form({
+        "code": "X",
+        "amount_usd": "5",
+        "expires_in_days": str(EXPIRES_IN_DAYS_MAX + 1),
+    })) == "days_too_large"
+
+
+def test_parse_gift_form_days_at_cap_ok():
+    out = parse_gift_form(_form({
+        "code": "X",
+        "amount_usd": "5",
+        "expires_in_days": str(EXPIRES_IN_DAYS_MAX),
+    }))
+    assert isinstance(out, dict)
+    assert out["expires_in_days"] == EXPIRES_IN_DAYS_MAX
+
+
+def test_parse_promo_form_days_too_large():
+    """Same OverflowError fix mirrored on the promo form parser."""
+    assert parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "percent",
+        "discount_value": "10",
+        "expires_in_days": str(EXPIRES_IN_DAYS_MAX + 1),
+    })) == "days_too_large"
+
+
+def test_parse_promo_form_days_at_cap_ok():
+    out = parse_promo_form(_form({
+        "code": "X",
+        "discount_kind": "percent",
+        "discount_value": "10",
+        "expires_in_days": str(EXPIRES_IN_DAYS_MAX),
+    }))
+    assert isinstance(out, dict)
+    assert out["expires_in_days"] == EXPIRES_IN_DAYS_MAX
+
+
+# create_gift_code DB upper-bound guard (pure unit test)
+# ---------------------------------------------------------------------
+
+
+def test_create_gift_code_rejects_amount_over_decimal_cap():
+    """DB layer must also reject amount_usd > DECIMAL(10,4) capacity
+    so a hypothetical caller bypassing parse_gift_form (e.g. a future
+    JSON API) can't trigger PG ``numeric field overflow``."""
+    from database import Database
+    db = Database.__new__(Database)
+    db.pool = None
+    import asyncio
+    with pytest.raises(ValueError, match="DECIMAL"):
+        asyncio.get_event_loop().run_until_complete(
+            db.create_gift_code(
+                code="X",
+                amount_usd=1_000_000.0,
+            )
+        )
+
+
+def test_create_gift_code_rejects_zero_amount():
+    from database import Database
+    db = Database.__new__(Database)
+    db.pool = None
+    import asyncio
+    with pytest.raises(ValueError, match="positive"):
+        asyncio.get_event_loop().run_until_complete(
+            db.create_gift_code(code="X", amount_usd=0.0)
+        )
+
+
+def test_create_gift_code_rejects_negative_max_uses():
+    from database import Database
+    db = Database.__new__(Database)
+    db.pool = None
+    import asyncio
+    with pytest.raises(ValueError, match="max_uses"):
+        asyncio.get_event_loop().run_until_complete(
+            db.create_gift_code(
+                code="X", amount_usd=5.0, max_uses=-1,
+            )
+        )
+
+
+# /admin/gifts GET
+# ---------------------------------------------------------------------
+
+
+async def test_gifts_get_requires_auth(aiohttp_client, make_admin_app):
+    client = await aiohttp_client(make_admin_app())
+    resp = await client.get("/admin/gifts", allow_redirects=False)
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+
+
+async def test_gifts_get_lists_codes(aiohttp_client, make_admin_app):
+    rows = [
+        {
+            "code": "BIRTHDAY5",
+            "amount_usd": 5.0,
+            "max_uses": 10,
+            "used_count": 3,
+            "expires_at": "2030-12-31T23:59:59+00:00",
+            "is_active": True,
+            "created_at": "2026-01-01T00:00:00+00:00",
+        },
+        {
+            "code": "REVOKED_GIFT",
+            "amount_usd": 1.5,
+            "max_uses": None,
+            "used_count": 0,
+            "expires_at": None,
+            "is_active": False,
+            "created_at": "2025-01-01T00:00:00+00:00",
+        },
+    ]
+    client = await aiohttp_client(
+        make_admin_app(password="pw", db=_stub_db(gift_rows=rows))
+    )
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.get("/admin/gifts")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert "BIRTHDAY5" in body
+    assert "$5.00" in body
+    assert "3 /" in body  # used_count / max_uses
+    assert "10" in body
+    assert "REVOKED_GIFT" in body
+    assert "$1.50" in body
+    assert "active" in body
+    assert "revoked" in body
+    assert 'action="/admin/gifts/BIRTHDAY5/revoke"' in body
+
+
+async def test_gifts_get_db_error_renders_banner(
+    aiohttp_client, make_admin_app
+):
+    db = AsyncMock()
+    db.list_gift_codes = AsyncMock(side_effect=RuntimeError("boom"))
+    client = await aiohttp_client(
+        make_admin_app(password="pw", db=db)
+    )
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.get("/admin/gifts")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert "Database query failed" in body
+
+
+async def test_layout_has_gifts_nav_link(aiohttp_client, make_admin_app):
+    """The sidebar should now show Gift codes as a real link, not
+    the disabled coming-soon placeholder Stage-8-Part-1 left."""
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.get("/admin/")
+    body = await resp.text()
+    assert 'href="/admin/gifts"' in body
+    assert "Coming in Stage-8-Part-3" not in body
+
+
+# /admin/gifts POST (create)
+# ---------------------------------------------------------------------
+
+
+async def _login_and_get_gift_csrf(client, password: str = "pw") -> str:
+    """Log in, fetch the gifts page, scrape its CSRF token."""
+    await client.post(
+        "/admin/login", data={"password": password}, allow_redirects=False
+    )
+    resp = await client.get("/admin/gifts")
+    body = await resp.text()
+    import re
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+    assert m, "Expected CSRF token in /admin/gifts form"
+    return m.group(1)
+
+
+async def test_gifts_create_happy_path(aiohttp_client, make_admin_app):
+    db = _stub_db(create_gift_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_gift_csrf(client, "pw")
+
+    resp = await client.post(
+        "/admin/gifts",
+        data={
+            "csrf_token": csrf,
+            "code": "BIRTHDAY5",
+            "amount_usd": "5",
+            "max_uses": "10",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/gifts"
+    db.create_gift_code.assert_awaited_once()
+    kwargs = db.create_gift_code.await_args.kwargs
+    assert kwargs["code"] == "BIRTHDAY5"
+    assert kwargs["amount_usd"] == 5.0
+    assert kwargs["max_uses"] == 10
+    assert kwargs["expires_at"] is None
+
+    resp2 = await client.get("/admin/gifts")
+    body = await resp2.text()
+    assert "alert-success" in body
+    assert "Created" in body and "BIRTHDAY5" in body
+
+
+async def test_gifts_create_rejects_missing_csrf(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.post(
+        "/admin/gifts",
+        data={"code": "X", "amount_usd": "5"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.create_gift_code.assert_not_awaited()
+    resp2 = await client.get("/admin/gifts")
+    body = await resp2.text()
+    assert "CSRF" in body
+
+
+async def test_gifts_create_rejects_wrong_csrf(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login_and_get_gift_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/gifts",
+        data={
+            "csrf_token": "obviously-wrong",
+            "code": "X",
+            "amount_usd": "5",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.create_gift_code.assert_not_awaited()
+
+
+async def test_gifts_create_validation_error_shows_flash(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_gift_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/gifts",
+        data={
+            "csrf_token": csrf,
+            "code": "BAD",
+            "amount_usd": "-1",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.create_gift_code.assert_not_awaited()
+    resp2 = await client.get("/admin/gifts")
+    body = await resp2.text()
+    assert "alert-error" in body
+    assert "Amount must be" in body
+
+
+async def test_gifts_create_oversized_days_does_not_crash(
+    aiohttp_client, make_admin_app
+):
+    """The bundled bug fix: a huge expires_in_days no longer crashes
+    the handler with OverflowError → 500. It now flashes a friendly
+    error and re-renders the page."""
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_gift_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/gifts",
+        data={
+            "csrf_token": csrf,
+            "code": "BIG",
+            "amount_usd": "5",
+            "expires_in_days": str(10**18),  # would OverflowError timedelta
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.create_gift_code.assert_not_awaited()
+    resp2 = await client.get("/admin/gifts")
+    body = await resp2.text()
+    assert "alert-error" in body
+    assert "100 years" in body or "at most" in body
+
+
+async def test_gifts_create_duplicate_shows_flash(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(create_gift_result=False)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_gift_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/gifts",
+        data={
+            "csrf_token": csrf,
+            "code": "BIRTHDAY5",
+            "amount_usd": "5",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    resp2 = await client.get("/admin/gifts")
+    body = await resp2.text()
+    assert "alert-error" in body
+    assert "already exists" in body
+
+
+async def test_gifts_create_db_value_error_shows_flash(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(create_gift_result=ValueError("DECIMAL(10,4) limit"))
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_gift_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/gifts",
+        data={
+            "csrf_token": csrf,
+            "code": "BIG",
+            "amount_usd": "100",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    resp2 = await client.get("/admin/gifts")
+    body = await resp2.text()
+    assert "alert-error" in body
+    assert "DECIMAL" in body
+
+
+async def test_gifts_create_expires_in_days_passes_through(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(create_gift_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_gift_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/gifts",
+        data={
+            "csrf_token": csrf,
+            "code": "EXPIRING",
+            "amount_usd": "5",
+            "expires_in_days": "7",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    kwargs = db.create_gift_code.await_args.kwargs
+    assert kwargs["expires_at"] is not None
+    delta = kwargs["expires_at"] - datetime.now(timezone.utc)
+    assert timedelta(days=6, hours=23, minutes=58) < delta < timedelta(days=7, minutes=2)
+
+
+# /admin/gifts/{code}/revoke POST
+# ---------------------------------------------------------------------
+
+
+async def test_gifts_revoke_happy_path(aiohttp_client, make_admin_app):
+    db = _stub_db(revoke_gift_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_gift_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/gifts/BIRTHDAY5/revoke",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.revoke_gift_code.assert_awaited_once_with("BIRTHDAY5")
+    resp2 = await client.get("/admin/gifts")
+    body = await resp2.text()
+    assert "alert-success" in body
+    assert "Revoked" in body and "BIRTHDAY5" in body
+
+
+async def test_gifts_revoke_already_inactive_shows_info(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(revoke_gift_result=False)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_gift_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/gifts/GHOST/revoke",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    resp2 = await client.get("/admin/gifts")
+    body = await resp2.text()
+    assert "alert-info" in body
+    assert "already revoked" in body
+    assert ("doesn't exist" in body) or ("doesn&#39;t exist" in body) \
+        or ("doesn&#x27;t exist" in body)
+
+
+async def test_gifts_revoke_rejects_missing_csrf(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(revoke_gift_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.post(
+        "/admin/gifts/X/revoke",
+        data={},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.revoke_gift_code.assert_not_awaited()
+
+
+async def test_gifts_revoke_requires_auth(aiohttp_client, make_admin_app):
+    db = _stub_db(revoke_gift_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    resp = await client.post(
+        "/admin/gifts/X/revoke",
+        data={"csrf_token": "anything"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+    db.revoke_gift_code.assert_not_awaited()
+
+
+async def test_gifts_revoke_invalid_url_code(aiohttp_client, make_admin_app):
+    db = _stub_db(revoke_gift_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_gift_csrf(client, "pw")
+    long_code = "A" * 80
+    resp = await client.post(
+        f"/admin/gifts/{long_code}/revoke",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.revoke_gift_code.assert_not_awaited()
