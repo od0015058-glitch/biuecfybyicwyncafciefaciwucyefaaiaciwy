@@ -151,11 +151,18 @@ _STRINGS: dict[str, dict[str, str]] = {
             "صفحه {page} از {total_pages}"
         ),
         # ---- Wallet ----
+        # Stage-11-Step-D: ``{toman_line}`` is an optional pre-newlined
+        # annotation supplied by ``wallet_display.format_toman_annotation``.
+        # Empty when no FX rate is cached, ``\n≈ N تومان`` when it is, or
+        # ``\n≈ N تومان (نرخ تقریبی)`` when the cached rate is stale.
+        # The wallet is still denominated in USD — Toman is display-only.
         "wallet_text": (
             "👛 **کیف پول شما**\n\n"
-            "موجودی فعلی: ${balance:.2f}\n\n"
+            "موجودی فعلی: ${balance:.2f}{toman_line}\n\n"
             "برای شارژ حساب کلیک کنید:"
         ),
+        "wallet_toman_line": "≈ {toman:,.0f} تومان",
+        "wallet_toman_line_stale": "≈ {toman:,.0f} تومان (نرخ تقریبی)",
         "btn_add_crypto": "➕ شارژ حساب (Crypto)",
         # ---- Charge wallet flow ----
         "charge_pick_amount": (
@@ -474,11 +481,14 @@ _STRINGS: dict[str, dict[str, str]] = {
             "Page {page} of {total_pages}"
         ),
         # ---- Wallet ----
+        # Stage-11-Step-D: see fa-locale comment above.
         "wallet_text": (
             "👛 **Your wallet**\n\n"
-            "Current balance: ${balance:.2f}\n\n"
+            "Current balance: ${balance:.2f}{toman_line}\n\n"
             "Tap below to top up:"
         ),
+        "wallet_toman_line": "≈ {toman:,.0f} TMN",
+        "wallet_toman_line_stale": "≈ {toman:,.0f} TMN (approx)",
         "btn_add_crypto": "➕ Top up (Crypto)",
         # ---- Charge wallet flow ----
         "charge_pick_amount": (
