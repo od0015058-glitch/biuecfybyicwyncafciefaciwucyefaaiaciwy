@@ -15,7 +15,9 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from ai_engine import chat_with_model
+from amount_input import normalize_amount
 from database import db
+from fx_rates import convert_toman_to_usd, get_usd_to_toman_snapshot
 from models_catalog import CatalogModel, get_catalog
 from payments import (
     GLOBAL_MIN_TOPUP_USD,
@@ -36,6 +38,11 @@ router = Router()
 
 class UserStates(StatesGroup):
     waiting_custom_amount = State()
+    # Stage-11-Step-B: a separate FSM state for the Toman entry flow.
+    # Kept distinct from ``waiting_custom_amount`` so we don't have to
+    # smuggle a "currency_mode" flag in FSM data and can wire different
+    # error strings / prompts per entry path.
+    waiting_toman_amount = State()
     waiting_promo_code = State()
     waiting_gift_code = State()
 
@@ -1253,6 +1260,11 @@ async def _render_charge_pick_amount(message, lang: str, state: FSMContext) -> N
     builder.button(text=t(lang, "btn_amt_10"), callback_data="amt_10")
     builder.button(text=t(lang, "btn_amt_25"), callback_data="amt_25")
     builder.button(text=t(lang, "btn_amt_custom"), callback_data="amt_custom")
+    # Stage-11-Step-B: Toman entry sits alongside USD custom. Wallet
+    # balance is still in USD — this button just lets Iranian users
+    # *type* the amount in TMN. The handler converts to USD on entry
+    # using the live fx_rates ticker.
+    builder.button(text=t(lang, "btn_amt_toman"), callback_data="amt_toman")
     if banner:
         # Promo applied → offer removal in place of add.
         builder.button(text=t(lang, "btn_promo_remove"), callback_data="remove_promo")
@@ -1260,8 +1272,9 @@ async def _render_charge_pick_amount(message, lang: str, state: FSMContext) -> N
         builder.button(text=t(lang, "btn_promo_enter"), callback_data="enter_promo")
     builder.button(text=t(lang, "btn_back_to_wallet"), callback_data="back_to_wallet")
     builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
-    # Layout: 3 amount buttons | custom row | promo row | back+home.
-    builder.adjust(3, 1, 1, 2)
+    # Layout: 3 fixed-USD amounts | custom USD row | custom Toman row
+    # | promo row | back+home.
+    builder.adjust(3, 1, 1, 1, 2)
 
     text = t(lang, "charge_pick_amount")
     if banner:
@@ -1383,10 +1396,11 @@ async def process_promo_input(message: Message, state: FSMContext):
 
 
 # Step 2 (custom-amount path): prompt for free-text input
-# IMPORTANT: the specific "amt_custom" handler must be registered BEFORE the
-# generic "amt_*" prefix handler. aiogram v3 dispatches the first matching
-# handler, so registering the prefix first would swallow "amt_custom" and
-# the custom-amount flow would be unreachable.
+# IMPORTANT: the specific "amt_custom" / "amt_toman" handlers must be
+# registered BEFORE the generic "amt_*" prefix handler. aiogram v3
+# dispatches the first matching handler, so registering the prefix
+# first would swallow "amt_custom" and the custom-amount flow would be
+# unreachable.
 @router.callback_query(F.data == "amt_custom")
 async def process_custom_amount_request(callback: CallbackQuery, state: FSMContext):
     await state.set_state(UserStates.waiting_custom_amount)
@@ -1397,6 +1411,42 @@ async def process_custom_amount_request(callback: CallbackQuery, state: FSMConte
     builder.adjust(2)
     await callback.message.edit_text(
         t(lang, "charge_custom_prompt"), reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+
+# Stage-11-Step-B: Toman entry (lets an Iranian user type the amount
+# in tomans, converts to USD on the fly). Registered BEFORE the
+# generic ``amt_*`` handler for the same aiogram-dispatch reason noted
+# above.
+@router.callback_query(F.data == "amt_toman")
+async def process_toman_amount_request(callback: CallbackQuery, state: FSMContext):
+    lang = await _get_user_language(callback.from_user.id)
+    snap = await get_usd_to_toman_snapshot()
+    builder = InlineKeyboardBuilder()
+    builder.button(text=t(lang, "btn_cancel"), callback_data="add_crypto")
+    builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+    builder.adjust(2)
+    if snap is None:
+        # No rate, no meaningful Toman prompt. Tell the user clearly
+        # and keep them on the amount picker via the Cancel button.
+        # We do NOT transition to waiting_toman_amount because the
+        # next message can't be parsed without a rate anyway.
+        await callback.message.edit_text(
+            t(lang, "charge_toman_no_rate"),
+            reply_markup=builder.as_markup(),
+        )
+        await callback.answer()
+        return
+    await state.set_state(UserStates.waiting_toman_amount)
+    min_toman = GLOBAL_MIN_TOPUP_USD * snap.toman_per_usd
+    await callback.message.edit_text(
+        t(
+            lang, "charge_toman_prompt",
+            rate_toman=snap.toman_per_usd,
+            min_toman=min_toman,
+        ),
+        reply_markup=builder.as_markup(),
     )
     await callback.answer()
 
@@ -1518,19 +1568,12 @@ async def process_custom_amount_input(message: Message, state: FSMContext):
     # empty string so the float parse below fails the same way an
     # alphabetic message would and we route through ``charge_custom_invalid``.
     raw_text = (message.text or "").strip()
-    try:
-        amount = float(raw_text.replace("$", ""))
-    except ValueError:
-        await message.answer(t(lang, "charge_custom_invalid"))
-        return
-
-    # Reject NaN / Inf — float() happily parses 'nan' and 'inf', and
-    # NaN comparisons silently return False so any naive `amount < 5`
-    # check would let it through and then explode downstream when
-    # NowPayments rejects the JSON or our DECIMAL(20,8) column trips.
-    # `not (amount > 0)` is True for NaN and -Inf simultaneously, but
-    # we still want a clean upper bound, so cap explicitly too.
-    if not (amount == amount) or amount in (float("inf"), float("-inf")):
+    # Stage-11-Step-B: route through ``amount_input.normalize_amount``
+    # so fa-digits and thousand-separators work in the USD path too.
+    # ``normalize_amount`` already rejects NaN / Inf / ≤0 / empty, so
+    # a ``None`` return is unambiguously "invalid input".
+    amount = normalize_amount(raw_text)
+    if amount is None:
         await message.answer(t(lang, "charge_custom_invalid"))
         return
 
@@ -1568,6 +1611,89 @@ async def process_custom_amount_input(message: Message, state: FSMContext):
 
     await message.answer(
         t(lang, "charge_custom_amount_saved", amount=amount),
+        reply_markup=builder.as_markup(),
+    )
+
+
+@router.message(UserStates.waiting_toman_amount)
+async def process_toman_amount_input(message: Message, state: FSMContext):
+    """Stage-11-Step-B: accept a free-text Toman amount, convert to
+    USD via the live fx_rates ticker, and hand off to the same
+    currency picker the USD path uses.
+
+    The wallet is always denominated in USD — conversion happens
+    *here* at entry time. The USD figure we stash in FSM data
+    (``custom_amount``) flows through the existing NowPayments
+    invoice path unchanged; Toman is input-layer only.
+
+    If the rate ticker has no rate at all (cold boot, prolonged
+    source outage), we refuse rather than guess — the prompt
+    already told the user the rate was unavailable.
+    """
+    if message.from_user is None:
+        return
+    lang = await _get_user_language(message.from_user.id)
+    raw_text = (message.text or "").strip()
+    entered_toman = normalize_amount(raw_text)
+    if entered_toman is None:
+        await message.answer(t(lang, "charge_toman_invalid"))
+        return
+
+    usd_amount = await convert_toman_to_usd(entered_toman)
+    snap = await get_usd_to_toman_snapshot()
+    if usd_amount is None or snap is None:
+        await message.answer(t(lang, "charge_toman_no_rate"))
+        return
+
+    # Reject fat-fingered entries below $2 equivalent using the same
+    # threshold the USD path uses, but render the error in Toman so
+    # the user sees what they actually typed.
+    if usd_amount < GLOBAL_MIN_TOPUP_USD:
+        min_toman = GLOBAL_MIN_TOPUP_USD * snap.toman_per_usd
+        await message.answer(
+            t(
+                lang, "charge_toman_min_error",
+                min_toman=min_toman,
+                entered_toman=entered_toman,
+            )
+        )
+        return
+
+    # Upper bound on the converted USD figure — same $10k rail the
+    # USD path uses. A 1 000 000 000 TMN entry should fail cleanly
+    # rather than create a $10k+ invoice.
+    if usd_amount > 10_000:
+        await message.answer(t(lang, "charge_toman_invalid"))
+        return
+
+    # Round the USD figure to cents so downstream DECIMAL columns and
+    # NowPayments invoice totals render as ``$12.34`` rather than
+    # ``$12.345678``. We keep the raw Toman entry in FSM data for
+    # the confirmation string only.
+    usd_amount_rounded = round(usd_amount, 2)
+
+    await state.set_state(None)
+    await state.update_data(
+        custom_amount=usd_amount_rounded,
+        toman_entry=entered_toman,
+        toman_rate_at_entry=snap.toman_per_usd,
+    )
+
+    builder = InlineKeyboardBuilder()
+    for label, ticker in SUPPORTED_PAY_CURRENCIES:
+        builder.button(text=label, callback_data=f"cur_{ticker}")
+    # Back returns to the Toman prompt, not the USD one.
+    builder.button(text=t(lang, "btn_back"), callback_data="amt_toman")
+    builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+    builder.adjust(*_CURRENCY_ROWS_LAYOUT, 2)
+
+    await message.answer(
+        t(
+            lang, "charge_toman_amount_saved",
+            entered_toman=entered_toman,
+            amount=usd_amount_rounded,
+            rate_toman=snap.toman_per_usd,
+        ),
         reply_markup=builder.as_markup(),
     )
 

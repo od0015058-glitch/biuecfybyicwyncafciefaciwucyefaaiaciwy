@@ -166,16 +166,39 @@ _STRINGS: dict[str, dict[str, str]] = {
         "btn_amt_5": "💵 $5",
         "btn_amt_10": "💵 $10",
         "btn_amt_25": "💵 $25",
-        "btn_amt_custom": "✏️ مبلغ دلخواه",
+        "btn_amt_custom": "✏️ مبلغ دلخواه (دلار)",
+        "btn_amt_toman": "✏️ مبلغ دلخواه (تومان)",
         "charge_custom_prompt": (
-            "✏️ مبلغ دلخواه خود را وارد کنید:\n\n"
+            "✏️ مبلغ دلخواه خود را به دلار وارد کنید:\n\n"
             "💡 حداقل: $2\n"
             "💡 مثال: 15 یا 25.5"
         ),
+        "charge_toman_prompt": (
+            "✏️ مبلغ مورد نظر خود را به تومان وارد کنید:\n\n"
+            "💡 نرخ فعلی: هر دلار ≈ {rate_toman:,.0f} تومان\n"
+            "💡 حداقل معادل: $2 (≈ {min_toman:,.0f} تومان)\n"
+            "💡 مثال: 400000 یا ۴۰۰٬۰۰۰"
+        ),
+        "charge_toman_no_rate": (
+            "⚠️ در حال حاضر نرخ زنده دلار به تومان در دسترس نیست.\n"
+            "لطفاً چند دقیقه بعد دوباره تلاش کنید یا مبلغ را به دلار وارد کنید."
+        ),
         "charge_custom_min_error": "❌ حداقل مبلغ $2 است.",
+        "charge_toman_min_error": (
+            "❌ حداقل معادل $2 است (≈ {min_toman:,.0f} تومان). "
+            "شما وارد کردید: {entered_toman:,.0f} تومان."
+        ),
         "charge_custom_invalid": "❌ لطفاً یک عدد معتبر وارد کنید (مثال: 15 یا 20.5)",
+        "charge_toman_invalid": (
+            "❌ لطفاً یک عدد معتبر وارد کنید (مثال: 400000 یا ۴۰۰٬۰۰۰)."
+        ),
         "charge_custom_amount_saved": (
             "💵 مبلغ ${amount:.2f} ثبت شد.\n\n🪙 ارز مورد نظر را انتخاب کنید:"
+        ),
+        "charge_toman_amount_saved": (
+            "💵 مبلغ {entered_toman:,.0f} تومان ≈ ${amount:.2f} ثبت شد.\n"
+            "(نرخ تبدیل: هر دلار ≈ {rate_toman:,.0f} تومان)\n\n"
+            "🪙 روش پرداخت را انتخاب کنید:"
         ),
         "charge_pick_currency": "💰 مبلغ: **${amount}**\n\n🪙 ارز خود را انتخاب کنید:",
         "charge_amount_lost": "❌ مبلغ یافت نشد. دوباره تلاش کنید.",
@@ -446,16 +469,39 @@ _STRINGS: dict[str, dict[str, str]] = {
         "btn_amt_5": "💵 $5",
         "btn_amt_10": "💵 $10",
         "btn_amt_25": "💵 $25",
-        "btn_amt_custom": "✏️ Custom amount",
+        "btn_amt_custom": "✏️ Custom (USD)",
+        "btn_amt_toman": "✏️ Custom (Toman)",
         "charge_custom_prompt": (
-            "✏️ Enter your custom amount:\n\n"
+            "✏️ Enter your custom amount in USD:\n\n"
             "💡 Minimum: $2\n"
             "💡 Examples: 15 or 25.5"
         ),
+        "charge_toman_prompt": (
+            "✏️ Enter the amount you want to top up, in Toman:\n\n"
+            "💡 Current rate: 1 USD ≈ {rate_toman:,.0f} TMN\n"
+            "💡 Minimum: $2 (≈ {min_toman:,.0f} TMN)\n"
+            "💡 Examples: 400000 or ۴۰۰٬۰۰۰"
+        ),
+        "charge_toman_no_rate": (
+            "⚠️ The live USD→Toman rate is not available right now.\n"
+            "Please try again in a few minutes, or enter the amount in USD instead."
+        ),
         "charge_custom_min_error": "❌ Minimum amount is $2.",
+        "charge_toman_min_error": (
+            "❌ Minimum is the equivalent of $2 (≈ {min_toman:,.0f} TMN). "
+            "You entered: {entered_toman:,.0f} TMN."
+        ),
         "charge_custom_invalid": "❌ Please enter a valid number (example: 15 or 20.5).",
+        "charge_toman_invalid": (
+            "❌ Please enter a valid number (example: 400000 or ۴۰۰٬۰۰۰)."
+        ),
         "charge_custom_amount_saved": (
             "💵 ${amount:.2f} saved.\n\n🪙 Pick your currency:"
+        ),
+        "charge_toman_amount_saved": (
+            "💵 {entered_toman:,.0f} TMN ≈ ${amount:.2f} saved.\n"
+            "(Conversion rate: 1 USD ≈ {rate_toman:,.0f} TMN)\n\n"
+            "🪙 Pick a payment method:"
         ),
         "charge_pick_currency": "💰 Amount: **${amount}**\n\n🪙 Pick your currency:",
         "charge_amount_lost": "❌ Amount not found. Please try again.",
