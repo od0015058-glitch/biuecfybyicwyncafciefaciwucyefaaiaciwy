@@ -222,19 +222,48 @@ class Database:
         in that case no balance change is made.
 
         Defense-in-depth: refuses to attempt the SQL when ``cost_usd`` is
-        ``NaN`` / ``±Infinity``. The pre-fix WHERE clause
-        ``balance_usd >= $1`` is already a silent no-op for ``NaN`` (every
-        comparison against ``NaN`` is ``False``), but a negative-Infinity
-        cost would *match* for any finite balance and try to write
-        ``balance_usd - (-inf) = inf`` into the row, bricking the wallet
-        the same way PR #75 prevented at the IPN layer. Returning
-        ``False`` here mirrors the "insufficient funds" path the caller
-        already handles.
+        ``NaN`` / ``±Infinity`` or strictly negative. The pre-fix WHERE
+        clause ``balance_usd >= $1`` is already a silent no-op for
+        ``NaN`` (every comparison against ``NaN`` is ``False``), but a
+        negative-Infinity cost would *match* for any finite balance and
+        try to write ``balance_usd - (-inf) = inf`` into the row,
+        bricking the wallet the same way PR #75 prevented at the IPN
+        layer. A *finite* negative ``cost_usd`` is just as bad — the
+        WHERE clause ``balance_usd >= -5`` is True for every solvent
+        wallet, and ``SET balance_usd = balance_usd - (-5)`` then
+        silently credits $5 without writing a ``transactions`` ledger
+        row. Today the only caller (``ai_engine.chat_with_model`` →
+        ``pricing._apply_markup``) clamps the cost to ``[0, ∞)`` via
+        ``max(raw * markup, 0.0)`` before it gets here, so a sign-
+        flipped price (negative ``input_per_1m_usd`` from a
+        misconfigured model row) currently rounds to a $0 free reply
+        rather than a credit. But that clamp lives one module away,
+        and a future caller / refactor / test stub bypassing it would
+        re-open the hole — we already paid the cost of having
+        ``transactions`` be the canonical ledger, so any wallet
+        movement that doesn't go through it is an audit-trail
+        regression. Refuse non-finite OR negative ``cost_usd`` here so
+        the only way money flows into a user's wallet is through
+        ``finalize_payment`` / ``admin_adjust_balance`` / gift / promo
+        — every one of which writes a ``transactions`` row in the
+        same DB transaction.
+
+        Returning ``False`` mirrors the "insufficient funds" path the
+        caller already handles.
         """
         if not _is_finite_amount(cost_usd):
             log.error(
                 "deduct_balance refused for telegram_id=%s: non-finite "
                 "cost_usd=%r (NaN / Infinity)",
+                telegram_id,
+                cost_usd,
+            )
+            return False
+        if cost_usd < 0:
+            log.error(
+                "deduct_balance refused for telegram_id=%s: negative "
+                "cost_usd=%r — would silently credit the wallet without "
+                "a transactions ledger row.",
                 telegram_id,
                 cost_usd,
             )
