@@ -18,6 +18,7 @@ import math
 import pytest
 
 
+from amount_input import normalize_amount
 from payments import GLOBAL_MIN_TOPUP_USD
 
 
@@ -29,18 +30,26 @@ def _validate_custom_amount(raw: str | None) -> tuple[bool, str | None]:
     (e.g. when a user sends a sticker / photo while in
     waiting_custom_amount) is treated like an empty string and
     rejected as ``not_a_number``.
-    """
-    raw_text = (raw or "").strip()
-    try:
-        amount = float(raw_text.replace("$", ""))
-    except ValueError:
-        return False, "not_a_number"
 
-    if not (amount == amount) or amount in (
-        float("inf"),
-        float("-inf"),
-    ):
-        return False, "nan_or_inf"
+    Stage-11-Step-B: handlers.py now delegates input-level rejection
+    (unparseable text, NaN, Inf, ≤0) to ``amount_input.normalize_amount``;
+    this mirror does the same so reject reasons stay aligned.
+    """
+    raw_text = (raw or "").strip() if isinstance(raw, str) else ""
+    amount = normalize_amount(raw_text)
+    if amount is None:
+        # normalize_amount swallows NaN / Inf / unparseable /
+        # negative / zero into one bucket. For the drift guard we
+        # just need to confirm rejection — the reason is informative
+        # only. Classify by a re-parse so downstream tests that
+        # expect "nan_or_inf" vs "not_a_number" still bucket right.
+        try:
+            raw_float = float((raw or "").strip().replace("$", ""))
+        except (ValueError, AttributeError, TypeError):
+            return False, "not_a_number"
+        if raw_float != raw_float or raw_float in (float("inf"), float("-inf")):
+            return False, "nan_or_inf"
+        return False, "not_a_number"
 
     if amount < GLOBAL_MIN_TOPUP_USD:
         return False, "below_min"
@@ -109,24 +118,27 @@ def test_valid_amounts_pass(value, parsed):
 
 
 def test_handler_validation_matches_inline_helper():
-    """Cheap smoke test: verify the real handler still has both the
-    NaN/Inf rejection and the upper-bound check that this test mirrors.
+    """Cheap smoke test: verify the real handler still exercises
+    ``normalize_amount`` (which owns the NaN/Inf/empty rejection) and
+    both the $2 lower bound and the $10k upper bound.
+
     Catches drift if someone edits handlers.py without updating the
-    inline copy here.
+    inline mirror above.
     """
     handlers_src = (
         __import__("pathlib").Path(__file__).resolve().parent.parent
         / "handlers.py"
     ).read_text()
-    assert "amount == amount" in handlers_src, (
-        "NaN check `amount == amount` missing from handlers.py — "
-        "process_custom_amount_input would silently accept NaN"
+    assert "normalize_amount(raw_text)" in handlers_src, (
+        "handlers.py no longer funnels custom-amount input through "
+        "amount_input.normalize_amount — NaN/Inf/empty rejection is at risk"
     )
-    assert "amount > 10_000" in handlers_src, (
-        "Upper-bound check `amount > 10_000` missing from handlers.py "
-        "— process_custom_amount_input would accept arbitrary amounts"
+    assert "amount > 10_000" in handlers_src or "usd_amount > 10_000" in handlers_src, (
+        "Upper-bound check missing from handlers.py — the USD path "
+        "would accept arbitrary amounts"
     )
-    assert "amount < GLOBAL_MIN_TOPUP_USD" in handlers_src, (
-        "Lower-bound check `amount < GLOBAL_MIN_TOPUP_USD` missing from "
-        "handlers.py — the $2 floor would be bypassed"
+    assert "amount < GLOBAL_MIN_TOPUP_USD" in handlers_src or \
+           "usd_amount < GLOBAL_MIN_TOPUP_USD" in handlers_src, (
+        "Lower-bound check missing from handlers.py — the $2 floor "
+        "would be bypassed"
     )
