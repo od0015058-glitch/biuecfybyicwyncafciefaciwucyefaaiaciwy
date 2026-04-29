@@ -18,6 +18,7 @@ from fx_rates import refresh_usd_to_toman_loop
 from model_discovery import discover_new_models_loop
 from payments import payment_webhook, refresh_min_amounts_loop
 from tetrapay import tetrapay_webhook
+from pending_alert import start_pending_alert_task
 from pending_expiration import start_pending_expiration_task
 from rate_limit import install_webhook_rate_limit
 from web_admin import setup_admin_routes
@@ -173,6 +174,15 @@ async def main():
     # pending_expiration.py for the full contract.
     expiration_task = start_pending_expiration_task(bot)
 
+    # Stage-12-Step-B: proactive admin alert loop for stuck PENDING
+    # transactions. Wakes every PENDING_ALERT_INTERVAL_MIN minutes
+    # (default 30) and DMs admins about PENDING rows older than
+    # PENDING_ALERT_THRESHOLD_HOURS (default 2). Per-row dedupe is
+    # by hour-bucket so the same stuck row alerts at most once per
+    # crossed integer hour. See pending_alert.py for the full
+    # contract + per-admin fault isolation policy.
+    pending_alert_task = start_pending_alert_task(bot)
+
     # Background refresher for NowPayments per-currency min-amounts.
     # Keeps the in-memory cache warm so the checkout pre-flight check
     # (see handlers._preflight_min_amount_check) never blocks on a
@@ -240,6 +250,13 @@ async def main():
             pass
         except Exception:
             log.exception("pending-expiration reaper exited with error")
+        pending_alert_task.cancel()
+        try:
+            await pending_alert_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("pending-alert loop exited with error")
         await runner.cleanup()
         await db.close()
         await bot.session.close()

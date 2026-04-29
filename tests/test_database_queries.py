@@ -92,8 +92,13 @@ async def test_get_system_metrics_returns_shape():
     conn.fetchval = AsyncMock(side_effect=lambda *a, **k: next(fetchval_vals))
     conn.fetch = AsyncMock(return_value=[])
     # Stage-9-Step-9: pending_payments tile reads via fetchrow.
+    # Stage-12-Step-B: ``over_threshold_count`` joined onto the same
+    # row so the dashboard tile and the proactive alert loop share
+    # one canonical "stuck" definition.
     conn.fetchrow = AsyncMock(return_value={
-        "count": 0, "oldest_age_hours": None,
+        "count": 0,
+        "oldest_age_hours": None,
+        "over_threshold_count": 0,
     })
 
     db = database_module.Database()
@@ -105,6 +110,8 @@ async def test_get_system_metrics_returns_shape():
         "users_total", "users_active_7d", "revenue_usd",
         "spend_usd", "top_models",
         "pending_payments_count", "pending_payments_oldest_age_hours",
+        "pending_payments_over_threshold_count",
+        "pending_alert_threshold_hours",
     }
     assert result["users_total"] == 10
     assert result["users_active_7d"] == 3
@@ -113,6 +120,10 @@ async def test_get_system_metrics_returns_shape():
     assert result["top_models"] == []
     assert result["pending_payments_count"] == 0
     assert result["pending_payments_oldest_age_hours"] is None
+    assert result["pending_payments_over_threshold_count"] == 0
+    # Default threshold = 2 h (mirrors PENDING_ALERT_THRESHOLD_HOURS
+    # default in pending_alert.py).
+    assert result["pending_alert_threshold_hours"] == 2
 
 
 # ---------------------------------------------------------------------
@@ -1336,7 +1347,9 @@ async def test_get_system_metrics_includes_pending_payments_count():
     conn.fetchval = AsyncMock(side_effect=lambda *a, **k: 0)
     conn.fetch = AsyncMock(return_value=[])
     conn.fetchrow = AsyncMock(return_value={
-        "count": 3, "oldest_age_hours": 2.5,
+        "count": 3,
+        "oldest_age_hours": 2.5,
+        "over_threshold_count": 2,
     })
 
     db = database_module.Database()
@@ -1346,6 +1359,7 @@ async def test_get_system_metrics_includes_pending_payments_count():
 
     assert result["pending_payments_count"] == 3
     assert result["pending_payments_oldest_age_hours"] == 2.5
+    assert result["pending_payments_over_threshold_count"] == 2
 
     # Pin the SQL: filter MUST be exactly status='PENDING'.
     pending_sql = conn.fetchrow.await_args.args[0]
@@ -1367,7 +1381,9 @@ async def test_get_system_metrics_pending_zero_returns_none_age():
     conn.fetchval = AsyncMock(side_effect=lambda *a, **k: 0)
     conn.fetch = AsyncMock(return_value=[])
     conn.fetchrow = AsyncMock(return_value={
-        "count": 0, "oldest_age_hours": None,
+        "count": 0,
+        "oldest_age_hours": None,
+        "over_threshold_count": 0,
     })
 
     db = database_module.Database()
@@ -1376,6 +1392,7 @@ async def test_get_system_metrics_pending_zero_returns_none_age():
     result = await db.get_system_metrics()
     assert result["pending_payments_count"] == 0
     assert result["pending_payments_oldest_age_hours"] is None
+    assert result["pending_payments_over_threshold_count"] == 0
 
 
 # ---------------------------------------------------------------------

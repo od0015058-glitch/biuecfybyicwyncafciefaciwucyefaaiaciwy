@@ -33,6 +33,9 @@
       {% if metrics.pending_payments_count and metrics.pending_payments_oldest_age_hours is not none %}
         <span class="stat-sub" style="display: block; font-size: 0.55em; color: var(--text-muted); margin-top: 0.25em;">
           oldest {{ "%.1f"|format(metrics.pending_payments_oldest_age_hours) }}h
+          {% if metrics.pending_payments_over_threshold_count %}
+            • {{ metrics.pending_payments_over_threshold_count }} over {{ metrics.pending_alert_threshold_hours }}h
+          {% endif %}
         </span>
       {% endif %}
     </div>

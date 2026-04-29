@@ -533,6 +533,13 @@ async def dashboard(request: web.Request) -> web.StreamResponse:
     # ``admin.format_metrics`` consumers): users_total, users_active_7d,
     # revenue_usd, spend_usd, top_models[{model,count,cost_usd}],
     # pending_payments_count, pending_payments_oldest_age_hours.
+    # Stage-12-Step-B: dashboard reads the same alert threshold as
+    # the proactive admin-DM loop so the "overdue" tile and any DM
+    # the operator received reference the same set of rows. The
+    # import is local to keep web_admin's import surface slim — this
+    # is the only call site.
+    from pending_alert import get_pending_alert_threshold_hours
+    threshold_hours = get_pending_alert_threshold_hours()
     empty_metrics: dict = {
         "users_total": 0,
         "users_active_7d": 0,
@@ -541,13 +548,17 @@ async def dashboard(request: web.Request) -> web.StreamResponse:
         "top_models": [],
         "pending_payments_count": 0,
         "pending_payments_oldest_age_hours": None,
+        "pending_payments_over_threshold_count": 0,
+        "pending_alert_threshold_hours": threshold_hours,
     }
     if db is None:
         metrics = dict(empty_metrics)
         db_error = "No database wired up (development mode)."
     else:
         try:
-            metrics = await db.get_system_metrics()
+            metrics = await db.get_system_metrics(
+                pending_alert_threshold_hours=threshold_hours,
+            )
         except Exception:
             log.exception("dashboard: get_system_metrics failed")
             metrics = dict(empty_metrics)
