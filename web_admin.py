@@ -3133,6 +3133,7 @@ async def transactions_get(request: web.Request) -> web.StreamResponse:
         # we hand it through the context (matches the
         # ``gateway_choices`` / ``status_choices`` pattern above).
         "refundable_gateways": sorted(Database.REFUNDABLE_GATEWAYS),
+        "refund_reason_max_chars": REFUND_REASON_MAX_CHARS,
         "csrf_token": csrf_token_for(request),
         "flash": None,
     }
@@ -3165,10 +3166,25 @@ async def transactions_get(request: web.Request) -> web.StreamResponse:
 # rejected) so the audit log distinguishes "we tried" from "we
 # succeeded".
 
-# Hard cap on the operator-supplied reason. Mirrors the DB-side
-# ``Database.REFUND_REASON_MAX_LEN`` so the UI rejects oversize
-# input before reaching the SQL boundary.
-REFUND_REASON_MAX_CHARS = 500
+# The route prepends this prefix to the operator-supplied reason so
+# audit trails are easy to grep across web vs Telegram-DM-initiated
+# wallet movements (mirrors the ``user_adjust`` note convention).
+_REFUND_REASON_PREFIX = "[web] "
+
+# Hard cap on the operator-supplied reason. Calculated as the DB-side
+# ``Database.REFUND_REASON_MAX_LEN`` minus the prefix length so the
+# stored ``reason_raw + prefix`` value fits within the DB-layer limit
+# without truncation. A previous version of this constant hard-coded
+# ``500`` (the DB cap) which let a 500-char operator reason slip
+# past the form validation, get prefixed to 506 chars, then trip the
+# ``ValueError`` raised by ``Database.refund_transaction`` — caught by
+# the route's exception handler, but only after rendering a confusing
+# "Invalid input: reason longer than … (500); got 506" banner. Now
+# the form validation is the single source of truth and rejects
+# oversize input cleanly with the actual operator-facing limit.
+REFUND_REASON_MAX_CHARS = (
+    Database.REFUND_REASON_MAX_LEN - len(_REFUND_REASON_PREFIX)
+)
 
 
 _REFUND_REFUSAL_TEXT = {
@@ -3270,9 +3286,10 @@ async def transaction_refund_post(request: web.Request) -> web.StreamResponse:
         )
         return response
 
-    # Mirror the user_adjust note prefix so audit trails are easy to
-    # grep across web vs Telegram-DM-initiated wallet movements.
-    note = f"[web] {reason_raw}"
+    # Form validation above already capped ``reason_raw`` such that the
+    # prefixed string fits within the DB-side ``REFUND_REASON_MAX_LEN``
+    # — see the comment on ``REFUND_REASON_MAX_CHARS`` for the math.
+    note = f"{_REFUND_REASON_PREFIX}{reason_raw}"
 
     try:
         result = await db.refund_transaction(
