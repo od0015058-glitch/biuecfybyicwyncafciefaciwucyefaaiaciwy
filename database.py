@@ -2751,6 +2751,118 @@ class Database:
             )
         return len(rows)
 
+    async def get_model_prices(self) -> dict[str, tuple[float, float]]:
+        """Return the last-known OpenRouter prices per model.
+
+        Result is ``{model_id: (input_per_1m_usd, output_per_1m_usd)}``.
+        Empty dict on first run before the discovery loop has written
+        anything. Used by :mod:`model_discovery` to diff against the
+        live catalog and raise alerts when any side moves by more than
+        ``PRICE_ALERT_THRESHOLD_PERCENT``.
+        """
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT model_id, input_per_1m_usd, output_per_1m_usd
+                  FROM model_prices
+                """
+            )
+        return {
+            row["model_id"]: (
+                float(row["input_per_1m_usd"]),
+                float(row["output_per_1m_usd"]),
+            )
+            for row in rows
+        }
+
+    async def upsert_model_prices(
+        self, prices: dict[str, tuple[float, float]]
+    ) -> int:
+        """Bulk upsert the given prices into ``model_prices``.
+
+        ``prices`` maps model_id to ``(input_per_1m_usd,
+        output_per_1m_usd)``. Uses a single INSERT … ON CONFLICT DO
+        UPDATE so we don't pay N round-trips for a 200-model catalog.
+        Always bumps ``last_seen_at`` to ``NOW()`` so the operator can
+        eyeball "when did we last observe this model's price" even if
+        the value didn't move.
+
+        Returns the number of rows processed (for test / log
+        observability — ``None`` -> empty input short-circuits).
+        """
+        if not prices:
+            return 0
+        model_ids: list[str] = []
+        input_prices: list[float] = []
+        output_prices: list[float] = []
+        for model_id, (in_price, out_price) in prices.items():
+            model_ids.append(model_id)
+            input_prices.append(float(in_price))
+            output_prices.append(float(out_price))
+        async with self.pool.acquire() as connection:
+            await connection.execute(
+                """
+                INSERT INTO model_prices (
+                    model_id, input_per_1m_usd, output_per_1m_usd, last_seen_at
+                )
+                SELECT
+                    unnest($1::text[]),
+                    unnest($2::double precision[]),
+                    unnest($3::double precision[]),
+                    NOW()
+                ON CONFLICT (model_id) DO UPDATE
+                   SET input_per_1m_usd  = EXCLUDED.input_per_1m_usd,
+                       output_per_1m_usd = EXCLUDED.output_per_1m_usd,
+                       last_seen_at      = EXCLUDED.last_seen_at
+                """,
+                model_ids,
+                input_prices,
+                output_prices,
+            )
+        return len(model_ids)
+
+    async def get_fx_snapshot(self) -> tuple[float, "datetime.datetime"] | None:
+        """Return the single-row FX snapshot as ``(toman_per_usd,
+        fetched_at)`` or ``None`` if the table is empty (first boot
+        before any refresh).
+
+        Used by :mod:`fx_rates` to warm the in-memory cache on
+        process start so the wallet UI and top-up path have a rate
+        to convert with before the first refresh completes.
+        """
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                "SELECT toman_per_usd, fetched_at FROM fx_rates_snapshot WHERE id = 1"
+            )
+        if row is None:
+            return None
+        return (float(row["toman_per_usd"]), row["fetched_at"])
+
+    async def upsert_fx_snapshot(
+        self, *, toman_per_usd: float, source: str
+    ) -> None:
+        """Overwrite the single-row FX snapshot.
+
+        We only track "the latest value", so the table is keyed by
+        the literal ``id=1`` and every refresh upserts that row.
+        ``ON CONFLICT DO UPDATE`` so the very first write (fresh
+        migration, no row yet) and all subsequent updates go through
+        the same SQL — saves a row-exists probe.
+        """
+        async with self.pool.acquire() as connection:
+            await connection.execute(
+                """
+                INSERT INTO fx_rates_snapshot (id, toman_per_usd, source, fetched_at)
+                     VALUES (1, $1, $2, NOW())
+                ON CONFLICT (id) DO UPDATE
+                   SET toman_per_usd = EXCLUDED.toman_per_usd,
+                       source        = EXCLUDED.source,
+                       fetched_at    = EXCLUDED.fetched_at
+                """,
+                float(toman_per_usd),
+                str(source),
+            )
+
     async def update_user_admin_fields(
         self,
         telegram_id: int,
