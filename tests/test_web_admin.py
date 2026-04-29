@@ -6690,6 +6690,66 @@ async def test_broadcast_get_falls_back_to_in_memory_when_db_fails(
     assert "in memory only" in body
 
 
+async def test_broadcast_get_in_memory_only_jobs_appear_newest_first(
+    aiohttp_client, make_admin_app
+):
+    """Stage-9-Step-10 regression pin (Devin Review on PR #91): when
+    DB rows exist AND the in-memory dict has jobs the DB hasn't
+    observed yet (race between INSERT and the recent-jobs GET), the
+    in-memory-only prefix of the rendered list must be newest-first.
+    The earlier ``reversed(list(in_memory.items()))`` + ``insert(0,
+    ...)`` produced oldest-first, contradicting the DB-side
+    ``ORDER BY created_at DESC``."""
+    from web_admin import _new_broadcast_job, _store_broadcast_job
+
+    db_row = {
+        "id": "db-row",
+        "text_preview": "From DB",
+        "full_text_len": 5,
+        "only_active_days": None,
+        "state": "completed",
+        "total": 1, "sent": 1, "blocked": 0, "failed": 0,
+        "i": 1, "error": None, "cancel_requested": False,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "started_at": "2026-01-01T00:00:01+00:00",
+        "completed_at": "2026-01-01T00:00:02+00:00",
+    }
+    db = _stub_db(broadcast_jobs_rows=[db_row])
+    bot = AsyncMock()
+    app = make_admin_app(password="pw", db=db, bot=bot)
+
+    # Three in-memory-only jobs, registered oldest → newest. None
+    # of them are in the DB-rows list above.
+    inmem_oldest = _new_broadcast_job(text="A oldest", only_active_days=None)
+    inmem_oldest["state"] = "running"
+    _store_broadcast_job(app, inmem_oldest)
+    inmem_middle = _new_broadcast_job(text="B middle", only_active_days=None)
+    inmem_middle["state"] = "running"
+    _store_broadcast_job(app, inmem_middle)
+    inmem_newest = _new_broadcast_job(text="C newest", only_active_days=None)
+    inmem_newest["state"] = "running"
+    _store_broadcast_job(app, inmem_newest)
+
+    client = await aiohttp_client(app)
+    await _login(client, "pw")
+    resp = await client.get("/admin/broadcast")
+    assert resp.status == 200
+    body = await resp.text()
+
+    # The newest in-memory-only job should appear before the older
+    # in-memory-only jobs in the rendered HTML; oldest comes last
+    # before the DB row.
+    pos_newest = body.find(inmem_newest["id"])
+    pos_middle = body.find(inmem_middle["id"])
+    pos_oldest = body.find(inmem_oldest["id"])
+    pos_db = body.find("db-row")
+    assert -1 < pos_newest < pos_middle < pos_oldest < pos_db, (
+        "in-memory-only jobs must appear newest-first then DB rows; "
+        f"got positions newest={pos_newest} middle={pos_middle} "
+        f"oldest={pos_oldest} db={pos_db}"
+    )
+
+
 async def test_broadcast_detail_falls_back_to_db_after_restart(
     aiohttp_client, make_admin_app
 ):

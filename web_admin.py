@@ -2419,8 +2419,13 @@ async def broadcast_get(request: web.Request) -> web.StreamResponse:
             recent.append(row)
         # Surface any in-memory-only jobs the DB hasn't observed yet
         # (e.g. a row INSERT that lost a race with the recent-jobs
-        # GET, or a test that didn't wire up the DB).
-        for jid, live in reversed(list(in_memory.items())):
+        # GET, or a test that didn't wire up the DB). Iterate
+        # oldest → newest (insertion order) so each ``insert(0, …)``
+        # pushes older items down — the final prefix is newest-first,
+        # matching the DB rows' ``ORDER BY created_at DESC``. (Reversing
+        # first would yield oldest-first; Devin Review caught this on
+        # the first revision of PR #91.)
+        for jid, live in in_memory.items():
             if jid not in seen:
                 recent.insert(0, dict(live))
     else:
