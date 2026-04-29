@@ -19,6 +19,10 @@ from amount_input import normalize_amount
 from database import db
 from fx_rates import get_usd_to_toman_snapshot
 from wallet_display import format_toman_annotation
+from wallet_receipts import (
+    format_receipts_page,
+    get_receipts_page_size,
+)
 from models_catalog import CatalogModel, get_catalog
 from payments import (
     GLOBAL_MIN_TOPUP_USD,
@@ -1176,9 +1180,142 @@ def _build_wallet_keyboard(lang: str) -> InlineKeyboardBuilder:
     builder.button(
         text=t(lang, "btn_redeem_gift"), callback_data="hub_redeem_gift"
     )
+    # Stage-12-Step-C: a user-facing "Recent top-ups" view of the
+    # transactions ledger. The data was previously only reachable
+    # via the admin panel; routing it through a dedicated DB method
+    # (`Database.list_user_transactions`) hard-codes the
+    # ``WHERE telegram_id = …`` filter so a future caller can't drop
+    # the user-scope by accident.
+    builder.button(
+        text=t(lang, "btn_receipts"), callback_data="hub_receipts"
+    )
     _back_to_menu_button(builder, lang)
-    builder.adjust(1, 1, 1)
+    builder.adjust(1, 1, 1, 1)
     return builder
+
+
+# ==========================================
+# Stage-12-Step-C: wallet → recent top-ups (paginated receipt feed).
+# Cursor pagination over `transaction_id` so a fresh top-up landing
+# while the user is browsing doesn't shift pages or surface dupes.
+# Callback shape:
+#   "hub_receipts"            → first page (no cursor)
+#   "receipts_more:<before>"  → subsequent pages, ``<before>`` is the
+#                                smallest tx-id from the previous page.
+# ``Database.list_user_transactions`` hard-codes the
+# ``WHERE telegram_id = …`` filter so the caller can't drop the
+# user-scope by accident.
+# ==========================================
+
+
+def _build_receipts_keyboard(
+    lang: str, *, next_before_id: int | None
+) -> InlineKeyboardBuilder:
+    builder = InlineKeyboardBuilder()
+    if next_before_id is not None:
+        builder.button(
+            text=t(lang, "btn_receipts_more"),
+            callback_data=f"receipts_more:{int(next_before_id)}",
+        )
+    builder.button(
+        text=t(lang, "btn_back_to_wallet"), callback_data="back_to_wallet"
+    )
+    builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+    if next_before_id is not None:
+        builder.adjust(1, 2)
+    else:
+        builder.adjust(2)
+    return builder
+
+
+async def _render_receipts_page(
+    callback: CallbackQuery, *, before_id: int | None
+) -> None:
+    """Render one page of receipts as an edit on the current message.
+
+    Shared by ``hub_receipts_handler`` (initial page, ``before_id=None``)
+    and ``receipts_more_handler`` (subsequent pages with the cursor
+    embedded in the callback payload).
+    """
+    user_id = callback.from_user.id
+    lang = await _get_user_language(user_id)
+    page_size = get_receipts_page_size()
+    try:
+        page = await db.list_user_transactions(
+            telegram_id=user_id,
+            limit=page_size,
+            before_id=before_id,
+        )
+    except ValueError:
+        # Defensive — list_user_transactions raises on a missing /
+        # zero / negative ``telegram_id`` to keep a future buggy
+        # caller from leaking other users' rows. ``callback.from_user.id``
+        # is always set for inline-button callbacks, but if Telegram
+        # ever sends one without a from_user we'd rather show the
+        # empty state than 500.
+        log.exception("list_user_transactions refused for user %r", user_id)
+        page = {"rows": [], "has_more": False, "next_before_id": None}
+
+    rows = page["rows"]
+    if not rows and before_id is None:
+        # First-page empty state: brand-new user, no top-ups ever.
+        text = (
+            f"{t(lang, 'receipts_title')}\n\n"
+            f"{t(lang, 'receipts_empty')}"
+        )
+    else:
+        # Either a populated first page, or a "Show more" tail page.
+        # Even a populated tail with zero rows still renders the
+        # title (shouldn't happen — has_more=False would have hidden
+        # the More button — but the fallback is "show the title and
+        # the empty list" rather than crashing).
+        body = format_receipts_page(rows, lang)
+        text = f"{t(lang, 'receipts_title')}\n\n{body}"
+
+    builder = _build_receipts_keyboard(
+        lang, next_before_id=page["next_before_id"]
+    )
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=builder.as_markup(),
+            parse_mode="Markdown",
+        )
+    except TelegramBadRequest:
+        # Same "message is not modified" race as _edit_to_hub: a
+        # double-tap on the same page renders identical text +
+        # keyboard, which Telegram refuses to edit.
+        log.debug("receipts edit was a no-op", exc_info=True)
+
+
+@router.callback_query(F.data == "hub_receipts")
+async def hub_receipts_handler(callback: CallbackQuery, state: FSMContext):
+    """Render the first page of the user's recent top-ups."""
+    # Defensive FSM clear — the wallet menu is reachable from inside
+    # the charge flows.
+    await state.clear()
+    await _render_receipts_page(callback, before_id=None)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("receipts_more:"))
+async def receipts_more_handler(callback: CallbackQuery, state: FSMContext):
+    """Render the next page of receipts.
+
+    The cursor is embedded in the callback payload; we parse it
+    defensively (a tampered payload yields a fresh first-page render
+    rather than a crash). Telegram callback_data is capped at 64
+    bytes — a positive ``transaction_id`` integer always fits.
+    """
+    raw = (callback.data or "").split(":", 1)[1] if callback.data else ""
+    try:
+        before_id = int(raw)
+        if before_id <= 0:
+            before_id = None
+    except (TypeError, ValueError):
+        before_id = None
+    await _render_receipts_page(callback, before_id=before_id)
+    await callback.answer()
 
 
 @router.message(F.text.in_(_WALLET_LABELS))

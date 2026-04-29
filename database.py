@@ -2414,6 +2414,180 @@ class Database:
             "total_pages": total_pages,
         }
 
+    # Stage-12-Step-C: per-user paginated receipts surfaced via the
+    # bot's /wallet menu. Status whitelist is the *user-visible*
+    # set — PENDING / EXPIRED / FAILED rows are kept off the user
+    # surface (a stuck PENDING is operational state, not a receipt;
+    # an EXPIRED row is "you didn't actually pay"; a FAILED row is
+    # an internal error). REFUNDED is included because the user
+    # *should* see "we refunded you on date X" — otherwise the
+    # refund is invisible to the only person who cares about it.
+    USER_RECEIPTS_STATUS_VALUES: frozenset[str] = frozenset(
+        {"SUCCESS", "PARTIAL", "REFUNDED"}
+    )
+    # Hard cap on how many receipts a single page can return.
+    # Protects against a malicious / typo'd ``limit=999999`` query
+    # on the user surface independently of the env-driven default.
+    USER_RECEIPTS_MAX_PER_PAGE: int = 20
+
+    async def list_user_transactions(
+        self,
+        *,
+        telegram_id: int,
+        limit: int = 5,
+        before_id: int | None = None,
+    ) -> dict:
+        """Stage-12-Step-C: per-user receipt feed.
+
+        Hard-coded ``telegram_id`` filter — this method exists
+        specifically so a future caller on the user-side surface
+        can't accidentally drop the ``WHERE telegram_id = …`` clause
+        and expose somebody else's transactions. ``telegram_id`` is
+        positional-only via the keyword form, must be an integer,
+        and must be > 0; we ``raise ValueError`` rather than
+        silently returning everything (or nothing) for a missing /
+        zero / negative value, so the bug surfaces at the call site.
+
+        Status filter is locked to :attr:`USER_RECEIPTS_STATUS_VALUES`
+        — PENDING / EXPIRED / FAILED are not user-visible (a PENDING
+        row is operational state, not a paid receipt). The caller
+        cannot expand or restrict the set; receipts are always the
+        same shape regardless of where they're rendered.
+
+        Cursor pagination via ``before_id`` (returns rows with
+        ``transaction_id < before_id``). We deliberately don't use
+        page/offset semantics: a new top-up landing while the user
+        is browsing would shift every page and surface duplicates.
+        Cursor pagination is stable.
+
+        Returns::
+
+            {
+              "rows": [
+                {"id": int, "gateway": str, "currency": str,
+                 "amount_crypto_or_rial": float | None,
+                 "amount_usd": float, "status": str,
+                 "gateway_invoice_id": str | None,
+                 "created_at": iso str | None,
+                 "completed_at": iso str | None,
+                 "refunded_at": iso str | None,
+                 "gateway_locked_rate_toman_per_usd": float | None},
+                ...
+              ],
+              "has_more": bool,    # True iff a next page exists
+              "next_before_id": int | None,  # cursor for the next page
+            }
+
+        ``next_before_id`` is the smallest ``id`` in the current
+        page (so the caller doesn't recompute it). ``None`` when
+        ``has_more`` is False.
+        """
+        if not isinstance(telegram_id, int) or telegram_id <= 0:
+            # Refuse silent zero/missing filter — the whole point of
+            # this method is to *guarantee* the user filter is
+            # present. A buggy caller passing 0 or None must crash
+            # loudly, not list everything.
+            raise ValueError(
+                "telegram_id is required and must be a positive integer; "
+                f"got {telegram_id!r}"
+            )
+        limit = max(1, min(int(limit), self.USER_RECEIPTS_MAX_PER_PAGE))
+        if before_id is not None:
+            if not isinstance(before_id, int) or before_id <= 0:
+                raise ValueError(
+                    "before_id must be a positive integer or None; "
+                    f"got {before_id!r}"
+                )
+
+        # ANY($2::text[]) is the canonical asyncpg pattern for an IN
+        # over a fixed enum without splatting per-value placeholders.
+        # Sorted for deterministic test pinning.
+        statuses = sorted(self.USER_RECEIPTS_STATUS_VALUES)
+
+        # We fetch ``limit + 1`` rows: if the (limit+1)-th row exists,
+        # there's a next page; otherwise this is the last. The extra
+        # row is then trimmed before returning.
+        fetch_limit = int(limit) + 1
+
+        if before_id is None:
+            sql = """
+                SELECT transaction_id, gateway, currency_used,
+                       amount_crypto_or_rial, amount_usd_credited,
+                       status, gateway_invoice_id,
+                       created_at, completed_at, refunded_at,
+                       gateway_locked_rate_toman_per_usd
+                FROM transactions
+                WHERE telegram_id = $1
+                  AND status = ANY($2::text[])
+                ORDER BY transaction_id DESC
+                LIMIT $3
+            """
+            params = (int(telegram_id), statuses, fetch_limit)
+        else:
+            sql = """
+                SELECT transaction_id, gateway, currency_used,
+                       amount_crypto_or_rial, amount_usd_credited,
+                       status, gateway_invoice_id,
+                       created_at, completed_at, refunded_at,
+                       gateway_locked_rate_toman_per_usd
+                FROM transactions
+                WHERE telegram_id = $1
+                  AND status = ANY($2::text[])
+                  AND transaction_id < $3
+                ORDER BY transaction_id DESC
+                LIMIT $4
+            """
+            params = (
+                int(telegram_id), statuses, int(before_id), fetch_limit,
+            )
+
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(sql, *params)
+
+        has_more = len(rows) > limit
+        page_rows = list(rows[:limit])
+        next_before_id: int | None = None
+        if has_more and page_rows:
+            # Last (oldest-shown) row's id is the next-page cursor.
+            next_before_id = int(page_rows[-1]["transaction_id"])
+
+        def _normalise(r) -> dict:
+            return {
+                "id": int(r["transaction_id"]),
+                "gateway": r["gateway"],
+                "currency": r["currency_used"],
+                "amount_crypto_or_rial": (
+                    float(r["amount_crypto_or_rial"])
+                    if r["amount_crypto_or_rial"] is not None else None
+                ),
+                "amount_usd": float(r["amount_usd_credited"] or 0),
+                "status": r["status"],
+                "gateway_invoice_id": r["gateway_invoice_id"],
+                "created_at": (
+                    r["created_at"].isoformat()
+                    if r["created_at"] is not None else None
+                ),
+                "completed_at": (
+                    r["completed_at"].isoformat()
+                    if r["completed_at"] is not None else None
+                ),
+                "refunded_at": (
+                    r["refunded_at"].isoformat()
+                    if r["refunded_at"] is not None else None
+                ),
+                "gateway_locked_rate_toman_per_usd": (
+                    float(r["gateway_locked_rate_toman_per_usd"])
+                    if r["gateway_locked_rate_toman_per_usd"] is not None
+                    else None
+                ),
+            }
+
+        return {
+            "rows": [_normalise(r) for r in page_rows],
+            "has_more": has_more,
+            "next_before_id": next_before_id,
+        }
+
     USAGE_LOGS_MAX_PER_PAGE: int = 200
 
     async def list_user_usage_logs(
