@@ -351,7 +351,7 @@ Two tables added by **Stage-8-Part-3** (alembic 0003, this PR):
 
 ## 9. Test suite
 
-**750 tests** as of the code-ascii-only PR (15 test modules):
+**832 tests** as of the `_edit_to_hub` exception-tightening PR (15 test modules):
 
 ```
 tests/
@@ -383,10 +383,11 @@ tests/
 │                                          #          determinism + ignores overrides)
 ├── test_bot_commands.py                   # 9 cases (PUBLIC/ADMIN scope shape, set_my_commands
 │                                          #          per-admin scoping, swallowed-failure semantics)
-├── test_hub_ux.py                         # 20 cases (6-button hub layout, hub_newchat wipes,
+├── test_hub_ux.py                         # 22 cases (6-button hub layout, hub_newchat wipes,
 │                                          #          hub_memory opens settings, wallet redeem button,
 │                                          #          waiting_gift_code FSM input handler,
 │                                          #          _render_memory_screen exception tightening,
+│                                          #          _edit_to_hub exception tightening,
 │                                          #          shared _redeem_code_for_user helper status branches)
 └── test_web_admin.py                      # 230 cases (cookie sign/verify, login, dashboard,
                                           #             promo + gift + user list/create/revoke,
@@ -415,7 +416,7 @@ assumption.
 | `main.py` | Clean. Env-driven port, `build_fsm_storage` (Redis if `REDIS_URL` set, in-memory fallback with warning), `install_webhook_rate_limit`, admin router included BEFORE the public router. |
 | `database.py` | Clean. All money-touching methods use `SELECT … FOR UPDATE`. `finalize_partial_payment` already uses `max(already_credited, actually_paid_usd)`. `admin_adjust_balance` writes `transactions` row + updates wallet in one tx with FOR UPDATE on the user row. Part-6 added `list_transactions(gateway, status, telegram_id, page, per_page)` with allow-listed enum filters (`TRANSACTIONS_GATEWAY_VALUES`, `TRANSACTIONS_STATUS_VALUES`) and `TRANSACTIONS_MAX_PER_PAGE=200`, plus `BROADCAST_ACTIVE_DAYS_MAX=36_500` defense-in-depth cap inside `iter_broadcast_recipients`. |
 | `payments.py` | Clean. Two-pass IPN verifier (raw → canonical fallback). Idempotent finalize, partial-delta crediting. |
-| `handlers.py` | Clean. `cmd_start`, `_route_legacy_text_to_hub`, `process_chat`, `process_promo_input`, and `process_custom_amount_input` all guard `from_user is None` and `text is None`. `_redeem_code_for_user` enforces ASCII-only `[A-Z0-9_-]` (matching the admin-side validators) so user-typed Unicode digits / homoglyphs return the clearer `redeem_bad_code` reply without a wasted DB round-trip. |
+| `handlers.py` | Clean. `cmd_start`, `_route_legacy_text_to_hub`, `process_chat`, `process_promo_input`, and `process_custom_amount_input` all guard `from_user is None` and `text is None`. `_redeem_code_for_user` enforces ASCII-only `[A-Z0-9_-]` (matching the admin-side validators) so user-typed Unicode digits / homoglyphs return the clearer `redeem_bad_code` reply without a wasted DB round-trip. Both `_render_memory_screen` (Stage-9-Step-1.5) and `_edit_to_hub` (standalone bug-fix PR) wrap their `edit_text` calls in `except TelegramBadRequest:` only — the legitimate "message is not modified" no-op — so unrelated DB drops, `TelegramForbiddenError`, `TelegramRetryAfter`, and network blips propagate to logs / the dispatcher's error handler instead of getting silenced as a single `log.debug` line. |
 | `web_admin.py` | aiohttp+jinja2 panel mounted under `/admin/`. HMAC-signed cookies (`ADMIN_PASSWORD` + `ADMIN_SESSION_SECRET`). Login + dashboard (Part-1). Promos page with CSRF tokens + flash banners (Part-2). Gift codes page (Part-3) with `parse_gift_form` + `EXPIRES_IN_DAYS_MAX` bound. Users page + credit/debit form (Part-4) with `parse_adjust_form`, `ADJUST_MAX_USD` bound, `ADMIN_WEB_SENTINEL_ID=0` audit attribution. Broadcast page (Part-5) with in-memory job registry (`APP_KEY_BROADCAST_JOBS` + `APP_KEY_BROADCAST_TASKS`), `asyncio.create_task` background worker, JSON polling endpoint, shares `admin._do_broadcast` via `progress_callback`; `BROADCAST_ACTIVE_DAYS_MAX` cap added in Part-6. Transactions browser (Part-6) with `parse_transactions_query` + `_encode_tx_query` helpers, paginated read against `Database.list_transactions`. Promo / gift code parsers + revoke handlers enforce ASCII-only `[A-Z0-9_-]` (`(c.isascii() and c.isalnum()) or c in "_-"`) so a Unicode digit / homoglyph in a code doesn't store a row no user can ever redeem. |
 | `templates/admin/` | jinja2 templates. `base.html` = global CSS + `<head>`; `_layout.html` = sidebar shell (extended by content pages); `login.html`, `dashboard.html`, `promos.html`, `gifts.html`, `users.html`, `user_detail.html`, `broadcast.html`, `broadcast_detail.html`, `transactions.html`. |
 | `ai_engine.py` | Clean. `aiohttp.ClientTimeout(total=60, connect=10, sock_read=50)` on OpenRouter. Defensive guard for malformed responses. |

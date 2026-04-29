@@ -13,6 +13,9 @@
   case), not every ``Exception``. Pre-fix any unrelated DB / network
   exception on ``edit_text`` was silenced as a single ``log.debug``
   line, masking real bugs.
+* ``_edit_to_hub`` (every "🏠 Back to menu" button on every
+  sub-screen funnels here) tightened the same way in a standalone
+  bug-fix PR — same regression pattern, much wider blast radius.
 """
 
 from __future__ import annotations
@@ -217,6 +220,67 @@ async def test_render_memory_screen_propagates_other_exceptions():
     ):
         with pytest.raises(RuntimeError):
             await _render_memory_screen(cb, "en")
+
+
+# --- _edit_to_hub exception tightening (standalone bug-fix PR) -------------
+#
+# Mirror of the ``_render_memory_screen`` regression pins above. Every
+# "🏠 Back to menu" button on every sub-screen funnels through
+# ``_edit_to_hub``, so a bare ``except Exception`` here was a much
+# wider blast radius than the one tightened in Stage-9-Step-1.5 — a
+# DB-pool drop while building the hub keyboard upstream, a
+# ``TelegramForbiddenError`` (the user blocked the bot), or a
+# ``TelegramRetryAfter`` (which we genuinely want to see) all
+# silenced as a single ``log.debug`` line. Now only the legitimate
+# "message is not modified" no-op is swallowed; everything else
+# propagates so it surfaces in logs / the dispatcher's error
+# handler.
+
+
+@pytest.mark.asyncio
+async def test_edit_to_hub_swallows_telegram_bad_request():
+    """The "message is not modified" no-op is a TelegramBadRequest;
+    the handler must continue normally so back-to-menu taps don't
+    surface an error to the user when the hub message is already
+    rendered."""
+    from handlers import _edit_to_hub
+
+    fake_user = {
+        "active_model": "openai/gpt-4o",
+        "balance_usd": 1.23,
+        "memory_enabled": False,
+    }
+    bad_req = TelegramBadRequest(
+        method=None, message="message is not modified"
+    )
+    cb = _make_callback(edit_text_side_effect=bad_req)
+    with patch(
+        "handlers.db.get_user", new=AsyncMock(return_value=fake_user)
+    ):
+        # Must not raise.
+        await _edit_to_hub(cb, "en")
+
+
+@pytest.mark.asyncio
+async def test_edit_to_hub_propagates_other_exceptions():
+    """Pre-fix bug: ``except Exception`` swallowed every error here,
+    masking DB drops, ``TelegramForbiddenError`` (bot was blocked),
+    ``TelegramRetryAfter``, and unrelated network blips. Post-fix only
+    TelegramBadRequest is swallowed; everything else propagates so it
+    surfaces in logs."""
+    from handlers import _edit_to_hub
+
+    fake_user = {
+        "active_model": "openai/gpt-4o",
+        "balance_usd": 1.23,
+        "memory_enabled": False,
+    }
+    cb = _make_callback(edit_text_side_effect=RuntimeError("boom"))
+    with patch(
+        "handlers.db.get_user", new=AsyncMock(return_value=fake_user)
+    ):
+        with pytest.raises(RuntimeError):
+            await _edit_to_hub(cb, "en")
 
 
 # --- Wallet redeem button ---------------------------------------------------

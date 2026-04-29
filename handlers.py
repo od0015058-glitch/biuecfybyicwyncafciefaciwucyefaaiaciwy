@@ -188,17 +188,28 @@ async def _edit_to_hub(callback: CallbackQuery, lang: str) -> None:
 
     All "🏠 Back to menu" buttons funnel here. Idempotent: if the
     message text + keyboard are already the hub, Telegram's
-    ``edit_text`` raises a "message is not modified" error which we
-    swallow.
+    ``edit_text`` raises a ``TelegramBadRequest: message is not
+    modified`` for that no-op, which is the only exception we want
+    to silence.
+
+    Pre-fix the bare ``except Exception`` here swallowed every
+    exception including DB-pool drops bubbling out of an upstream
+    ``edit_text`` retry layer, ``TelegramForbiddenError`` (the user
+    blocked the bot — worth surfacing in logs as a real warning, not
+    a debug line), ``TelegramRetryAfter`` (which we genuinely want
+    to see so we can tune backoff), and unrelated aiohttp network
+    blips. Tightening to ``TelegramBadRequest`` matches the same
+    fix shipped for ``_render_memory_screen`` in Stage-9-Step-1.5.
     """
     text, kb = await _hub_text_and_kb(callback.from_user.id, lang)
     try:
         await callback.message.edit_text(
             text, reply_markup=kb.as_markup(), parse_mode="Markdown"
         )
-    except Exception:
-        # Telegram may raise TelegramBadRequest when the message is
-        # already exactly the hub. Not user-facing.
+    except TelegramBadRequest:
+        # The legitimate "message is not modified" / parse-mode no-op
+        # case. Not user-facing; everything else propagates so it
+        # surfaces in logs / the dispatcher's error handler.
         log.debug("edit_to_hub: edit_text was a no-op", exc_info=True)
 
 
