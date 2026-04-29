@@ -398,7 +398,10 @@ async def refresh_usd_to_toman_loop(
     Swallows every exception except ``CancelledError`` so a
     network / source hiccup doesn't permanently stop the refresher.
     """
-    interval = interval_seconds or _get_interval_seconds()
+    # ``is not None`` (not ``or``) so a test-time ``interval_seconds=0``
+    # tight loop works. ``0 or X == X`` would silently fall through to
+    # the 600s default and hang the tests.
+    interval = interval_seconds if interval_seconds is not None else _get_interval_seconds()
     while True:
         try:
             await refresh_usd_to_toman_once(bot)
