@@ -2190,18 +2190,33 @@ def _new_broadcast_job(
     }
 
 
+#: Set of broadcast-job states the in-memory eviction policy is
+#: allowed to drop. MUST stay in sync with
+#: ``Database.BROADCAST_JOB_TERMINAL_STATES`` — drift between the
+#: two means a job that's terminal in the durable registry would
+#: still be pinned in memory (or vice-versa) and the eviction cap
+#: stops working. Stage-9-Step-10 added ``"interrupted"`` here
+#: alongside the original three; Devin Review caught the omission
+#: in the eviction tuple at PR-time.
+_BROADCAST_TERMINAL_STATES_FOR_EVICTION: frozenset[str] = frozenset(
+    {"completed", "failed", "cancelled", "interrupted"}
+)
+
+
 def _store_broadcast_job(app: web.Application, job: dict) -> None:
     """Record *job* in the registry and evict old completed entries.
 
     We never evict a job whose ``state`` is ``queued`` or ``running``
     — a rolling eviction policy must not silently kill live work.
+    Terminal states (``completed`` / ``failed`` / ``cancelled`` /
+    ``interrupted``) are evictable.
     """
     jobs: dict = app[APP_KEY_BROADCAST_JOBS]
     jobs[job["id"]] = job
     if len(jobs) > BROADCAST_MAX_HISTORY:
         terminal = [
             jid for jid, j in jobs.items()
-            if j["state"] in ("completed", "failed", "cancelled")
+            if j["state"] in _BROADCAST_TERMINAL_STATES_FOR_EVICTION
             and jid != job["id"]
         ]
         # Evict oldest terminal jobs first. ``jobs`` is insertion-

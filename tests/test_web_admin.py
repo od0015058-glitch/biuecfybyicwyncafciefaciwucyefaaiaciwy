@@ -6894,3 +6894,37 @@ async def test_persist_broadcast_progress_swallows_db_failure():
     }
     # Must not raise.
     await _persist_broadcast_progress(db, job, force=True)
+
+
+def test_store_broadcast_job_evicts_interrupted_terminal_state():
+    """Stage-9-Step-10 regression pin (Devin Review on PR #91): the
+    in-memory eviction tuple must include the new ``"interrupted"``
+    state alongside ``completed`` / ``failed`` / ``cancelled``.
+    Otherwise an ``interrupted`` job is treated like a live
+    ``queued`` / ``running`` one and pins the registry above
+    ``BROADCAST_MAX_HISTORY`` until the process exits — so the
+    in-memory cap silently breaks every time a deploy interrupts
+    a broadcast."""
+    from web_admin import (
+        BROADCAST_MAX_HISTORY,
+        APP_KEY_BROADCAST_JOBS,
+        _new_broadcast_job,
+        _store_broadcast_job,
+    )
+
+    app = web.Application()
+    app[APP_KEY_BROADCAST_JOBS] = {}
+    interrupted_ids: list[str] = []
+    for _ in range(BROADCAST_MAX_HISTORY):
+        j = _new_broadcast_job(text="ouch", only_active_days=None)
+        j["state"] = "interrupted"
+        _store_broadcast_job(app, j)
+        interrupted_ids.append(j["id"])
+    # One more terminal pushes the cap — oldest interrupted must
+    # be evictable, not pinned.
+    newest = _new_broadcast_job(text="next", only_active_days=None)
+    newest["state"] = "completed"
+    _store_broadcast_job(app, newest)
+    assert interrupted_ids[0] not in app[APP_KEY_BROADCAST_JOBS]
+    assert newest["id"] in app[APP_KEY_BROADCAST_JOBS]
+    assert len(app[APP_KEY_BROADCAST_JOBS]) == BROADCAST_MAX_HISTORY
