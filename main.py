@@ -12,9 +12,9 @@ import strings
 from admin import parse_admin_user_ids, router as admin_router
 from bot_commands import publish_bot_commands
 from database import db
-from handlers import router
+from handlers import SUPPORTED_PAY_CURRENCIES, router
 from middlewares import UserUpsertMiddleware
-from payments import payment_webhook
+from payments import payment_webhook, refresh_min_amounts_loop
 from pending_expiration import start_pending_expiration_task
 from rate_limit import install_webhook_rate_limit
 from web_admin import setup_admin_routes
@@ -164,9 +164,28 @@ async def main():
     # pending_expiration.py for the full contract.
     expiration_task = start_pending_expiration_task(bot)
 
+    # Background refresher for NowPayments per-currency min-amounts.
+    # Keeps the in-memory cache warm so the checkout pre-flight check
+    # (see handlers._preflight_min_amount_check) never blocks on a
+    # cold-cache HTTP call and so ops sees fresh minimums within the
+    # refresh interval (15 min by default). Cheap: ~18 HTTP calls per
+    # pass, gated by a concurrency=3 semaphore inside the loop.
+    tickers = [ticker for _, ticker in SUPPORTED_PAY_CURRENCIES]
+    min_amount_refresher = asyncio.create_task(
+        refresh_min_amounts_loop(tickers),
+        name="min-amount-refresher",
+    )
+
     try:
         await dp.start_polling(bot)
     finally:
+        min_amount_refresher.cancel()
+        try:
+            await min_amount_refresher
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("min-amount refresher exited with error")
         expiration_task.cancel()
         try:
             await expiration_task

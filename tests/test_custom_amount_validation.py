@@ -18,13 +18,17 @@ import math
 import pytest
 
 
+from payments import GLOBAL_MIN_TOPUP_USD
+
+
 def _validate_custom_amount(raw: str | None) -> tuple[bool, str | None]:
     """Mirror of the validation logic in handlers.py.
 
     Returns (ok, reject_reason). ok=True only for amounts in
-    [5, 10_000] that aren't NaN / Inf. ``None`` (e.g. when a user
-    sends a sticker / photo while in waiting_custom_amount) is
-    treated like an empty string and rejected as ``not_a_number``.
+    [GLOBAL_MIN_TOPUP_USD, 10_000] that aren't NaN / Inf. ``None``
+    (e.g. when a user sends a sticker / photo while in
+    waiting_custom_amount) is treated like an empty string and
+    rejected as ``not_a_number``.
     """
     raw_text = (raw or "").strip()
     try:
@@ -38,7 +42,7 @@ def _validate_custom_amount(raw: str | None) -> tuple[bool, str | None]:
     ):
         return False, "nan_or_inf"
 
-    if amount < 5:
+    if amount < GLOBAL_MIN_TOPUP_USD:
         return False, "below_min"
 
     if amount > 10_000:
@@ -60,7 +64,9 @@ def _validate_custom_amount(raw: str | None) -> tuple[bool, str | None]:
         # Stickers / photos / voice / video notes: aiogram delivers
         # ``message.text is None``. Must not crash; must reject.
         (None, "not_a_number"),
-        ("4.99", "below_min"),
+        # Below the $2 floor introduced alongside the per-currency
+        # min-amount preflight. Pre-$2-floor the threshold was $5.
+        ("1.99", "below_min"),
         ("0", "below_min"),
         ("-50", "below_min"),
         ("10001", "above_max"),
@@ -76,6 +82,15 @@ def test_invalid_amounts_are_rejected(value, expected_reason):
 @pytest.mark.parametrize(
     "value,parsed",
     [
+        # The $2 floor — smallest accepted amount.
+        ("2", 2.0),
+        ("$2", 2.0),
+        # Between old $5 floor and new $2 floor: these USED to be
+        # rejected as below_min but now pass. Explicit to prevent
+        # accidental re-raising of the floor.
+        ("2.50", 2.5),
+        ("3", 3.0),
+        ("4.99", 4.99),
         ("5", 5.0),
         ("$5", 5.0),
         ("$5.00", 5.0),
@@ -110,4 +125,8 @@ def test_handler_validation_matches_inline_helper():
     assert "amount > 10_000" in handlers_src, (
         "Upper-bound check `amount > 10_000` missing from handlers.py "
         "— process_custom_amount_input would accept arbitrary amounts"
+    )
+    assert "amount < GLOBAL_MIN_TOPUP_USD" in handlers_src, (
+        "Lower-bound check `amount < GLOBAL_MIN_TOPUP_USD` missing from "
+        "handlers.py — the $2 floor would be bypassed"
     )
