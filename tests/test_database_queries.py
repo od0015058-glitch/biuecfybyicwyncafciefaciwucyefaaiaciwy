@@ -881,6 +881,59 @@ async def test_deduct_balance_finite_positive_cost_still_runs_sql():
     assert tg == 777
 
 
+async def test_deduct_balance_refuses_finite_negative_cost():
+    """A finite negative ``cost_usd`` would flip the SQL
+    ``SET balance_usd = balance_usd - $1`` into a *credit* (the WHERE
+    clause ``balance_usd >= -N`` is True for every solvent wallet) and
+    write the credit without a ``transactions`` ledger row — bypassing
+    the audit trail. ``pricing._apply_markup`` clamps cost to ``[0,
+    ∞)`` upstream today, but that clamp lives one module away; defend
+    in depth here so a future caller bypassing it can't credit users
+    silently. We refuse BEFORE issuing the SQL so the log line points
+    at the bad caller."""
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.deduct_balance(telegram_id=777, cost_usd=-5.0)
+    assert result is False
+    conn.fetchval.assert_not_awaited()
+
+
+async def test_deduct_balance_refuses_negative_cost_smallest_magnitude():
+    """A near-zero negative cost (``-0.0001``) is just as much an
+    audit-trail regression as a large one — refuse anything strictly
+    below zero. ``-0.0`` is treated as zero (Python ``-0.0 < 0`` is
+    ``False``) so the "free message via paid path" call site that
+    routes a $0 settlement still goes through unchanged."""
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.deduct_balance(telegram_id=777, cost_usd=-0.0001)
+    assert result is False
+    conn.fetchval.assert_not_awaited()
+
+
+async def test_deduct_balance_negative_zero_treated_as_zero():
+    """``-0.0`` is an IEEE-754 oddity but ``-0.0 < 0`` is ``False`` in
+    Python, so the negative guard MUST NOT short-circuit it — the
+    free-message-via-paid-path settlement (cost=0) still has to issue
+    the UPDATE so the test in ``test_ai_engine.py`` that pins
+    ``log_usage(cost=0)`` against ``deduct_balance`` returning True
+    keeps holding."""
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=10.0)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.deduct_balance(telegram_id=777, cost_usd=-0.0)
+    assert result is True
+    conn.fetchval.assert_awaited_once()
+
+
 async def test_admin_adjust_balance_raises_on_nan_delta():
     """``new_balance < 0`` is False for NaN, so the existing guard
     would let the NaN slip through and write into the wallet. The new
