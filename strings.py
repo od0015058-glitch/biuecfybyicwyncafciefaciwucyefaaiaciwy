@@ -99,6 +99,17 @@ _STRINGS: dict[str, dict[str, str]] = {
             "📥 لطفاً کد هدیه خود را ارسال کنید.\n"
             "برای انصراف دکمهٔ بازگشت را بزنید."
         ),
+        # ---- Wallet receipts (Stage-12-Step-C) ----
+        "btn_receipts": "🧾 رسیدهای اخیر",
+        "receipts_title": "🧾 **رسیدهای اخیر**",
+        "receipts_empty": (
+            "📭 هنوز رسیدی ندارید.\n\n"
+            "وقتی شارژ موفق ثبت شود اینجا نمایش داده می‌شود."
+        ),
+        "receipts_status_success": "✅",
+        "receipts_status_partial": "⚠️",
+        "receipts_status_refunded": "🔄",
+        "btn_receipts_more": "⏬ موارد بیشتر",
         # ---- /start ----
         "start_greeting": (
             "سلام {first_name}!\n\n"
@@ -429,6 +440,17 @@ _STRINGS: dict[str, dict[str, str]] = {
             "📥 Send your gift code now.\n"
             "Tap Back to cancel."
         ),
+        # ---- Wallet receipts (Stage-12-Step-C) ----
+        "btn_receipts": "🧾 Recent top-ups",
+        "receipts_title": "🧾 **Recent top-ups**",
+        "receipts_empty": (
+            "📭 No top-ups yet.\n\n"
+            "Successful charges will show up here."
+        ),
+        "receipts_status_success": "✅",
+        "receipts_status_partial": "⚠️",
+        "receipts_status_refunded": "🔄",
+        "btn_receipts_more": "⏬ Show more",
         # ---- /start ----
         "start_greeting": (
             "Hi {first_name}!\n\n"
