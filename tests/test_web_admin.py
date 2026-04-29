@@ -129,6 +129,9 @@ def test_signed_cookie_contains_no_secret():
 # ---------------------------------------------------------------------
 
 
+_UNSET = object()  # sentinel for stub-default vs explicit-None.
+
+
 def _stub_db(
     metrics: dict | None = None,
     promo_rows: list | None = None,
@@ -158,6 +161,13 @@ def _stub_db(
     mark_orphan_broadcast_jobs_result: int | Exception = 0,
     # Stage-12-Step-A: refund flow.
     refund_transaction_result: dict | None | Exception = None,
+    # Stage-12-Step-D: per-code redemption drilldown. Sentinel default
+    # ``object()`` distinguishes "caller didn't pass a value, use the
+    # standard fixture row" from "caller explicitly wants None" (i.e.
+    # the gift code doesn't exist).
+    get_gift_code_result=_UNSET,
+    list_gift_code_redemptions_result: dict | Exception | None = None,
+    gift_code_redemption_aggregates_result: dict | Exception | None = None,
 ):
     """A minimal Database stub that exposes the methods web_admin uses.
 
@@ -376,6 +386,53 @@ def _stub_db(
         db.refund_transaction = AsyncMock(side_effect=refund_transaction_result)
     else:
         db.refund_transaction = AsyncMock(return_value=refund_transaction_result)
+    # Stage-12-Step-D: per-code redemption drilldown stubs. Default to
+    # a non-None gift row so the handler doesn't redirect on every test
+    # that doesn't explicitly opt out — tests that *want* a missing
+    # code pass ``get_gift_code_result=None`` explicitly.
+    _DEFAULT_GIFT_META = {
+        "code": "BIRTHDAY5",
+        "amount_usd": 5.0,
+        "max_uses": 10,
+        "used_count": 3,
+        "expires_at": None,
+        "is_active": True,
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    if isinstance(get_gift_code_result, Exception):
+        db.get_gift_code = AsyncMock(side_effect=get_gift_code_result)
+    elif get_gift_code_result is _UNSET:
+        db.get_gift_code = AsyncMock(return_value=_DEFAULT_GIFT_META)
+    else:
+        db.get_gift_code = AsyncMock(return_value=get_gift_code_result)
+    _DEFAULT_REDEMPTIONS = {
+        "rows": [], "total": 0, "page": 1,
+        "per_page": 50, "total_pages": 0,
+    }
+    if isinstance(list_gift_code_redemptions_result, Exception):
+        db.list_gift_code_redemptions = AsyncMock(
+            side_effect=list_gift_code_redemptions_result
+        )
+    else:
+        db.list_gift_code_redemptions = AsyncMock(
+            return_value=list_gift_code_redemptions_result
+            if list_gift_code_redemptions_result is not None
+            else _DEFAULT_REDEMPTIONS
+        )
+    _DEFAULT_GIFT_AGG = {
+        "total_redemptions": 0, "total_credited_usd": 0.0,
+        "first_redeemed_at": None, "last_redeemed_at": None,
+    }
+    if isinstance(gift_code_redemption_aggregates_result, Exception):
+        db.get_gift_code_redemption_aggregates = AsyncMock(
+            side_effect=gift_code_redemption_aggregates_result
+        )
+    else:
+        db.get_gift_code_redemption_aggregates = AsyncMock(
+            return_value=gift_code_redemption_aggregates_result
+            if gift_code_redemption_aggregates_result is not None
+            else _DEFAULT_GIFT_AGG
+        )
     # Surface the canonical refundable-gateways set on the stub so the
     # transactions template can iterate it without reaching for the
     # real Database class — matches the production import path.
@@ -2479,8 +2536,9 @@ async def test_gifts_get_lists_codes(aiohttp_client, make_admin_app):
     body = await resp.text()
     assert "BIRTHDAY5" in body
     assert "$5.00" in body
-    assert "3 /" in body  # used_count / max_uses
-    assert "10" in body
+    # used_count: now wrapped in a drilldown link when > 0 (Stage-12-Step-D).
+    assert ">3</a>" in body
+    assert "10" in body  # max_uses
     assert "REVOKED_GIFT" in body
     assert "$1.50" in body
     assert "active" in body
@@ -2804,6 +2862,311 @@ async def test_gifts_revoke_invalid_url_code(aiohttp_client, make_admin_app):
     )
     assert resp.status == 302
     db.revoke_gift_code.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------
+# Stage-12-Step-D: per-code redemption drilldown
+# ---------------------------------------------------------------------
+
+
+async def test_gift_redemptions_requires_auth(aiohttp_client, make_admin_app):
+    """Anonymous request bounces to /admin/login like every other admin page."""
+    client = await aiohttp_client(make_admin_app())
+    resp = await client.get(
+        "/admin/gifts/BIRTHDAY5/redemptions", allow_redirects=False
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+
+
+async def test_gift_redemptions_renders_rows(aiohttp_client, make_admin_app):
+    """Happy path: code exists with redemptions; aggregates render and
+    each row surfaces telegram_id / username / credited / tx id."""
+    redemptions = {
+        "rows": [
+            {
+                "telegram_id": 1001,
+                "username": "alice",
+                "redeemed_at": "2026-04-29T10:00:00+00:00",
+                "transaction_id": 555,
+                "amount_usd_credited": 5.0,
+            },
+            {
+                "telegram_id": 1002,
+                "username": None,
+                "redeemed_at": "2026-04-28T09:30:00+00:00",
+                "transaction_id": 554,
+                "amount_usd_credited": 5.0,
+            },
+        ],
+        "total": 2, "page": 1, "per_page": 50, "total_pages": 1,
+    }
+    aggregates = {
+        "total_redemptions": 2,
+        "total_credited_usd": 10.0,
+        "first_redeemed_at": "2026-04-28T09:30:00+00:00",
+        "last_redeemed_at": "2026-04-29T10:00:00+00:00",
+    }
+    db = _stub_db(
+        list_gift_code_redemptions_result=redemptions,
+        gift_code_redemption_aggregates_result=aggregates,
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.get("/admin/gifts/BIRTHDAY5/redemptions")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    # Aggregates rendered
+    assert "Redemptions" in body
+    assert "$10.00" in body
+    # Both rows present
+    assert "1001" in body
+    assert "1002" in body
+    assert "@alice" in body
+    assert "#555" in body
+    assert "#554" in body
+    # Per-row credited shown
+    assert "$5.0000" in body
+
+
+async def test_gift_redemptions_uppercases_url_code(
+    aiohttp_client, make_admin_app
+):
+    """``/admin/gifts/birthday5/redemptions`` is normalised to BIRTHDAY5
+    before hitting the DB — the gift_codes PK is stored uppercase."""
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.get("/admin/gifts/birthday5/redemptions")
+    assert resp.status == 200
+    db.get_gift_code.assert_awaited_once_with("BIRTHDAY5")
+    db.list_gift_code_redemptions.assert_awaited_once_with(
+        code="BIRTHDAY5", page=1, per_page=50,
+    )
+    db.get_gift_code_redemption_aggregates.assert_awaited_once_with(
+        "BIRTHDAY5"
+    )
+
+
+async def test_gift_redemptions_unknown_code_redirects_with_flash(
+    aiohttp_client, make_admin_app
+):
+    """A deep link to a code that no longer exists redirects back to
+    /admin/gifts with an info-banner flash, NOT a 404 (matches the
+    user-detail redirect-with-flash convention)."""
+    db = _stub_db(get_gift_code_result=None)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.get(
+        "/admin/gifts/GHOST/redemptions", allow_redirects=False
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/gifts"
+    # And the per-page browser was NOT queried — the meta lookup
+    # returned None so we short-circuit before paying for the page.
+    db.list_gift_code_redemptions.assert_not_awaited()
+    db.get_gift_code_redemption_aggregates.assert_not_awaited()
+
+
+async def test_gift_redemptions_invalid_url_code_redirects(
+    aiohttp_client, make_admin_app
+):
+    """Tampered URL with chars outside [A-Za-z0-9_-] redirects to
+    /admin/gifts BEFORE hitting the DB — defense in depth even though
+    the SQL is parameterised."""
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.get(
+        "/admin/gifts/<script>/redemptions", allow_redirects=False
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/gifts"
+    db.get_gift_code.assert_not_awaited()
+
+
+async def test_gift_redemptions_oversized_url_code_redirects(
+    aiohttp_client, make_admin_app
+):
+    """A code longer than 64 chars is rejected at the URL layer before
+    we hit the DB. Matches the parse_gift_form / gifts_revoke ceiling."""
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    long_code = "A" * 80
+    resp = await client.get(
+        f"/admin/gifts/{long_code}/redemptions", allow_redirects=False
+    )
+    assert resp.status == 302
+    db.get_gift_code.assert_not_awaited()
+
+
+async def test_gift_redemptions_per_page_clamps(
+    aiohttp_client, make_admin_app
+):
+    """``per_page=9999`` is clamped to GIFT_REDEMPTIONS_PER_PAGE_MAX (200)
+    before being passed to the DB. ``per_page=0`` is clamped to 1.
+    ``per_page=junk`` falls back to the default."""
+    from web_admin import GIFT_REDEMPTIONS_PER_PAGE_MAX
+
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+
+    await client.get("/admin/gifts/X/redemptions?per_page=9999")
+    db.list_gift_code_redemptions.assert_awaited_with(
+        code="X", page=1, per_page=GIFT_REDEMPTIONS_PER_PAGE_MAX,
+    )
+
+    db.list_gift_code_redemptions.reset_mock()
+    await client.get("/admin/gifts/X/redemptions?per_page=0")
+    db.list_gift_code_redemptions.assert_awaited_with(
+        code="X", page=1, per_page=1,
+    )
+
+    db.list_gift_code_redemptions.reset_mock()
+    await client.get("/admin/gifts/X/redemptions?per_page=not-a-number")
+    db.list_gift_code_redemptions.assert_awaited_with(
+        code="X", page=1, per_page=50,
+    )
+
+
+async def test_gift_redemptions_pagination_links(
+    aiohttp_client, make_admin_app
+):
+    """When total_pages > current page, the rendered template MUST
+    include a Next link with ?page=N+1; first page MUST NOT link
+    'Prev' to a real page."""
+    redemptions = {
+        "rows": [
+            {
+                "telegram_id": 1001,
+                "username": None,
+                "redeemed_at": "2026-04-29T10:00:00+00:00",
+                "transaction_id": 555,
+                "amount_usd_credited": 5.0,
+            },
+        ],
+        "total": 75, "page": 1, "per_page": 50, "total_pages": 2,
+    }
+    db = _stub_db(list_gift_code_redemptions_result=redemptions)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.get("/admin/gifts/X/redemptions")
+    body = await resp.text()
+    # Next link present, points at page=2
+    assert "/admin/gifts/X/redemptions?page=2" in body
+    # First page should NOT have a clickable Prev link — only the
+    # disabled <span>.
+    assert '<span class="disabled">← Prev</span>' in body
+
+
+async def test_gift_redemptions_empty_state(aiohttp_client, make_admin_app):
+    """Code exists but has zero redemptions: render the empty-state
+    placeholder, NOT a broken table."""
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.get("/admin/gifts/BIRTHDAY5/redemptions")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "No redemptions yet for this code." in body
+
+
+async def test_gift_redemptions_orphan_row_renders_dash(
+    aiohttp_client, make_admin_app
+):
+    """Redemption with NULL transaction_id (the underlying transactions
+    row was cleaned up — ON DELETE SET NULL) renders as '—' for both
+    the credited amount and the transaction column instead of crashing
+    or printing 'None'."""
+    redemptions = {
+        "rows": [
+            {
+                "telegram_id": 1001,
+                "username": "alice",
+                "redeemed_at": "2026-04-29T10:00:00+00:00",
+                "transaction_id": None,
+                "amount_usd_credited": None,
+            },
+        ],
+        "total": 1, "page": 1, "per_page": 50, "total_pages": 1,
+    }
+    db = _stub_db(list_gift_code_redemptions_result=redemptions)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.get("/admin/gifts/X/redemptions")
+    body = await resp.text()
+    assert "1001" in body
+    assert "None" not in body  # don't leak Python None into the page
+    # at least one em-dash placeholder rendered
+    assert body.count("—") >= 1
+
+
+async def test_gift_redemptions_db_error_renders_banner(
+    aiohttp_client, make_admin_app
+):
+    """If the DB query blows up, we render the page with a banner —
+    we do NOT 500 the request."""
+    db = _stub_db(list_gift_code_redemptions_result=Exception("boom"))
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.get("/admin/gifts/BIRTHDAY5/redemptions")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Database query failed" in body
+
+
+async def test_gifts_list_links_to_redemptions_when_used_count_positive(
+    aiohttp_client, make_admin_app
+):
+    """The gifts list's used_count cell should now be a clickable
+    drilldown link when used_count > 0; remain plain text when 0."""
+    rows = [
+        {
+            "code": "USED",
+            "amount_usd": 5.0, "max_uses": 10, "used_count": 3,
+            "expires_at": None, "is_active": True,
+            "created_at": "2026-01-01T00:00:00+00:00",
+        },
+        {
+            "code": "UNUSED",
+            "amount_usd": 5.0, "max_uses": 10, "used_count": 0,
+            "expires_at": None, "is_active": True,
+            "created_at": "2026-01-01T00:00:00+00:00",
+        },
+    ]
+    client = await aiohttp_client(
+        make_admin_app(password="pw", db=_stub_db(gift_rows=rows))
+    )
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.get("/admin/gifts")
+    body = await resp.text()
+    # Drilldown link only on the used row.
+    assert 'href="/admin/gifts/USED/redemptions"' in body
+    assert 'href="/admin/gifts/UNUSED/redemptions"' not in body
 
 
 # ---------------------------------------------------------------------
