@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 
 import aiohttp
@@ -53,6 +54,34 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
 
     free_msgs = user['free_messages_left']
     balance = float(user['balance_usd'])
+    # Defense-in-depth: a non-finite ``balance_usd`` (NaN or
+    # ``+Infinity``) silently bypasses the ``balance < 0.05``
+    # insufficient-funds gate below — every comparison against NaN
+    # returns False, and ``+Infinity < 0.05`` is also False (so
+    # neither value is "less than 0.05"). A user with a poisoned
+    # wallet (legacy row predating the write-side finite guards on
+    # ``finalize_payment`` / ``finalize_partial_payment`` /
+    # ``deduct_balance`` / ``redeem_gift_code`` /
+    # ``admin_adjust_balance``, a manual SQL fix, a future migration
+    # mishap, or any path that bypasses those callers) would
+    # therefore pass the gate, hit OpenRouter on the bot's dime, then
+    # have ``deduct_balance`` silently no-op (``balance_usd >= cost``
+    # is False for NaN, and the existing ``_is_finite_amount`` guard
+    # at the SQL layer refuses the +Infinity branch) and fall to the
+    # ``cost=0`` ``log_usage`` branch — i.e. unlimited free chat at
+    # the bot's expense. ``-Infinity`` correctly fails the gate
+    # (``-Inf < 0.05`` is True) so it isn't part of this hole, but
+    # we treat any non-finite value the same way for simplicity and
+    # because ``-Inf`` is just as wrong to display in the hub UI.
+    # Treat non-finite as $0 locally so the gate fires correctly;
+    # log loud-and-once so ops can repair the row.
+    if not math.isfinite(balance):
+        log.error(
+            "user %d has non-finite balance_usd=%r in DB; treating "
+            "as $0 for gating. Investigate row corruption.",
+            telegram_id, user['balance_usd'],
+        )
+        balance = 0.0
     raw_active_model = user['active_model']
     active_model = _resolve_active_model(raw_active_model)
     if active_model != raw_active_model:

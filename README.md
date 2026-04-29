@@ -172,7 +172,7 @@ pytest tests/
 | `payments.py` | NowPayments invoice creation, IPN verification (HMAC-SHA512), idempotent finalize, partial-payment crediting. |
 | `pending_expiration.py` | Background reaper task. Wakes every `PENDING_EXPIRATION_INTERVAL_MIN` (default 15) minutes, calls `Database.expire_stale_pending` to flip stuck `PENDING` rows older than `PENDING_EXPIRATION_HOURS` (default 24) to `EXPIRED`, drops a `payment_expired` audit row (`actor="reaper"`), and pings the affected user. `TelegramForbiddenError` / `TelegramBadRequest` are swallowed. Spawned by `main.main` after the webhook server, cancelled cleanly on shutdown. |
 | `handlers.py` | All aiogram handlers — `/start`, hub UI, charge flow, model picker, language picker, support. |
-| `ai_engine.py` | OpenRouter call, cost calc, balance deduct, optional conversation memory. |
+| `ai_engine.py` | OpenRouter call, cost calc, balance deduct, optional conversation memory. Defense-in-depth: a non-finite `users.balance_usd` (NaN / +Infinity from a legacy poisoned row) is treated as $0 for the insufficient-funds gate so a corrupted wallet can't silently bypass the gate and grant unlimited free chat at the bot's expense. |
 | `pricing.py` | Per-model price table + `COST_MARKUP` env var (default 1.5×). |
 | `models_catalog.py` | Live `/v1/models` fetch from OpenRouter with 24 h cache, provider whitelist, free/paid split. |
 | `middlewares.py` | `UserUpsertMiddleware` — ensures `users` row exists before any handler runs. |
