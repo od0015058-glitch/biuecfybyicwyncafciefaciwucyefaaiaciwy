@@ -1468,6 +1468,64 @@ def test_create_promo_code_rejects_amount_over_decimal_cap():
         )
 
 
+def test_create_promo_code_rejects_nan_discount_amount():
+    """Defense-in-depth: a NaN ``discount_amount`` slips past every
+    upstream comparison (``NaN <= 0`` is ``False``, ``NaN >
+    999_999.9999`` is ``False``) and PostgreSQL ``NUMERIC`` would
+    happily store ``'NaN'::numeric``. Once stored, the redeemer's
+    ``balance_usd + bonus`` arithmetic on invoice finalize
+    propagates NaN into the wallet column, bricking it the same
+    way PR #75 prevented at the IPN layer. Refuse at the DB
+    layer so the only paths money flows out of a promo are the
+    finite-amount happy paths."""
+    from database import Database
+    db = Database.__new__(Database)
+    db.pool = None
+    import asyncio
+    with pytest.raises(ValueError, match="finite"):
+        asyncio.get_event_loop().run_until_complete(
+            db.create_promo_code(
+                code="X",
+                discount_amount=float("nan"),
+            )
+        )
+
+
+def test_create_promo_code_rejects_negative_infinity_discount_amount():
+    """``-Infinity`` is technically caught by the existing ``<= 0``
+    branch, but we want the more specific ``finite`` error so the
+    log line points at the actual cause (and so a future refactor
+    that reorders the checks keeps the guard)."""
+    from database import Database
+    db = Database.__new__(Database)
+    db.pool = None
+    import asyncio
+    with pytest.raises(ValueError, match="finite"):
+        asyncio.get_event_loop().run_until_complete(
+            db.create_promo_code(
+                code="X",
+                discount_amount=float("-inf"),
+            )
+        )
+
+
+def test_create_promo_code_rejects_positive_infinity_discount_amount():
+    """``+Infinity`` was already caught by the ``> 999_999.9999``
+    DECIMAL-cap branch, but we now reject it at the up-front
+    finite-check with a clearer error message."""
+    from database import Database
+    db = Database.__new__(Database)
+    db.pool = None
+    import asyncio
+    with pytest.raises(ValueError, match="finite"):
+        asyncio.get_event_loop().run_until_complete(
+            db.create_promo_code(
+                code="X",
+                discount_amount=float("inf"),
+            )
+        )
+
+
 # CSRF helpers
 # ---------------------------------------------------------------------
 
@@ -2210,6 +2268,56 @@ def test_create_gift_code_rejects_negative_max_uses():
             db.create_gift_code(
                 code="X", amount_usd=5.0, max_uses=-1,
             )
+        )
+
+
+def test_create_gift_code_rejects_nan_amount():
+    """Defense-in-depth: a NaN ``amount_usd`` slips past every
+    upstream comparison (``NaN <= 0`` is ``False``, ``NaN >
+    GIFT_AMOUNT_MAX`` is ``False``) and PostgreSQL ``NUMERIC``
+    would store ``'NaN'::numeric``. The next ``redeem_gift_code``
+    caller would then run ``balance_usd + NaN`` and brick the
+    wallet \u2014 same shape as the ``deduct_balance`` /
+    ``finalize_payment`` / ``admin_adjust_balance`` non-finite
+    refusals we already ship. Web admin form rejects this before
+    it gets here, but the DB layer is the only line of defence
+    against a future caller that bypasses ``parse_gift_form``."""
+    from database import Database
+    db = Database.__new__(Database)
+    db.pool = None
+    import asyncio
+    with pytest.raises(ValueError, match="finite"):
+        asyncio.get_event_loop().run_until_complete(
+            db.create_gift_code(code="X", amount_usd=float("nan"))
+        )
+
+
+def test_create_gift_code_rejects_positive_infinity_amount():
+    """``+Infinity`` was already caught by the GIFT_AMOUNT_MAX
+    upper bound; we now reject it earlier with a clearer message
+    so the log line points at the actual cause."""
+    from database import Database
+    db = Database.__new__(Database)
+    db.pool = None
+    import asyncio
+    with pytest.raises(ValueError, match="finite"):
+        asyncio.get_event_loop().run_until_complete(
+            db.create_gift_code(code="X", amount_usd=float("inf"))
+        )
+
+
+def test_create_gift_code_rejects_negative_infinity_amount():
+    """``-Infinity`` was already caught by ``amount_usd <= 0`` but
+    we surface the more specific finite-check error so a future
+    refactor that reorders the checks doesn't quietly re-open the
+    NaN hole alongside ``-Inf``."""
+    from database import Database
+    db = Database.__new__(Database)
+    db.pool = None
+    import asyncio
+    with pytest.raises(ValueError, match="finite"):
+        asyncio.get_event_loop().run_until_complete(
+            db.create_gift_code(code="X", amount_usd=float("-inf"))
         )
 
 
