@@ -4397,6 +4397,96 @@ async def test_strings_save_post_rejects_unknown_key(
     db.upsert_string_override.assert_not_awaited()
 
 
+async def test_strings_save_post_rejects_unknown_placeholder(
+    aiohttp_client, make_admin_app
+):
+    """An override using a placeholder the compiled default doesn't
+    expose is rejected at save time. Pre-fix this saved silently and
+    crashed every ``t()`` call rendering the slug with KeyError."""
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_strings_csrf(client, "pw")
+    # ``hub_title`` declares {active_model}, {balance}, {lang_label},
+    # {memory_label}. Sending an unknown {bal} placeholder must be
+    # rejected.
+    resp = await client.post(
+        "/admin/strings/en/hub_title",
+        data={"csrf_token": csrf, "value": "Bad: {bal}"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_string_override.assert_not_awaited()
+    resp2 = await client.get("/admin/strings/en/hub_title")
+    body = await resp2.text()
+    assert "Unknown placeholder" in body
+
+
+async def test_strings_save_post_rejects_invalid_format_syntax(
+    aiohttp_client, make_admin_app
+):
+    """An override with an unclosed brace is rejected at save time."""
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_strings_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/strings/en/hub_title",
+        data={"csrf_token": csrf, "value": "Balance: {balance"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_string_override.assert_not_awaited()
+    resp2 = await client.get("/admin/strings/en/hub_title")
+    body = await resp2.text()
+    assert "Invalid placeholder syntax" in body
+
+
+async def test_strings_save_post_rejects_positional_placeholder(
+    aiohttp_client, make_admin_app
+):
+    """``{0}`` / ``{}`` are rejected — every ``t()`` call site uses
+    keyword arguments."""
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_strings_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/strings/en/hub_title",
+        data={"csrf_token": csrf, "value": "Balance: {0}"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_string_override.assert_not_awaited()
+
+
+async def test_strings_save_post_accepts_subset_of_placeholders(
+    aiohttp_client, make_admin_app
+):
+    """An override that drops some — but not all — of the compiled
+    default's placeholders saves fine; ``str.format`` ignores extra
+    kwargs the template doesn't reference."""
+    import strings as bot_strings_module
+    bot_strings_module.set_overrides({})
+
+    db = _stub_db()
+    db.load_all_string_overrides = AsyncMock(
+        side_effect=[{}, {("en", "hub_title"): "Just balance: ${balance:.2f}"}]
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_strings_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/strings/en/hub_title",
+        data={
+            "csrf_token": csrf,
+            "value": "Just balance: ${balance:.2f}",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_string_override.assert_awaited_once_with(
+        "en", "hub_title", "Just balance: ${balance:.2f}", updated_by="web"
+    )
+    bot_strings_module.set_overrides({})
+
+
 async def test_strings_save_post_db_error_shows_flash(
     aiohttp_client, make_admin_app
 ):

@@ -27,6 +27,7 @@ they just shadow it, so reverting an override resurrects the default.
 from __future__ import annotations
 
 import logging
+import string as _string_module
 
 log = logging.getLogger("bot.strings")
 
@@ -626,6 +627,107 @@ def get_compiled_default(lang: str, key: str) -> str | None:
     return _STRINGS[lang].get(key)
 
 
+_FORMATTER = _string_module.Formatter()
+
+
+def extract_format_fields(template: str) -> set[str]:
+    """Return the set of top-level ``str.format`` field names referenced by
+    *template*.
+
+    For example::
+
+        "Balance: ${balance:.2f}, model={user.name}"  ->  {"balance", "user"}
+
+    Only the **top-level** name is recorded — ``user.name`` and
+    ``user[0]`` both contribute ``"user"`` because that's the kwarg the
+    caller has to supply. Positional placeholders (``"{0}"``, ``"{}"``)
+    are intentionally not modelled: every call site in this codebase
+    uses keyword arguments, so a positional placeholder in an admin
+    override is by definition broken.
+
+    Raises :class:`ValueError` if *template* has invalid format
+    syntax (unclosed brace, bare ``{``, ``}``, etc.).
+    """
+    fields: set[str] = set()
+    for _literal, field_name, _format_spec, _conversion in _FORMATTER.parse(
+        template
+    ):
+        if field_name is None:
+            # Pure-literal segment with no placeholder.
+            continue
+        # Strip attribute / index access — we only need the kwarg name.
+        # ``user.name`` -> ``user``;  ``items[0]`` -> ``items``.
+        head = field_name.split(".", 1)[0].split("[", 1)[0]
+        if head == "" or head.isdigit():
+            # Bare ``"{}"`` (auto-numbered) or indexed ``"{0}"`` /
+            # ``"{1}"``. ``str.format(**kwargs)`` can't satisfy these
+            # — caller passes only kwargs — so treat the template as
+            # broken. Surface as ValueError so the validator can
+            # produce a clear error message.
+            raise ValueError(
+                "positional placeholders ({} or {0}) are not allowed in "
+                "string overrides; use named placeholders like {balance}."
+            )
+        fields.add(head)
+    return fields
+
+
+def validate_override(
+    lang: str, key: str, value: str
+) -> str | None:
+    """Validate that *value* is safe to use as the ``(lang, key)``
+    override.
+
+    Returns ``None`` on success, or a short error message describing
+    why the override would break runtime ``t()`` calls. The web admin
+    handler uses the message verbatim in a flash banner so admins can
+    see what's wrong without trawling logs.
+
+    Two failure modes:
+
+    * **Invalid syntax.** Unbalanced braces, unrecognised conversion,
+      etc. — :class:`ValueError` from :class:`string.Formatter.parse`.
+      Pre-fix this got saved into ``_OVERRIDES`` and then *every*
+      ``t()`` call for the slug raised, crashing the handler that
+      tried to render it (e.g. the wallet view).
+    * **Unknown placeholder.** ``"{bal}"`` when the compiled default
+      uses ``"{balance}"``. ``str.format(balance=…)`` raises
+      ``KeyError: 'bal'`` for the override, same crash mode.
+
+    Both checks are run against the compiled default for the slug —
+    we trust the compiled default's placeholder set and require the
+    override to use a subset. Dropping placeholders entirely is fine
+    (an override that ignores ``{balance}`` just renders without it).
+    """
+    default = get_compiled_default(lang, key)
+    if default is None:
+        return f"Unknown slug {lang}:{key}."
+    try:
+        default_fields = extract_format_fields(default)
+    except ValueError:
+        # The compiled default itself is malformed — that's a code
+        # bug, not the admin's. Don't block the override on it; the
+        # runtime fallback in :func:`t` will catch any subsequent
+        # render failure.
+        default_fields = set()
+    try:
+        override_fields = extract_format_fields(value)
+    except ValueError as exc:
+        return f"Invalid placeholder syntax: {exc}"
+    extra = override_fields - default_fields
+    if extra:
+        allowed = (
+            ", ".join(sorted(f"{{{f}}}" for f in default_fields))
+            if default_fields
+            else "(none — this slug takes no placeholders)"
+        )
+        return (
+            f"Unknown placeholder(s) {sorted(extra)!r}. "
+            f"Allowed for this slug: {allowed}"
+        )
+    return None
+
+
 def iter_compiled_strings():
     """Yield ``(lang, key, default_value)`` for every compiled string.
 
@@ -680,7 +782,38 @@ def t(lang: str | None, key: str, **kwargs: object) -> str:
             )
         return key
     if kwargs:
-        return template.format(**kwargs)
+        try:
+            return template.format(**kwargs)
+        except (KeyError, IndexError, ValueError) as exc:
+            # Defensive runtime fallback for a broken admin override.
+            # ``string_save_post`` validates new overrides via
+            # :func:`validate_override`, but a legacy DB row (saved
+            # before that validation existed) can still slip through;
+            # without this guard, ``str.format`` would raise here and
+            # bubble up as a poller-level crash, taking out the
+            # handler that tried to render the slug.
+            #
+            # Strategy: if we're rendering an override (template !=
+            # compiled default), retry with the compiled default,
+            # which we trust to have correct placeholders.
+            # Otherwise — or if the default also fails — surface the
+            # bare slug, same fallback as the missing-key branch.
+            default_template = (
+                _STRINGS.get(lang, {}).get(key)
+                or _STRINGS[DEFAULT_LANGUAGE].get(key)
+            )
+            if default_template is not None and default_template != template:
+                try:
+                    return default_template.format(**kwargs)
+                except (KeyError, IndexError, ValueError):
+                    pass
+            log.warning(
+                "strings.t(): format failed for key=%r lang=%r (%s); "
+                "rendering bare slug. Fix the override at "
+                "/admin/strings/%s/%s.",
+                key, lang, exc, lang, key,
+            )
+            return key
     return template
 
 
@@ -699,9 +832,11 @@ __all__ = [
     "DEFAULT_LANGUAGE",
     "SUPPORTED_LANGUAGES",
     "all_button_labels",
+    "extract_format_fields",
     "get_compiled_default",
     "get_override",
     "iter_compiled_strings",
     "set_overrides",
     "t",
+    "validate_override",
 ]
