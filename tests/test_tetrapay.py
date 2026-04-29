@@ -19,6 +19,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 from unittest.mock import AsyncMock, MagicMock
@@ -394,11 +395,18 @@ async def test_webhook_drops_missing_authority(_tetrapay_env, patched_db, patche
     assert tetrapay.get_tetrapay_drop_counters()["missing_authority"] == 1
 
 
-async def test_webhook_drops_replay(_tetrapay_env, patched_db, patched_verify):
-    """``record_payment_status_transition`` returning ``None`` means the
-    same (authority, status) pair was already observed — handler must
-    bail before verify or finalize."""
-    patched_db.record_payment_status_transition.return_value = None
+async def test_webhook_drops_already_finalized_replay(
+    _tetrapay_env, patched_db, patched_verify,
+):
+    """Replay protection lives at the DB row layer, not the
+    ``payment_status_transitions`` table: once an invoice has been
+    finalized, ``get_pending_invoice_amount_usd`` returns ``None`` and
+    the handler bails before calling ``verify_payment`` or
+    ``finalize_payment``. This is the same shape as the unknown-invoice
+    drop because, from the handler's POV, "already finalized" and
+    "never existed" are indistinguishable — the row simply isn't
+    PENDING / PARTIAL anymore."""
+    patched_db.get_pending_invoice_amount_usd.return_value = None
     body = json.dumps({
         "status": "100", "authority": "auth-1", "hash_id": "hid-1",
     }).encode("utf-8")
@@ -408,7 +416,36 @@ async def test_webhook_drops_replay(_tetrapay_env, patched_db, patched_verify):
     assert response.status == 200
     patched_verify.assert_not_awaited()
     patched_db.finalize_payment.assert_not_awaited()
-    assert tetrapay.get_tetrapay_drop_counters()["replay"] == 1
+    # No transition row written here either — the audit record is only
+    # made AFTER a successful finalize, so the handler stays silent on
+    # already-finalized replays.
+    patched_db.record_payment_status_transition.assert_not_awaited()
+    assert tetrapay.get_tetrapay_drop_counters()["unknown_invoice"] == 1
+
+
+async def test_webhook_does_not_record_transition_before_verify(
+    _tetrapay_env, patched_db, patched_verify,
+):
+    """Critical correctness invariant: the
+    ``payment_status_transitions`` row MUST NOT be inserted before a
+    successful ``verify_payment`` + ``finalize_payment``. Otherwise a
+    transient verify failure (timeout, network blip) would leave a
+    ``(authority, "100")`` row that blocks every TetraPay retry —
+    permanent uncreditability for an order the user actually paid."""
+    body = json.dumps({
+        "status": "100", "authority": "auth-1", "hash_id": "hid-1",
+    }).encode("utf-8")
+    request = _make_request(body)
+    await tetrapay.tetrapay_webhook(request)
+
+    # The audit row was written after finalize succeeded, not before.
+    patched_db.finalize_payment.assert_awaited_once()
+    patched_db.record_payment_status_transition.assert_awaited_once()
+    finalize_call = patched_db.finalize_payment.call_args_list[0]
+    record_call = patched_db.record_payment_status_transition.call_args_list[0]
+    assert finalize_call.args[0] == "auth-1"
+    assert record_call.args[0] == "auth-1"
+    assert record_call.kwargs.get("outcome") == "applied"
 
 
 async def test_webhook_non_success_callback_does_not_credit(
@@ -518,6 +555,158 @@ async def test_webhook_telegram_failure_does_not_500(
     # Still 200, even though the notification raised.
     assert response.status == 200
     patched_db.finalize_payment.assert_awaited_once()
+
+
+async def test_webhook_verify_timeout_returns_500_without_recording(
+    _tetrapay_env, patched_db, patched_verify,
+):
+    """``asyncio.TimeoutError`` is not a subclass of
+    ``aiohttp.ClientError``. A naive ``except aiohttp.ClientError``
+    would let a verify timeout escape to the outer 500-returning
+    handler — but ALSO leave a ``payment_status_transitions`` row
+    behind (under the pre-fix ordering), permanently locking the user
+    out of their own paid invoice. This regression test pins the
+    correct shape: timeout → 500, no transition row, retry can succeed.
+    """
+    patched_verify.side_effect = asyncio.TimeoutError()
+    body = json.dumps({
+        "status": "100", "authority": "auth-1", "hash_id": "hid-1",
+    }).encode("utf-8")
+    request = _make_request(body)
+    response = await tetrapay.tetrapay_webhook(request)
+
+    # 500 so TetraPay retries the callback…
+    assert response.status == 500
+    # …with no dedupe row in the way of that retry.
+    patched_db.record_payment_status_transition.assert_not_awaited()
+    patched_db.finalize_payment.assert_not_awaited()
+    assert tetrapay.get_tetrapay_drop_counters()["verify_failed"] == 1
+
+
+async def test_webhook_verify_client_error_returns_500_without_recording(
+    _tetrapay_env, patched_db, patched_verify,
+):
+    """Same shape as the timeout case but for ``aiohttp.ClientError``
+    (DNS, connection reset, TLS handshake failure, etc.). Transient,
+    so we want TetraPay to retry — and we MUST NOT record a transition
+    that would block that retry."""
+    patched_verify.side_effect = aiohttp.ClientError("connection reset")
+    body = json.dumps({
+        "status": "100", "authority": "auth-1", "hash_id": "hid-1",
+    }).encode("utf-8")
+    request = _make_request(body)
+    response = await tetrapay.tetrapay_webhook(request)
+
+    assert response.status == 500
+    patched_db.record_payment_status_transition.assert_not_awaited()
+    patched_db.finalize_payment.assert_not_awaited()
+
+
+async def test_webhook_verify_ambiguous_status_returns_500_without_recording(
+    _tetrapay_env, patched_db, patched_verify,
+):
+    """``TetraPayError(status=None, ...)`` is the shape ``verify_payment``
+    raises when the response wasn't even JSON. We can't tell the gateway's
+    intent from that — treat as transient, return 500, don't record."""
+    patched_verify.side_effect = tetrapay.TetraPayError(
+        None, "non-JSON response", body="<html>503</html>",
+    )
+    body = json.dumps({
+        "status": "100", "authority": "auth-1", "hash_id": "hid-1",
+    }).encode("utf-8")
+    request = _make_request(body)
+    response = await tetrapay.tetrapay_webhook(request)
+
+    assert response.status == 500
+    patched_db.record_payment_status_transition.assert_not_awaited()
+    patched_db.finalize_payment.assert_not_awaited()
+
+
+async def test_webhook_verify_explicit_rejection_returns_200_and_records(
+    _tetrapay_env, patched_db, patched_verify,
+):
+    """A ``TetraPayError`` with a concrete non-None status means
+    TetraPay's ``/api/verify`` told us the order is not settled. Don't
+    retry — gateway has spoken — but DO record the transition (with
+    ``outcome="rejected"``) so the audit log shows we considered and
+    rejected this callback."""
+    patched_verify.side_effect = tetrapay.TetraPayError(
+        "404", "verify rejected", body={},
+    )
+    body = json.dumps({
+        "status": "100", "authority": "auth-1", "hash_id": "hid-1",
+    }).encode("utf-8")
+    request = _make_request(body)
+    response = await tetrapay.tetrapay_webhook(request)
+
+    assert response.status == 200
+    patched_db.finalize_payment.assert_not_awaited()
+    patched_db.record_payment_status_transition.assert_awaited_once()
+    record_call = patched_db.record_payment_status_transition.call_args_list[0]
+    assert record_call.kwargs.get("outcome") == "rejected"
+
+
+async def test_webhook_credit_notification_includes_promo_bonus_line(
+    _tetrapay_env, patched_db, patched_verify,
+):
+    """A user who used a promo code on a TetraPay payment should see
+    the bonus line in their credit notification, mirroring the
+    NowPayments path. The base ``tetrapay_credit_notification``
+    template only shows the base amount; the handler must append the
+    ``pay_promo_bonus`` line when ``bonus_credited > 0``."""
+    patched_db.finalize_payment.return_value = {
+        "telegram_id": 7,
+        "delta_credited": 5.0,
+        "amount_usd_credited": 5.0,
+        "promo_bonus_credited": 1.5,
+    }
+    body = json.dumps({
+        "status": "100", "authority": "auth-1", "hash_id": "hid-1",
+    }).encode("utf-8")
+    request = _make_request(body)
+    response = await tetrapay.tetrapay_webhook(request)
+
+    assert response.status == 200
+    request.app["bot"].send_message.assert_awaited_once()
+    call_kwargs = request.app["bot"].send_message.call_args
+    sent_text = call_kwargs.args[1] if len(call_kwargs.args) > 1 else call_kwargs.kwargs.get("text") or call_kwargs.args[0]
+    # Base credit string + promo bonus line both present.
+    assert "5" in sent_text  # delta credited
+    assert "1.5" in sent_text or "1,50" in sent_text or "1.50" in sent_text
+
+
+async def test_webhook_credit_notification_omits_promo_line_when_no_bonus(
+    _tetrapay_env, patched_db, patched_verify,
+):
+    """The mirror case: when ``bonus_credited`` is zero, the notification
+    must NOT contain the ``pay_promo_bonus`` line. The fa string for it
+    starts with the 🎁 emoji; assert that's absent so we don't tell the
+    user they got a bonus when they didn't."""
+    patched_db.finalize_payment.return_value = {
+        "telegram_id": 7,
+        "delta_credited": 5.0,
+        "amount_usd_credited": 5.0,
+        "promo_bonus_credited": 0.0,
+    }
+    body = json.dumps({
+        "status": "100", "authority": "auth-1", "hash_id": "hid-1",
+    }).encode("utf-8")
+    request = _make_request(body)
+    await tetrapay.tetrapay_webhook(request)
+
+    call = request.app["bot"].send_message.call_args
+    sent_text = call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "")
+    assert "🎁" not in sent_text
+
+
+def test_transactions_gateway_values_includes_tetrapay():
+    """Admins filtering ``/admin/transactions`` by gateway must be able
+    to pick the new ``tetrapay`` value. ``list_transactions`` validates
+    the filter against ``TRANSACTIONS_GATEWAY_VALUES`` and raises
+    ``ValueError`` for unknown values, so omitting ``tetrapay`` here
+    would silently break the admin view for the new payment method."""
+    from database import db as real_db
+    assert "tetrapay" in real_db.TRANSACTIONS_GATEWAY_VALUES
 
 
 # ---------------------------------------------------------------------

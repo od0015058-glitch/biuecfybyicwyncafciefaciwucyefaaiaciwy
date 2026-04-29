@@ -93,6 +93,7 @@ lazily inside each function so tests can patch them via
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -516,40 +517,11 @@ async def tetrapay_webhook(request: web.Request) -> web.Response:
             )
             return web.Response(status=200, text="OK")
 
-        # Replay-dedupe BEFORE we do any expensive work (DB lookup +
-        # verify HTTP call). The NowPayments path follows the same
-        # ordering. ``record_payment_status_transition`` returns
-        # ``None`` on duplicate (invoice, status) pairs.
-        outcome = "applied" if status == _SUCCESS_STATUS else "noop"
-        try:
-            transition_id = await db.record_payment_status_transition(
-                authority,
-                status,
-                outcome=outcome,
-                meta={
-                    "remote": request.remote,
-                    "body_len": len(raw_body),
-                    "gateway": "tetrapay",
-                    "hash_id": hash_id,
-                },
-            )
-        except Exception:
-            log.exception(
-                "TetraPay record_payment_status_transition failed for "
-                "authority=%s status=%s; falling through to row-level "
-                "dedupe",
-                authority, status,
-            )
-            transition_id = "deferred"  # truthy sentinel
-        if transition_id is None:
-            _bump_tetrapay_drop_counter("replay")
-            log.info(
-                "TetraPay webhook replay dropped: authority=%s status=%s "
-                "already observed",
-                authority, status,
-            )
-            return web.Response(status=200, text="OK")
-
+        # User cancelled / declined — gateway will not deliver "100"
+        # for this same authority later, but we still record the
+        # transition for audit. PENDING row stays so the reaper can
+        # sweep it after 24h. Don't gate this branch on dedupe — TetraPay
+        # may legitimately re-deliver the same non-success status.
         if status != _SUCCESS_STATUS:
             _bump_tetrapay_drop_counter("non_success_callback")
             log.info(
@@ -558,10 +530,31 @@ async def tetrapay_webhook(request: web.Request) -> web.Response:
                 "user retry",
                 status, authority, hash_id,
             )
+            try:
+                await db.record_payment_status_transition(
+                    authority, status, outcome="noop",
+                    meta={
+                        "remote": request.remote,
+                        "gateway": "tetrapay",
+                        "hash_id": hash_id,
+                    },
+                )
+            except Exception:
+                log.exception(
+                    "TetraPay non-success transition record failed for "
+                    "authority=%s; ignoring (non-critical audit miss)",
+                    authority,
+                )
             return web.Response(status=200, text="OK")
 
-        # Look up the locked USD figure on our ledger. If the row is
-        # unknown (no PENDING) or already terminal, refuse to credit.
+        # Look up the locked USD figure on our ledger. ``None`` means
+        # one of: (a) no PENDING/PARTIAL row for this authority (forged
+        # callback or pre-creation race), or (b) the row already moved
+        # to a terminal status — i.e. we already credited a previous
+        # webhook delivery. Both are safe drops with 200; in case (b)
+        # ``finalize_payment`` would return None anyway via FOR UPDATE +
+        # status-check, but bailing here saves a useless ``verify_payment``
+        # round-trip on every TetraPay retry of an already-credited order.
         locked_usd = await db.get_pending_invoice_amount_usd(authority)
         if locked_usd is None:
             _bump_tetrapay_drop_counter("unknown_invoice")
@@ -575,15 +568,69 @@ async def tetrapay_webhook(request: web.Request) -> web.Response:
         # AUTHORITATIVE settlement check. A user could craft a forged
         # callback to this endpoint with a guessed authority; only
         # TetraPay's verify endpoint can confirm the order is settled.
+        #
+        # Two failure shapes here, deliberately distinguished:
+        #
+        # 1. **Deterministic gateway rejection** — ``TetraPayError`` with
+        #    a non-None ``status`` field means TetraPay's ``/api/verify``
+        #    explicitly told us the authority is not settled. We log,
+        #    record the transition for audit, and return **200** (no
+        #    retry; the gateway has spoken).
+        #
+        # 2. **Transient infrastructure failure** —
+        #    ``asyncio.TimeoutError``, ``aiohttp.ClientError`` (DNS,
+        #    connection reset, etc.), or ``TetraPayError`` with
+        #    ``status=None`` (non-JSON response) all indicate we have no
+        #    ground truth on settlement. We bump the counter and return
+        #    **500** so TetraPay retries. Crucially we do **NOT** record
+        #    a ``payment_status_transitions`` row here: the dedupe table
+        #    must not block a future retry that could legitimately credit
+        #    the user. A timeout that recorded the (authority, "100")
+        #    transition would otherwise lock the user out of their own
+        #    paid invoice forever.
         try:
             await verify_payment(authority)
-        except (TetraPayError, aiohttp.ClientError) as exc:
+        except TetraPayError as exc:
+            _bump_tetrapay_drop_counter("verify_failed")
+            if exc.status is None:
+                # Non-JSON / no status → treat as transient.
+                log.error(
+                    "TetraPay verify ambiguous failure for authority=%s "
+                    "(hash_id=%r): %s; returning 500 to trigger retry",
+                    authority, hash_id, exc,
+                )
+                return web.Response(status=500, text="verify failed")
+            log.error(
+                "TetraPay verify rejected authority=%s (hash_id=%r): "
+                "status=%r %s",
+                authority, hash_id, exc.status, exc,
+            )
+            try:
+                await db.record_payment_status_transition(
+                    authority, status, outcome="rejected",
+                    meta={
+                        "remote": request.remote,
+                        "gateway": "tetrapay",
+                        "hash_id": hash_id,
+                        "verify_status": exc.status,
+                    },
+                )
+            except Exception:
+                log.exception(
+                    "TetraPay verify-rejected transition record failed for "
+                    "authority=%s; ignoring (non-critical audit miss)",
+                    authority,
+                )
+            return web.Response(status=200, text="OK")
+        except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+            # Transient — return 500 so TetraPay retries.
             _bump_tetrapay_drop_counter("verify_failed")
             log.error(
-                "TetraPay verify rejected authority=%s (hash_id=%r): %s",
+                "TetraPay verify transport failure for authority=%s "
+                "(hash_id=%r): %s; returning 500 to trigger retry",
                 authority, hash_id, exc,
             )
-            return web.Response(status=200, text="OK")
+            return web.Response(status=500, text="verify failed")
 
         row = await db.finalize_payment(authority, locked_usd)
         if row is None:
@@ -595,24 +642,58 @@ async def tetrapay_webhook(request: web.Request) -> web.Response:
             )
             return web.Response(status=200, text="OK")
 
+        # Audit-only transition record, written AFTER successful finalize.
+        # Critically NOT pre-finalize: a pre-finalize record would lock a
+        # transient verify failure into permanent uncreditability (the
+        # retry would drop on dedupe before reaching ``finalize_payment``
+        # again). ``finalize_payment`` is itself idempotent via FOR
+        # UPDATE + status-check, so it's the canonical correctness gate;
+        # this row is purely for ``/admin/transactions`` history and ops.
+        try:
+            await db.record_payment_status_transition(
+                authority, status, outcome="applied",
+                meta={
+                    "remote": request.remote,
+                    "body_len": len(raw_body),
+                    "gateway": "tetrapay",
+                    "hash_id": hash_id,
+                },
+            )
+        except Exception:
+            log.exception(
+                "TetraPay applied transition record failed for "
+                "authority=%s; ignoring (non-critical audit miss; "
+                "wallet was already credited)",
+                authority,
+            )
+
         telegram_id = row["telegram_id"]
         delta_credited = float(row["delta_credited"])
         bonus_credited = float(row.get("promo_bonus_credited") or 0.0)
 
         # Best-effort user notification — see NowPayments path for
         # rationale on why a Telegram failure must NOT cause a 500.
+        # Mirror the NowPayments path's promo-bonus rendering: append
+        # a separate ``pay_promo_bonus`` line when a bonus was credited
+        # so the user sees both the base credit and the promo on top
+        # of it (the credit notification template only shows the base
+        # amount).
         bot: Bot = request.app["bot"]
         try:
             lang = await db.get_user_language(telegram_id)
-            await bot.send_message(
-                telegram_id,
-                t(
+            msg = t(
+                lang or "fa",
+                "tetrapay_credit_notification",
+                amount=delta_credited,
+            )
+            if bonus_credited > 0:
+                msg = msg + "\n\n" + t(
                     lang or "fa",
-                    "tetrapay_credit_notification",
-                    amount=delta_credited,
+                    "pay_promo_bonus",
                     bonus=bonus_credited,
-                ),
-                parse_mode="Markdown",
+                )
+            await bot.send_message(
+                telegram_id, msg, parse_mode="Markdown",
             )
         except (TelegramForbiddenError, TelegramBadRequest):
             # User blocked the bot or the chat is gone. Wallet is

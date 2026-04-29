@@ -1893,7 +1893,7 @@ class Database:
     # boundary rather than at the SQL layer — keeps PostgreSQL from
     # ever seeing an arbitrary admin-supplied string.
     TRANSACTIONS_GATEWAY_VALUES: frozenset[str] = frozenset(
-        {"nowpayments", "admin", "gift"}
+        {"nowpayments", "tetrapay", "admin", "gift"}
     )
     # Mirror for ``status`` column — the state-machine values the
     # codebase uses anywhere. ``PARTIAL`` is the NowPayments
