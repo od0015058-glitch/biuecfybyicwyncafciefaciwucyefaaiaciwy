@@ -155,6 +155,37 @@ def test_balance_block_fresh_snapshot_english():
     assert "TMN" in tail
 
 
+def test_balance_block_nan_balance_renders_zero_dollars_not_dollar_nan():
+    """A non-finite balance must not leak ``$nan`` to the user. The
+    annotation guard already returns ``""`` for the Toman line, but
+    Python's ``f"${math.nan:.2f}"`` produces literally ``"$nan"`` so
+    the head string itself needs the same defense. We render
+    ``$0.00`` instead — the closest sensible "we don't know" string."""
+    out = format_balance_block("fa", math.nan, _snap(rate=100_000.0))
+    assert out == "$0.00"
+    assert "nan" not in out.lower()
+
+
+def test_balance_block_pos_inf_balance_renders_zero_dollars():
+    out = format_balance_block("fa", math.inf, _snap(rate=100_000.0))
+    assert out == "$0.00"
+    assert "inf" not in out.lower()
+
+
+def test_balance_block_neg_inf_balance_renders_zero_dollars():
+    out = format_balance_block("en", -math.inf, _snap(rate=100_000.0))
+    assert out == "$0.00"
+
+
+def test_balance_block_non_numeric_balance_renders_zero_dollars():
+    """``isinstance`` guard mirrors the annotation function so a
+    future caller passing a Decimal-as-str / None / etc. doesn't
+    crash with a TypeError on ``f"${val:.2f}"``."""
+    # type: ignore[arg-type] — we're explicitly testing the guard.
+    out = format_balance_block("fa", "not-a-number", _snap(rate=100_000.0))  # type: ignore[arg-type]
+    assert out == "$0.00"
+
+
 # ---------------------------------------------------------------------
 # Wallet handlers: ``wallet_text`` is templated with ``{toman_line}``
 # ---------------------------------------------------------------------
