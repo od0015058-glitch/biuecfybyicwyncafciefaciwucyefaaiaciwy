@@ -438,15 +438,33 @@ class Database:
     # the canonical set without grepping. SUCCESS is its own ledger
     # status reached via ``finalize_payment``, NOT
     # ``mark_transaction_terminal``.
+    #
+    # Stage-12-Step-A bug-fix: REFUNDED used to live in this set, which
+    # meant ``mark_transaction_terminal("...", "REFUNDED")`` would flip
+    # a row to REFUNDED *without* debiting the user — a future caller
+    # using the helper for a SUCCESS-row refund would silently mint
+    # money (user keeps the credit AND the gateway returned the funds).
+    # REFUNDED is now its own state with its own entry points:
+    #   * :meth:`refund_transaction` — admin-issued refund, debits the
+    #     wallet by the credited USD amount inside the same DB tx.
+    #   * :meth:`mark_payment_refunded_via_ipn` — gateway-side refund
+    #     (NowPayments ``refunded`` IPN); does not debit, mirrors the
+    #     PARTIAL-credit-stays-with-the-user limitation documented on
+    #     ``mark_transaction_terminal``.
     TERMINAL_FAILURE_STATUSES: frozenset[str] = frozenset(
-        {"EXPIRED", "FAILED", "REFUNDED"}
+        {"EXPIRED", "FAILED"}
     )
+    # Refund states have their own canonical set so the type/value
+    # system catches a future caller passing REFUNDED to
+    # ``mark_transaction_terminal`` (which never debits) when they
+    # actually meant ``refund_transaction`` (which does).
+    REFUND_STATUSES: frozenset[str] = frozenset({"REFUNDED"})
 
     async def mark_transaction_terminal(
         self, gateway_invoice_id: str, new_status: str
     ):
         """Atomically close a PENDING or PARTIAL transaction with a terminal
-        failure status (EXPIRED / FAILED / REFUNDED).
+        failure status (EXPIRED / FAILED).
 
         The user's balance is **not** modified — even when transitioning from
         PARTIAL. The semantics are:
@@ -472,6 +490,12 @@ class Database:
         clause now also checks ``status != $2`` as belt-and-suspenders so
         a future caller sneaking past the entry guard still can't bump
         the timestamp on a real no-op.
+
+        Stage-12-Step-A: REFUNDED is no longer accepted here — see the
+        ``REFUND_STATUSES`` docstring above and the dedicated
+        :meth:`refund_transaction` / :meth:`mark_payment_refunded_via_ipn`
+        entry points. A caller that needs to record a refund must pick
+        one of those depending on whether the wallet should be debited.
         """
         if new_status not in self.TERMINAL_FAILURE_STATUSES:
             raise ValueError(
@@ -511,6 +535,274 @@ class Database:
                     "currency_used": row["currency_used"],
                     "amount_usd_credited": row["amount_usd_credited"],
                     "previous_status": previous_status,
+                }
+
+    # Stage-12-Step-A: gateway-side refund (NowPayments ``refunded`` IPN).
+    # Carved out of ``mark_transaction_terminal`` so the type system
+    # makes "refund" a deliberate, separate API surface — the wallet
+    # debit / no-debit decision is no longer hidden behind a status
+    # string parameter.
+    async def mark_payment_refunded_via_ipn(self, gateway_invoice_id: str):
+        """Atomically close a PENDING / PARTIAL row as REFUNDED in
+        response to a gateway-side refund (today: NowPayments
+        ``refunded`` IPN).
+
+        The user's wallet is **not** debited — for a PARTIAL row the
+        partial credit they already received stays put, mirroring the
+        documented limitation on :meth:`mark_transaction_terminal`
+        (we cannot programmatically reverse a partial-credit on the
+        wallet side because the gateway has already returned the
+        crypto / fiat to the buyer; the operator handles any
+        correction off-ledger). For a PENDING row there is nothing
+        to debit — no credit was issued.
+
+        Returns the same row-dict shape as :meth:`mark_transaction_terminal`
+        on success, or ``None`` if the row was unknown or already
+        terminal. Idempotent against retries via the WHERE-status
+        guard.
+
+        Admin-issued refunds of SUCCESS rows go through
+        :meth:`refund_transaction` instead, which DOES debit the
+        wallet — the two flows are intentionally distinct entry
+        points so a misrouted call can't silently mint money.
+        """
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    """
+                    SELECT telegram_id, status, currency_used, amount_usd_credited
+                    FROM transactions
+                    WHERE gateway_invoice_id = $1
+                    FOR UPDATE
+                    """,
+                    gateway_invoice_id,
+                )
+                if row is None or row["status"] not in ("PENDING", "PARTIAL"):
+                    return None
+                previous_status = row["status"]
+                await connection.execute(
+                    """
+                    UPDATE transactions
+                    SET status = 'REFUNDED',
+                        completed_at = CURRENT_TIMESTAMP,
+                        refunded_at = CURRENT_TIMESTAMP,
+                        refund_reason = $2
+                    WHERE gateway_invoice_id = $1
+                      AND status != 'REFUNDED'
+                    """,
+                    gateway_invoice_id,
+                    "[ipn] gateway reported refunded",
+                )
+                return {
+                    "telegram_id": row["telegram_id"],
+                    "currency_used": row["currency_used"],
+                    "amount_usd_credited": row["amount_usd_credited"],
+                    "previous_status": previous_status,
+                }
+
+    # Stage-12-Step-A: admin-issued bookkeeping refund.
+    REFUND_REASON_MAX_LEN: int = 500
+    # Distinguishable failure shapes returned by ``refund_transaction``
+    # so the caller can render a friendly banner without a second DB
+    # round-trip to figure out *why* we said no. ``None`` is reserved
+    # for "row no longer exists" — a benign race where the row was
+    # deleted between the user clicking refund and the POST landing.
+    REFUND_REFUSAL_NOT_FOUND = "not_found"
+    REFUND_REFUSAL_NOT_SUCCESS = "not_success"
+    REFUND_REFUSAL_GATEWAY_NOT_REFUNDABLE = "gateway_not_refundable"
+    REFUND_REFUSAL_INSUFFICIENT_BALANCE = "insufficient_balance"
+    # The set of gateways the admin refund flow knows how to reverse.
+    # ``admin`` and ``gift`` rows are reversed via
+    # :meth:`admin_adjust_balance` (which writes its own ledger row)
+    # so the refund flow refuses them — there's no underlying gateway
+    # transaction to mark refunded.
+    REFUNDABLE_GATEWAYS: frozenset[str] = frozenset({"nowpayments", "tetrapay"})
+
+    async def refund_transaction(
+        self,
+        *,
+        transaction_id: int,
+        reason: str,
+        admin_telegram_id: int,
+    ) -> dict | None:
+        """Admin-issued refund of a SUCCESS gateway transaction.
+
+        Atomically:
+          1. Lock the row with ``SELECT ... FOR UPDATE``.
+          2. Refuse if it's not SUCCESS, not from a refundable gateway,
+             or has already been refunded.
+          3. Lock the user row and refuse if the wallet doesn't have
+             enough balance to absorb the debit (the operator gets a
+             friendly "user spent it; debit manually first" banner).
+          4. Debit the wallet by ``amount_usd_credited`` (the original
+             credit USD figure, NOT recomputed at refund time — for
+             TetraPay this preserves the locked-rate semantics from
+             Stage-11-Step-C; for NowPayments this is the same USD
+             we credited at finalize time).
+          5. Flip ``status`` -> REFUNDED, write ``refunded_at`` and
+             ``refund_reason``.
+
+        Returns a dict on success::
+
+            {
+              "transaction_id": int,
+              "telegram_id": int,
+              "amount_refunded_usd": float,
+              "new_balance_usd": float,
+            }
+
+        On a refusal returns a dict shaped
+        ``{"error": <REFUND_REFUSAL_*>, "current_status": str | None,
+           "balance_usd": float | None, "amount_usd": float | None}``.
+
+        Returns ``None`` only when the row genuinely does not exist
+        (the rare race where it was deleted between the operator
+        clicking the button and the POST landing).
+
+        ``reason`` is mandatory, capped at ``REFUND_REASON_MAX_LEN``
+        chars, and stored verbatim on ``transactions.refund_reason``
+        for the forensic record. ``admin_telegram_id`` is the
+        operator's id (the web panel passes its sentinel
+        ``ADMIN_WEB_SENTINEL_ID``); it lands on the audit log row
+        recorded by the caller (this method does not write the audit
+        row itself — the web layer does, so a DB blip writing the
+        audit row never blocks the refund itself, mirroring the
+        ``_record_audit_safe`` pattern used everywhere else).
+
+        NowPayments has no programmatic refund API for confirmed
+        crypto payments — this method is a **bookkeeping** refund
+        only. The operator separately settles the user off-chain /
+        off-card; the row's REFUNDED state records that we did.
+        TetraPay's ``/api/refund`` endpoint is documented; calling
+        it inline is a Stage-12-Step-A.5 follow-up if the user asks.
+        """
+        if not isinstance(transaction_id, int) or transaction_id <= 0:
+            raise ValueError(
+                f"transaction_id must be a positive int; got {transaction_id!r}"
+            )
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("reason must be a non-empty string")
+        reason = reason.strip()
+        if len(reason) > self.REFUND_REASON_MAX_LEN:
+            raise ValueError(
+                f"reason longer than REFUND_REASON_MAX_LEN "
+                f"({self.REFUND_REASON_MAX_LEN}); got {len(reason)}"
+            )
+
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                # Lock the transactions row first so a concurrent IPN
+                # cannot flip status out from under us between the
+                # eligibility check and the UPDATE.
+                tx_row = await connection.fetchrow(
+                    """
+                    SELECT transaction_id, telegram_id, gateway,
+                           amount_usd_credited, status
+                    FROM transactions
+                    WHERE transaction_id = $1
+                    FOR UPDATE
+                    """,
+                    transaction_id,
+                )
+                if tx_row is None:
+                    return None
+                if tx_row["status"] != "SUCCESS":
+                    return {
+                        "error": self.REFUND_REFUSAL_NOT_SUCCESS,
+                        "current_status": tx_row["status"],
+                        "balance_usd": None,
+                        "amount_usd": float(tx_row["amount_usd_credited"]),
+                    }
+                if tx_row["gateway"] not in self.REFUNDABLE_GATEWAYS:
+                    return {
+                        "error": self.REFUND_REFUSAL_GATEWAY_NOT_REFUNDABLE,
+                        "current_status": tx_row["status"],
+                        "balance_usd": None,
+                        "amount_usd": float(tx_row["amount_usd_credited"]),
+                    }
+
+                telegram_id = int(tx_row["telegram_id"])
+                amount_usd = float(tx_row["amount_usd_credited"])
+                # Defense-in-depth: refuse non-finite or non-positive
+                # amounts. ``finalize_payment`` already guards the
+                # credit side, but a corrupted row from a manual SQL
+                # fix could still poison the refund path.
+                if not _is_finite_amount(amount_usd) or amount_usd <= 0:
+                    log.error(
+                        "refund_transaction: non-finite or non-positive "
+                        "amount_usd_credited=%r on transaction_id=%d; "
+                        "refusing refund",
+                        amount_usd, transaction_id,
+                    )
+                    return {
+                        "error": self.REFUND_REFUSAL_INSUFFICIENT_BALANCE,
+                        "current_status": tx_row["status"],
+                        "balance_usd": None,
+                        "amount_usd": amount_usd,
+                    }
+
+                # Lock the user row so a concurrent ``deduct_balance`` /
+                # ``admin_adjust_balance`` can't race the balance check.
+                user_row = await connection.fetchrow(
+                    "SELECT balance_usd FROM users "
+                    "WHERE telegram_id = $1 FOR UPDATE",
+                    telegram_id,
+                )
+                if user_row is None:
+                    # The user row is gone but the transaction row
+                    # still references it — extremely unlikely with
+                    # the FK in place, but treat as "not found" for
+                    # the operator banner.
+                    return None
+                current_balance = float(user_row["balance_usd"])
+                if not _is_finite_amount(current_balance):
+                    log.error(
+                        "refund_transaction: non-finite balance_usd=%r on "
+                        "user %d; refusing refund",
+                        current_balance, telegram_id,
+                    )
+                    return {
+                        "error": self.REFUND_REFUSAL_INSUFFICIENT_BALANCE,
+                        "current_status": tx_row["status"],
+                        "balance_usd": current_balance,
+                        "amount_usd": amount_usd,
+                    }
+                new_balance = current_balance - amount_usd
+                if new_balance < 0:
+                    return {
+                        "error": self.REFUND_REFUSAL_INSUFFICIENT_BALANCE,
+                        "current_status": tx_row["status"],
+                        "balance_usd": current_balance,
+                        "amount_usd": amount_usd,
+                    }
+
+                await connection.execute(
+                    "UPDATE users SET balance_usd = $1 "
+                    "WHERE telegram_id = $2",
+                    new_balance, telegram_id,
+                )
+                await connection.execute(
+                    """
+                    UPDATE transactions
+                    SET status = 'REFUNDED',
+                        refunded_at = CURRENT_TIMESTAMP,
+                        refund_reason = $2
+                    WHERE transaction_id = $1
+                      AND status = 'SUCCESS'
+                    """,
+                    transaction_id, reason,
+                )
+                log.info(
+                    "refund_transaction: tx=%d user=%d amount=$%.4f "
+                    "admin=%d reason=%r",
+                    transaction_id, telegram_id, amount_usd,
+                    admin_telegram_id, reason,
+                )
+                return {
+                    "transaction_id": transaction_id,
+                    "telegram_id": telegram_id,
+                    "amount_refunded_usd": amount_usd,
+                    "new_balance_usd": new_balance,
                 }
 
     async def get_pending_invoice_amount_usd(

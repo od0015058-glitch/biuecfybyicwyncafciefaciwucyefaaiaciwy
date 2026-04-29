@@ -21,6 +21,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp import web
 
+import database as database_module
+
 from web_admin import (
     COOKIE_NAME,
     setup_admin_routes,
@@ -154,6 +156,8 @@ def _stub_db(
     insert_broadcast_job_result: object | Exception = None,
     update_broadcast_job_result: bool | Exception = True,
     mark_orphan_broadcast_jobs_result: int | Exception = 0,
+    # Stage-12-Step-A: refund flow.
+    refund_transaction_result: dict | None | Exception = None,
 ):
     """A minimal Database stub that exposes the methods web_admin uses.
 
@@ -367,6 +371,24 @@ def _stub_db(
         db.mark_orphan_broadcast_jobs_interrupted = AsyncMock(
             return_value=mark_orphan_broadcast_jobs_result
         )
+    # Stage-12-Step-A: refund_transaction stub.
+    if isinstance(refund_transaction_result, Exception):
+        db.refund_transaction = AsyncMock(side_effect=refund_transaction_result)
+    else:
+        db.refund_transaction = AsyncMock(return_value=refund_transaction_result)
+    # Surface the canonical refundable-gateways set on the stub so the
+    # transactions template can iterate it without reaching for the
+    # real Database class — matches the production import path.
+    db.REFUNDABLE_GATEWAYS = database_module.Database.REFUNDABLE_GATEWAYS
+    db.REFUND_REFUSAL_NOT_SUCCESS = (
+        database_module.Database.REFUND_REFUSAL_NOT_SUCCESS
+    )
+    db.REFUND_REFUSAL_GATEWAY_NOT_REFUNDABLE = (
+        database_module.Database.REFUND_REFUSAL_GATEWAY_NOT_REFUNDABLE
+    )
+    db.REFUND_REFUSAL_INSUFFICIENT_BALANCE = (
+        database_module.Database.REFUND_REFUSAL_INSUFFICIENT_BALANCE
+    )
     return db
 
 
@@ -6988,3 +7010,330 @@ def test_store_broadcast_job_evicts_interrupted_terminal_state():
     assert interrupted_ids[0] not in app[APP_KEY_BROADCAST_JOBS]
     assert newest["id"] in app[APP_KEY_BROADCAST_JOBS]
     assert len(app[APP_KEY_BROADCAST_JOBS]) == BROADCAST_MAX_HISTORY
+
+
+# =========================================================================
+# Stage-12-Step-A: refunds / chargebacks admin UI
+# =========================================================================
+#
+# The integration tests below exercise the full route stack —
+# CSRF, auth, audit logging, flash banners, redirect — against a
+# stubbed DB layer so we don't need Postgres in CI. The DB-method
+# semantics themselves are covered by the SQL-shape tests in
+# ``tests/test_database_queries.py``.
+
+
+from web_admin import (  # noqa: E402  (keep Stage-12-Step-A imports grouped)
+    transaction_refund_post,
+    REFUND_REASON_MAX_CHARS,
+)
+
+
+async def _login_and_get_transactions_csrf(
+    client, password: str = "pw"
+) -> str:
+    """Log in, fetch /admin/transactions, scrape its CSRF token.
+
+    The transactions list page started embedding a CSRF token in
+    Stage-12-Step-A so the inline refund form can POST. We pin the
+    scrape pattern here so the integration tests fail loudly if the
+    template ever drops the token.
+    """
+    await _login(client, password)
+    resp = await client.get("/admin/transactions")
+    assert resp.status == 200
+    body = await resp.text()
+    import re
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+    assert m, "Expected CSRF token on /admin/transactions"
+    return m.group(1)
+
+
+def _success_tx_row(**overrides) -> dict:
+    """Default SUCCESS row shape for the transactions list stub."""
+    base = {
+        "id": 501,
+        "telegram_id": 42,
+        "gateway": "nowpayments",
+        "currency": "USDT",
+        "amount_crypto_or_rial": 1.0,
+        "amount_usd": 9.99,
+        "status": "SUCCESS",
+        "gateway_invoice_id": "inv-501",
+        "created_at": "2026-04-28T12:00:00+00:00",
+        "completed_at": "2026-04-28T12:05:00+00:00",
+        "notes": None,
+    }
+    base.update(overrides)
+    return base
+
+
+async def test_transactions_list_shows_refund_button_only_on_eligible_rows(
+    aiohttp_client, make_admin_app
+):
+    """The inline Refund form must render only on SUCCESS rows from
+    a refundable gateway (nowpayments / tetrapay). Admin and gift
+    rows route through the credit/debit flow on the user detail
+    page — rendering a Refund button there would silently double
+    debit if clicked.
+    """
+    rows = [
+        _success_tx_row(id=701, gateway="nowpayments", status="SUCCESS"),
+        _success_tx_row(id=702, gateway="tetrapay", status="SUCCESS"),
+        _success_tx_row(id=703, gateway="admin", status="SUCCESS"),
+        _success_tx_row(id=704, gateway="gift", status="SUCCESS"),
+        _success_tx_row(id=705, gateway="nowpayments", status="PENDING"),
+        _success_tx_row(id=706, gateway="nowpayments", status="REFUNDED"),
+    ]
+    db = _stub_db(
+        list_transactions_result={
+            "rows": rows, "total": len(rows), "page": 1,
+            "per_page": 50, "total_pages": 1,
+        }
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/transactions")
+    body = await resp.text()
+    # Eligible: SUCCESS + nowpayments / tetrapay
+    assert 'action="/admin/transactions/701/refund"' in body
+    assert 'action="/admin/transactions/702/refund"' in body
+    # Not eligible: admin / gift gateways
+    assert 'action="/admin/transactions/703/refund"' not in body
+    assert 'action="/admin/transactions/704/refund"' not in body
+    # Not eligible: non-SUCCESS status (PENDING / REFUNDED)
+    assert 'action="/admin/transactions/705/refund"' not in body
+    assert 'action="/admin/transactions/706/refund"' not in body
+
+
+async def test_transactions_refund_requires_auth(
+    aiohttp_client, make_admin_app
+):
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    resp = await client.post(
+        "/admin/transactions/501/refund",
+        data={"csrf_token": "x", "reason": "test"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+
+
+async def test_transactions_refund_rejects_bad_csrf(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.post(
+        "/admin/transactions/501/refund",
+        data={"csrf_token": "wrong", "reason": "x"},
+        allow_redirects=False,
+    )
+    # Always redirects back to /admin/transactions with a flash; the
+    # underlying DB call must NOT have happened.
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/transactions"
+    db.refund_transaction.assert_not_awaited()
+
+
+async def test_transactions_refund_rejects_invalid_id(
+    aiohttp_client, make_admin_app
+):
+    """A non-integer transaction id never hits the DB; the route
+    returns the same redirect-to-list as a normal not-found click."""
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.post(
+        "/admin/transactions/not-an-int/refund",
+        data={"csrf_token": "anything", "reason": "x"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/transactions"
+    db.refund_transaction.assert_not_awaited()
+
+
+async def test_transactions_refund_rejects_zero_or_negative_id(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    for bad in ("0", "-1"):
+        resp = await client.post(
+            f"/admin/transactions/{bad}/refund",
+            data={"csrf_token": "anything", "reason": "x"},
+            allow_redirects=False,
+        )
+        assert resp.status == 302
+        assert resp.headers["Location"] == "/admin/transactions"
+    db.refund_transaction.assert_not_awaited()
+
+
+async def test_transactions_refund_rejects_empty_reason(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        list_transactions_result={
+            "rows": [_success_tx_row()], "total": 1, "page": 1,
+            "per_page": 50, "total_pages": 1,
+        }
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_transactions_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/transactions/501/refund",
+        data={"csrf_token": csrf, "reason": "   "},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.refund_transaction.assert_not_awaited()
+
+
+async def test_transactions_refund_rejects_oversize_reason(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        list_transactions_result={
+            "rows": [_success_tx_row()], "total": 1, "page": 1,
+            "per_page": 50, "total_pages": 1,
+        }
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_transactions_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/transactions/501/refund",
+        data={
+            "csrf_token": csrf,
+            "reason": "x" * (REFUND_REASON_MAX_CHARS + 1),
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.refund_transaction.assert_not_awaited()
+
+
+async def test_transactions_refund_happy_path_audits_and_calls_db(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        list_transactions_result={
+            "rows": [_success_tx_row()], "total": 1, "page": 1,
+            "per_page": 50, "total_pages": 1,
+        },
+        refund_transaction_result={
+            "transaction_id": 501,
+            "telegram_id": 42,
+            "amount_refunded_usd": 9.99,
+            "new_balance_usd": 5.0,
+        },
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_transactions_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/transactions/501/refund",
+        data={"csrf_token": csrf, "reason": "duplicate charge"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/transactions"
+    # DB called with exactly the parsed inputs (with the [web] prefix
+    # on the reason for grep-friendly forensics).
+    db.refund_transaction.assert_awaited_once()
+    call = db.refund_transaction.await_args
+    assert call.kwargs["transaction_id"] == 501
+    assert call.kwargs["reason"].startswith("[web] ")
+    assert "duplicate charge" in call.kwargs["reason"]
+    # Audit row records refund_issued.
+    actions = [c.kwargs["action"] for c in db.record_admin_audit.await_args_list]
+    assert "refund_issued" in actions
+
+
+async def test_transactions_refund_insufficient_balance_records_refused(
+    aiohttp_client, make_admin_app
+):
+    """User has spent the credit — the DB returns the error dict and
+    the route writes a refund_refused audit row instead of
+    refund_issued. The wallet must NOT have been debited (the DB
+    method is responsible for the no-write guarantee; the route just
+    surfaces the refusal)."""
+    db = _stub_db(
+        list_transactions_result={
+            "rows": [_success_tx_row()], "total": 1, "page": 1,
+            "per_page": 50, "total_pages": 1,
+        },
+        refund_transaction_result={
+            "error": database_module.Database.REFUND_REFUSAL_INSUFFICIENT_BALANCE,
+            "current_status": "SUCCESS",
+            "balance_usd": 1.0,
+            "amount_usd": 9.99,
+        },
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_transactions_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/transactions/501/refund",
+        data={"csrf_token": csrf, "reason": "chargeback"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    actions = [c.kwargs["action"] for c in db.record_admin_audit.await_args_list]
+    assert "refund_refused" in actions
+    assert "refund_issued" not in actions
+
+
+async def test_transactions_refund_not_found_records_refused(
+    aiohttp_client, make_admin_app
+):
+    """The DB returns ``None`` when the transaction row is gone (rare
+    benign race — operator clicks Refund, row deleted, POST lands).
+    Route must redirect with a friendly banner and write a
+    ``refund_refused`` audit row with outcome=not_found."""
+    db = _stub_db(
+        list_transactions_result={
+            "rows": [_success_tx_row()], "total": 1, "page": 1,
+            "per_page": 50, "total_pages": 1,
+        },
+        refund_transaction_result=None,
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_transactions_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/transactions/501/refund",
+        data={"csrf_token": csrf, "reason": "chargeback"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    audited = [
+        c for c in db.record_admin_audit.await_args_list
+        if c.kwargs["action"] == "refund_refused"
+    ]
+    assert audited, "expected a refund_refused audit row for not-found"
+    assert audited[0].kwargs["outcome"] == "not_found"
+
+
+async def test_transactions_refund_db_exception_yields_friendly_error(
+    aiohttp_client, make_admin_app
+):
+    """A bare Exception from the DB layer must NOT 500 — the route
+    redirects with an error flash so the operator can retry. No audit
+    row is written for an unhandled exception (the DB layer's own
+    error log carries the diagnostic)."""
+    db = _stub_db(
+        list_transactions_result={
+            "rows": [_success_tx_row()], "total": 1, "page": 1,
+            "per_page": 50, "total_pages": 1,
+        },
+        refund_transaction_result=RuntimeError("pool exhausted"),
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_transactions_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/transactions/501/refund",
+        data={"csrf_token": csrf, "reason": "chargeback"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/transactions"
