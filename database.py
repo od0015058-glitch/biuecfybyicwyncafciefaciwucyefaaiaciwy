@@ -2447,6 +2447,267 @@ class Database:
             for r in rows
         ]
 
+    # ------------------------------------------------------------------
+    # Stage-9-Step-10: durable broadcast job registry
+    # ------------------------------------------------------------------
+    #
+    # Mirrors the in-memory ``APP_KEY_BROADCAST_JOBS`` dict used by
+    # ``web_admin._run_broadcast_job``. Persistence is write-through:
+    # the worker keeps writing to the in-memory dict for cheap
+    # progress polling, and mirrors every state transition + throttled
+    # progress tick to this table so a process restart leaves a
+    # forensic trail rather than orphaning the job. Reads from
+    # ``broadcast_get`` / ``broadcast_detail_get`` come straight from
+    # the DB (with the in-memory dict layered on top for live
+    # progress numbers on an active job that the throttled writer
+    # may not have flushed yet).
+    #
+    # Terminal states: ``completed`` / ``failed`` / ``cancelled`` /
+    # ``interrupted``. The ``interrupted`` state is set by the
+    # startup orphan sweep below (any row left in ``queued`` or
+    # ``running`` from before the restart).
+
+    BROADCAST_JOB_STATES: frozenset[str] = frozenset(
+        {
+            "queued", "running",
+            "completed", "failed", "cancelled", "interrupted",
+        }
+    )
+    BROADCAST_JOB_TERMINAL_STATES: frozenset[str] = frozenset(
+        {"completed", "failed", "cancelled", "interrupted"}
+    )
+    BROADCAST_JOB_LIST_DEFAULT_LIMIT: int = 50
+    BROADCAST_JOB_LIST_MAX_LIMIT: int = 200
+
+    @staticmethod
+    def _broadcast_job_row_to_dict(row) -> dict:
+        """Coerce an asyncpg ``Record`` into the dict shape
+        ``web_admin`` consumes (matches the in-memory ``job`` dict
+        keys: ``sent`` / ``blocked`` / ``failed`` rather than the
+        ``_count``-suffixed column names — the suffix is purely a
+        SQL-side disambiguation against ``state="failed"``).
+        """
+        return {
+            "id": row["job_id"],
+            "text_preview": row["text_preview"],
+            "full_text_len": int(row["full_text_len"]),
+            "only_active_days": (
+                int(row["only_active_days"])
+                if row["only_active_days"] is not None else None
+            ),
+            "state": row["state"],
+            "total": int(row["total"]),
+            "sent": int(row["sent_count"]),
+            "blocked": int(row["blocked_count"]),
+            "failed": int(row["failed_count"]),
+            "i": int(row["i"]),
+            "error": row["error"],
+            "cancel_requested": bool(row["cancel_requested"]),
+            "created_at": (
+                row["created_at"].isoformat()
+                if row["created_at"] is not None else None
+            ),
+            "started_at": (
+                row["started_at"].isoformat()
+                if row["started_at"] is not None else None
+            ),
+            "completed_at": (
+                row["completed_at"].isoformat()
+                if row["completed_at"] is not None else None
+            ),
+        }
+
+    async def insert_broadcast_job(
+        self,
+        *,
+        job_id: str,
+        text_preview: str,
+        full_text_len: int,
+        only_active_days: int | None,
+        state: str = "queued",
+    ) -> None:
+        """Insert a freshly-created job row in its initial state.
+
+        Called once from ``broadcast_post`` right after the
+        in-memory dict is populated; subsequent updates flow
+        through ``update_broadcast_job``. Fails loudly on
+        duplicate ``job_id`` — the caller's
+        ``secrets.token_urlsafe(6)`` collision rate is one in
+        2**48 so this is a real bug if it ever fires.
+        """
+        if state not in self.BROADCAST_JOB_STATES:
+            raise ValueError(
+                f"invalid broadcast job state {state!r}; "
+                f"expected one of {sorted(self.BROADCAST_JOB_STATES)}"
+            )
+        async with self.pool.acquire() as connection:
+            await connection.execute(
+                """
+                INSERT INTO broadcast_jobs
+                    (job_id, text_preview, full_text_len,
+                     only_active_days, state)
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                job_id, text_preview, int(full_text_len),
+                only_active_days, state,
+            )
+
+    async def update_broadcast_job(
+        self,
+        job_id: str,
+        *,
+        state: str | None = None,
+        total: int | None = None,
+        sent: int | None = None,
+        blocked: int | None = None,
+        failed: int | None = None,
+        i: int | None = None,
+        error: str | None = None,
+        cancel_requested: bool | None = None,
+        started_at_now: bool = False,
+        completed_at_now: bool = False,
+    ) -> bool:
+        """Patch one or more fields on a broadcast job row.
+
+        Each parameter is opt-in — passing only ``state="running"``
+        sets just the state column. ``started_at_now`` /
+        ``completed_at_now`` are flag-shaped (rather than accepting
+        a caller-supplied timestamp) so the wall-clock value is
+        the DB's ``NOW()`` and we can't write ``None`` accidentally.
+
+        Returns ``True`` if a row was updated, ``False`` if no row
+        matched (already-evicted history, or the caller passed a
+        bad ``job_id``).
+        """
+        if state is not None and state not in self.BROADCAST_JOB_STATES:
+            raise ValueError(
+                f"invalid broadcast job state {state!r}; "
+                f"expected one of {sorted(self.BROADCAST_JOB_STATES)}"
+            )
+        set_clauses: list[str] = []
+        params: list[object] = []
+        if state is not None:
+            params.append(state)
+            set_clauses.append(f"state = ${len(params)}")
+        if total is not None:
+            params.append(int(total))
+            set_clauses.append(f"total = ${len(params)}")
+        if sent is not None:
+            params.append(int(sent))
+            set_clauses.append(f"sent_count = ${len(params)}")
+        if blocked is not None:
+            params.append(int(blocked))
+            set_clauses.append(f"blocked_count = ${len(params)}")
+        if failed is not None:
+            params.append(int(failed))
+            set_clauses.append(f"failed_count = ${len(params)}")
+        if i is not None:
+            params.append(int(i))
+            set_clauses.append(f"i = ${len(params)}")
+        if error is not None:
+            params.append(error)
+            set_clauses.append(f"error = ${len(params)}")
+        if cancel_requested is not None:
+            params.append(bool(cancel_requested))
+            set_clauses.append(f"cancel_requested = ${len(params)}")
+        if started_at_now:
+            set_clauses.append("started_at = NOW()")
+        if completed_at_now:
+            set_clauses.append("completed_at = NOW()")
+        if not set_clauses:
+            # No-op patch — explicitly OK rather than a SQL error.
+            return True
+        params.append(job_id)
+        sql = (
+            f"UPDATE broadcast_jobs SET {', '.join(set_clauses)} "
+            f"WHERE job_id = ${len(params)} "
+            f"RETURNING job_id"
+        )
+        async with self.pool.acquire() as connection:
+            row_id = await connection.fetchval(sql, *params)
+        return row_id is not None
+
+    async def get_broadcast_job(self, job_id: str) -> dict | None:
+        """Read a single job row by id; ``None`` if not found."""
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT job_id, text_preview, full_text_len,
+                       only_active_days, state, total,
+                       sent_count, blocked_count, failed_count,
+                       i, error, cancel_requested,
+                       created_at, started_at, completed_at
+                  FROM broadcast_jobs
+                 WHERE job_id = $1
+                """,
+                job_id,
+            )
+        if row is None:
+            return None
+        return self._broadcast_job_row_to_dict(row)
+
+    async def list_broadcast_jobs(
+        self, *, limit: int | None = None
+    ) -> list[dict]:
+        """Most recent broadcast jobs, newest first.
+
+        ``limit`` defaults to ``BROADCAST_JOB_LIST_DEFAULT_LIMIT``
+        and is clamped to ``[1, BROADCAST_JOB_LIST_MAX_LIMIT]``
+        defensively — the recent-jobs page only renders 50ish
+        anyway, and we don't want a UI bug to stream the entire
+        table back into the template.
+        """
+        if limit is None:
+            limit = self.BROADCAST_JOB_LIST_DEFAULT_LIMIT
+        effective = max(1, min(int(limit), self.BROADCAST_JOB_LIST_MAX_LIMIT))
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT job_id, text_preview, full_text_len,
+                       only_active_days, state, total,
+                       sent_count, blocked_count, failed_count,
+                       i, error, cancel_requested,
+                       created_at, started_at, completed_at
+                  FROM broadcast_jobs
+                 ORDER BY created_at DESC, job_id DESC
+                 LIMIT $1
+                """,
+                effective,
+            )
+        return [self._broadcast_job_row_to_dict(r) for r in rows]
+
+    async def mark_orphan_broadcast_jobs_interrupted(self) -> int:
+        """Startup orphan sweep — flip every row left in
+        ``queued`` / ``running`` from before the restart to
+        ``interrupted`` with ``completed_at = NOW()`` and a
+        canned error message.
+
+        Returns the number of rows updated. Idempotent: a second
+        call after the same restart returns 0 because the rows
+        are now ``interrupted``.
+
+        Called from ``setup_admin_routes`` on app start so a
+        restart mid-broadcast leaves a clean audit trail rather
+        than a phantom "running" job whose worker task no longer
+        exists.
+        """
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                UPDATE broadcast_jobs
+                   SET state = 'interrupted',
+                       completed_at = NOW(),
+                       error = COALESCE(error,
+                           'Job was running when the bot process '
+                           'restarted; no recipients sent after this '
+                           'point. Re-run the broadcast manually if '
+                           'needed.')
+                 WHERE state IN ('queued', 'running')
+                RETURNING job_id
+                """
+            )
+        return len(rows)
+
     async def update_user_admin_fields(
         self,
         telegram_id: int,
