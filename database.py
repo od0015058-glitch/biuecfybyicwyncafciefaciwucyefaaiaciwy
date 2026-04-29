@@ -916,6 +916,31 @@ class Database:
         if discount_percent is not None and not (1 <= discount_percent <= 100):
             raise ValueError("discount_percent must be between 1 and 100")
         if discount_amount is not None:
+            # Defense-in-depth: refuse non-finite values BEFORE the
+            # range checks below. Both the web admin form
+            # (``parse_promo_form``) and the Telegram-side parser
+            # (``parse_promo_create_args``) already reject NaN /
+            # ±Infinity, but PostgreSQL ``NUMERIC`` happily stores
+            # ``'NaN'::numeric`` and the comparison guards we use
+            # downstream (``discount_amount <= 0``,
+            # ``discount_amount > 999_999.9999``) are silent no-ops
+            # against NaN — every comparison returns ``False`` — so
+            # a NaN slipping past them would land in the column,
+            # then propagate into ``promos.compute_promo_bonus``
+            # (which multiplies by NaN) and ultimately into the
+            # ``balance_usd + bonus`` SQL on invoice finalize,
+            # bricking the wallet exactly the way PR #75 prevented
+            # at the IPN layer. ``+Infinity`` is caught by the
+            # ``> 999_999.9999`` check below, but a NaN is not — so
+            # we filter both up-front using the same
+            # ``_is_finite_amount`` helper that already guards
+            # ``deduct_balance`` / ``finalize_payment`` /
+            # ``finalize_partial_payment`` / ``admin_adjust_balance``.
+            if not _is_finite_amount(discount_amount):
+                raise ValueError(
+                    "discount_amount must be a finite number "
+                    "(NaN / ±Infinity rejected)"
+                )
             if discount_amount <= 0:
                 raise ValueError("discount_amount must be positive")
             # ``discount_amount`` is stored as ``DECIMAL(10,4)`` (alembic
@@ -1098,7 +1123,27 @@ class Database:
         a PG ``numeric field overflow`` on the INSERT.
         """
         code = code.upper()
-        if amount_usd is None or amount_usd <= 0:
+        if amount_usd is None:
+            raise ValueError("amount_usd must be positive")
+        # Defense-in-depth: refuse non-finite values BEFORE the
+        # ordering checks below. ``parse_gift_form`` already rejects
+        # NaN / ±Infinity, but the DB layer is the only line of
+        # defence against a hypothetical caller bypassing it (a
+        # future JSON API, a refactor that drops the parser, a test
+        # stub). PostgreSQL ``NUMERIC`` happily stores
+        # ``'NaN'::numeric`` and ``amount_usd <= 0`` /
+        # ``amount_usd > GIFT_AMOUNT_MAX`` are both silent no-ops
+        # for NaN (every comparison returns ``False``), so a NaN
+        # would land in ``gift_codes.amount_usd`` and brick the
+        # next redeemer's wallet via ``balance_usd + NaN`` in
+        # ``redeem_gift_code``. ``+Infinity`` is caught by the
+        # ``> GIFT_AMOUNT_MAX`` check below, but NaN is not.
+        if not _is_finite_amount(amount_usd):
+            raise ValueError(
+                "amount_usd must be a finite number "
+                "(NaN / ±Infinity rejected)"
+            )
+        if amount_usd <= 0:
             raise ValueError("amount_usd must be positive")
         if amount_usd > self.GIFT_AMOUNT_MAX:
             raise ValueError(
