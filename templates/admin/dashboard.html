@@ -26,6 +26,17 @@
     <div class="label">Total spend (AI)</div>
     <div class="value">${{ "{:,.4f}".format(metrics.spend_usd) }}</div>
   </div>
+  <div class="stat">
+    <div class="label">Pending payments</div>
+    <div class="value">
+      {{ "{:,}".format(metrics.pending_payments_count) }}
+      {% if metrics.pending_payments_count and metrics.pending_payments_oldest_age_hours is not none %}
+        <span class="stat-sub" style="display: block; font-size: 0.55em; color: var(--text-muted); margin-top: 0.25em;">
+          oldest {{ "%.1f"|format(metrics.pending_payments_oldest_age_hours) }}h
+        </span>
+      {% endif %}
+    </div>
+  </div>
 </div>
 
 <div class="panel">

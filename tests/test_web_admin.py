@@ -174,6 +174,9 @@ def _stub_db(
                     "cost_usd": 3.21,
                 }
             ],
+            # Stage-9-Step-9: pending-payments tile keys.
+            "pending_payments_count": 0,
+            "pending_payments_oldest_age_hours": None,
         }
     )
     db.list_promo_codes = AsyncMock(
@@ -403,6 +406,8 @@ async def test_dashboard_with_auth_renders_metrics(
             "revenue_usd": 99.50,
             "spend_usd": 12.3456,
             "top_models": [],
+            "pending_payments_count": 0,
+            "pending_payments_oldest_age_hours": None,
         }
     )
     client = await aiohttp_client(
@@ -1154,6 +1159,8 @@ async def test_dashboard_renders_against_real_db_schema(
                     "cost_usd": 7.8901,
                 },
             ],
+            "pending_payments_count": 7,
+            "pending_payments_oldest_age_hours": 12.5,
         }
     )
     client = await aiohttp_client(
@@ -1167,17 +1174,55 @@ async def test_dashboard_renders_against_real_db_schema(
     resp = await client.get("/admin/")
     assert resp.status == 200, await resp.text()
     body = await resp.text()
-    # All four stat tiles render with the right values.
+    # All five stat tiles render with the right values (Stage-9-Step-9
+    # added the pending-payments tile).
     assert "9,999" in body
     assert "250" in body
     assert "$4,321.00" in body
     assert "$1,234.5678" in body
+    # Pending-payments tile renders count + oldest-age sub-label.
+    assert "Pending payments" in body
+    assert "12.5h" in body
     # Top-models table renders both rows, with model name + count + cost.
     assert "openai/gpt-4o-mini" in body
     assert "anthropic/claude-3.5-sonnet" in body
     assert "5,000" in body
     assert "$12.3456" in body
     assert "$7.8901" in body
+
+
+async def test_dashboard_pending_zero_hides_oldest_age(
+    aiohttp_client, make_admin_app
+):
+    """Stage-9-Step-9: the 'oldest Xh' sub-label must NOT render
+    when zero pending rows exist — that's where the back-end query
+    returns ``MIN(created_at)`` = NULL and we surface ``None``. The
+    main count still renders ('0'), but the misleading sub-label is
+    suppressed.
+    """
+    db = _stub_db({
+        "users_total": 1,
+        "users_active_7d": 0,
+        "revenue_usd": 0.0,
+        "spend_usd": 0.0,
+        "top_models": [],
+        "pending_payments_count": 0,
+        "pending_payments_oldest_age_hours": None,
+    })
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert "Pending payments" in body
+    # The "oldest Xh" sub-label MUST be hidden when count == 0; pin
+    # the absence of the literal "oldest" word in the rendered tile.
+    assert "oldest " not in body, (
+        "pending-payments tile rendered oldest-age sub-label "
+        "with count=0 — UI shows misleading 'oldest 0.0h' text"
+    )
 
 
 async def test_dashboard_fallback_dicts_match_template_keys(
