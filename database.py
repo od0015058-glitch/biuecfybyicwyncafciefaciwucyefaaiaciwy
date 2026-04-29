@@ -2708,6 +2708,49 @@ class Database:
             )
         return len(rows)
 
+    async def get_seen_model_ids(self) -> set[str]:
+        """Return the full set of previously-observed OpenRouter model ids.
+
+        Used by :mod:`model_discovery` to diff against the live
+        catalog. Returns a :class:`set` so the caller can compute
+        ``live_ids - seen_ids`` in O(n). Empty set on first run
+        (migration just created the table). Callers must NOT treat
+        the empty case as "every current model is new" — the
+        discovery loop's bootstrap path handles first-run suppression.
+        """
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch("SELECT model_id FROM seen_models")
+        return {row["model_id"] for row in rows}
+
+    async def record_seen_models(self, model_ids) -> int:
+        """Insert any new ``model_ids`` into ``seen_models``.
+
+        Uses ``ON CONFLICT DO NOTHING`` so concurrent calls (e.g.
+        two worker processes racing the discovery loop) can't crash
+        on duplicate keys. Accepts any iterable — caller typically
+        passes the set difference from :meth:`get_seen_model_ids`.
+
+        Returns the number of rows actually inserted (useful for tests
+        and operator logging — zero means every id was already known).
+        A unit-test caller that wants to re-seed a deterministic set
+        should clear the table between runs rather than relying on
+        this method's insert count.
+        """
+        ids = [str(m) for m in model_ids if m]
+        if not ids:
+            return 0
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                INSERT INTO seen_models (model_id)
+                     SELECT unnest($1::text[])
+                ON CONFLICT (model_id) DO NOTHING
+                  RETURNING model_id
+                """,
+                ids,
+            )
+        return len(rows)
+
     async def update_user_admin_fields(
         self,
         telegram_id: int,

@@ -116,6 +116,19 @@ def is_admin(telegram_id: int | None) -> bool:
     return telegram_id in _ADMIN_USER_IDS
 
 
+def get_admin_user_ids() -> frozenset[int]:
+    """Read-only accessor for the current admin set.
+
+    Most callers historically reached into ``_ADMIN_USER_IDS``
+    directly, which is fine inside this module but leaks the private
+    attribute to outside modules (``model_discovery``, future admin
+    notifiers). Expose a typed accessor so tests that use
+    :func:`set_admin_user_ids` to reshape the set still flow through
+    the gated predicate + this getter.
+    """
+    return _ADMIN_USER_IDS
+
+
 # ---------------------------------------------------------------------
 # /admin   →  hub message
 # ---------------------------------------------------------------------
