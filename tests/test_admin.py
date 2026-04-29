@@ -137,6 +137,42 @@ def test_format_metrics_empty_top_models():
     assert "(no usage logged yet)" in out
 
 
+def test_format_metrics_omits_pending_line_when_zero():
+    """Stage-9-Step-9: zero PENDING rows = no spend signal worth a
+    line in the metrics digest. The dashboard tile still renders
+    "0", but the Telegram-side digest stays terse."""
+    metrics = _sample_metrics()
+    metrics["pending_payments_count"] = 0
+    metrics["pending_payments_oldest_age_hours"] = None
+    out = format_metrics(metrics)
+    assert "Pending payments" not in out
+
+
+def test_format_metrics_includes_pending_line_when_non_zero():
+    """Stage-9-Step-9: surface count + oldest age so the admin can
+    distinguish "5 fresh invoices waiting for IPN" from "5 invoices
+    stuck for 23h about to be reaped"."""
+    metrics = _sample_metrics()
+    metrics["pending_payments_count"] = 5
+    metrics["pending_payments_oldest_age_hours"] = 12.4
+    out = format_metrics(metrics)
+    assert "Pending payments" in out
+    assert "5" in out
+    assert "12.4h" in out
+
+
+def test_format_metrics_pending_without_age_renders_count_only():
+    """Defensive: if a future caller passes count>0 with no age (a
+    half-populated dict from an upgrade-in-flight), still render
+    the count instead of crashing."""
+    metrics = _sample_metrics()
+    metrics["pending_payments_count"] = 2
+    metrics["pending_payments_oldest_age_hours"] = None
+    out = format_metrics(metrics)
+    assert "Pending payments" in out
+    assert "2" in out
+
+
 # ---- import-time module state ------------------------------------
 
 

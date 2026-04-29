@@ -279,7 +279,43 @@ class Database:
         return new_balance is not None
 
     async def log_usage(self, telegram_id: int, model: str, prompt_tokens: int, completion_tokens: int, cost: float):
-        """Logs the exact token usage for accounting."""
+        """Logs the exact token usage for accounting.
+
+        Defense-in-depth: refuses non-finite (``NaN`` / ``±Infinity``)
+        or negative ``cost`` and skips the INSERT with a logged error.
+        ``usage_logs.cost_deducted_usd`` is ``DECIMAL(10,6) NOT NULL``
+        with no CHECK constraint, and PostgreSQL ``NUMERIC`` accepts
+        ``'NaN'::numeric`` happily; once stored, every aggregate
+        (``SUM(cost_deducted_usd)`` for the dashboard's spend tile,
+        per-model totals in ``top_models``, per-user totals in
+        ``get_user_usage_aggregates``) propagates the NaN and bricks
+        the figure. The only present caller (``chat_with_model``)
+        clamps cost via ``pricing._apply_markup``'s
+        ``max(raw * markup, 0.0)`` so a sign-flipped per-1M price
+        currently rounds to $0 — but the clamp lives one module away
+        from the SQL. A future caller (a refactor that drops the
+        clamp, a stub ``ModelPrice`` in a test, a new internal
+        billing path) bypassing it would silently poison the table.
+        Refusing here keeps the only paths that can put a row into
+        ``usage_logs`` finite-and-non-negative.
+
+        Skipping vs raising: the call is fire-and-forget from
+        ``chat_with_model`` (return value unused) and the user has
+        already received their reply by this point. Skipping with a
+        log line preserves the user's reply without poisoning the
+        table; raising would either crash the handler (bad UX for
+        a "should never happen" assertion) or be swallowed silently
+        by an outer ``except`` (worse). The error log is the right
+        signal for ops.
+        """
+        if not _is_finite_amount(cost) or cost < 0:
+            log.error(
+                "log_usage refused for telegram_id=%s model=%r: bad "
+                "cost=%r (must be a finite non-negative number). "
+                "Row NOT inserted; investigate the caller.",
+                telegram_id, model, cost,
+            )
+            return
         query = """
             INSERT INTO usage_logs (telegram_id, model_used, prompt_tokens, completion_tokens, cost_deducted_usd)
             VALUES ($1, $2, $3, $4, $5)
@@ -2017,8 +2053,8 @@ class Database:
         Single round trip via ``acquire`` → multiple ``fetch*`` calls
         on the same connection. We don't bother wrapping in a
         transaction because the values are all snapshot-style and
-        slight drift between the four queries is tolerable for an
-        admin dashboard.
+        slight drift between the queries is tolerable for an admin
+        dashboard.
 
         Returns a dict shaped like::
 
@@ -2031,6 +2067,8 @@ class Database:
                 {"model": str, "count": int, "cost_usd": float},
                 ...  # up to 5 rows, by call count over last 30d
               ],
+              "pending_payments_count":            int,           # transactions.status='PENDING'
+              "pending_payments_oldest_age_hours": float | None,  # NULL when zero pending
             }
         """
         async with self.pool.acquire() as connection:
@@ -2079,6 +2117,35 @@ class Database:
                 LIMIT 5
                 """
             )
+            # Stage-9-Step-9: dashboard pending-payments tile.
+            # A spike of stuck PENDING rows (gateway flap, mis-issued
+            # invoice, IPN delivery delay, NowPayments outage) is the
+            # earliest signal that money flow has broken — every
+            # PENDING is a user who paid but hasn't been credited yet.
+            # The reaper (``pending_expiration``) sweeps rows older
+            # than 24h to EXPIRED, so a steadily climbing count below
+            # that threshold means active inflow that's not landing.
+            # We surface (a) the count and (b) the oldest age so the
+            # admin can tell "5 fresh invoices waiting for IPN" from
+            # "5 invoices stuck for 23h about to be reaped".
+            pending_row = await connection.fetchrow(
+                """
+                SELECT
+                    COUNT(*)::int AS count,
+                    EXTRACT(EPOCH FROM (NOW() - MIN(created_at))) / 3600.0
+                        AS oldest_age_hours
+                FROM transactions
+                WHERE status = 'PENDING'
+                """
+            )
+        # ``MIN(created_at)`` is NULL when zero PENDING rows exist;
+        # ``EXTRACT(EPOCH FROM (NOW() - NULL))`` is NULL too, so the
+        # branch surfaces ``None`` cleanly without a second query.
+        pending_count = int(pending_row["count"] or 0) if pending_row else 0
+        oldest_age_raw = pending_row["oldest_age_hours"] if pending_row else None
+        pending_oldest_age_hours = (
+            float(oldest_age_raw) if oldest_age_raw is not None else None
+        )
         return {
             "users_total": int(users_total or 0),
             "users_active_7d": int(users_active_7d or 0),
@@ -2092,6 +2159,8 @@ class Database:
                 }
                 for r in top_rows
             ],
+            "pending_payments_count": pending_count,
+            "pending_payments_oldest_age_hours": pending_oldest_age_hours,
         }
 
     # ---- bot_strings (Stage-9-Step-1.6) ---------------------------

@@ -166,6 +166,16 @@ def format_metrics(rows: dict) -> str:
         f"💰 Revenue (USD credited): *${rows['revenue_usd']:.2f}*",
         f"🤖 AI spend (USD deducted): *${rows['spend_usd']:.4f}*",
     ]
+    pending_count = rows.get("pending_payments_count", 0)
+    if pending_count:
+        oldest = rows.get("pending_payments_oldest_age_hours")
+        if oldest is not None:
+            lines.append(
+                f"⏳ Pending payments: *{pending_count:,}* "
+                f"(oldest {oldest:.1f}h)"
+            )
+        else:
+            lines.append(f"⏳ Pending payments: *{pending_count:,}*")
     if rows.get("top_models"):
         lines.append("")
         lines.append("🔝 *Top models* (by call count, 30d)")

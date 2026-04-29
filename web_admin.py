@@ -526,34 +526,31 @@ async def dashboard(request: web.Request) -> web.StreamResponse:
     db = request.app.get(APP_KEY_DB)
     metrics: dict
     db_error: str | None = None
+    # Local dev / unit-test path where the app didn't get a Database
+    # wired up — and the DB-error path — both render the same shape
+    # so the template renders the same in dev / DB-error / live.
+    # Keys MUST match ``Database.get_system_metrics`` (and
+    # ``admin.format_metrics`` consumers): users_total, users_active_7d,
+    # revenue_usd, spend_usd, top_models[{model,count,cost_usd}],
+    # pending_payments_count, pending_payments_oldest_age_hours.
+    empty_metrics: dict = {
+        "users_total": 0,
+        "users_active_7d": 0,
+        "revenue_usd": 0.0,
+        "spend_usd": 0.0,
+        "top_models": [],
+        "pending_payments_count": 0,
+        "pending_payments_oldest_age_hours": None,
+    }
     if db is None:
-        # Local dev / unit-test path where the app didn't get a Database
-        # wired up. Render with empty data so the UI is at least visible.
-        # Keys MUST match ``Database.get_system_metrics`` (and
-        # ``admin.format_metrics`` consumers) so the template renders
-        # the same in dev / DB-error / live: users_total, users_active_7d,
-        # revenue_usd, spend_usd, top_models[{model,count,cost_usd}].
-        metrics = {
-            "users_total": 0,
-            "users_active_7d": 0,
-            "revenue_usd": 0.0,
-            "spend_usd": 0.0,
-            "top_models": [],
-        }
+        metrics = dict(empty_metrics)
         db_error = "No database wired up (development mode)."
     else:
         try:
             metrics = await db.get_system_metrics()
         except Exception:
             log.exception("dashboard: get_system_metrics failed")
-            # Same shape as the dev-mode fallback above — see comment.
-            metrics = {
-                "users_total": 0,
-                "users_active_7d": 0,
-                "revenue_usd": 0.0,
-                "spend_usd": 0.0,
-                "top_models": [],
-            }
+            metrics = dict(empty_metrics)
             db_error = "Database query failed — see logs."
 
     return aiohttp_jinja2.render_template(

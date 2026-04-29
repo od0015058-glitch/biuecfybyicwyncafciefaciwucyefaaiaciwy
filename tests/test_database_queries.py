@@ -91,6 +91,10 @@ async def test_get_system_metrics_returns_shape():
     fetchval_vals = iter([10, 3, 100.0, 4.20])
     conn.fetchval = AsyncMock(side_effect=lambda *a, **k: next(fetchval_vals))
     conn.fetch = AsyncMock(return_value=[])
+    # Stage-9-Step-9: pending_payments tile reads via fetchrow.
+    conn.fetchrow = AsyncMock(return_value={
+        "count": 0, "oldest_age_hours": None,
+    })
 
     db = database_module.Database()
     db.pool = _PoolStub(conn)
@@ -100,12 +104,15 @@ async def test_get_system_metrics_returns_shape():
     assert set(result.keys()) == {
         "users_total", "users_active_7d", "revenue_usd",
         "spend_usd", "top_models",
+        "pending_payments_count", "pending_payments_oldest_age_hours",
     }
     assert result["users_total"] == 10
     assert result["users_active_7d"] == 3
     assert result["revenue_usd"] == 100.0
     assert result["spend_usd"] == 4.20
     assert result["top_models"] == []
+    assert result["pending_payments_count"] == 0
+    assert result["pending_payments_oldest_age_hours"] is None
 
 
 # ---------------------------------------------------------------------
@@ -1210,3 +1217,162 @@ async def test_redeem_gift_code_finite_amount_proceeds_to_credit():
     assert result["status"] == "ok"
     assert result["amount_usd"] == 5.0
     assert result["transaction_id"] == 12345
+
+
+# ---------------------------------------------------------------------
+# log_usage: defense-in-depth non-finite / negative guard (this PR)
+# ---------------------------------------------------------------------
+
+
+async def test_log_usage_skips_insert_for_nan_cost(caplog):
+    """Defense-in-depth: a NaN ``cost`` would land in
+    ``usage_logs.cost_deducted_usd`` and poison every aggregate
+    (dashboard ``spend_usd`` tile, ``top_models`` per-model totals,
+    ``get_user_usage_aggregates``). PG ``NUMERIC`` accepts
+    ``'NaN'::numeric`` happily and there's no CHECK constraint.
+    Refuse at the DB layer with the same shape as ``deduct_balance``
+    — log error + skip the INSERT. The user's reply is preserved
+    (``log_usage`` is fire-and-forget from ``chat_with_model``);
+    we just don't poison the table.
+    """
+    import logging
+
+    conn = _make_conn()
+    conn.execute = AsyncMock()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    with caplog.at_level(logging.ERROR, logger="bot.database"):
+        await db.log_usage(
+            telegram_id=42, model="openai/gpt-4o-mini",
+            prompt_tokens=10, completion_tokens=20,
+            cost=float("nan"),
+        )
+    conn.execute.assert_not_awaited()
+    assert any("log_usage refused" in rec.message for rec in caplog.records)
+
+
+async def test_log_usage_skips_insert_for_positive_infinity_cost():
+    conn = _make_conn()
+    conn.execute = AsyncMock()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.log_usage(
+        telegram_id=42, model="openai/gpt-4o-mini",
+        prompt_tokens=10, completion_tokens=20,
+        cost=float("inf"),
+    )
+    conn.execute.assert_not_awaited()
+
+
+async def test_log_usage_skips_insert_for_negative_cost():
+    """A finite-negative ``cost`` slips past the non-finite check
+    but would still under-count the spend tile (``SUM`` would go
+    negative for that bucket). Refuse with the same log + return
+    shape so the only paths into ``usage_logs`` are non-negative.
+    """
+    conn = _make_conn()
+    conn.execute = AsyncMock()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.log_usage(
+        telegram_id=42, model="openai/gpt-4o-mini",
+        prompt_tokens=10, completion_tokens=20,
+        cost=-0.001,
+    )
+    conn.execute.assert_not_awaited()
+
+
+async def test_log_usage_zero_cost_still_inserts():
+    """``cost == 0.0`` is the legitimate free-message-via-paid-path
+    settlement (``chat_with_model`` calls through with cost=0 to
+    keep ``log_usage`` honest about the call). MUST insert so the
+    usage log is complete.
+    """
+    conn = _make_conn()
+    conn.execute = AsyncMock()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.log_usage(
+        telegram_id=42, model="openai/gpt-4o-mini",
+        prompt_tokens=10, completion_tokens=20,
+        cost=0.0,
+    )
+    conn.execute.assert_awaited_once()
+
+
+async def test_log_usage_finite_positive_cost_inserts():
+    """Sanity: the happy path still works. Pins the contract so a
+    typo in the new check (e.g. inverted ``not``) can't silently
+    break every paid-message log.
+    """
+    conn = _make_conn()
+    conn.execute = AsyncMock()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.log_usage(
+        telegram_id=42, model="openai/gpt-4o-mini",
+        prompt_tokens=10, completion_tokens=20,
+        cost=0.0042,
+    )
+    conn.execute.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------
+# get_system_metrics: pending_payments tile (Stage-9-Step-9)
+# ---------------------------------------------------------------------
+
+
+async def test_get_system_metrics_includes_pending_payments_count():
+    """The new tile reads from ``transactions WHERE status='PENDING'``
+    via ``fetchrow`` — it must NOT include any other status (a
+    SUCCESS or PARTIAL row in the bucket would inflate the alert).
+    """
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(side_effect=lambda *a, **k: 0)
+    conn.fetch = AsyncMock(return_value=[])
+    conn.fetchrow = AsyncMock(return_value={
+        "count": 3, "oldest_age_hours": 2.5,
+    })
+
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.get_system_metrics()
+
+    assert result["pending_payments_count"] == 3
+    assert result["pending_payments_oldest_age_hours"] == 2.5
+
+    # Pin the SQL: filter MUST be exactly status='PENDING'.
+    pending_sql = conn.fetchrow.await_args.args[0]
+    normalized = " ".join(pending_sql.split())
+    assert "WHERE status = 'PENDING'" in normalized, (
+        f"pending-payments query doesn't filter by PENDING "
+        f"(got: {normalized!r})"
+    )
+    assert "FROM transactions" in normalized
+
+
+async def test_get_system_metrics_pending_zero_returns_none_age():
+    """When zero pending rows exist, ``MIN(created_at)`` is NULL
+    and the EXTRACT yields NULL too — surface as Python ``None``
+    (not 0.0!) so the template can hide the "oldest Xh" sub-label
+    cleanly.
+    """
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(side_effect=lambda *a, **k: 0)
+    conn.fetch = AsyncMock(return_value=[])
+    conn.fetchrow = AsyncMock(return_value={
+        "count": 0, "oldest_age_hours": None,
+    })
+
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.get_system_metrics()
+    assert result["pending_payments_count"] == 0
+    assert result["pending_payments_oldest_age_hours"] is None
