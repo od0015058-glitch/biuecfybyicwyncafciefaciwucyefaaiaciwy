@@ -387,3 +387,106 @@ async def test_chat_with_model_passes_through_real_active_model(stub_db):
     stub_db.log_usage.assert_awaited_once()
     log_args, _ = stub_db.log_usage.await_args
     assert log_args[1] == "anthropic/claude-3-opus"
+
+
+# ---------------------------------------------------------------------
+# Non-finite balance_usd defense-in-depth (this PR).
+#
+# A non-finite ``balance_usd`` (NaN or +Infinity) silently bypasses
+# the ``balance < 0.05`` insufficient-funds gate at the top of
+# ``chat_with_model`` — every comparison against NaN returns False,
+# and ``+Infinity < 0.05`` is also False. A user with a poisoned
+# wallet (legacy row, manual SQL fix, or any path bypassing the
+# write-side finite guards on finalize_payment / deduct_balance /
+# redeem_gift_code / admin_adjust_balance) would therefore pass the
+# gate, hit OpenRouter on the bot's dime, and have ``deduct_balance``
+# silently no-op (NaN comparison) or refuse (+Infinity), falling to
+# the cost=0 ``log_usage`` branch — i.e. unlimited free chat at the
+# bot's expense.
+#
+# Fix: detect non-finite balance at read time, log loud-and-once,
+# and treat as $0 locally so the gate fires correctly.
+# ---------------------------------------------------------------------
+
+
+async def test_chat_with_model_treats_nan_balance_as_zero(stub_db, caplog):
+    """A NaN ``balance_usd`` with no free messages must hit the
+    insufficient-funds branch — NOT a free OpenRouter call. Pre-fix
+    ``NaN < 0.05`` was False, so the gate let the user through."""
+    import logging
+
+    stub_db.get_user.return_value = {
+        "free_messages_left": 0,
+        "balance_usd": float("nan"),
+        "active_model": "test/m1",
+        "language_code": "en",
+        "memory_enabled": False,
+    }
+    # Do NOT patch ClientSession — if we got far enough to POST to
+    # OpenRouter the test would crash. That's the assertion.
+    with caplog.at_level(logging.ERROR, logger="bot.ai_engine"):
+        reply = await ai_engine.chat_with_model(42, "hi")
+
+    assert "balance" in reply.lower() or "موجودی" in reply
+    stub_db.deduct_balance.assert_not_awaited()
+    stub_db.log_usage.assert_not_awaited()
+    # The corruption is loud enough for ops to repair the row.
+    assert any("non-finite balance_usd" in rec.message for rec in caplog.records)
+
+
+async def test_chat_with_model_treats_positive_infinity_balance_as_zero(stub_db):
+    """Same hole on the +Infinity branch: ``+Inf < 0.05`` is False,
+    so a poisoned wallet would silently grant unlimited free chat."""
+    stub_db.get_user.return_value = {
+        "free_messages_left": 0,
+        "balance_usd": float("inf"),
+        "active_model": "test/m1",
+        "language_code": "en",
+        "memory_enabled": False,
+    }
+    reply = await ai_engine.chat_with_model(42, "hi")
+    assert "balance" in reply.lower() or "موجودی" in reply
+    stub_db.deduct_balance.assert_not_awaited()
+    stub_db.log_usage.assert_not_awaited()
+
+
+async def test_chat_with_model_negative_infinity_balance_falls_through(stub_db):
+    """``-Inf < 0.05`` is True so the gate already fires correctly
+    for ``-Infinity`` — pin that the fix doesn't accidentally mask
+    the existing-correct behaviour. Either way no OpenRouter call."""
+    stub_db.get_user.return_value = {
+        "free_messages_left": 0,
+        "balance_usd": float("-inf"),
+        "active_model": "test/m1",
+        "language_code": "en",
+        "memory_enabled": False,
+    }
+    reply = await ai_engine.chat_with_model(42, "hi")
+    assert "balance" in reply.lower() or "موجودی" in reply
+    stub_db.deduct_balance.assert_not_awaited()
+    stub_db.log_usage.assert_not_awaited()
+
+
+async def test_chat_with_model_nan_balance_with_free_messages_still_uses_free_path(
+    stub_db,
+):
+    """A user with a poisoned wallet but free messages remaining
+    should still get to use them — the wallet poisoning shouldn't
+    cancel out their non-money quota. Pin so the new guard doesn't
+    accidentally short-circuit the free path."""
+    stub_db.get_user.return_value = {
+        "free_messages_left": 3,
+        "balance_usd": float("nan"),
+        "active_model": "test/m1",
+        "language_code": "en",
+        "memory_enabled": False,
+    }
+    stub_db.decrement_free_message.return_value = 2
+
+    with _patched_session(_StubResponse()):
+        reply = await ai_engine.chat_with_model(42, "hi")
+
+    assert reply == "hello back"
+    stub_db.decrement_free_message.assert_awaited_once_with(42)
+    # Free path: no balance deduction.
+    stub_db.deduct_balance.assert_not_awaited()
