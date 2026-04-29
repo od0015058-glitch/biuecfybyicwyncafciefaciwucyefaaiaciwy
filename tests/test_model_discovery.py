@@ -604,6 +604,9 @@ def test_format_price_delta_notification_renders_arrows_and_percents():
     assert "moved price by more than 20%" in text
     assert "openai/gpt-5" in text
     assert "↑50.0%" in text
+    # The unchanged output side must render as a flat arrow, not
+    # ``↓0.0%`` — that would imply a downward move where none exists.
+    assert "→0.0%" in text
 
 
 def test_format_price_delta_notification_caps_and_adds_overflow(monkeypatch):

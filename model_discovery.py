@@ -277,8 +277,19 @@ def _format_price_delta_notification(
     shown = deltas[:_MAX_NEW_MODELS_PER_NOTIFICATION]
     lines: list[str] = []
     for d in shown:
-        in_arrow = "↑" if d.input_delta_pct > 0 else "↓"
-        out_arrow = "↑" if d.output_delta_pct > 0 else "↓"
+        # A model can enter the delta tuple because only ONE side
+        # moved past the threshold; the other side's pct is 0.0
+        # (unchanged) or sub-threshold. Render 0.0 as a flat arrow
+        # ``→`` so the operator doesn't see a misleading ``↓0.0%``
+        # next to an unchanged price.
+        in_arrow = (
+            "↑" if d.input_delta_pct > 0
+            else ("↓" if d.input_delta_pct < 0 else "→")
+        )
+        out_arrow = (
+            "↑" if d.output_delta_pct > 0
+            else ("↓" if d.output_delta_pct < 0 else "→")
+        )
         lines.append(
             f"• {d.model_id}\n"
             f"    input:  ${d.old_input_per_1m_usd:.4f} → "
