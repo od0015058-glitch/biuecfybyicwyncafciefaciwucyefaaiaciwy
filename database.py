@@ -927,6 +927,90 @@ class Database:
             for r in rows
         ]
 
+    async def list_pending_payments_over_threshold(
+        self,
+        *,
+        threshold_hours: int,
+        limit: int = 500,
+    ) -> list[dict]:
+        """List stuck PENDING transactions older than ``threshold_hours``.
+
+        Stage-12-Step-B: read-only companion to :meth:`expire_stale_pending`.
+        The reaper *closes* rows older than the terminal 24 h
+        threshold; this method *surfaces* rows that crossed a much
+        earlier alert threshold (``PENDING_ALERT_THRESHOLD_HOURS``,
+        default 2 h) so the background :func:`pending_alert.run_pending_alert_pass`
+        can DM admins while the invoice is still well inside the
+        reaper's grace period.
+
+        Returns one dict per row, sorted oldest first, including the
+        ``age_hours`` computed server-side (authoritative clock is
+        Postgres, not the Python host) so the dedupe bucketing in the
+        alert loop is consistent across restarts and across replicas.
+
+        ``limit`` is a safety cap so a runaway backlog can't produce
+        a 10-row DM with 500 line items — the alert body itself will
+        also truncate, but the DB side bounds the transfer size.
+
+        Never raises for a zero-row result: callers iterate the empty
+        list and are done. Raises :class:`ValueError` only for
+        invalid bounds (threshold_hours <= 0, limit <= 0).
+        """
+        if threshold_hours <= 0:
+            raise ValueError("threshold_hours must be positive")
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT transaction_id,
+                       telegram_id,
+                       gateway,
+                       currency_used,
+                       amount_usd_credited,
+                       gateway_invoice_id,
+                       created_at,
+                       EXTRACT(EPOCH FROM (NOW() - created_at)) / 3600.0
+                           AS age_hours
+                FROM transactions
+                WHERE status = 'PENDING'
+                  AND created_at < NOW() - ($1 || ' hours')::interval
+                ORDER BY created_at
+                LIMIT $2
+                """,
+                str(int(threshold_hours)),
+                int(limit),
+            )
+        return [
+            {
+                "transaction_id": int(r["transaction_id"]),
+                "telegram_id": (
+                    int(r["telegram_id"])
+                    if r["telegram_id"] is not None
+                    else None
+                ),
+                "gateway": r["gateway"],
+                "currency_used": r["currency_used"],
+                "amount_usd_credited": (
+                    float(r["amount_usd_credited"])
+                    if r["amount_usd_credited"] is not None
+                    else 0.0
+                ),
+                "gateway_invoice_id": r["gateway_invoice_id"],
+                "created_at": (
+                    r["created_at"].isoformat()
+                    if r["created_at"] is not None
+                    else None
+                ),
+                "age_hours": (
+                    float(r["age_hours"])
+                    if r["age_hours"] is not None
+                    else 0.0
+                ),
+            }
+            for r in rows
+        ]
+
     async def finalize_partial_payment(
         self, gateway_invoice_id: str, actually_paid_usd: float
     ):
@@ -2447,7 +2531,9 @@ class Database:
             "total_cost_usd": float(row["cost"] or 0),
         }
 
-    async def get_system_metrics(self) -> dict:
+    async def get_system_metrics(
+        self, *, pending_alert_threshold_hours: int = 2
+    ) -> dict:
         """Aggregate counters for the admin metrics panel.
 
         Single round trip via ``acquire`` → multiple ``fetch*`` calls
@@ -2455,6 +2541,16 @@ class Database:
         transaction because the values are all snapshot-style and
         slight drift between the queries is tolerable for an admin
         dashboard.
+
+        ``pending_alert_threshold_hours`` defines the boundary for
+        the Stage-12-Step-B "overdue" counter so the dashboard tile
+        and the proactive :func:`pending_alert.run_pending_alert_pass`
+        DM stay in sync — an admin who sees "3 overdue" on the
+        dashboard at 15:00 and a DM at 15:30 saying "3 overdue" should
+        be seeing the same underlying set of rows, not two drifting
+        numbers computed from two differently-defined thresholds.
+        Default mirrors ``PENDING_ALERT_THRESHOLD_HOURS``'s env
+        default (2 h).
 
         Returns a dict shaped like::
 
@@ -2469,8 +2565,14 @@ class Database:
               ],
               "pending_payments_count":            int,           # transactions.status='PENDING'
               "pending_payments_oldest_age_hours": float | None,  # NULL when zero pending
+              "pending_payments_over_threshold_count": int,       # Stage-12-Step-B — PENDING rows older than pending_alert_threshold_hours
+              "pending_alert_threshold_hours":        int,        # Stage-12-Step-B — the threshold the above count was computed against
             }
         """
+        if pending_alert_threshold_hours <= 0:
+            raise ValueError(
+                "pending_alert_threshold_hours must be positive"
+            )
         async with self.pool.acquire() as connection:
             users_total = await connection.fetchval(
                 "SELECT COUNT(*) FROM users"
@@ -2533,10 +2635,15 @@ class Database:
                 SELECT
                     COUNT(*)::int AS count,
                     EXTRACT(EPOCH FROM (NOW() - MIN(created_at))) / 3600.0
-                        AS oldest_age_hours
+                        AS oldest_age_hours,
+                    COUNT(*) FILTER (
+                        WHERE created_at
+                              < NOW() - ($1 || ' hours')::interval
+                    )::int AS over_threshold_count
                 FROM transactions
                 WHERE status = 'PENDING'
-                """
+                """,
+                str(int(pending_alert_threshold_hours)),
             )
         # ``MIN(created_at)`` is NULL when zero PENDING rows exist;
         # ``EXTRACT(EPOCH FROM (NOW() - NULL))`` is NULL too, so the
@@ -2545,6 +2652,11 @@ class Database:
         oldest_age_raw = pending_row["oldest_age_hours"] if pending_row else None
         pending_oldest_age_hours = (
             float(oldest_age_raw) if oldest_age_raw is not None else None
+        )
+        pending_over_threshold = (
+            int(pending_row["over_threshold_count"] or 0)
+            if pending_row
+            else 0
         )
         return {
             "users_total": int(users_total or 0),
@@ -2561,6 +2673,16 @@ class Database:
             ],
             "pending_payments_count": pending_count,
             "pending_payments_oldest_age_hours": pending_oldest_age_hours,
+            # Stage-12-Step-B: the "overdue" count — PENDING rows
+            # older than the alert threshold the caller cares about.
+            # Shipped together with the proactive admin-DM loop so
+            # the dashboard tile and the DM body reference the same
+            # number, not one computed from MIN(created_at) and the
+            # other from a COUNT(…) OVER threshold.
+            "pending_payments_over_threshold_count": pending_over_threshold,
+            "pending_alert_threshold_hours": int(
+                pending_alert_threshold_hours
+            ),
         }
 
     # ---- bot_strings (Stage-9-Step-1.6) ---------------------------
