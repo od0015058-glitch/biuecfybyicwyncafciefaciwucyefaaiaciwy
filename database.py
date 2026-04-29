@@ -1367,6 +1367,36 @@ class Database:
                     }
 
                 amount = float(row["amount_usd"])
+                # Defense-in-depth: refuse to credit a non-finite
+                # amount even if a corrupted ``gift_codes`` row
+                # somehow holds NaN / ±Infinity. ``create_gift_code``
+                # rejects non-finite ``amount_usd`` at write time
+                # (PR #86), but a row predating that guard, a manual
+                # SQL fix, a future migration mishap, or any other
+                # path that bypasses the create method could still
+                # leave a ``'NaN'::numeric`` in the column — and
+                # PostgreSQL stores it without complaint. Crediting
+                # it here would run ``balance_usd + NaN`` in the
+                # ``UPDATE users`` below and brick the wallet exactly
+                # the way PR #75 / #77 prevented at the IPN layer.
+                # We raise inside the open transaction so it rolls
+                # back cleanly (no transactions ledger row, no
+                # gift_redemptions row, no counter bump); the caller
+                # in ``handlers.py`` already wraps this call in
+                # ``try / except`` and returns the generic
+                # ``redeem_error`` string, which is the right UX for
+                # a "should never happen" DB-corruption case.
+                if not _is_finite_amount(amount):
+                    log.error(
+                        "redeem_gift_code refused for code=%r telegram_id=%d: "
+                        "non-finite amount_usd in gift_codes row (%r). "
+                        "Rolling back; investigate row corruption.",
+                        code, telegram_id, row["amount_usd"],
+                    )
+                    raise ValueError(
+                        "gift_codes.amount_usd must be a finite number "
+                        "(NaN / ±Infinity rejected)"
+                    )
 
                 # Bump the gift_codes counter first so a concurrent
                 # transaction blocked on FOR UPDATE will see the new

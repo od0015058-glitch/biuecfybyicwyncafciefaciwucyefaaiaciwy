@@ -1097,3 +1097,116 @@ async def test_finalize_partial_payment_refuses_negative_actually_paid():
     )
     assert result is None
     conn.fetchrow.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------
+# redeem_gift_code: read-side non-finite guard (this PR)
+# ---------------------------------------------------------------------
+
+
+def _make_redeem_conn(amount_usd):
+    """Connection stub that walks ``redeem_gift_code`` to the credit
+    UPDATE — every eligibility branch passes — so the only thing we're
+    verifying is what happens when the row's stored ``amount_usd`` is
+    ``amount_usd``.
+    """
+    conn = MagicMock()
+    # gift_codes row → user_exists lookup → tx_id INSERT RETURNING →
+    # new_balance UPDATE RETURNING. ``amount_usd`` is the first read.
+    conn.fetchrow = AsyncMock(return_value={
+        "amount_usd": amount_usd,
+        "max_uses": None,
+        "used_count": 0,
+        "expires_at": None,
+        "is_active": True,
+    })
+    # 1) already_used probe → None (no prior redemption)
+    # 2) user_exists probe → 1
+    # 3) tx_id INSERT RETURNING → 12345
+    # 4) new_balance UPDATE RETURNING → 99.99 (only reached if guard fails)
+    conn.fetchval = AsyncMock(side_effect=[None, 1, 12345, 99.99])
+    conn.execute = AsyncMock(return_value="UPDATE 1")
+
+    class _TxCtx:
+        async def __aenter__(self_inner):
+            return None
+
+        async def __aexit__(self_inner, *a):
+            return False
+
+    conn.transaction = MagicMock(return_value=_TxCtx())
+    return conn
+
+
+async def test_redeem_gift_code_refuses_nan_amount_in_row():
+    """Defense-in-depth: a corrupted ``gift_codes.amount_usd``
+    holding ``'NaN'::numeric`` must NOT credit the user. Every
+    upstream comparison on NaN returns ``False`` (``NaN <= 0`` is
+    ``False``, etc.) and PostgreSQL stores NaN happily, so a row
+    that predates the create-side guard (PR #86) — or one inserted
+    by a manual SQL fix, a future migration mishap, or any other
+    path bypassing ``create_gift_code`` — would feed NaN into
+    ``UPDATE users SET balance_usd = balance_usd + NaN`` and brick
+    the wallet exactly the way PR #75 / #77 prevented at the IPN
+    layer. This test pins the read-side guard so a future refactor
+    can't quietly drop it.
+    """
+    conn = _make_redeem_conn(float("nan"))
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    with pytest.raises(ValueError, match="finite"):
+        await db.redeem_gift_code("GIFT5", 777)
+    # The wallet UPDATE must NOT have been issued.
+    update_calls = [
+        c for c in conn.fetchval.await_args_list
+        if "UPDATE users" in c.args[0]
+    ]
+    assert update_calls == [], (
+        "wallet UPDATE issued despite non-finite gift amount "
+        "(transaction should have been rolled back before credit)"
+    )
+
+
+async def test_redeem_gift_code_refuses_positive_infinity_amount_in_row():
+    """``+Infinity`` would land in the ledger as
+    ``amount_usd_credited = Inf`` and propagate through
+    ``balance_usd + Inf`` the same way NaN does. Reject at the
+    read-side for the same reason — the create-side guard catches
+    new rows; this catches legacy / manually-edited rows.
+    """
+    conn = _make_redeem_conn(float("inf"))
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    with pytest.raises(ValueError, match="finite"):
+        await db.redeem_gift_code("GIFT5", 777)
+
+
+async def test_redeem_gift_code_refuses_negative_infinity_amount_in_row():
+    """``-Infinity`` is the dual of ``+Infinity``. Catch it for
+    completeness so a future refactor that changes the sign-handling
+    upstream doesn't quietly re-open the hole.
+    """
+    conn = _make_redeem_conn(float("-inf"))
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    with pytest.raises(ValueError, match="finite"):
+        await db.redeem_gift_code("GIFT5", 777)
+
+
+async def test_redeem_gift_code_finite_amount_proceeds_to_credit():
+    """Sanity-check the happy path: a finite ``amount_usd`` does
+    NOT raise — the guard only fires on NaN / ±Infinity. Pins the
+    contract so a typo in the new check (e.g. inverted ``not``)
+    can't silently break every redemption.
+    """
+    conn = _make_redeem_conn(5.0)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.redeem_gift_code("GIFT5", 777)
+    assert result["status"] == "ok"
+    assert result["amount_usd"] == 5.0
+    assert result["transaction_id"] == 12345
