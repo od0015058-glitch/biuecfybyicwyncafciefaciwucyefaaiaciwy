@@ -124,6 +124,39 @@ def _apply_markup(price: ModelPrice, prompt_tokens: int, completion_tokens: int)
     return max(raw * get_markup(), 0.0)
 
 
+def apply_markup_to_price(price: ModelPrice) -> ModelPrice:
+    """Return a ``ModelPrice`` with :func:`get_markup` applied to each side.
+
+    **Why this exists.** Billing applies the markup per-call via
+    :func:`_apply_markup` after tokens are known, but the bot's model
+    picker renders the *raw* OpenRouter-reported ``$/1M`` numbers —
+    which are **not** what we actually charge the user (we charge
+    ``raw * COST_MARKUP``). Showing the upstream sticker price in the
+    picker and then deducting more from their wallet is dishonest and
+    eroded user trust (2026-04-29 user feedback: *"right now in
+    selecting models of chat it shows the price of same as the site.
+    but we want som profits dont we. and thats not true to dont tell
+    them"*).
+
+    This helper is the single source of truth for the *display* side.
+    Reuses :func:`_apply_markup`'s defensive fallback (non-finite /
+    negative sides collapse to :data:`FALLBACK_PRICE`) so the picker
+    never renders a silly ``$nan/1M``.
+    """
+    if not (
+        math.isfinite(price.input_per_1m_usd)
+        and math.isfinite(price.output_per_1m_usd)
+        and price.input_per_1m_usd >= 0.0
+        and price.output_per_1m_usd >= 0.0
+    ):
+        price = FALLBACK_PRICE
+    markup = get_markup()
+    return ModelPrice(
+        input_per_1m_usd=price.input_per_1m_usd * markup,
+        output_per_1m_usd=price.output_per_1m_usd * markup,
+    )
+
+
 def calculate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
     """Synchronous cost using the static table. Kept for tests / callers
     that genuinely can't await. Production code should prefer

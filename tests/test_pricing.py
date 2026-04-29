@@ -11,7 +11,9 @@ import pytest
 from pricing import (
     FALLBACK_PRICE,
     MODEL_PRICES,
+    ModelPrice,
     _apply_markup,
+    apply_markup_to_price,
     calculate_cost,
     get_markup,
     get_price,
@@ -161,6 +163,65 @@ def test_apply_markup_falls_back_for_non_finite_or_negative_price(
     cost = _apply_markup(bad_price, prompt_tokens=1_000_000, completion_tokens=1_000_000)
     # FALLBACK_PRICE is (10, 30): (10 + 30) * 1.5 markup = 60.
     assert cost == pytest.approx(60.0)
+
+
+def test_apply_markup_to_price_default_markup():
+    """Default 1.5x markup should multiply both sides of a ModelPrice.
+
+    This is the display-side equivalent of ``_apply_markup`` (which
+    operates on token-weighted cost). Powers the model picker so the
+    user sees what they'll actually be charged, not the upstream
+    sticker price.
+    """
+    raw = ModelPrice(input_per_1m_usd=0.15, output_per_1m_usd=0.60)
+    marked = apply_markup_to_price(raw)
+    assert marked.input_per_1m_usd == pytest.approx(0.225)
+    assert marked.output_per_1m_usd == pytest.approx(0.90)
+
+
+def test_apply_markup_to_price_honours_env_override(monkeypatch):
+    monkeypatch.setenv("COST_MARKUP", "2.5")
+    raw = ModelPrice(input_per_1m_usd=1.00, output_per_1m_usd=2.00)
+    marked = apply_markup_to_price(raw)
+    assert marked.input_per_1m_usd == pytest.approx(2.50)
+    assert marked.output_per_1m_usd == pytest.approx(5.00)
+
+
+def test_apply_markup_to_price_preserves_zero_for_free_models():
+    """Free-tier models (both sides $0/M) must stay $0 after markup so
+    the `:free` semantics survive — otherwise a free model would
+    display a nonsense non-zero price from
+    ``0 * markup`` drift or a fallback substitution."""
+    free = ModelPrice(input_per_1m_usd=0.0, output_per_1m_usd=0.0)
+    marked = apply_markup_to_price(free)
+    assert marked.input_per_1m_usd == 0.0
+    assert marked.output_per_1m_usd == 0.0
+
+
+def test_apply_markup_to_price_rejects_nan_with_fallback():
+    """Same defensive fallback as ``_apply_markup``: a NaN/infinite/
+    negative ModelPrice collapses to FALLBACK_PRICE so the picker
+    never renders $nan/1M."""
+    bad = ModelPrice(input_per_1m_usd=float("nan"), output_per_1m_usd=1.0)
+    marked = apply_markup_to_price(bad)
+    # Fallback is (10, 30); default markup 1.5x → (15, 45).
+    assert marked.input_per_1m_usd == pytest.approx(15.0)
+    assert marked.output_per_1m_usd == pytest.approx(45.0)
+
+
+def test_apply_markup_to_price_display_matches_actual_charge(monkeypatch):
+    """The key honesty property: what the picker shows per-1M is the
+    same rate we actually charge via _apply_markup. Pick a specific
+    COST_MARKUP, compute the displayed input rate, then compute the
+    cost of exactly 1M input tokens — must match.
+    """
+    monkeypatch.setenv("COST_MARKUP", "1.8")
+    raw = ModelPrice(input_per_1m_usd=2.00, output_per_1m_usd=8.00)
+    displayed = apply_markup_to_price(raw)
+    charged_for_1m_input = _apply_markup(raw, 1_000_000, 0)
+    assert displayed.input_per_1m_usd == pytest.approx(charged_for_1m_input)
+    charged_for_1m_output = _apply_markup(raw, 0, 1_000_000)
+    assert displayed.output_per_1m_usd == pytest.approx(charged_for_1m_output)
 
 
 def test_calculate_cost_happy_path_pin_with_finite_guards(monkeypatch):
