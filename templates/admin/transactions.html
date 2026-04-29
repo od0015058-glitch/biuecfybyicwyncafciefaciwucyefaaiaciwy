@@ -117,8 +117,16 @@
   Read-only ledger view. Shows every row in the <code class="mono">transactions</code>
   table, newest first. Use the filters to narrow by gateway, status, or
   telegram id. For <strong>credit / debit</strong> adjustments, open a user
-  from <a href="/admin/users">Users</a>.
+  from <a href="/admin/users">Users</a>. Refund a settled gateway charge
+  with the <strong>Refund</strong> button on a <code>SUCCESS</code> row —
+  this debits the user's wallet by the credited USD figure and flips the
+  row to <code>REFUNDED</code> (book-keeping only; settle the user
+  off-platform separately).
 </div>
+
+{% if flash %}
+<div class="alert alert-{{ flash.kind }}">{{ flash.message }}</div>
+{% endif %}
 
 <div class="panel">
   <form class="filters" method="get" action="/admin/transactions">
@@ -179,6 +187,7 @@
         <th class="amount">Amount (USD)</th>
         <th>Status</th>
         <th>Notes</th>
+        <th>Action</th>
       </tr>
     </thead>
     <tbody>
@@ -207,6 +216,32 @@
         <td><span class="status-pill status-{{ r.status }}">{{ r.status }}</span></td>
         <td class="notes" title="{{ r.notes or '' }}">
           {{ r.notes or '—' }}
+        </td>
+        <td>
+          {# Stage-12-Step-A: per-row refund form. Only rendered for
+             SUCCESS rows on a refundable gateway — admin / gift rows
+             are reversed via the user-detail credit/debit flow. #}
+          {% if r.status == "SUCCESS" and r.gateway in refundable_gateways %}
+          <form method="post"
+                action="/admin/transactions/{{ r.id }}/refund"
+                onsubmit="return confirm('Refund transaction #{{ r.id }} (debit ${{ '%.4f' | format(r.amount_usd) }} from user {{ r.telegram_id }})? This is bookkeeping only — settle the user off-platform separately.');"
+                style="display:flex;gap:6px;align-items:center;margin:0;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="text"
+                   name="reason"
+                   required
+                   maxlength="500"
+                   placeholder="reason (required)"
+                   style="font-size:12px;padding:4px 6px;width:160px;">
+            <button type="submit"
+                    class="primary"
+                    style="background:#dc2626;color:#fff;border:0;border-radius:4px;padding:4px 10px;font-size:12px;font-weight:600;cursor:pointer;">
+              Refund
+            </button>
+          </form>
+          {% else %}
+          <span style="color:var(--text-muted);font-size:12px;">—</span>
+          {% endif %}
         </td>
       </tr>
       {% endfor %}

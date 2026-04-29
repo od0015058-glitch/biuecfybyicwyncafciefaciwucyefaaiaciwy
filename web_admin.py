@@ -586,6 +586,9 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     "string_save": "Bot text override saved",
     "string_revert": "Bot text override reverted",
     "enroll_2fa_view": "2FA enrolment page viewed",
+    # Stage-12-Step-A: refund flow on /admin/transactions.
+    "refund_issued": "Refund issued",
+    "refund_refused": "Refund refused",
 }
 
 
@@ -3115,21 +3118,278 @@ async def transactions_get(request: web.Request) -> web.StreamResponse:
         csv_query_parts + "&format=csv" if csv_query_parts else "format=csv"
     )
 
-    return aiohttp_jinja2.render_template(
-        "transactions.html",
+    context = {
+        "active_page": "transactions",
+        "filters": filters,
+        "result": page_result,
+        "prev_url": prev_url,
+        "next_url": next_url,
+        "gateway_choices": sorted(Database.TRANSACTIONS_GATEWAY_VALUES),
+        "status_choices": sorted(Database.TRANSACTIONS_STATUS_VALUES),
+        "per_page_choices": TRANSACTIONS_PER_PAGE_CHOICES,
+        "csv_query": csv_query,
+        # Stage-12-Step-A: drives the inline "Refund" button on
+        # SUCCESS rows. Templates can't import the constant, so
+        # we hand it through the context (matches the
+        # ``gateway_choices`` / ``status_choices`` pattern above).
+        "refundable_gateways": sorted(Database.REFUNDABLE_GATEWAYS),
+        "csrf_token": csrf_token_for(request),
+        "flash": None,
+    }
+    response = aiohttp_jinja2.render_template(
+        "transactions.html", request, context
+    )
+    # Stage-12-Step-A: refund POSTs redirect back here with a flash
+    # banner. Mirror the users / promos / gifts re-render pattern.
+    flash = pop_flash(request, response)
+    if flash is not None:
+        context["flash"] = flash
+        response = aiohttp_jinja2.render_template(
+            "transactions.html", request, context
+        )
+        response.del_cookie(FLASH_COOKIE, path="/admin/")
+    return response
+
+
+# ---------------------------------------------------------------------
+# Stage-12-Step-A: refund a SUCCESS transaction.
+# ---------------------------------------------------------------------
+#
+# An admin clicking "Refund" on a SUCCESS row in the transactions
+# browser POSTs here. The handler is gateway-agnostic — it only
+# touches the ledger + wallet (the actual money-movement back to the
+# user is the operator's responsibility, off-platform; NowPayments
+# has no programmatic refund API and TetraPay's would be a future
+# enhancement). Every refund writes a ``refund_issued`` audit row
+# (or a ``refund_refused`` row when the operator's request is
+# rejected) so the audit log distinguishes "we tried" from "we
+# succeeded".
+
+# Hard cap on the operator-supplied reason. Mirrors the DB-side
+# ``Database.REFUND_REASON_MAX_LEN`` so the UI rejects oversize
+# input before reaching the SQL boundary.
+REFUND_REASON_MAX_CHARS = 500
+
+
+_REFUND_REFUSAL_TEXT = {
+    Database.REFUND_REFUSAL_NOT_SUCCESS: (
+        "Refund refused — only SUCCESS rows can be refunded "
+        "(this row is in status {current_status})."
+    ),
+    Database.REFUND_REFUSAL_GATEWAY_NOT_REFUNDABLE: (
+        "Refund refused — this gateway is not eligible for the "
+        "refund flow. Use the Users page to credit/debit instead."
+    ),
+    Database.REFUND_REFUSAL_INSUFFICIENT_BALANCE: (
+        "Refund refused — user has spent the credit. Current "
+        "balance ${balance_usd:.4f} is below the refund amount "
+        "${amount_usd:.4f}. Debit them manually first via the "
+        "Users page, then retry."
+    ),
+}
+
+
+async def transaction_refund_post(request: web.Request) -> web.StreamResponse:
+    """POST /admin/transactions/{transaction_id}/refund — issue a refund.
+
+    Form fields:
+        * ``csrf_token`` — required; same scheme as every other
+          POST endpoint.
+        * ``reason`` — required; free text, capped at
+          ``REFUND_REASON_MAX_CHARS`` chars after strip.
+
+    Always redirects back to ``/admin/transactions`` (the caller's
+    list view) with a flash banner describing the outcome.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+
+    raw_id = request.match_info.get("transaction_id", "")
+    try:
+        tx_id = int(raw_id)
+    except ValueError:
+        return web.HTTPFound(location="/admin/transactions")
+    # Reject zero / negative ids early — would never match a real
+    # SERIAL row and the DB method asserts on it anyway.
+    if tx_id <= 0:
+        return web.HTTPFound(location="/admin/transactions")
+
+    form = await request.post()
+    redirect_url = "/admin/transactions"
+    response = web.HTTPFound(location=redirect_url)
+
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning(
+            "transaction_refund_post: CSRF token mismatch from %s",
+            request.remote,
+        )
+        set_flash(
+            response,
+            kind="error",
+            message=(
+                "Form submission was rejected (CSRF). "
+                "Refresh and try again."
+            ),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    reason_raw = str(form.get("reason", "")).strip()
+    if not reason_raw:
+        set_flash(
+            response,
+            kind="error",
+            message="Refund reason is required.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+    if len(reason_raw) > REFUND_REASON_MAX_CHARS:
+        set_flash(
+            response,
+            kind="error",
+            message=(
+                f"Refund reason too long "
+                f"(max {REFUND_REASON_MAX_CHARS} chars; "
+                f"got {len(reason_raw)})."
+            ),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    db = request.app.get(APP_KEY_DB)
+    if db is None:
+        set_flash(
+            response,
+            kind="error",
+            message="No database wired up — cannot refund.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    # Mirror the user_adjust note prefix so audit trails are easy to
+    # grep across web vs Telegram-DM-initiated wallet movements.
+    note = f"[web] {reason_raw}"
+
+    try:
+        result = await db.refund_transaction(
+            transaction_id=tx_id,
+            reason=note,
+            admin_telegram_id=ADMIN_WEB_SENTINEL_ID,
+        )
+    except ValueError as exc:
+        log.warning(
+            "transaction_refund_post: refund_transaction validation "
+            "rejected tx=%d: %s",
+            tx_id, exc,
+        )
+        set_flash(
+            response,
+            kind="error",
+            message=f"Invalid input: {exc}",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+    except Exception:
+        log.exception(
+            "transaction_refund_post: refund_transaction failed tx=%d",
+            tx_id,
+        )
+        set_flash(
+            response,
+            kind="error",
+            message="Database write failed — see logs.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    if result is None:
+        set_flash(
+            response,
+            kind="error",
+            message=f"No transaction with id {tx_id}.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        await _record_audit_safe(
+            request,
+            "refund_refused",
+            target=f"transaction:{tx_id}",
+            outcome="not_found",
+            meta={"reason": reason_raw},
+        )
+        return response
+
+    if "error" in result:
+        err = result["error"]
+        # Resolve the human-friendly banner template + interpolate
+        # whichever subset of (current_status, balance_usd,
+        # amount_usd) is relevant to that error variant.
+        template = _REFUND_REFUSAL_TEXT.get(
+            err, "Refund refused (reason: {error})."
+        )
+        message = template.format(
+            error=err,
+            current_status=result.get("current_status") or "?",
+            balance_usd=result.get("balance_usd") or 0.0,
+            amount_usd=result.get("amount_usd") or 0.0,
+        )
+        set_flash(
+            response,
+            kind="error",
+            message=message,
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        await _record_audit_safe(
+            request,
+            "refund_refused",
+            target=f"transaction:{tx_id}",
+            outcome=err,
+            meta={
+                "reason": reason_raw,
+                "current_status": result.get("current_status"),
+                "balance_usd": result.get("balance_usd"),
+                "amount_usd": result.get("amount_usd"),
+            },
+        )
+        return response
+
+    log.info(
+        "web_admin transaction_refund: tx=%d user=%d amount=$%.4f "
+        "reason=%r",
+        tx_id, result["telegram_id"],
+        result["amount_refunded_usd"], reason_raw,
+    )
+    await _record_audit_safe(
         request,
-        {
-            "active_page": "transactions",
-            "filters": filters,
-            "result": page_result,
-            "prev_url": prev_url,
-            "next_url": next_url,
-            "gateway_choices": sorted(Database.TRANSACTIONS_GATEWAY_VALUES),
-            "status_choices": sorted(Database.TRANSACTIONS_STATUS_VALUES),
-            "per_page_choices": TRANSACTIONS_PER_PAGE_CHOICES,
-            "csv_query": csv_query,
+        "refund_issued",
+        target=f"transaction:{tx_id}",
+        meta={
+            "telegram_id": result["telegram_id"],
+            "amount_refunded_usd": result["amount_refunded_usd"],
+            "new_balance_usd": result["new_balance_usd"],
+            "reason": reason_raw,
         },
     )
+    set_flash(
+        response,
+        kind="success",
+        message=(
+            f"Refunded transaction #{tx_id} — "
+            f"debited ${result['amount_refunded_usd']:.4f} from "
+            f"user {result['telegram_id']} "
+            f"(new balance ${result['new_balance_usd']:.4f})."
+        ),
+        secret=secret,
+        cookie_secure=cookie_secure,
+    )
+    return response
 
 
 # ---------------------------------------------------------------------
@@ -4146,6 +4406,14 @@ def setup_admin_routes(
     app.router.add_get(
         "/admin/transactions",
         _require_auth(transactions_get),
+    )
+    # Stage-12-Step-A: refund a SUCCESS transaction. Issued from the
+    # inline form on the transactions browser; CSRF-protected and
+    # audit-logged. The handler always redirects back to the list
+    # view with a flash banner.
+    app.router.add_post(
+        "/admin/transactions/{transaction_id}/refund",
+        _require_auth(transaction_refund_post),
     )
 
     # Stage-9-Step-1.6: editable bot strings.

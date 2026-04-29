@@ -185,6 +185,37 @@ async def test_webhook_falls_open_on_dedupe_db_error(patched_db):
     )
 
 
+async def test_webhook_refunded_ipn_routes_to_dedicated_helper(
+    patched_db, monkeypatch,
+):
+    """Stage-12-Step-A: a NowPayments ``refunded`` IPN used to call
+    ``mark_transaction_terminal("...", "REFUNDED")``, which silently
+    flipped the row to REFUNDED with no wallet bookkeeping. After
+    the split, REFUNDED has its own no-debit entry point
+    ``mark_payment_refunded_via_ipn``, and the admin-issued
+    debiting refund is a separate method. Pin the routing so a
+    future refactor can't re-merge them."""
+    patched_db.mark_payment_refunded_via_ipn = AsyncMock(
+        return_value={
+            "telegram_id": 7,
+            "previous_status": "PENDING",
+            "amount_usd_credited": 0.0,
+            "currency_used": "usdttrc20",
+        }
+    )
+    body = _make_body(payment_id=66666, payment_status="refunded")
+    request = _make_request(body, _sign(body))
+
+    response = await payments.payment_webhook(request)
+
+    assert response.status == 200
+    patched_db.mark_payment_refunded_via_ipn.assert_awaited_once_with(
+        "66666"
+    )
+    # The old generic helper must NOT have been called for a refund.
+    patched_db.mark_transaction_terminal.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------
 # Outcome classification
 # ---------------------------------------------------------------------

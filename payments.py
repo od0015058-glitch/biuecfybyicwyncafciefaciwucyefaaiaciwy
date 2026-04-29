@@ -975,7 +975,17 @@ async def payment_webhook(request: web.Request):
             # No balance change: PARTIAL rows keep the partial credit they
             # already received.
             target_status = _TERMINAL_FAILURE_STATUSES[status]
-            row = await db.mark_transaction_terminal(str(payment_id), target_status)
+            # Stage-12-Step-A: REFUNDED has its own dedicated DB entry
+            # point so the type system can't confuse a gateway-side
+            # refund (no debit, IPN-driven) with an admin-issued one
+            # (debit + audit, web-panel driven). Functionally identical
+            # to the previous ``mark_transaction_terminal("REFUNDED")``
+            # call from the IPN's perspective — same row dict shape,
+            # same idempotent retry semantics.
+            if target_status == "REFUNDED":
+                row = await db.mark_payment_refunded_via_ipn(str(payment_id))
+            else:
+                row = await db.mark_transaction_terminal(str(payment_id), target_status)
             if row is None:
                 log.info(
                     "Webhook %s for payment_id=%s ignored "

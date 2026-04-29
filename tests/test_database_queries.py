@@ -1630,3 +1630,344 @@ async def test_mark_orphan_broadcast_jobs_interrupted_idempotent():
     db.pool = _PoolStub(conn)
     n = await db.mark_orphan_broadcast_jobs_interrupted()
     assert n == 0
+
+
+# =========================================================================
+# Stage-12-Step-A: refund_transaction + mark_payment_refunded_via_ipn
+# =========================================================================
+#
+# Both methods wrap the read-then-write pair in a single DB transaction
+# with row-level locks. We pin:
+#   * the validation surface (rejects bad inputs at the API boundary)
+#   * the SQL shape on the happy path (status flip, refunded_at /
+#     refund_reason write, FOR UPDATE locks)
+#   * the refusal surface (NOT_SUCCESS / GATEWAY_NOT_REFUNDABLE /
+#     INSUFFICIENT_BALANCE) — each must NOT issue any UPDATE
+#
+# Without these guards a future refactor could drop the SELECT FOR UPDATE
+# (re-introducing the race) or accept a non-SUCCESS row (silently
+# minting money via a double-refund of an already-refunded charge).
+
+
+async def test_mark_payment_refunded_via_ipn_pending_row_flips_status():
+    """Gateway-side refund of a PENDING row: no credit was issued, no
+    debit needed. The row flips to REFUNDED and we record the IPN
+    source on ``refund_reason``."""
+    conn = _make_conn()
+    conn.fetchrow = AsyncMock(
+        return_value={
+            "telegram_id": 7,
+            "status": "PENDING",
+            "currency_used": "usdttrc20",
+            "amount_usd_credited": 0.0,
+        }
+    )
+    conn.execute = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.mark_payment_refunded_via_ipn("inv-1")
+    assert result is not None
+    assert result["previous_status"] == "PENDING"
+    assert result["telegram_id"] == 7
+
+    # The UPDATE writes refunded_at + refund_reason and uses the
+    # status guard for idempotence.
+    sql, *_ = conn.execute.await_args.args
+    assert "UPDATE transactions" in sql
+    assert "refunded_at = CURRENT_TIMESTAMP" in sql
+    assert "refund_reason = $2" in sql
+    assert "status = 'REFUNDED'" in sql
+    assert "AND status != 'REFUNDED'" in sql
+
+
+async def test_mark_payment_refunded_via_ipn_partial_row_keeps_credit():
+    """Documented limitation: a PARTIAL -> REFUNDED transition does
+    NOT debit the user. The partial credit they already received
+    stays put — same semantics as ``mark_transaction_terminal`` for
+    EXPIRED / FAILED on PARTIAL rows."""
+    conn = _make_conn()
+    conn.fetchrow = AsyncMock(
+        return_value={
+            "telegram_id": 7,
+            "status": "PARTIAL",
+            "currency_used": "usdttrc20",
+            "amount_usd_credited": 2.5,
+        }
+    )
+    conn.execute = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.mark_payment_refunded_via_ipn("inv-1")
+    assert result is not None
+    assert result["previous_status"] == "PARTIAL"
+    # Only one UPDATE — no balance write.
+    assert conn.execute.await_count == 1
+
+
+async def test_mark_payment_refunded_via_ipn_returns_none_on_terminal():
+    """Idempotence: a row already in SUCCESS / REFUNDED / EXPIRED /
+    FAILED is left alone. No second UPDATE."""
+    conn = _make_conn()
+    conn.fetchrow = AsyncMock(
+        return_value={
+            "telegram_id": 7,
+            "status": "SUCCESS",
+            "currency_used": "usdttrc20",
+            "amount_usd_credited": 9.99,
+        }
+    )
+    conn.execute = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.mark_payment_refunded_via_ipn("inv-1")
+    assert result is None
+    conn.execute.assert_not_awaited()
+
+
+async def test_mark_payment_refunded_via_ipn_returns_none_when_unknown():
+    conn = _make_conn()
+    conn.fetchrow = AsyncMock(return_value=None)
+    conn.execute = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.mark_payment_refunded_via_ipn("nope")
+    assert result is None
+    conn.execute.assert_not_awaited()
+
+
+async def test_refund_transaction_rejects_non_positive_id():
+    """A zero / negative / non-int transaction id never matches a
+    real SERIAL row. ValueError at the API surface so the bug shows
+    up at the call site, not as a silent no-op."""
+    db = database_module.Database()
+    db.pool = _PoolStub(_make_conn())
+    with pytest.raises(ValueError):
+        await db.refund_transaction(
+            transaction_id=0, reason="x", admin_telegram_id=0
+        )
+    with pytest.raises(ValueError):
+        await db.refund_transaction(
+            transaction_id=-1, reason="x", admin_telegram_id=0
+        )
+    with pytest.raises(ValueError):
+        await db.refund_transaction(
+            transaction_id="not-an-int",  # type: ignore[arg-type]
+            reason="x",
+            admin_telegram_id=0,
+        )
+
+
+async def test_refund_transaction_rejects_empty_reason():
+    db = database_module.Database()
+    db.pool = _PoolStub(_make_conn())
+    with pytest.raises(ValueError):
+        await db.refund_transaction(
+            transaction_id=1, reason="", admin_telegram_id=0
+        )
+    with pytest.raises(ValueError):
+        await db.refund_transaction(
+            transaction_id=1, reason="   ", admin_telegram_id=0
+        )
+
+
+async def test_refund_transaction_rejects_oversize_reason():
+    db = database_module.Database()
+    db.pool = _PoolStub(_make_conn())
+    huge = "x" * (database_module.Database.REFUND_REASON_MAX_LEN + 1)
+    with pytest.raises(ValueError):
+        await db.refund_transaction(
+            transaction_id=1, reason=huge, admin_telegram_id=0
+        )
+
+
+async def test_refund_transaction_returns_none_on_unknown_id():
+    """The benign race: row was deleted between operator clicking
+    Refund and the POST landing. The route surfaces this as a
+    ``not_found`` banner."""
+    conn = _make_conn()
+    conn.fetchrow = AsyncMock(return_value=None)
+    conn.execute = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.refund_transaction(
+        transaction_id=999, reason="x", admin_telegram_id=0
+    )
+    assert result is None
+    conn.execute.assert_not_awaited()
+
+
+async def test_refund_transaction_refuses_non_success_status():
+    """A PENDING / PARTIAL / EXPIRED / FAILED / REFUNDED row cannot
+    be refunded via the admin flow — only SUCCESS rows are eligible.
+    Pre-fix, this would have happily double-refunded an already-
+    REFUNDED row, debiting the wallet twice for the same transaction.
+    """
+    for current in ("PENDING", "PARTIAL", "EXPIRED", "FAILED", "REFUNDED"):
+        conn = _make_conn()
+        conn.fetchrow = AsyncMock(
+            return_value={
+                "transaction_id": 1,
+                "telegram_id": 7,
+                "gateway": "nowpayments",
+                "amount_usd_credited": 9.99,
+                "status": current,
+            }
+        )
+        conn.execute = AsyncMock(return_value=None)
+        db = database_module.Database()
+        db.pool = _PoolStub(conn)
+        result = await db.refund_transaction(
+            transaction_id=1, reason="x", admin_telegram_id=0
+        )
+        assert isinstance(result, dict), f"expected refusal dict for {current}"
+        assert result["error"] == db.REFUND_REFUSAL_NOT_SUCCESS
+        assert result["current_status"] == current
+        # No UPDATE on a refusal.
+        conn.execute.assert_not_awaited()
+
+
+async def test_refund_transaction_refuses_admin_or_gift_gateway():
+    """Admin and gift rows are reversed via ``admin_adjust_balance``
+    on the user detail page — they don't represent an external
+    money movement, so the refund flow refuses them."""
+    for gateway in ("admin", "gift"):
+        conn = _make_conn()
+        conn.fetchrow = AsyncMock(
+            return_value={
+                "transaction_id": 1,
+                "telegram_id": 7,
+                "gateway": gateway,
+                "amount_usd_credited": 9.99,
+                "status": "SUCCESS",
+            }
+        )
+        conn.execute = AsyncMock(return_value=None)
+        db = database_module.Database()
+        db.pool = _PoolStub(conn)
+        result = await db.refund_transaction(
+            transaction_id=1, reason="x", admin_telegram_id=0
+        )
+        assert isinstance(result, dict)
+        assert result["error"] == db.REFUND_REFUSAL_GATEWAY_NOT_REFUNDABLE
+        conn.execute.assert_not_awaited()
+
+
+async def test_refund_transaction_refuses_when_balance_below_amount():
+    """Operator must debit the user manually before retrying — we
+    don't drive a wallet negative."""
+    conn = _make_conn()
+    # First fetchrow (transactions row), then second fetchrow (users row).
+    conn.fetchrow = AsyncMock(side_effect=[
+        {
+            "transaction_id": 1,
+            "telegram_id": 7,
+            "gateway": "nowpayments",
+            "amount_usd_credited": 9.99,
+            "status": "SUCCESS",
+        },
+        {"balance_usd": 1.0},
+    ])
+    conn.execute = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.refund_transaction(
+        transaction_id=1, reason="x", admin_telegram_id=0
+    )
+    assert isinstance(result, dict)
+    assert result["error"] == db.REFUND_REFUSAL_INSUFFICIENT_BALANCE
+    assert result["balance_usd"] == 1.0
+    assert result["amount_usd"] == 9.99
+    # No UPDATEs on a refusal.
+    conn.execute.assert_not_awaited()
+
+
+async def test_refund_transaction_happy_path_debits_and_flips():
+    """SUCCESS row, sufficient balance: wallet is debited by the
+    credited USD figure, status flips to REFUNDED, refunded_at /
+    refund_reason are set. Two UPDATEs in order: balance, then
+    transactions."""
+    conn = _make_conn()
+    conn.fetchrow = AsyncMock(side_effect=[
+        {
+            "transaction_id": 1,
+            "telegram_id": 7,
+            "gateway": "nowpayments",
+            "amount_usd_credited": 9.99,
+            "status": "SUCCESS",
+        },
+        {"balance_usd": 50.0},
+    ])
+    conn.execute = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.refund_transaction(
+        transaction_id=1,
+        reason="duplicate charge",
+        admin_telegram_id=0,
+    )
+    assert isinstance(result, dict)
+    assert result["transaction_id"] == 1
+    assert result["telegram_id"] == 7
+    assert result["amount_refunded_usd"] == 9.99
+    # 50.0 - 9.99 (float subtraction precision: assert via tolerance)
+    assert abs(result["new_balance_usd"] - 40.01) < 1e-9
+
+    # Two UPDATEs: users.balance_usd, then transactions.status.
+    assert conn.execute.await_count == 2
+    sqls = [c.args[0] for c in conn.execute.await_args_list]
+    assert any("UPDATE users" in s and "balance_usd" in s for s in sqls)
+    refund_sql = next(
+        s for s in sqls if "UPDATE transactions" in s
+    )
+    assert "status = 'REFUNDED'" in refund_sql
+    assert "refunded_at = CURRENT_TIMESTAMP" in refund_sql
+    assert "refund_reason = $2" in refund_sql
+    # Idempotency: only flip a still-SUCCESS row.
+    assert "AND status = 'SUCCESS'" in refund_sql
+
+
+async def test_refund_transaction_locks_with_for_update():
+    """The transactions read AND the users read must both use
+    ``FOR UPDATE`` so a concurrent IPN / deduct_balance can't race
+    the eligibility check."""
+    conn = _make_conn()
+    conn.fetchrow = AsyncMock(side_effect=[
+        {
+            "transaction_id": 1,
+            "telegram_id": 7,
+            "gateway": "nowpayments",
+            "amount_usd_credited": 9.99,
+            "status": "SUCCESS",
+        },
+        {"balance_usd": 50.0},
+    ])
+    conn.execute = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.refund_transaction(
+        transaction_id=1, reason="x", admin_telegram_id=0
+    )
+    sqls = [c.args[0] for c in conn.fetchrow.await_args_list]
+    assert any(
+        "FROM transactions" in s and "FOR UPDATE" in s for s in sqls
+    ), "transactions read must use FOR UPDATE"
+    assert any(
+        "FROM users" in s and "FOR UPDATE" in s for s in sqls
+    ), "users read must use FOR UPDATE"
+
+
+async def test_refundable_gateways_constant():
+    """Pin the canonical set so a future refactor can't accidentally
+    add ``admin`` / ``gift`` (which would then double-debit on the
+    user detail page) or drop a real gateway."""
+    assert database_module.Database.REFUNDABLE_GATEWAYS == frozenset(
+        {"nowpayments", "tetrapay"}
+    )

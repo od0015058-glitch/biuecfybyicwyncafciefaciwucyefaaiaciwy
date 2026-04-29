@@ -155,10 +155,40 @@ async def test_mark_transaction_terminal_returns_none_on_already_terminal():
 def test_terminal_failure_statuses_constant():
     """The constant is the canonical allow-list — pin its membership
     so a future refactor doesn't accidentally let SUCCESS or PENDING
-    in."""
+    in.
+
+    Stage-12-Step-A: REFUNDED is no longer in this set. It moved to
+    its own ``REFUND_STATUSES`` set with two dedicated entry points
+    (:meth:`refund_transaction` for admin debits,
+    :meth:`mark_payment_refunded_via_ipn` for gateway-side refunds)
+    so the type system can't confuse the wallet-debit path with the
+    no-debit path. Pin the new shape AND the new sibling constant
+    to lock in the split.
+    """
     assert database_module.Database.TERMINAL_FAILURE_STATUSES == frozenset(
-        {"EXPIRED", "FAILED", "REFUNDED"}
+        {"EXPIRED", "FAILED"}
     )
+    assert database_module.Database.REFUND_STATUSES == frozenset({"REFUNDED"})
+    # Sanity: the two sets are disjoint — a status string is *either*
+    # a terminal-failure status *or* a refund status, never both.
+    assert (
+        database_module.Database.TERMINAL_FAILURE_STATUSES
+        & database_module.Database.REFUND_STATUSES
+    ) == frozenset()
+
+
+async def test_mark_transaction_terminal_rejects_refunded_post_split():
+    """Stage-12-Step-A bug-fix: passing ``REFUNDED`` to
+    ``mark_transaction_terminal`` used to silently flip a row to
+    REFUNDED *without* debiting the wallet — money-mint hazard for
+    any future caller using this helper instead of
+    :meth:`refund_transaction`. The split puts REFUNDED out of
+    reach of this entry point entirely.
+    """
+    db = database_module.Database()
+    db.pool = _PoolStub(_make_conn())
+    with pytest.raises(ValueError, match="EXPIRED"):
+        await db.mark_transaction_terminal("inv-1", "REFUNDED")
 
 
 # ---------------------------------------------------------------------
