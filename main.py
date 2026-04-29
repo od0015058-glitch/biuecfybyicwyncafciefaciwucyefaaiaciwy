@@ -14,6 +14,7 @@ from bot_commands import publish_bot_commands
 from database import db
 from handlers import SUPPORTED_PAY_CURRENCIES, router
 from middlewares import UserUpsertMiddleware
+from model_discovery import discover_new_models_loop
 from payments import payment_webhook, refresh_min_amounts_loop
 from pending_expiration import start_pending_expiration_task
 from rate_limit import install_webhook_rate_limit
@@ -176,9 +177,27 @@ async def main():
         name="min-amount-refresher",
     )
 
+    # Stage-10-Step-C: background loop that diffs the live OpenRouter
+    # catalog against the ``seen_models`` watermark and DMs admins
+    # about genuinely new models in the prominent-provider allowlist.
+    # First-run deploys silently bootstrap the seen-set (no DMs) so
+    # admins aren't spammed with the full catalog on day 1. See
+    # ``model_discovery.py`` for the full contract.
+    model_discovery_task = asyncio.create_task(
+        discover_new_models_loop(bot),
+        name="model-discovery",
+    )
+
     try:
         await dp.start_polling(bot)
     finally:
+        model_discovery_task.cancel()
+        try:
+            await model_discovery_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("model-discovery loop exited with error")
         min_amount_refresher.cancel()
         try:
             await min_amount_refresher
