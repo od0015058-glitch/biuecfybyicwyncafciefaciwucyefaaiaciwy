@@ -2821,6 +2821,48 @@ class Database:
             )
         return len(model_ids)
 
+    async def get_fx_snapshot(self) -> tuple[float, "datetime.datetime"] | None:
+        """Return the single-row FX snapshot as ``(toman_per_usd,
+        fetched_at)`` or ``None`` if the table is empty (first boot
+        before any refresh).
+
+        Used by :mod:`fx_rates` to warm the in-memory cache on
+        process start so the wallet UI and top-up path have a rate
+        to convert with before the first refresh completes.
+        """
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                "SELECT toman_per_usd, fetched_at FROM fx_rates_snapshot WHERE id = 1"
+            )
+        if row is None:
+            return None
+        return (float(row["toman_per_usd"]), row["fetched_at"])
+
+    async def upsert_fx_snapshot(
+        self, *, toman_per_usd: float, source: str
+    ) -> None:
+        """Overwrite the single-row FX snapshot.
+
+        We only track "the latest value", so the table is keyed by
+        the literal ``id=1`` and every refresh upserts that row.
+        ``ON CONFLICT DO UPDATE`` so the very first write (fresh
+        migration, no row yet) and all subsequent updates go through
+        the same SQL — saves a row-exists probe.
+        """
+        async with self.pool.acquire() as connection:
+            await connection.execute(
+                """
+                INSERT INTO fx_rates_snapshot (id, toman_per_usd, source, fetched_at)
+                     VALUES (1, $1, $2, NOW())
+                ON CONFLICT (id) DO UPDATE
+                   SET toman_per_usd = EXCLUDED.toman_per_usd,
+                       source        = EXCLUDED.source,
+                       fetched_at    = EXCLUDED.fetched_at
+                """,
+                float(toman_per_usd),
+                str(source),
+            )
+
     async def update_user_admin_fields(
         self,
         telegram_id: int,

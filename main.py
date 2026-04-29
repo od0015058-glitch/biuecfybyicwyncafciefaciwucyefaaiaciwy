@@ -14,6 +14,7 @@ from bot_commands import publish_bot_commands
 from database import db
 from handlers import SUPPORTED_PAY_CURRENCIES, router
 from middlewares import UserUpsertMiddleware
+from fx_rates import refresh_usd_to_toman_loop
 from model_discovery import discover_new_models_loop
 from payments import payment_webhook, refresh_min_amounts_loop
 from pending_expiration import start_pending_expiration_task
@@ -188,9 +189,29 @@ async def main():
         name="model-discovery",
     )
 
+    # Stage-11-Step-A: USD→Toman FX refresher. Polls the configured
+    # rate source every ``FX_REFRESH_INTERVAL_SECONDS`` (default 10
+    # min), persists the snapshot to ``fx_rates_snapshot``, and DMs
+    # admins on rate moves above ``FX_RATE_ALERT_THRESHOLD_PERCENT``
+    # (default 10%). The wallet UI (Stage-11-Step-D) and Toman
+    # top-up entry (Stage-11-Step-B) read the cache this loop
+    # maintains. See ``fx_rates.py`` for the cache-preservation
+    # and plausibility-bound semantics.
+    fx_refresher_task = asyncio.create_task(
+        refresh_usd_to_toman_loop(bot),
+        name="fx-refresher",
+    )
+
     try:
         await dp.start_polling(bot)
     finally:
+        fx_refresher_task.cancel()
+        try:
+            await fx_refresher_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("fx-refresher loop exited with error")
         model_discovery_task.cancel()
         try:
             await model_discovery_task
