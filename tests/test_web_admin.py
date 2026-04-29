@@ -7215,6 +7215,68 @@ async def test_transactions_refund_rejects_oversize_reason(
     db.refund_transaction.assert_not_awaited()
 
 
+def test_refund_reason_max_chars_leaves_room_for_prefix():
+    """Stage-12-Step-A follow-up: the route prepends ``[web] `` (6
+    chars) to the operator-supplied reason before calling
+    :meth:`Database.refund_transaction`, which independently caps
+    the value at ``REFUND_REASON_MAX_LEN`` (500). If the form-side
+    cap had stayed at ``500`` (the DB cap, not "DB cap minus
+    prefix"), a 500-char reason would slip past form validation,
+    get prefixed to 506 chars, then trip the DB-side ``ValueError``
+    — caught by the route, but only after rendering a confusing
+    "Invalid input: reason longer than … (500); got 506" banner.
+    Pin the math so a future refactor that drops the prefix or
+    bumps either constant breaks this test, not production.
+    """
+    assert (
+        REFUND_REASON_MAX_CHARS
+        + len("[web] ")
+        == database_module.Database.REFUND_REASON_MAX_LEN
+    ), (
+        "form-side cap + prefix length must equal DB-side cap so "
+        "the prefixed value always fits within REFUND_REASON_MAX_LEN"
+    )
+
+
+async def test_transactions_refund_max_length_reason_passes_validation(
+    aiohttp_client, make_admin_app
+):
+    """A reason that is *exactly* the form-side cap must pass form
+    validation AND fit within the DB-side cap once prefixed. This
+    is the regression test for the prefix-overflow bug — pre-fix,
+    a 500-char reason got prefixed to 506 chars and the DB raised
+    ``ValueError("reason longer than (500); got 506")``."""
+    db = _stub_db(
+        list_transactions_result={
+            "rows": [_success_tx_row()], "total": 1, "page": 1,
+            "per_page": 50, "total_pages": 1,
+        },
+        refund_transaction_result={
+            "transaction_id": 501,
+            "telegram_id": 42,
+            "amount_refunded_usd": 9.99,
+            "new_balance_usd": 5.0,
+        },
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_transactions_csrf(client, "pw")
+    boundary_reason = "x" * REFUND_REASON_MAX_CHARS
+    resp = await client.post(
+        "/admin/transactions/501/refund",
+        data={"csrf_token": csrf, "reason": boundary_reason},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.refund_transaction.assert_awaited_once()
+    sent_reason = db.refund_transaction.await_args.kwargs["reason"]
+    # The route prefixed it; combined length must still fit the DB cap.
+    assert sent_reason.startswith("[web] ")
+    assert (
+        len(sent_reason)
+        <= database_module.Database.REFUND_REASON_MAX_LEN
+    )
+
+
 async def test_transactions_refund_happy_path_audits_and_calls_db(
     aiohttp_client, make_admin_app
 ):
