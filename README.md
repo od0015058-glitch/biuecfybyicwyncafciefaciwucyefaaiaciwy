@@ -47,6 +47,16 @@ NowPayments crypto invoices.
   table. View the feed at `${WEBHOOK_BASE_URL}/admin/audit` with
   optional action/actor filters. Audit writes are best-effort — a
   failed audit insert never blocks the underlying admin operation.
+- **Wallet shows USD + live Toman equivalent** — Iranian users see
+  their USD balance with a `≈ N تومان` annotation computed from the
+  live USDT/IRR ticker (default source: `api.nobitex.ir`). The wallet
+  itself stays denominated in USD — Toman is display-only — so a
+  swing in the rial doesn't change the user's purchasing power. When
+  the FX cache is stale (rate-source down for >40 min) the line
+  suffixes a `(approx)` marker so the figure is shown as
+  informational, not a quote. Cold-cache deploys silently drop the
+  line until the first refresh lands, rather than rendering `≈ 0
+  تومان`.
 - **TOTP / 2FA on admin login** — set `ADMIN_2FA_SECRET` to a base32
   string and `/admin/login` will require a 6-digit code from your
   authenticator app (Google Authenticator, Authy, 1Password,
@@ -178,6 +188,7 @@ pytest tests/
 | `middlewares.py` | `UserUpsertMiddleware` — ensures `users` row exists before any handler runs. |
 | `rate_limit.py` | Token-bucket primitives + `ChatRateLimitMiddleware` (per-user) and `webhook_rate_limit_middleware` (per-IP). Guards `/chat` against runaway OpenRouter spend and the `/nowpayments-webhook` endpoint against DoS bursts. |
 | `strings.py` | Two-locale (fa/en) compiled string table + `t(lang, key, **kwargs)` helper. Layered with a runtime override cache populated from the `bot_strings` DB table — admin edits at `/admin/strings` shadow the compiled defaults until reverted. Missing-slug lookups now log a one-shot WARNING per `(lang, key)` instead of silently returning the bare slug. |
+| `wallet_display.py` | Stage-11-Step-D. `format_toman_annotation(lang, balance_usd, snap)` returns the `\n≈ N تومان` (fa) / `\n≈ N TMN` (en) line spliced onto every wallet view's `$X.YZ` figure when an FX snapshot is cached. Stale snapshots get the `(نرخ تقریبی)` / `(approx)` suffix; cold cache returns `""` so the wallet still renders without the line; non-finite balances and arithmetic-overflow products are rejected with `""` rather than rendering `≈ nan تومان`. `format_balance_block(lang, balance_usd, snap)` packages `$X.YZ` + the annotation for callers (post-credit DMs, future wallet sub-screens) that don't go through `strings.t`. |
 | `admin.py` | Telegram-side admin commands gated on `ADMIN_USER_IDS`: `/admin`, `/admin_metrics`, `/admin_balance`, `/admin_credit`, `/admin_debit`, `/admin_promo_create`, `/admin_promo_list`, `/admin_promo_revoke`, `/admin_broadcast`. |
 | `web_admin.py` | aiohttp + jinja2 web admin panel mounted under `/admin/` on the same web server that serves `/nowpayments-webhook`. HMAC-cookie auth via `ADMIN_PASSWORD` / `ADMIN_SESSION_SECRET`. CSRF-protected POST forms + signed flash-cookie banners. Login + dashboard + promo codes UI + gift codes UI + users UI + **per-user AI usage log browser** (`/admin/users/{id}/usage` with lifetime aggregates + paginated last-N calls) + **broadcast UI with live-progress polling** + **paginated transactions browser** + **editable bot text** (`/admin/strings`) shipped. |
 | `templates/admin/` | Jinja2 templates for the web admin (login, dashboard, promos, gifts, users, user_detail, user_usage, broadcast, broadcast_detail, transactions, strings, string_detail). |
