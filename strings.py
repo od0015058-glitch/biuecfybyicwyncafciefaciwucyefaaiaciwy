@@ -124,6 +124,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         "models_provider_title": (
             "🤖 ارائه‌دهنده: **{provider}**\n\n"
             "مدل فعلی: `{active_model}`\n\n"
+            "💡 قیمت‌ها شامل کارمزد سرویس هستند و دقیقاً همان مبلغی است که از کیف پول شما کسر می‌شود.\n\n"
             "صفحه {page} از {total_pages}"
         ),
         "models_price_format": "${input:.2f} / ${output:.2f} per 1M",
@@ -403,6 +404,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         "models_provider_title": (
             "🤖 Provider: **{provider}**\n\n"
             "Currently active: `{active_model}`\n\n"
+            "💡 Prices shown include our service fee — this is exactly what gets deducted from your wallet.\n\n"
             "Page {page} of {total_pages}"
         ),
         "models_price_format": "${input:.2f} / ${output:.2f} per 1M",

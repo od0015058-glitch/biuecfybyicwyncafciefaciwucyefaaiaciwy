@@ -25,6 +25,7 @@ from payments import (
     find_cheaper_alternative,
     get_min_amount_usd,
 )
+from pricing import apply_markup_to_price
 from rate_limit import consume_chat_token
 from strings import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, all_button_labels, t
 
@@ -839,11 +840,19 @@ async def show_provider_models(callback: CallbackQuery):
     builder = InlineKeyboardBuilder()
     for model in page_slice:
         marker = "✅ " if model.id == active_model else ""
+        # Render the price the user will ACTUALLY be charged (raw
+        # OpenRouter price * COST_MARKUP), not the upstream sticker
+        # price. Otherwise the picker quotes one number and the wallet
+        # deducts a different (larger) one — which the user caught.
+        # Free-tier models ($0/M) collapse to $0 through the multiply
+        # regardless of markup so the ":free" suffix semantics are
+        # preserved.
+        display_price = apply_markup_to_price(model.price)
         price_label = t(
             lang,
             "models_price_format",
-            input=model.price.input_per_1m_usd,
-            output=model.price.output_per_1m_usd,
+            input=display_price.input_per_1m_usd,
+            output=display_price.output_per_1m_usd,
         )
         # The user has already tapped this provider, so dropping the
         # "OpenAI: " / "Google: " prefix from each row removes
