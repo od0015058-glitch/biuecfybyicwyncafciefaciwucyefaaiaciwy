@@ -333,6 +333,7 @@ class Database:
         gateway_invoice_id: str,
         promo_code: str | None = None,
         promo_bonus_usd: float = 0.0,
+        gateway_locked_rate_toman_per_usd: float | None = None,
     ) -> bool:
         """Records a payment as PENDING. Returns True iff a new row was inserted.
 
@@ -345,15 +346,80 @@ class Database:
         invoice ends up EXPIRED / FAILED / REFUNDED, the promo is not
         consumed (its used_count is incremented in the same DB tx as
         the SUCCESS credit, not here).
+
+        ``gateway_locked_rate_toman_per_usd`` (Stage-11-Step-C) is the
+        USD→Toman rate captured at order-creation time for the
+        TetraPay Rial gateway. ``finalize_payment`` does NOT consult
+        this column — the locked USD figure is already in
+        ``amount_usd_credited`` and that's what gets credited. The
+        rate is stored for forensic / audit purposes ("what rate did
+        we promise the user?"). NULL for crypto rows.
+
+        Bundled bug fix (Stage-11-Step-C): refuse non-finite
+        ``amount_usd`` / ``amount_crypto`` / ``promo_bonus_usd`` /
+        ``gateway_locked_rate_toman_per_usd`` *before* INSERT.
+        Pre-fix, ``create_pending_transaction`` had NO finite-amount
+        guard — the matching defense lives on every *write* site
+        (``deduct_balance``, ``redeem_gift_code``, ``log_usage``,
+        ``admin_adjust_balance``) and every *settle* site
+        (``finalize_payment``, ``finalize_partial_payment``), but the
+        *create* site relied entirely on its callers being
+        well-behaved. A buggy / future caller (or an admin tool that
+        pre-stages PENDING rows from CSV) passing ``float('nan')``
+        would happily INSERT a poisoned row: PostgreSQL's NUMERIC
+        accepts ``'NaN'::numeric`` without complaint and there's no
+        CHECK constraint on the column. ``finalize_payment`` then
+        refuses to credit (its own NaN guard fires), leaving the
+        invoice eternally PENDING until the reaper (Stage-9-Step-9)
+        sweeps it ~24h later — but with the user already having
+        paid the gateway. This guard fails fast at the INSERT instead.
         """
+        if not _is_finite_amount(amount_usd) or amount_usd <= 0:
+            log.error(
+                "create_pending_transaction refused for invoice=%s "
+                "gateway=%s: non-finite or non-positive amount_usd=%r",
+                gateway_invoice_id, gateway, amount_usd,
+            )
+            return False
+        if not _is_finite_amount(amount_crypto) or amount_crypto <= 0:
+            log.error(
+                "create_pending_transaction refused for invoice=%s "
+                "gateway=%s: non-finite or non-positive amount_crypto=%r",
+                gateway_invoice_id, gateway, amount_crypto,
+            )
+            return False
+        # Bonus may legitimately be 0 (no promo) so we only refuse on
+        # non-finite or *negative* values — a positive 0 is fine.
+        if not _is_finite_amount(promo_bonus_usd) or promo_bonus_usd < 0:
+            log.error(
+                "create_pending_transaction refused for invoice=%s "
+                "gateway=%s: non-finite or negative promo_bonus_usd=%r",
+                gateway_invoice_id, gateway, promo_bonus_usd,
+            )
+            return False
+        if gateway_locked_rate_toman_per_usd is not None:
+            if (
+                not _is_finite_amount(gateway_locked_rate_toman_per_usd)
+                or gateway_locked_rate_toman_per_usd <= 0
+            ):
+                log.error(
+                    "create_pending_transaction refused for invoice=%s "
+                    "gateway=%s: non-finite or non-positive "
+                    "gateway_locked_rate_toman_per_usd=%r",
+                    gateway_invoice_id, gateway,
+                    gateway_locked_rate_toman_per_usd,
+                )
+                return False
+
         query = """
             INSERT INTO transactions (
                 telegram_id, gateway, currency_used,
                 amount_crypto_or_rial, amount_usd_credited,
                 status, gateway_invoice_id,
-                promo_code_used, promo_bonus_usd
+                promo_code_used, promo_bonus_usd,
+                gateway_locked_rate_toman_per_usd
             )
-            VALUES ($1, $2, $3, $4, $5, 'PENDING', $6, $7, $8)
+            VALUES ($1, $2, $3, $4, $5, 'PENDING', $6, $7, $8, $9)
             ON CONFLICT (gateway_invoice_id) DO NOTHING
             RETURNING transaction_id
         """
@@ -363,6 +429,7 @@ class Database:
                 telegram_id, gateway, currency_used,
                 amount_crypto, amount_usd, gateway_invoice_id,
                 promo_code, promo_bonus_usd,
+                gateway_locked_rate_toman_per_usd,
             )
         return row is not None
 
@@ -445,6 +512,47 @@ class Database:
                     "amount_usd_credited": row["amount_usd_credited"],
                     "previous_status": previous_status,
                 }
+
+    async def get_pending_invoice_amount_usd(
+        self, gateway_invoice_id: str
+    ) -> float | None:
+        """Look up the locked USD figure for a PENDING / PARTIAL invoice.
+
+        Returns the value of ``amount_usd_credited`` cast to ``float``,
+        or ``None`` if the invoice is unknown or already in a terminal
+        status (SUCCESS / EXPIRED / FAILED / REFUNDED).
+
+        Stage-11-Step-C. Used by the TetraPay webhook to read the
+        at-creation-time locked USD amount before passing it to
+        :meth:`finalize_payment`. The NowPayments path doesn't use
+        this helper because the IPN itself carries ``price_amount``
+        (NowPayments quotes the USD figure on every IPN); TetraPay's
+        callback only carries ``{status, hash_id, authority}``, so
+        we have to read our own ledger to recover the locked figure.
+
+        Note: this helper does NOT take ``FOR UPDATE``. The
+        subsequent ``finalize_payment`` call re-reads the same row
+        under ``FOR UPDATE`` and re-checks the status, so the only
+        lossy race is "row was finalized between our read and the
+        UPDATE" — which ``finalize_payment`` itself handles by
+        returning ``None``. Holding the lock across the verify HTTP
+        call would be much worse (a slow TetraPay verify would
+        starve any concurrent reads of the same row).
+        """
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT status, amount_usd_credited
+                FROM transactions
+                WHERE gateway_invoice_id = $1
+                """,
+                gateway_invoice_id,
+            )
+        if row is None:
+            return None
+        if row["status"] not in ("PENDING", "PARTIAL"):
+            return None
+        return float(row["amount_usd_credited"])
 
     async def expire_stale_pending(
         self,

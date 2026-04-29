@@ -203,6 +203,26 @@ _STRINGS: dict[str, dict[str, str]] = {
         "charge_pick_currency": "💰 مبلغ: **${amount}**\n\n🪙 ارز خود را انتخاب کنید:",
         "charge_amount_lost": "❌ مبلغ یافت نشد. دوباره تلاش کنید.",
         "charge_creating_invoice": "⏳ در حال ارتباط با درگاه ناوپیمنتس. لطفا صبر کنید...",
+        # Stage-11-Step-C: TetraPay (Rial card / Shaparak) gateway.
+        "tetrapay_button": "💳 پرداخت با کارت ایرانی",
+        "tetrapay_creating_order": "⏳ در حال ارتباط با درگاه پرداخت ایرانی. لطفا صبر کنید...",
+        "tetrapay_order_text": (
+            "🧾 **پرداخت با کارت ایرانی**\n\n"
+            "مبلغ: `{amount_irr:,} ریال` (≈ ${amount_usd:.2f})\n"
+            "نرخ تبدیل قفل‌شده: هر دلار ≈ {rate_toman:,.0f} تومان\n\n"
+            "روی دکمه زیر بزنید تا به درگاه پرداخت هدایت شوید.\n"
+            "پس از پرداخت، حساب شما به طور خودکار شارژ می‌شود.\n\n"
+            "⚠️ این لینک حدود ۲۰ دقیقه اعتبار دارد."
+        ),
+        "tetrapay_pay_button": "💳 رفتن به درگاه پرداخت",
+        "tetrapay_unreachable": (
+            "❌ درگاه پرداخت ایرانی پاسخگو نیست. "
+            "لطفاً چند دقیقه بعد دوباره تلاش کنید یا از ارز دیجیتال استفاده کنید."
+        ),
+        "tetrapay_credit_notification": (
+            "✅ پرداخت شما با موفقیت تأیید شد.\n"
+            "**${amount:.2f}** به کیف پول شما اضافه گردید."
+        ),
         "charge_invoice_text": (
             "🧾 **فاکتور شارژ حساب**\n\n"
             "مبلغ شارژ خالص: `${amount}`\n"
@@ -506,6 +526,26 @@ _STRINGS: dict[str, dict[str, str]] = {
         "charge_pick_currency": "💰 Amount: **${amount}**\n\n🪙 Pick your currency:",
         "charge_amount_lost": "❌ Amount not found. Please try again.",
         "charge_creating_invoice": "⏳ Contacting NowPayments. Please wait...",
+        # Stage-11-Step-C: TetraPay (Rial card / Shaparak) gateway.
+        "tetrapay_button": "💳 Pay with Iranian card",
+        "tetrapay_creating_order": "⏳ Contacting the Iranian card gateway. Please wait...",
+        "tetrapay_order_text": (
+            "🧾 **Pay with Iranian card**\n\n"
+            "Amount: `{amount_irr:,} IRR` (≈ ${amount_usd:.2f})\n"
+            "Locked rate: 1 USD ≈ {rate_toman:,.0f} TMN\n\n"
+            "Tap the button below to be redirected to the payment gateway.\n"
+            "Your wallet will be credited automatically after payment.\n\n"
+            "⚠️ This link is valid for about 20 minutes."
+        ),
+        "tetrapay_pay_button": "💳 Go to payment gateway",
+        "tetrapay_unreachable": (
+            "❌ The Iranian card gateway is not responding. "
+            "Please try again in a few minutes, or pay with crypto."
+        ),
+        "tetrapay_credit_notification": (
+            "✅ Your payment has been confirmed.\n"
+            "**${amount:.2f}** has been added to your wallet."
+        ),
         "charge_invoice_text": (
             "🧾 **Top-up invoice**\n\n"
             "Net amount: `${amount}`\n"

@@ -17,6 +17,7 @@ from middlewares import UserUpsertMiddleware
 from fx_rates import refresh_usd_to_toman_loop
 from model_discovery import discover_new_models_loop
 from payments import payment_webhook, refresh_min_amounts_loop
+from tetrapay import tetrapay_webhook
 from pending_expiration import start_pending_expiration_task
 from rate_limit import install_webhook_rate_limit
 from web_admin import setup_admin_routes
@@ -40,6 +41,12 @@ async def start_webhook_server(bot: Bot) -> web.AppRunner:
     install_webhook_rate_limit(app)
     app["bot"] = bot  # Give the server access to the bot so it can send messages
     app.router.add_post("/nowpayments-webhook", payment_webhook)
+    # Stage-11-Step-C: TetraPay (Rial card) settlement callback. Same
+    # rate-limit middleware applies (a flood of forged callbacks can't
+    # reach the JSON-parse / verify step). The handler itself is
+    # responsible for parsing, dedupe, the authoritative ``/api/verify``
+    # call, and the idempotent ``finalize_payment``.
+    app.router.add_post("/tetrapay-webhook", tetrapay_webhook)
 
     # Mount the web admin panel under /admin/. Same aiohttp app, same
     # process — one less thing to deploy. Auth is HMAC-cookie based,

@@ -30,6 +30,7 @@ from payments import (
 from pricing import apply_markup_to_price
 from rate_limit import consume_chat_token
 from strings import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, all_button_labels, t
+from tetrapay import create_order as tetrapay_create_order
 
 log = logging.getLogger("bot.handlers")
 
@@ -1680,12 +1681,22 @@ async def process_toman_amount_input(message: Message, state: FSMContext):
     )
 
     builder = InlineKeyboardBuilder()
+    # Stage-11-Step-C: surface the TetraPay (Rial card) option on its
+    # own row at the top of the keyboard. Only on the Toman entry path
+    # — TetraPay quotes IRR and we have the locked rate in FSM data,
+    # so we can compute the exact rial figure. The USD entry path
+    # (``process_custom_amount_input``) deliberately does NOT show
+    # this button: paying $5 of arbitrary rial without an entry-side
+    # rate lock would expose users to settlement-time rate moves.
+    builder.button(text=t(lang, "tetrapay_button"), callback_data="cur_tetrapay")
     for label, ticker in SUPPORTED_PAY_CURRENCIES:
         builder.button(text=label, callback_data=f"cur_{ticker}")
     # Back returns to the Toman prompt, not the USD one.
     builder.button(text=t(lang, "btn_back"), callback_data="amt_toman")
     builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
-    builder.adjust(*_CURRENCY_ROWS_LAYOUT, 2)
+    # Layout: TetraPay button alone on top, then the existing 3-wide
+    # crypto grid, then the back/home footer.
+    builder.adjust(1, *_CURRENCY_ROWS_LAYOUT, 2)
 
     await message.answer(
         t(
@@ -1698,9 +1709,140 @@ async def process_toman_amount_input(message: Message, state: FSMContext):
     )
 
 
+async def _start_tetrapay_invoice(
+    callback: CallbackQuery,
+    state: FSMContext,
+    *,
+    lang: str,
+    amount_usd: float,
+    toman_rate_at_entry: float | None,
+    promo_code: str | None,
+    promo_bonus_usd: float,
+) -> None:
+    """Stage-11-Step-C: spin up a TetraPay (Rial card) order for the user.
+
+    Reads the locked rate the user agreed to in
+    ``process_toman_amount_input`` (stashed in FSM as
+    ``toman_rate_at_entry``) and uses it as the order's per-invoice
+    rate lock. The same rate is recorded on the PENDING ``transactions``
+    row's ``gateway_locked_rate_toman_per_usd`` for audit.
+
+    Failure modes (all of which are user-facing):
+
+    * The locked rate is missing or non-finite — the FSM data was
+      corrupted between Toman entry and currency picking. Render the
+      same "no rate available" message the Toman-entry path uses.
+    * :func:`tetrapay.create_order` raises (transport, API key
+      missing, gateway returned non-100). Render
+      ``tetrapay_unreachable``.
+    * :meth:`Database.create_pending_transaction` returns ``False``
+      (defensive guards or gateway_invoice_id collision). Render
+      ``charge_invoice_error`` and log loudly — collision on
+      cryptographically random Authority is statistically impossible
+      so we'd want to know.
+    """
+    await state.clear()
+    await callback.message.edit_text(t(lang, "tetrapay_creating_order"))
+
+    if (
+        toman_rate_at_entry is None
+        or not isinstance(toman_rate_at_entry, (int, float))
+    ):
+        log.error(
+            "TetraPay order start: missing toman_rate_at_entry in FSM "
+            "for user=%s; refusing", callback.from_user.id,
+        )
+        builder = InlineKeyboardBuilder()
+        builder.button(text=t(lang, "btn_retry"), callback_data="amt_toman")
+        builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+        builder.adjust(2)
+        await callback.message.edit_text(
+            t(lang, "charge_toman_no_rate"), reply_markup=builder.as_markup()
+        )
+        await callback.answer()
+        return
+
+    try:
+        order = await tetrapay_create_order(
+            amount_usd=amount_usd,
+            rate_toman_per_usd=float(toman_rate_at_entry),
+            description="Meowassist wallet top-up",
+            user_id=callback.from_user.id,
+        )
+    except Exception as exc:
+        # Catches both ``TetraPayError`` (gateway returned non-100,
+        # missing API key, missing fields in response) AND transport
+        # errors (aiohttp.ClientError, asyncio.TimeoutError). Same
+        # fail-shape as the NowPayments path: log + user-facing
+        # "gateway is down" message + retry button.
+        log.exception(
+            "TetraPay create_order failed for user=%s amount_usd=%.2f: %s",
+            callback.from_user.id, amount_usd, exc,
+        )
+        builder = InlineKeyboardBuilder()
+        builder.button(text=t(lang, "btn_retry"), callback_data="amt_toman")
+        builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+        builder.adjust(2)
+        await callback.message.edit_text(
+            t(lang, "tetrapay_unreachable"), reply_markup=builder.as_markup()
+        )
+        await callback.answer()
+        return
+
+    # Persist the PENDING row BEFORE handing the user the redirect URL.
+    # If we can't persist, the webhook won't be able to credit on
+    # settlement, so we MUST refuse the invoice here (mirrors the
+    # NowPayments path's ``if create_pending_transaction failed →
+    # return None`` pattern).
+    inserted = await db.create_pending_transaction(
+        telegram_id=callback.from_user.id,
+        gateway="tetrapay",
+        currency_used="IRR",
+        amount_crypto=float(order.amount_irr),
+        amount_usd=order.amount_usd,
+        gateway_invoice_id=order.authority,
+        promo_code=promo_code,
+        promo_bonus_usd=promo_bonus_usd,
+        gateway_locked_rate_toman_per_usd=order.locked_rate_toman_per_usd,
+    )
+    if not inserted:
+        log.error(
+            "TetraPay create_pending_transaction refused for "
+            "authority=%s user=%s — defensive guard fired or "
+            "duplicate authority (statistically impossible)",
+            order.authority, callback.from_user.id,
+        )
+        builder = InlineKeyboardBuilder()
+        builder.button(text=t(lang, "btn_retry"), callback_data="amt_toman")
+        builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+        builder.adjust(2)
+        await callback.message.edit_text(
+            t(lang, "charge_invoice_error"), reply_markup=builder.as_markup()
+        )
+        await callback.answer()
+        return
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text=t(lang, "tetrapay_pay_button"), url=order.payment_url)
+    builder.button(text=t(lang, "btn_back"), callback_data="amt_toman")
+    builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+    builder.adjust(1, 2)
+    await callback.message.edit_text(
+        t(
+            lang, "tetrapay_order_text",
+            amount_irr=order.amount_irr,
+            amount_usd=order.amount_usd,
+            rate_toman=order.locked_rate_toman_per_usd,
+        ),
+        parse_mode="Markdown",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("cur_"))
 async def process_custom_currency_selection(callback: CallbackQuery, state: FSMContext):
-    currency = callback.data.split("_")[1]
+    currency = callback.data.split("_", 1)[1]
     lang = await _get_user_language(callback.from_user.id)
 
     data = await state.get_data()
@@ -1719,6 +1861,24 @@ async def process_custom_currency_selection(callback: CallbackQuery, state: FSMC
         discount_percent=data.get("promo_discount_percent"),
         discount_amount=data.get("promo_discount_amount"),
     ) if promo_code else 0.0
+
+    # Stage-11-Step-C: TetraPay (Rial card / Shaparak) branch. Branches
+    # off here BEFORE the NowPayments-specific pre-flight min-amount
+    # check (which only applies to crypto floors). The TetraPay path
+    # has no per-currency NowPayments minimum because it's not a
+    # crypto invoice — the only floor is ``GLOBAL_MIN_TOPUP_USD``,
+    # already enforced upstream in ``process_toman_amount_input``.
+    if currency == "tetrapay":
+        await _start_tetrapay_invoice(
+            callback,
+            state,
+            lang=lang,
+            amount_usd=float(amount),
+            toman_rate_at_entry=data.get("toman_rate_at_entry"),
+            promo_code=promo_code,
+            promo_bonus_usd=promo_bonus_usd,
+        )
+        return
 
     await state.clear()
     await callback.message.edit_text(t(lang, "charge_creating_invoice"))
