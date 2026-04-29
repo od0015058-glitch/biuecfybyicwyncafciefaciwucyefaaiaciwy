@@ -126,7 +126,12 @@
           <td><code class="code">{{ r.code }}</code></td>
           <td>{{ r.amount_usd | format_usd(2) }}</td>
           <td>
-            {{ r.used_count }} /
+            {% if r.used_count > 0 %}
+              <a href="/admin/gifts/{{ r.code }}/redemptions">{{ r.used_count }}</a>
+            {% else %}
+              {{ r.used_count }}
+            {% endif %}
+            /
             {% if r.max_uses is not none %}{{ r.max_uses }}{% else %}∞{% endif %}
           </td>
           <td>

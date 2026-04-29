@@ -1749,6 +1749,45 @@ class Database:
             for r in rows
         ]
 
+    async def get_gift_code(self, code: str) -> dict | None:
+        """Fetch one gift code by *code* (uppercased on lookup).
+
+        Returns the same dict shape as :meth:`list_gift_codes` rows,
+        or ``None`` if no row matches. Used by Stage-12-Step-D's
+        ``/admin/gifts/{code}/redemptions`` browser to render the
+        per-code header (amount + status + cap) above the
+        per-redemption table; cheap PK lookup.
+        """
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT code, amount_usd, max_uses, used_count,
+                       expires_at, is_active, created_at
+                FROM gift_codes
+                WHERE code = $1
+                """,
+                code.upper(),
+            )
+        if row is None:
+            return None
+        return {
+            "code": row["code"],
+            "amount_usd": float(row["amount_usd"]),
+            "max_uses": (
+                int(row["max_uses"]) if row["max_uses"] is not None else None
+            ),
+            "used_count": int(row["used_count"]),
+            "expires_at": (
+                row["expires_at"].isoformat()
+                if row["expires_at"] is not None else None
+            ),
+            "is_active": bool(row["is_active"]),
+            "created_at": (
+                row["created_at"].isoformat()
+                if row["created_at"] is not None else None
+            ),
+        }
+
     async def revoke_gift_code(self, code: str) -> bool:
         """Soft-delete a gift code. Returns True iff flipped active→inactive."""
         async with self.pool.acquire() as connection:
@@ -1795,6 +1834,179 @@ class Database:
             }
             for r in rows
         ]
+
+    # ------------------------------------------------------------------
+    # Stage-12-Step-D: paginated per-code redemption drilldown.
+    # ``get_gift_redemptions`` above is the legacy unpaginated helper
+    # used by the Telegram-side ``/admin_gift_status`` slash command;
+    # we keep it for backward compat. ``list_gift_code_redemptions``
+    # below is the new paginated companion for the web admin browser.
+    # ------------------------------------------------------------------
+    GIFT_REDEMPTIONS_MAX_PER_PAGE: int = 200
+
+    async def list_gift_code_redemptions(
+        self,
+        *,
+        code: str,
+        page: int = 1,
+        per_page: int = 50,
+    ) -> dict:
+        """Stage-12-Step-D: paginated per-code redemption browser.
+
+        Backs ``GET /admin/gifts/{code}/redemptions`` — for one code,
+        list everybody who redeemed it (telegram_id + username) plus
+        the per-redemption USD figure (joined from ``transactions``)
+        and the linked transaction id. Indexed by the new
+        ``idx_gift_redemptions_code_redeemed_at`` (alembic 0013) —
+        without that index the query would hit the ``(code, telegram_id)``
+        PK partition and then sort the partition in memory by time,
+        which scales poorly once a code has thousands of redemptions.
+
+        ``per_page`` is clamped to ``[1, GIFT_REDEMPTIONS_MAX_PER_PAGE]``;
+        ``page`` to ``>= 1``. Sort is ``redeemed_at DESC`` — the index
+        is built in that direction so a forward scan returns rows in
+        display order without an extra sort step. ``code`` is
+        upper-cased to match the ``gift_codes.code`` storage convention.
+
+        ``transaction_id`` is nullable on the schema (alembic 0003 sets
+        ``ON DELETE SET NULL`` so a manual ``transactions`` cleanup
+        doesn't cascade-delete the redemption record). When non-null
+        we LEFT JOIN ``transactions`` to surface the
+        ``amount_usd_credited`` actually credited to the user, which
+        is what the admin wants to see — *not* the gift_codes row's
+        amount_usd at the time of the page render (a code can be
+        edited / re-priced after redemptions land, but the credit
+        landed at the original price). For NULL transaction_id rows
+        (orphaned redemption — the underlying transaction row was
+        cleaned up) ``amount_usd_credited`` falls back to ``None``;
+        the template renders that as a dash.
+
+        Returns::
+
+            {
+              "rows": [
+                {"telegram_id": int, "username": str | None,
+                 "redeemed_at": iso str | None,
+                 "transaction_id": int | None,
+                 "amount_usd_credited": float | None},
+                ...
+              ],
+              "total": int, "page": int, "per_page": int,
+              "total_pages": int,
+            }
+        """
+        per_page = max(
+            1, min(int(per_page), self.GIFT_REDEMPTIONS_MAX_PER_PAGE)
+        )
+        page = max(1, int(page))
+        code_upper = code.upper()
+
+        async with self.pool.acquire() as connection:
+            total = await connection.fetchval(
+                "SELECT COUNT(*) FROM gift_redemptions WHERE code = $1",
+                code_upper,
+            )
+            rows = await connection.fetch(
+                """
+                SELECT r.telegram_id,
+                       r.redeemed_at,
+                       r.transaction_id,
+                       u.username,
+                       t.amount_usd_credited
+                FROM gift_redemptions r
+                LEFT JOIN users u ON u.telegram_id = r.telegram_id
+                LEFT JOIN transactions t
+                       ON t.transaction_id = r.transaction_id
+                WHERE r.code = $1
+                ORDER BY r.redeemed_at DESC
+                LIMIT $2 OFFSET $3
+                """,
+                code_upper, per_page, (page - 1) * per_page,
+            )
+
+        total = int(total or 0)
+        total_pages = (total + per_page - 1) // per_page
+        return {
+            "rows": [
+                {
+                    "telegram_id": int(r["telegram_id"]),
+                    "username": r["username"],
+                    "redeemed_at": (
+                        r["redeemed_at"].isoformat()
+                        if r["redeemed_at"] is not None else None
+                    ),
+                    "transaction_id": (
+                        int(r["transaction_id"])
+                        if r["transaction_id"] is not None else None
+                    ),
+                    "amount_usd_credited": (
+                        float(r["amount_usd_credited"])
+                        if r["amount_usd_credited"] is not None else None
+                    ),
+                }
+                for r in rows
+            ],
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages,
+        }
+
+    async def get_gift_code_redemption_aggregates(
+        self, code: str
+    ) -> dict:
+        """Stage-12-Step-D: lightweight aggregates rendered above the
+        per-code redemption table.
+
+        Returns::
+
+            {"total_redemptions": int,
+             "total_credited_usd": float,
+             "first_redeemed_at": iso str | None,
+             "last_redeemed_at": iso str | None}
+
+        ``total_credited_usd`` sums the *actual credited* USD figures
+        from the linked ``transactions`` rows (mirrors the row-level
+        accuracy described on :meth:`list_gift_code_redemptions`),
+        falling back to 0 for NULL ``transaction_id`` rows.
+
+        Cheap on the new index — three aggregate functions in one
+        query, full per-code partition scan but indexed.
+        """
+        code_upper = code.upper()
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT COUNT(*)                           AS n,
+                       COALESCE(SUM(t.amount_usd_credited), 0) AS sum_usd,
+                       MIN(r.redeemed_at)                 AS first_at,
+                       MAX(r.redeemed_at)                 AS last_at
+                FROM gift_redemptions r
+                LEFT JOIN transactions t
+                       ON t.transaction_id = r.transaction_id
+                WHERE r.code = $1
+                """,
+                code_upper,
+            )
+        if row is None:
+            return {
+                "total_redemptions": 0,
+                "total_credited_usd": 0.0,
+                "first_redeemed_at": None,
+                "last_redeemed_at": None,
+            }
+        return {
+            "total_redemptions": int(row["n"] or 0),
+            "total_credited_usd": float(row["sum_usd"] or 0),
+            "first_redeemed_at": (
+                row["first_at"].isoformat()
+                if row["first_at"] is not None else None
+            ),
+            "last_redeemed_at": (
+                row["last_at"].isoformat()
+                if row["last_at"] is not None else None
+            ),
+        }
 
     async def redeem_gift_code(
         self, code: str, telegram_id: int

@@ -1988,3 +1988,224 @@ async def test_refundable_gateways_constant():
     assert database_module.Database.REFUNDABLE_GATEWAYS == frozenset(
         {"nowpayments", "tetrapay"}
     )
+
+
+# ---------------------------------------------------------------------
+# Stage-12-Step-D: per-code gift redemption drilldown DB methods.
+# ---------------------------------------------------------------------
+
+
+async def test_list_gift_code_redemptions_uppercases_code():
+    """The code is upper-cased before being passed to the SQL — gift
+    codes are stored upper in ``gift_codes.code``."""
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=0)
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.list_gift_code_redemptions(code="birthday5")
+
+    # COUNT query passed the upper-cased code.
+    count_call = conn.fetchval.await_args_list[0]
+    assert count_call.args[1] == "BIRTHDAY5"
+    # SELECT-rows query also passed the upper-cased code.
+    rows_call = conn.fetch.await_args_list[0]
+    assert rows_call.args[1] == "BIRTHDAY5"
+
+
+async def test_list_gift_code_redemptions_clamps_per_page():
+    """``per_page`` outside [1, GIFT_REDEMPTIONS_MAX_PER_PAGE] is clamped
+    so a tampered ?per_page=999999 query string can't hand the DB a
+    LIMIT 999999 row scan."""
+    conn = _make_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.list_gift_code_redemptions(code="X", per_page=999_999)
+    # SELECT-rows LIMIT (positional arg index 2 in fetch call) is
+    # clamped to the class constant.
+    select_call = conn.fetch.await_args_list[0]
+    assert (
+        select_call.args[2]
+        == database_module.Database.GIFT_REDEMPTIONS_MAX_PER_PAGE
+    )
+
+    conn.fetch.reset_mock()
+    await db.list_gift_code_redemptions(code="X", per_page=0)
+    select_call = conn.fetch.await_args_list[0]
+    assert select_call.args[2] == 1  # clamped up to 1
+
+
+async def test_list_gift_code_redemptions_clamps_page_to_at_least_1():
+    """A page=0 / page=-1 query collapses to page=1 — never a negative
+    OFFSET (which postgres would reject)."""
+    conn = _make_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.list_gift_code_redemptions(code="X", page=-5, per_page=10)
+    select_call = conn.fetch.await_args_list[0]
+    # OFFSET is positional arg 3; must be 0 (page=1 ⇒ 0 offset).
+    assert select_call.args[3] == 0
+
+
+async def test_list_gift_code_redemptions_offset_uses_page_minus_1():
+    """OFFSET = (page - 1) * per_page, the standard pagination offset."""
+    conn = _make_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.list_gift_code_redemptions(code="X", page=3, per_page=25)
+    select_call = conn.fetch.await_args_list[0]
+    assert select_call.args[2] == 25
+    assert select_call.args[3] == 50
+
+
+async def test_list_gift_code_redemptions_sql_pinned():
+    """Query must SELECT from gift_redemptions, LEFT JOIN both users
+    and transactions (the latter is the new join — surface the actual
+    credited amount, not the gift_codes row's amount_usd at page-render
+    time), filter on r.code, ORDER BY r.redeemed_at DESC, and LIMIT/OFFSET
+    via the right placeholder positions."""
+    conn = _make_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.list_gift_code_redemptions(code="X", page=1, per_page=10)
+
+    sql = conn.fetch.await_args_list[0].args[0]
+    assert "FROM gift_redemptions" in sql
+    assert "LEFT JOIN users" in sql
+    assert "LEFT JOIN transactions" in sql
+    assert "amount_usd_credited" in sql
+    assert "WHERE r.code = $1" in sql
+    assert "ORDER BY r.redeemed_at DESC" in sql
+    assert "LIMIT $2 OFFSET $3" in sql
+
+
+async def test_list_gift_code_redemptions_pagination_metadata():
+    """``total_pages`` = ceil(total / per_page); also: result dict
+    surfaces the post-clamp ``page`` / ``per_page`` so the caller can
+    build prev/next URLs from the same numbers the DB used."""
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=125)  # total
+    conn.fetch = AsyncMock(return_value=[])  # rows for this page
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.list_gift_code_redemptions(
+        code="X", page=2, per_page=50,
+    )
+    assert result["total"] == 125
+    assert result["page"] == 2
+    assert result["per_page"] == 50
+    assert result["total_pages"] == 3  # ceil(125 / 50)
+
+
+async def test_list_gift_code_redemptions_normalises_rows():
+    """Per-row dict shape: ints / iso strings / None passthroughs.
+    Critically: ``amount_usd_credited`` is a float, transaction_id may
+    be None (orphaned redemption — ON DELETE SET NULL on transactions),
+    redeemed_at is iso-formatted."""
+    from datetime import datetime, timezone
+
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=2)
+    conn.fetch = AsyncMock(return_value=[
+        {
+            "telegram_id": 1001,
+            "redeemed_at": datetime(2026, 4, 29, 10, 0, tzinfo=timezone.utc),
+            "transaction_id": 555,
+            "username": "alice",
+            "amount_usd_credited": 5.0,
+        },
+        {
+            "telegram_id": 1002,
+            "redeemed_at": None,
+            "transaction_id": None,  # orphan: tx row was cleaned up
+            "username": None,
+            "amount_usd_credited": None,
+        },
+    ])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.list_gift_code_redemptions(code="X")
+    rows = result["rows"]
+    assert rows[0] == {
+        "telegram_id": 1001,
+        "username": "alice",
+        "redeemed_at": "2026-04-29T10:00:00+00:00",
+        "transaction_id": 555,
+        "amount_usd_credited": 5.0,
+    }
+    assert rows[1] == {
+        "telegram_id": 1002,
+        "username": None,
+        "redeemed_at": None,
+        "transaction_id": None,
+        "amount_usd_credited": None,
+    }
+
+
+async def test_get_gift_code_redemption_aggregates_sql_pinned():
+    """The aggregate query MUST sum ``transactions.amount_usd_credited``
+    (not ``gift_codes.amount_usd``) — a code can be re-priced after
+    redemptions land. ``COALESCE(..., 0)`` so an all-orphan code
+    surfaces 0, not None."""
+    conn = _make_conn()
+    conn.fetchrow = AsyncMock(return_value={
+        "n": 5, "sum_usd": 25.0, "first_at": None, "last_at": None,
+    })
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_gift_code_redemption_aggregates("birthday5")
+    sql = conn.fetchrow.await_args_list[0].args[0]
+    code_arg = conn.fetchrow.await_args_list[0].args[1]
+    assert code_arg == "BIRTHDAY5"  # uppercased
+    assert "FROM gift_redemptions" in sql
+    assert "LEFT JOIN transactions" in sql
+    assert "SUM(t.amount_usd_credited)" in sql
+    assert "COALESCE" in sql
+    assert "WHERE r.code = $1" in sql
+
+
+async def test_get_gift_code_redemption_aggregates_returns_zero_when_empty():
+    """No row → all-zero / all-None aggregates; never raise."""
+    conn = _make_conn()
+    conn.fetchrow = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.get_gift_code_redemption_aggregates("X")
+    assert result == {
+        "total_redemptions": 0,
+        "total_credited_usd": 0.0,
+        "first_redeemed_at": None,
+        "last_redeemed_at": None,
+    }
+
+
+async def test_get_gift_code_uppercases_lookup():
+    """get_gift_code(code) MUST upper-case before hitting the PK
+    lookup; ``gift_codes.code`` is uppercase by table convention."""
+    conn = _make_conn()
+    conn.fetchrow = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_gift_code("birthday5")
+    code_arg = conn.fetchrow.await_args_list[0].args[1]
+    assert code_arg == "BIRTHDAY5"
+
+
+async def test_get_gift_code_returns_none_when_missing():
+    """A missing code returns None, not an exception."""
+    conn = _make_conn()
+    conn.fetchrow = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    assert await db.get_gift_code("GHOST") is None

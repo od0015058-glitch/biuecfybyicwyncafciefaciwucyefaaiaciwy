@@ -1541,6 +1541,146 @@ async def gifts_revoke(request: web.Request) -> web.StreamResponse:
 
 
 # ---------------------------------------------------------------------
+# Stage-12-Step-D: per-code redemption drilldown.
+# ---------------------------------------------------------------------
+#
+# ``GET /admin/gifts/{code}/redemptions`` — list every gift_redemptions
+# row for one code (newest first), with telegram_id, username,
+# redeemed_at, transaction_id, and the per-redemption USD figure
+# joined from transactions.amount_usd_credited. Backed by the alembic
+# 0013 ``idx_gift_redemptions_code_redeemed_at`` index. Mirrors the
+# Stage-9-Step-8 ``/admin/users/{id}/usage`` per-page layout
+# (paginated, per-page picker, prev/next).
+
+GIFT_REDEMPTIONS_PER_PAGE_DEFAULT = 50
+GIFT_REDEMPTIONS_PER_PAGE_MAX = 200
+GIFT_REDEMPTIONS_PER_PAGE_CHOICES = (25, 50, 100, 200)
+
+
+def _is_valid_gift_code(code: str) -> bool:
+    """ASCII-only [A-Za-z0-9_-] gift-code shape, max 64 chars.
+
+    Mirrors the validation in ``parse_gift_form`` and ``gifts_revoke``
+    so a tampered URL can't smuggle SQL fragments or weird Unicode
+    into ``Database.list_gift_code_redemptions(code=...)`` even though
+    the SQL itself is fully parameterised.
+    """
+    return bool(code) and len(code) <= 64 and all(
+        (c.isascii() and c.isalnum()) or c in "_-" for c in code
+    )
+
+
+async def gift_redemptions_get(
+    request: web.Request,
+) -> web.StreamResponse:
+    """GET /admin/gifts/{code}/redemptions — paginated drilldown.
+
+    Stage-12-Step-D. Renders the list of every redemption for one
+    gift code: telegram_id, username, redeemed_at, transaction_id,
+    and the per-redemption USD figure. Aggregates (count + sum +
+    first/last) above the table.
+    """
+    raw_code = request.match_info.get("code", "")
+    code = raw_code.upper()
+    if not _is_valid_gift_code(code):
+        return web.HTTPFound(location="/admin/gifts")
+
+    try:
+        page = max(1, int(request.rel_url.query.get("page", "1")))
+    except (ValueError, TypeError):
+        page = 1
+    try:
+        per_page = int(
+            request.rel_url.query.get(
+                "per_page", str(GIFT_REDEMPTIONS_PER_PAGE_DEFAULT)
+            )
+        )
+    except (ValueError, TypeError):
+        per_page = GIFT_REDEMPTIONS_PER_PAGE_DEFAULT
+    per_page = max(1, min(per_page, GIFT_REDEMPTIONS_PER_PAGE_MAX))
+
+    db = request.app.get(APP_KEY_DB)
+    gift_meta: dict | None = None
+    page_result: dict | None = None
+    aggregates: dict | None = None
+    db_error: str | None = None
+    if db is None:
+        db_error = "No database wired up (development mode)."
+    else:
+        try:
+            gift_meta = await db.get_gift_code(code)
+            if gift_meta is not None:
+                page_result = await db.list_gift_code_redemptions(
+                    code=code, page=page, per_page=per_page,
+                )
+                aggregates = await db.get_gift_code_redemption_aggregates(
+                    code
+                )
+        except Exception:
+            log.exception(
+                "gift_redemptions_get: query failed code=%r", code,
+            )
+            db_error = "Database query failed — see logs."
+
+    # If the code itself doesn't exist, redirect back to the list with
+    # a flash. We deliberately don't 404 — a deep link to a deleted
+    # code is more friendly with a banner explanation than a hard
+    # error page, and is consistent with the user-detail page
+    # behaviour.
+    if (
+        db is not None
+        and db_error is None
+        and gift_meta is None
+    ):
+        secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+        cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+        response = web.HTTPFound(location="/admin/gifts")
+        set_flash(
+            response,
+            kind="info",
+            message=f"Gift code '{code}' not found.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    # Pre-build prev/next URLs (mirrors user_usage_get).
+    prev_url = next_url = None
+    base = f"/admin/gifts/{code}/redemptions"
+    qs_extra = (
+        f"&per_page={per_page}"
+        if per_page != GIFT_REDEMPTIONS_PER_PAGE_DEFAULT else ""
+    )
+    if page_result is not None:
+        if page_result["page"] > 1:
+            p = page_result["page"] - 1
+            prev_url = (
+                base if p == 1 and not qs_extra
+                else f"{base}?page={p}{qs_extra}"
+            )
+        if page_result["page"] < page_result["total_pages"]:
+            p = page_result["page"] + 1
+            next_url = f"{base}?page={p}{qs_extra}"
+
+    return aiohttp_jinja2.render_template(
+        "gift_redemptions.html",
+        request,
+        {
+            "active_page": "gifts",
+            "code": code,
+            "gift": gift_meta,
+            "result": page_result,
+            "aggregates": aggregates,
+            "db_error": db_error,
+            "prev_url": prev_url,
+            "next_url": next_url,
+            "per_page": per_page,
+            "per_page_choices": GIFT_REDEMPTIONS_PER_PAGE_CHOICES,
+        },
+    )
+
+
+# ---------------------------------------------------------------------
 # Users (Stage-8-Part-4)
 # ---------------------------------------------------------------------
 #
@@ -4395,6 +4535,11 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/gifts/{code}/revoke",
         _require_auth(gifts_revoke),
+    )
+    # Stage-12-Step-D: per-code redemption drilldown.
+    app.router.add_get(
+        "/admin/gifts/{code}/redemptions",
+        _require_auth(gift_redemptions_get),
     )
 
     # Stage-8-Part-4: users.
