@@ -2063,6 +2063,92 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+# Stage-9-Step-10: write progress to the durable ``broadcast_jobs``
+# table at most once every ``BROADCAST_DB_PROGRESS_FLUSH_EVERY``
+# recipients. The in-memory ``job`` dict still updates on every
+# send (so the live-progress page polling against
+# ``broadcast_status_get`` sees real-time numbers); the throttle
+# only applies to the DB mirror so a 10 000-recipient broadcast
+# isn't 10 000 UPDATE statements. Terminal transitions
+# (``completed`` / ``failed`` / ``cancelled`` / ``interrupted``)
+# always flush regardless of the throttle.
+BROADCAST_DB_PROGRESS_FLUSH_EVERY: int = 25
+
+
+async def _persist_broadcast_progress(
+    db, job: dict, *, force: bool = False
+) -> None:
+    """Mirror the in-memory ``job`` dict's progress to ``broadcast_jobs``.
+
+    Throttled to one UPDATE per
+    ``BROADCAST_DB_PROGRESS_FLUSH_EVERY`` recipients; ``force=True``
+    bypasses the throttle (terminal-state transitions always flush).
+    Best-effort — a DB blip mid-broadcast logs a warning and lets
+    the worker keep sending. The in-memory dict is the source of
+    truth for the live-progress page; the DB is the durable mirror.
+    """
+    if db is None:
+        return
+    if not force:
+        i = int(job.get("i", 0) or 0)
+        if i and i % BROADCAST_DB_PROGRESS_FLUSH_EVERY != 0:
+            return
+    try:
+        await db.update_broadcast_job(
+            job["id"],
+            total=int(job.get("total", 0) or 0),
+            sent=int(job.get("sent", 0) or 0),
+            blocked=int(job.get("blocked", 0) or 0),
+            failed=int(job.get("failed", 0) or 0),
+            i=int(job.get("i", 0) or 0),
+        )
+    except Exception:
+        log.warning(
+            "broadcast_job=%s: progress flush to broadcast_jobs failed",
+            job.get("id"),
+            exc_info=True,
+        )
+
+
+async def _persist_broadcast_state(
+    db,
+    job: dict,
+    *,
+    state: str,
+    error: str | None = None,
+    started: bool = False,
+    completed: bool = False,
+    cancel_requested: bool | None = None,
+) -> None:
+    """Mirror a state transition (queued → running → terminal) to
+    ``broadcast_jobs``. Always force-flushes progress counters
+    alongside the new state so a terminal row never carries stale
+    sent/blocked/failed numbers. Best-effort (logs and continues
+    on DB failure)."""
+    if db is None:
+        return
+    try:
+        await db.update_broadcast_job(
+            job["id"],
+            state=state,
+            error=error,
+            total=int(job.get("total", 0) or 0),
+            sent=int(job.get("sent", 0) or 0),
+            blocked=int(job.get("blocked", 0) or 0),
+            failed=int(job.get("failed", 0) or 0),
+            i=int(job.get("i", 0) or 0),
+            cancel_requested=cancel_requested,
+            started_at_now=started,
+            completed_at_now=completed,
+        )
+    except Exception:
+        log.warning(
+            "broadcast_job=%s: state transition to %s failed to persist",
+            job.get("id"), state,
+            exc_info=True,
+        )
+
+
 def _new_broadcast_job(
     *,
     text: str,
@@ -2144,6 +2230,10 @@ async def _run_broadcast_job(
 
     job["state"] = "running"
     job["started_at"] = _now_iso()
+    # Stage-9-Step-10: mirror the queued → running transition.
+    await _persist_broadcast_state(
+        db, job, state="running", started=True
+    )
 
     if db is None or bot is None:
         # Should never happen in production (both wired up by
@@ -2154,6 +2244,10 @@ async def _run_broadcast_job(
             "Background task launched without a DB or bot wired up."
         )
         job["completed_at"] = _now_iso()
+        await _persist_broadcast_state(
+            db, job, state="failed",
+            error=job["error"], completed=True,
+        )
         return
 
     try:
@@ -2167,12 +2261,19 @@ async def _run_broadcast_job(
         job["state"] = "failed"
         job["error"] = f"DB query failed: {exc}"
         job["completed_at"] = _now_iso()
+        await _persist_broadcast_state(
+            db, job, state="failed",
+            error=job["error"], completed=True,
+        )
         return
 
     job["total"] = len(recipients)
     if not recipients:
         job["state"] = "completed"
         job["completed_at"] = _now_iso()
+        await _persist_broadcast_state(
+            db, job, state="completed", completed=True
+        )
         return
 
     async def _on_progress(stats: dict) -> None:
@@ -2180,6 +2281,11 @@ async def _run_broadcast_job(
         job["sent"] = stats["sent"]
         job["blocked"] = stats["blocked"]
         job["failed"] = stats["failed"]
+        # Stage-9-Step-10: throttled mirror of progress to the
+        # durable broadcast_jobs row so a process restart leaves a
+        # forensic trail (best-effort; doesn't block the worker on
+        # a transient DB blip).
+        await _persist_broadcast_progress(db, job)
 
     def _cancel_requested() -> bool:
         # Stage-9-Step-6: ``broadcast_cancel_post`` flips this flag in
@@ -2202,15 +2308,38 @@ async def _run_broadcast_job(
             should_cancel=_cancel_requested,
         )
     except asyncio.CancelledError:
-        job["state"] = "failed"
+        # Stage-9-Step-10 bundled bug fix: this branch fires when the
+        # worker's asyncio Task is ``cancel()``-ed — which happens on
+        # app shutdown (the on_cleanup hook cancels every entry in
+        # ``APP_KEY_BROADCAST_TASKS``), NOT when an admin clicked the
+        # "Cancel" button. Pre-fix we labelled the resulting row
+        # ``state="failed"``, which conflated three semantically
+        # different terminal states (``failed`` = exception in the
+        # send loop; ``cancelled`` = admin clicked cancel and we
+        # exited cleanly between sends; this branch = process killed
+        # mid-send). The new ``"interrupted"`` state lets the recent-
+        # jobs page distinguish a deploy-time restart from a code
+        # bug, and matches the orphan-sweep state
+        # ``mark_orphan_broadcast_jobs_interrupted`` writes for jobs
+        # whose worker task didn't even get to ``except`` block (the
+        # process was SIGKILL-ed).
+        job["state"] = "interrupted"
         job["error"] = "Cancelled (admin panel shutting down)."
         job["completed_at"] = _now_iso()
+        await _persist_broadcast_state(
+            db, job, state="interrupted",
+            error=job["error"], completed=True,
+        )
         raise
     except Exception as exc:
         log.exception("broadcast_job=%s: _do_broadcast raised", job["id"])
         job["state"] = "failed"
         job["error"] = f"Broadcast failed: {exc}"
         job["completed_at"] = _now_iso()
+        await _persist_broadcast_state(
+            db, job, state="failed",
+            error=job["error"], completed=True,
+        )
         return
 
     # ``i`` is the count of recipients we actually attempted — for a
@@ -2227,14 +2356,63 @@ async def _run_broadcast_job(
         job["i"] = stats["total"]
         job["state"] = "completed"
     job["completed_at"] = _now_iso()
+    await _persist_broadcast_state(
+        db, job, state=job["state"], completed=True
+    )
 
 
 async def broadcast_get(request: web.Request) -> web.StreamResponse:
-    """GET /admin/broadcast — form + recent jobs list."""
-    jobs: dict = request.app[APP_KEY_BROADCAST_JOBS]
-    # Newest first. Copy dicts so a background writer can't mutate
-    # under the Jinja template iterator.
-    recent = [dict(j) for j in reversed(list(jobs.values()))]
+    """GET /admin/broadcast — form + recent jobs list.
+
+    Stage-9-Step-10: the recent-jobs list is read from the durable
+    ``broadcast_jobs`` table so a process restart doesn't orphan
+    history. The in-memory ``APP_KEY_BROADCAST_JOBS`` dict is
+    layered on top — a live-running job's progress counters in
+    memory may be a few sends ahead of the throttled DB mirror, so
+    if a job is present in both we prefer the in-memory copy for
+    the live numbers (the row's terminal state always comes from
+    the DB on a completed run).
+    """
+    db = request.app.get(APP_KEY_DB)
+    in_memory: dict = request.app[APP_KEY_BROADCAST_JOBS]
+
+    rows: list[dict] = []
+    if db is not None:
+        try:
+            rows = await db.list_broadcast_jobs()
+        except Exception:
+            log.warning(
+                "broadcast_get: list_broadcast_jobs failed; "
+                "falling back to in-memory registry only",
+                exc_info=True,
+            )
+            rows = []
+
+    # Layer in-memory live data on top of the DB rows for jobs that
+    # are still active (the throttled progress flush may be a few
+    # sends behind the in-memory counters).
+    if rows:
+        recent: list[dict] = []
+        seen: set[str] = set()
+        for row in rows:
+            seen.add(row["id"])
+            if row["state"] in ("queued", "running"):
+                live = in_memory.get(row["id"])
+                if live is not None:
+                    recent.append(dict(live))
+                    continue
+            recent.append(row)
+        # Surface any in-memory-only jobs the DB hasn't observed yet
+        # (e.g. a row INSERT that lost a race with the recent-jobs
+        # GET, or a test that didn't wire up the DB).
+        for jid, live in reversed(list(in_memory.items())):
+            if jid not in seen:
+                recent.insert(0, dict(live))
+    else:
+        # DB unavailable / empty — fall back to the in-memory dict
+        # only. Newest first; copy dicts so a background writer
+        # can't mutate under the Jinja template iterator.
+        recent = [dict(j) for j in reversed(list(in_memory.values()))]
 
     response = aiohttp_jinja2.render_template(
         "broadcast.html",
@@ -2316,6 +2494,29 @@ async def broadcast_post(request: web.Request) -> web.StreamResponse:
         only_active_days=parsed["only_active_days"],
     )
     _store_broadcast_job(request.app, job)
+    # Stage-9-Step-10: insert the durable mirror row before kicking
+    # off the worker so a crash between create_task and the worker's
+    # first state write still leaves a forensic trail. Best-effort:
+    # if the DB is unavailable the in-memory job still runs (the
+    # broadcast itself doesn't depend on broadcast_jobs).
+    db = request.app.get(APP_KEY_DB)
+    if db is not None:
+        try:
+            await db.insert_broadcast_job(
+                job_id=job["id"],
+                text_preview=job["text_preview"],
+                full_text_len=job["full_text_len"],
+                only_active_days=job["only_active_days"],
+                state="queued",
+            )
+        except Exception:
+            log.warning(
+                "broadcast_post: insert_broadcast_job failed for "
+                "job=%s; in-memory job will still run but the "
+                "durable mirror is missing.",
+                job["id"],
+                exc_info=True,
+            )
     task = asyncio.create_task(
         _run_broadcast_job(
             app=request.app,
@@ -2341,10 +2542,38 @@ async def broadcast_post(request: web.Request) -> web.StreamResponse:
     return web.HTTPFound(location=f"/admin/broadcast/{job['id']}")
 
 
+async def _resolve_broadcast_job(
+    request: web.Request, job_id: str
+) -> dict | None:
+    """Look up a broadcast job by id, preferring the live in-memory
+    dict and falling back to the durable ``broadcast_jobs`` row.
+
+    Stage-9-Step-10: prior to durable storage, an admin who reloaded
+    a `/admin/broadcast/{id}` link after a process restart got an
+    "unknown job" redirect. Now the DB row carries the terminal
+    state forward so the link still resolves — we just lose live
+    progress polling once the worker task is gone.
+    """
+    live = request.app[APP_KEY_BROADCAST_JOBS].get(job_id)
+    if live is not None:
+        return dict(live)
+    db = request.app.get(APP_KEY_DB)
+    if db is None:
+        return None
+    try:
+        return await db.get_broadcast_job(job_id)
+    except Exception:
+        log.warning(
+            "_resolve_broadcast_job: get_broadcast_job(%s) failed",
+            job_id, exc_info=True,
+        )
+        return None
+
+
 async def broadcast_detail_get(request: web.Request) -> web.StreamResponse:
     """GET /admin/broadcast/{job_id} — live-progress page."""
     job_id = request.match_info.get("job_id", "")
-    job = request.app[APP_KEY_BROADCAST_JOBS].get(job_id)
+    job = await _resolve_broadcast_job(request, job_id)
     if job is None:
         response = web.HTTPFound(location="/admin/broadcast")
         set_flash(
@@ -2352,20 +2581,22 @@ async def broadcast_detail_get(request: web.Request) -> web.StreamResponse:
             kind="error",
             message=(
                 f"Unknown broadcast job {job_id!r}. "
-                f"(Jobs are in-memory and are lost on process restart.)"
+                f"(Job not found in the durable registry.)"
             ),
             secret=request.app.get(APP_KEY_SESSION_SECRET, ""),
             cookie_secure=request.app.get(APP_KEY_COOKIE_SECURE, True),
         )
         return response
 
-    # Snapshot so the template never sees a half-updated dict.
+    # ``_resolve_broadcast_job`` already returned a snapshot dict, so
+    # the template never sees a half-updated row mutated by a
+    # concurrent worker.
     return aiohttp_jinja2.render_template(
         "broadcast_detail.html",
         request,
         {
             "active_page": "broadcast",
-            "job": dict(job),
+            "job": job,
             # Stage-9-Step-6: CSRF token for the cancel-button form.
             "csrf_token": csrf_token_for(request),
         },
@@ -2375,14 +2606,13 @@ async def broadcast_detail_get(request: web.Request) -> web.StreamResponse:
 async def broadcast_status_get(request: web.Request) -> web.StreamResponse:
     """GET /admin/broadcast/{job_id}/status — JSON for polling."""
     job_id = request.match_info.get("job_id", "")
-    job = request.app[APP_KEY_BROADCAST_JOBS].get(job_id)
+    job = await _resolve_broadcast_job(request, job_id)
     if job is None:
         return web.json_response(
             {"error": "unknown_job", "job_id": job_id}, status=404
         )
-    # Snapshot before handing to json_response so a concurrent
-    # writer can't mutate mid-serialize.
-    return web.json_response(dict(job))
+    # ``_resolve_broadcast_job`` already returned a snapshot dict.
+    return web.json_response(job)
 
 
 async def broadcast_cancel_post(request: web.Request) -> web.StreamResponse:
@@ -2430,7 +2660,8 @@ async def broadcast_cancel_post(request: web.Request) -> web.StreamResponse:
             kind="error",
             message=(
                 f"Broadcast job '{job_id}' not found "
-                "(it may have been evicted from the in-memory registry)."
+                "(it may have been evicted from the in-memory registry, "
+                "or its worker task is no longer running after a restart)."
             ),
             secret=secret,
             cookie_secure=cookie_secure,
@@ -2465,6 +2696,22 @@ async def broadcast_cancel_post(request: web.Request) -> web.StreamResponse:
         return back
 
     job["cancel_requested"] = True
+    # Stage-9-Step-10: mirror the cancel flag to the durable mirror so
+    # the recent-jobs list shows "cancelled" status promptly even
+    # before the worker reaches its next loop iteration. Best-effort.
+    db = request.app.get(APP_KEY_DB)
+    if db is not None:
+        try:
+            await db.update_broadcast_job(
+                job_id, cancel_requested=True
+            )
+        except Exception:
+            log.warning(
+                "broadcast_cancel_post: cancel flag mirror failed "
+                "for job=%s; in-memory flag still set so the worker "
+                "will honour it on the next loop iteration.",
+                job_id, exc_info=True,
+            )
     log.info(
         "broadcast_cancel_post: cancel requested for job=%s "
         "(state=%s, sent=%d/%d)",
@@ -3912,6 +4159,34 @@ def setup_admin_routes(
         "/admin/enroll_2fa",
         _require_auth(enroll_2fa_get),
     )
+
+    # Stage-9-Step-10: durable broadcast registry orphan sweep.
+    # Any row left in ``queued`` / ``running`` from before the
+    # restart is flipped to ``interrupted`` so the recent-jobs page
+    # doesn't forever show a phantom "running" job whose worker
+    # task no longer exists. Best-effort — a DB blip at startup
+    # logs a warning but doesn't block the app from coming up.
+    async def _sweep_orphan_broadcast_jobs(_app: web.Application) -> None:
+        db_ref = _app.get(APP_KEY_DB)
+        if db_ref is None:
+            return
+        try:
+            n = await db_ref.mark_orphan_broadcast_jobs_interrupted()
+        except Exception:
+            log.warning(
+                "broadcast_jobs orphan sweep failed at startup "
+                "(broadcast_jobs table may be missing the migration "
+                "0007_broadcast_jobs).",
+                exc_info=True,
+            )
+            return
+        if n:
+            log.info(
+                "broadcast_jobs orphan sweep: marked %d row(s) "
+                "as interrupted (queued/running before restart).",
+                n,
+            )
+    app.on_startup.append(_sweep_orphan_broadcast_jobs)
 
     app[APP_KEY_INSTALLED] = True
     log.info("Web admin routes installed under /admin/")

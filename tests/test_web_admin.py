@@ -148,6 +148,12 @@ def _stub_db(
     update_user_fields_result: dict | None | Exception = None,
     user_usage_result: dict | Exception | None = None,
     user_usage_aggregates_result: dict | Exception | None = None,
+    # Stage-9-Step-10: durable broadcast registry.
+    broadcast_jobs_rows: list | Exception | None = None,
+    get_broadcast_job_result: dict | None | Exception = None,
+    insert_broadcast_job_result: object | Exception = None,
+    update_broadcast_job_result: bool | Exception = True,
+    mark_orphan_broadcast_jobs_result: int | Exception = 0,
 ):
     """A minimal Database stub that exposes the methods web_admin uses.
 
@@ -318,6 +324,48 @@ def _stub_db(
             return_value=user_usage_aggregates_result
             if user_usage_aggregates_result is not None
             else default_aggregates
+        )
+    # Stage-9-Step-10: durable broadcast registry stubs. These have to
+    # be explicit because ``AsyncMock()`` defaults every unspecified
+    # method to "returns an AsyncMock instance", which fails JSON
+    # serialisation on /admin/broadcast/{id}/status and turns the
+    # in-memory fallback into nonsense for /admin/broadcast.
+    if isinstance(broadcast_jobs_rows, Exception):
+        db.list_broadcast_jobs = AsyncMock(side_effect=broadcast_jobs_rows)
+    else:
+        db.list_broadcast_jobs = AsyncMock(
+            return_value=broadcast_jobs_rows
+            if broadcast_jobs_rows is not None else []
+        )
+    if isinstance(get_broadcast_job_result, Exception):
+        db.get_broadcast_job = AsyncMock(side_effect=get_broadcast_job_result)
+    else:
+        db.get_broadcast_job = AsyncMock(
+            return_value=get_broadcast_job_result
+        )
+    if isinstance(insert_broadcast_job_result, Exception):
+        db.insert_broadcast_job = AsyncMock(
+            side_effect=insert_broadcast_job_result
+        )
+    else:
+        db.insert_broadcast_job = AsyncMock(
+            return_value=insert_broadcast_job_result
+        )
+    if isinstance(update_broadcast_job_result, Exception):
+        db.update_broadcast_job = AsyncMock(
+            side_effect=update_broadcast_job_result
+        )
+    else:
+        db.update_broadcast_job = AsyncMock(
+            return_value=update_broadcast_job_result
+        )
+    if isinstance(mark_orphan_broadcast_jobs_result, Exception):
+        db.mark_orphan_broadcast_jobs_interrupted = AsyncMock(
+            side_effect=mark_orphan_broadcast_jobs_result
+        )
+    else:
+        db.mark_orphan_broadcast_jobs_interrupted = AsyncMock(
+            return_value=mark_orphan_broadcast_jobs_result
         )
     return db
 
@@ -6434,3 +6482,415 @@ def test_parse_user_edit_form_active_model_empty_is_treated_as_unchanged():
     )
     # No "active_model" key in result because the field was blank.
     assert "active_model" not in result
+
+
+
+# ---------------------------------------------------------------------
+# Stage-9-Step-10: durable broadcast job registry
+# ---------------------------------------------------------------------
+#
+# These tests pin the ``broadcast_jobs`` table integration: that
+# ``broadcast_post`` writes an INSERT, that ``_run_broadcast_job``
+# mirrors every state transition (queued → running → terminal) and
+# throttled progress ticks, that the recent-jobs page reads from
+# the DB rather than only the in-memory dict so a process restart
+# doesn't orphan history, that ``broadcast_detail_get`` /
+# ``broadcast_status_get`` fall back to the DB when the in-memory
+# entry is gone, and that ``broadcast_cancel_post`` mirrors the
+# cancel flag. Plus the bundled bug-fix pin: an
+# ``asyncio.CancelledError`` mid-broadcast (i.e. app shutdown)
+# now sets ``state="interrupted"`` instead of conflating with
+# ``state="failed"``, and the orphan sweep on app startup writes
+# the same state for any row left ``running`` from before the
+# restart. See HANDOFF.md §5 Step-10 for the rationale and the
+# bundled bug-fix description.
+
+
+async def test_broadcast_post_inserts_durable_row(
+    aiohttp_client, make_admin_app
+):
+    """Stage-9-Step-10: kicking off a broadcast must insert a
+    ``broadcast_jobs`` row in its initial ``queued`` state so a
+    crash between ``create_task`` and the worker's first state
+    write still leaves a forensic trail."""
+    db = _stub_db(broadcast_recipients=[])
+    bot = AsyncMock()
+    app = make_admin_app(password="pw", db=db, bot=bot)
+    client = await aiohttp_client(app)
+    csrf = await _login_and_get_broadcast_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/broadcast",
+        data={"text": "hello world", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.insert_broadcast_job.assert_awaited_once()
+    kwargs = db.insert_broadcast_job.await_args.kwargs
+    assert kwargs["text_preview"] == "hello world"
+    assert kwargs["full_text_len"] == len("hello world")
+    assert kwargs["state"] == "queued"
+    # ``job_id`` is a token_urlsafe(6) — no specific shape, just non-empty.
+    assert kwargs["job_id"]
+
+
+async def test_broadcast_post_continues_when_db_insert_fails(
+    aiohttp_client, make_admin_app
+):
+    """Pin: a DB blip on the durable mirror INSERT must not block
+    the in-memory job from running. The broadcast itself doesn't
+    depend on ``broadcast_jobs`` being writeable."""
+    db = _stub_db(
+        broadcast_recipients=[],
+        insert_broadcast_job_result=RuntimeError("pool drained"),
+    )
+    bot = AsyncMock()
+    app = make_admin_app(password="pw", db=db, bot=bot)
+    client = await aiohttp_client(app)
+    csrf = await _login_and_get_broadcast_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/broadcast",
+        data={"text": "hello", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/broadcast/")
+
+
+async def test_run_broadcast_job_mirrors_state_transitions(make_admin_app):
+    """Pin: every state mutation the worker performs is mirrored to
+    ``broadcast_jobs`` via ``update_broadcast_job``. Empty-recipients
+    path: queued → running → completed."""
+    from web_admin import _new_broadcast_job, _run_broadcast_job, _store_broadcast_job
+
+    db = _stub_db(broadcast_recipients=[])
+    bot = AsyncMock()
+    app = make_admin_app(db=db, bot=bot)
+    job = _new_broadcast_job(text="hi", only_active_days=None)
+    _store_broadcast_job(app, job)
+    await _run_broadcast_job(app=app, job=job, text="hi")
+
+    states_written = [
+        c.kwargs.get("state")
+        for c in db.update_broadcast_job.await_args_list
+        if c.kwargs.get("state") is not None
+    ]
+    assert states_written == ["running", "completed"]
+    final_call = db.update_broadcast_job.await_args_list[-1]
+    assert final_call.kwargs.get("completed_at_now") is True
+
+
+async def test_run_broadcast_job_mirrors_db_query_failure(make_admin_app):
+    """Pin: when ``iter_broadcast_recipients`` raises, the failure
+    state must be mirrored to ``broadcast_jobs`` with ``error``
+    populated and ``completed_at_now=True`` — otherwise a forensic
+    query against the table would see the row stuck in ``running``."""
+    from web_admin import _new_broadcast_job, _run_broadcast_job, _store_broadcast_job
+
+    db = _stub_db(broadcast_recipients=RuntimeError("pool closed"))
+    bot = AsyncMock()
+    app = make_admin_app(db=db, bot=bot)
+    job = _new_broadcast_job(text="hi", only_active_days=None)
+    _store_broadcast_job(app, job)
+    await _run_broadcast_job(app=app, job=job, text="hi")
+
+    final_call = db.update_broadcast_job.await_args_list[-1]
+    assert final_call.kwargs.get("state") == "failed"
+    assert final_call.kwargs.get("completed_at_now") is True
+    assert "pool closed" in (final_call.kwargs.get("error") or "")
+
+
+async def test_run_broadcast_job_cancelled_error_marks_interrupted(
+    make_admin_app
+):
+    """Stage-9-Step-10 BUNDLED BUG FIX. Pre-fix, an
+    ``asyncio.CancelledError`` propagating out of ``_do_broadcast``
+    (which fires on app shutdown when the worker task is cancelled)
+    set ``job["state"] = "failed"``, conflating three distinct
+    terminal states. Post-fix the same path sets
+    ``state="interrupted"`` so the recent-jobs page can distinguish
+    a deploy-time restart from a code bug, and matches the orphan-
+    sweep state for jobs whose worker task didn't even reach the
+    ``except`` block (process was SIGKILL-ed)."""
+    from web_admin import _new_broadcast_job, _run_broadcast_job, _store_broadcast_job
+
+    recipients = [100, 200, 300]
+    db = _stub_db(broadcast_recipients=recipients)
+    bot = AsyncMock()
+    app = make_admin_app(db=db, bot=bot)
+    job = _new_broadcast_job(text="hi", only_active_days=None)
+    _store_broadcast_job(app, job)
+
+    async def _raise_cancelled(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    with patch("admin._do_broadcast", side_effect=_raise_cancelled):
+        with pytest.raises(asyncio.CancelledError):
+            await _run_broadcast_job(app=app, job=job, text="hi")
+
+    assert job["state"] == "interrupted"
+    assert job["error"] == "Cancelled (admin panel shutting down)."
+    assert job["completed_at"] is not None
+    final_call = db.update_broadcast_job.await_args_list[-1]
+    assert final_call.kwargs.get("state") == "interrupted"
+    assert final_call.kwargs.get("completed_at_now") is True
+
+
+async def test_broadcast_get_reads_from_db(
+    aiohttp_client, make_admin_app
+):
+    """Pin: the recent-jobs list comes from ``list_broadcast_jobs``
+    rather than only the in-memory dict so a restart doesn't
+    orphan history."""
+    rows = [
+        {
+            "id": "abc123",
+            "text_preview": "Recent broadcast preview",
+            "full_text_len": 100,
+            "only_active_days": None,
+            "state": "completed",
+            "total": 50, "sent": 48, "blocked": 1, "failed": 1,
+            "i": 50, "error": None, "cancel_requested": False,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "started_at": "2026-01-01T00:00:01+00:00",
+            "completed_at": "2026-01-01T00:00:30+00:00",
+        }
+    ]
+    db = _stub_db(broadcast_jobs_rows=rows)
+    bot = AsyncMock()
+    app = make_admin_app(password="pw", db=db, bot=bot)
+    client = await aiohttp_client(app)
+    await _login(client, "pw")
+    resp = await client.get("/admin/broadcast")
+    assert resp.status == 200
+    body = await resp.text()
+    db.list_broadcast_jobs.assert_awaited_once()
+    assert "Recent broadcast preview" in body
+    assert "abc123" in body
+
+
+async def test_broadcast_get_falls_back_to_in_memory_when_db_fails(
+    aiohttp_client, make_admin_app
+):
+    """Defensive fallback pin: if ``list_broadcast_jobs`` raises,
+    the page still renders using the in-memory dict (the legacy
+    pre-Step-10 behaviour) rather than 500-ing the whole page."""
+    from web_admin import _new_broadcast_job, _store_broadcast_job
+
+    db = _stub_db(broadcast_jobs_rows=RuntimeError("db down"))
+    bot = AsyncMock()
+    app = make_admin_app(password="pw", db=db, bot=bot)
+    job = _new_broadcast_job(text="in memory only", only_active_days=None)
+    job["state"] = "completed"
+    _store_broadcast_job(app, job)
+    client = await aiohttp_client(app)
+    await _login(client, "pw")
+    resp = await client.get("/admin/broadcast")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "in memory only" in body
+
+
+async def test_broadcast_detail_falls_back_to_db_after_restart(
+    aiohttp_client, make_admin_app
+):
+    """Stage-9-Step-10: a `/admin/broadcast/{id}` link must keep
+    resolving after a process restart. The in-memory dict is empty
+    (no live worker), but ``get_broadcast_job`` returns the
+    durable row."""
+    durable_row = {
+        "id": "xyz789",
+        "text_preview": "Restart-survivor preview",
+        "full_text_len": 25,
+        "only_active_days": None,
+        "state": "interrupted",
+        "total": 100, "sent": 42, "blocked": 0, "failed": 0,
+        "i": 42,
+        "error": "Job was running when the bot process restarted",
+        "cancel_requested": False,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "started_at": "2026-01-01T00:00:01+00:00",
+        "completed_at": "2026-01-01T00:01:00+00:00",
+    }
+    db = _stub_db(get_broadcast_job_result=durable_row)
+    bot = AsyncMock()
+    app = make_admin_app(password="pw", db=db, bot=bot)
+    client = await aiohttp_client(app)
+    await _login(client, "pw")
+    resp = await client.get("/admin/broadcast/xyz789")
+    assert resp.status == 200
+    body = await resp.text()
+    db.get_broadcast_job.assert_awaited_with("xyz789")
+    assert "Restart-survivor preview" in body
+    assert "interrupted" in body
+
+
+async def test_broadcast_detail_unknown_redirects_with_flash(
+    aiohttp_client, make_admin_app
+):
+    """When neither the in-memory dict nor the DB knows the id,
+    redirect to the index with a flash error."""
+    db = _stub_db(get_broadcast_job_result=None)
+    bot = AsyncMock()
+    app = make_admin_app(password="pw", db=db, bot=bot)
+    client = await aiohttp_client(app)
+    await _login(client, "pw")
+    resp = await client.get(
+        "/admin/broadcast/nope", allow_redirects=False
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/broadcast"
+
+
+async def test_broadcast_status_falls_back_to_db_after_restart(
+    aiohttp_client, make_admin_app
+):
+    """The polling JSON endpoint must also resolve from the durable
+    mirror so a tab left open across a restart doesn't 404."""
+    durable_row = {
+        "id": "restart1",
+        "text_preview": "preview",
+        "full_text_len": 7,
+        "only_active_days": None,
+        "state": "completed",
+        "total": 10, "sent": 10, "blocked": 0, "failed": 0,
+        "i": 10, "error": None, "cancel_requested": False,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "started_at": "2026-01-01T00:00:01+00:00",
+        "completed_at": "2026-01-01T00:00:30+00:00",
+    }
+    db = _stub_db(get_broadcast_job_result=durable_row)
+    bot = AsyncMock()
+    app = make_admin_app(password="pw", db=db, bot=bot)
+    client = await aiohttp_client(app)
+    await _login(client, "pw")
+    resp = await client.get("/admin/broadcast/restart1/status")
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["id"] == "restart1"
+    assert payload["state"] == "completed"
+
+
+async def test_broadcast_cancel_mirrors_flag_to_db(
+    aiohttp_client, make_admin_app
+):
+    """Pin: clicking Cancel must set ``cancel_requested=True`` on
+    the durable row in addition to the in-memory job dict, so the
+    recent-jobs list shows the cancellation promptly."""
+    from web_admin import _new_broadcast_job, _store_broadcast_job
+
+    db = _stub_db()
+    bot = AsyncMock()
+    app = make_admin_app(password="pw", db=db, bot=bot)
+    job = _new_broadcast_job(text="cancel me", only_active_days=None)
+    job["state"] = "running"
+    _store_broadcast_job(app, job)
+    client = await aiohttp_client(app)
+    csrf = await _login_and_get_broadcast_csrf(client, "pw")
+    resp = await client.post(
+        f"/admin/broadcast/{job['id']}/cancel",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    cancel_calls = [
+        c for c in db.update_broadcast_job.await_args_list
+        if c.kwargs.get("cancel_requested") is True
+    ]
+    assert len(cancel_calls) == 1
+    assert cancel_calls[0].args[0] == job["id"]
+
+
+async def test_orphan_sweep_runs_at_app_startup(
+    aiohttp_client, make_admin_app
+):
+    """Pin: ``setup_admin_routes`` registers an ``on_startup``
+    handler that calls ``mark_orphan_broadcast_jobs_interrupted``
+    so any row left in queued/running from before the restart is
+    flipped to ``interrupted`` before the panel takes its first
+    request."""
+    db = _stub_db(mark_orphan_broadcast_jobs_result=3)
+    bot = AsyncMock()
+    client = await aiohttp_client(make_admin_app(db=db, bot=bot))
+    db.mark_orphan_broadcast_jobs_interrupted.assert_awaited_once()
+    resp = await client.get("/admin/login")
+    assert resp.status == 200
+
+
+async def test_orphan_sweep_swallows_db_failure_at_startup(
+    aiohttp_client, make_admin_app
+):
+    """Defensive pin: a DB blip during the orphan sweep must NOT
+    block app startup. The whole admin panel comes up; the missed
+    sweep is logged and we move on."""
+    db = _stub_db(
+        mark_orphan_broadcast_jobs_result=RuntimeError("db unreachable")
+    )
+    bot = AsyncMock()
+    client = await aiohttp_client(make_admin_app(db=db, bot=bot))
+    db.mark_orphan_broadcast_jobs_interrupted.assert_awaited_once()
+    resp = await client.get("/admin/login")
+    assert resp.status == 200
+
+
+# ---------------------------------------------------------------------
+# Throttled progress flush (web_admin._persist_broadcast_progress)
+# ---------------------------------------------------------------------
+
+
+async def test_persist_broadcast_progress_throttles_to_every_n():
+    """Pin: progress flushes mirror to the DB at most once every
+    ``BROADCAST_DB_PROGRESS_FLUSH_EVERY`` recipients. A 100-recipient
+    broadcast should produce 4 throttled flushes (i=25, 50, 75,
+    100) — NOT 100 UPDATEs."""
+    from web_admin import (
+        BROADCAST_DB_PROGRESS_FLUSH_EVERY, _persist_broadcast_progress
+    )
+
+    db = _stub_db()
+    job = {
+        "id": "j1", "total": 100, "sent": 0, "blocked": 0,
+        "failed": 0, "i": 0,
+    }
+    flushes = 0
+    for i in range(1, 101):
+        job["i"] = i
+        job["sent"] = i
+        before = db.update_broadcast_job.await_count
+        await _persist_broadcast_progress(db, job)
+        if db.update_broadcast_job.await_count > before:
+            flushes += 1
+    expected = 100 // BROADCAST_DB_PROGRESS_FLUSH_EVERY
+    assert flushes == expected, (
+        f"expected {expected} flushes (every "
+        f"{BROADCAST_DB_PROGRESS_FLUSH_EVERY} recipients), got {flushes}"
+    )
+
+
+async def test_persist_broadcast_progress_force_bypasses_throttle():
+    """Pin: ``force=True`` always flushes regardless of the
+    modulo throttle. Used by terminal-state transitions so the
+    final row never carries stale counters."""
+    from web_admin import _persist_broadcast_progress
+
+    db = _stub_db()
+    job = {
+        "id": "j1", "total": 10, "sent": 3, "blocked": 0,
+        "failed": 0, "i": 3,  # 3 % 25 != 0
+    }
+    await _persist_broadcast_progress(db, job, force=True)
+    db.update_broadcast_job.assert_awaited_once()
+
+
+async def test_persist_broadcast_progress_swallows_db_failure():
+    """Pin: a DB blip mid-broadcast must not crash the worker.
+    The in-memory dict is the source of truth for live progress;
+    the DB is the durable mirror. Best-effort throughout."""
+    from web_admin import _persist_broadcast_progress
+
+    db = _stub_db(update_broadcast_job_result=RuntimeError("blip"))
+    job = {
+        "id": "j1", "total": 10, "sent": 0, "blocked": 0,
+        "failed": 0, "i": 0,
+    }
+    # Must not raise.
+    await _persist_broadcast_progress(db, job, force=True)

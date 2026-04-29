@@ -1376,3 +1376,257 @@ async def test_get_system_metrics_pending_zero_returns_none_age():
     result = await db.get_system_metrics()
     assert result["pending_payments_count"] == 0
     assert result["pending_payments_oldest_age_hours"] is None
+
+
+# ---------------------------------------------------------------------
+# Stage-9-Step-10: durable broadcast job registry
+# ---------------------------------------------------------------------
+
+
+async def test_insert_broadcast_job_writes_initial_queued_row():
+    """Pin the INSERT shape: schema column ordering and the default
+    ``state="queued"`` so a forensic ``SELECT *`` against the table
+    is well-defined."""
+    conn = _make_conn()
+    conn.execute = AsyncMock(return_value="INSERT 0 1")
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.insert_broadcast_job(
+        job_id="abc123",
+        text_preview="preview",
+        full_text_len=42,
+        only_active_days=None,
+    )
+
+    assert conn.execute.await_count == 1
+    sql = conn.execute.await_args.args[0]
+    normalized = " ".join(sql.split())
+    assert "INSERT INTO broadcast_jobs" in normalized
+    assert (
+        "(job_id, text_preview, full_text_len, only_active_days, state)"
+        in normalized
+    )
+    args = conn.execute.await_args.args
+    assert args[1:] == ("abc123", "preview", 42, None, "queued")
+
+
+async def test_insert_broadcast_job_rejects_invalid_state():
+    """Defense in depth: a typo at the call site shouldn't write a
+    bogus state to the DB. The validation lives in the DB layer
+    rather than the web layer so direct callers (CLI scripts, ad-hoc
+    tests) get the same guarantee."""
+    db = database_module.Database()
+    db.pool = _PoolStub(_make_conn())
+    with pytest.raises(ValueError, match="invalid broadcast job state"):
+        await db.insert_broadcast_job(
+            job_id="x", text_preview="x", full_text_len=1,
+            only_active_days=None, state="not-a-real-state",
+        )
+
+
+async def test_update_broadcast_job_patches_only_specified_fields():
+    """Pin: passing ``state="running"`` writes ONLY the state
+    column (plus ``started_at = NOW()`` if flag set), NOT every
+    other field as NULL. The opt-in shape is what makes the
+    throttled progress flush cheap (single column UPDATE)."""
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value="abc")
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.update_broadcast_job(
+        "abc", state="running", started_at_now=True
+    )
+
+    sql = conn.fetchval.await_args.args[0]
+    normalized = " ".join(sql.split())
+    assert "UPDATE broadcast_jobs SET state = $1, started_at = NOW()" in normalized
+    assert "WHERE job_id = $2" in normalized
+    # Only one bound param (state) — no NULL writes for the
+    # progress counters or completed_at.
+    assert conn.fetchval.await_args.args[1:] == ("running", "abc")
+
+
+async def test_update_broadcast_job_progress_throttle_shape():
+    """A throttled progress flush patches the four counters + ``i``
+    and nothing else. Pins the column-name mapping
+    (``sent`` → ``sent_count``, etc.) so a future rename has to
+    intentionally update both call sites."""
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value="abc")
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.update_broadcast_job(
+        "abc", total=100, sent=42, blocked=1, failed=2, i=45
+    )
+
+    sql = conn.fetchval.await_args.args[0]
+    normalized = " ".join(sql.split())
+    assert "total = $1" in normalized
+    assert "sent_count = $2" in normalized
+    assert "blocked_count = $3" in normalized
+    assert "failed_count = $4" in normalized
+    assert "i = $5" in normalized
+    assert conn.fetchval.await_args.args[1:] == (100, 42, 1, 2, 45, "abc")
+
+
+async def test_update_broadcast_job_returns_false_when_no_row_matches():
+    """Pin: the boolean return — used by ``broadcast_cancel_post``
+    fallback paths — is False when ``job_id`` doesn't exist."""
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    result = await db.update_broadcast_job("missing", state="running")
+    assert result is False
+
+
+async def test_update_broadcast_job_no_op_short_circuits():
+    """Pin: an empty patch (no fields to update) skips the SQL
+    entirely. Otherwise we'd issue a syntactically-broken
+    ``UPDATE broadcast_jobs SET WHERE ...`` statement."""
+    conn = _make_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    result = await db.update_broadcast_job("any")
+    assert result is True
+    conn.fetchval.assert_not_awaited()
+
+
+async def test_update_broadcast_job_rejects_invalid_state():
+    """Same allow-list as ``insert_broadcast_job`` so a typo at the
+    state-transition call site can't poison the row."""
+    db = database_module.Database()
+    db.pool = _PoolStub(_make_conn())
+    with pytest.raises(ValueError):
+        await db.update_broadcast_job("any", state="bogus")
+
+
+async def test_get_broadcast_job_returns_none_for_missing_id():
+    """Pin the None contract — ``broadcast_detail_get`` /
+    ``broadcast_status_get`` fall back to the in-memory dict's
+    behaviour (404 / redirect-with-flash) when ``None`` is
+    returned, so we have to be sure the method returns ``None``
+    rather than an AsyncMock."""
+    conn = _make_conn()
+    conn.fetchrow = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    assert await db.get_broadcast_job("nope") is None
+
+
+async def test_get_broadcast_job_coerces_record_to_dict_shape():
+    """Pin the column → key mapping (notably the ``_count``
+    suffix removal: ``sent_count`` → ``sent``, etc.) and
+    timestamp .isoformat()-coercion so the web layer can
+    consume the dict identically whether it came from the
+    in-memory registry or the DB."""
+    from datetime import datetime, timezone
+    created = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    started = datetime(2026, 1, 1, 0, 0, 1, tzinfo=timezone.utc)
+    completed = datetime(2026, 1, 1, 0, 0, 30, tzinfo=timezone.utc)
+    fake_row = {
+        "job_id": "abc123",
+        "text_preview": "preview",
+        "full_text_len": 42,
+        "only_active_days": None,
+        "state": "completed",
+        "total": 100,
+        "sent_count": 95,
+        "blocked_count": 3,
+        "failed_count": 2,
+        "i": 100,
+        "error": None,
+        "cancel_requested": False,
+        "created_at": created,
+        "started_at": started,
+        "completed_at": completed,
+    }
+    conn = _make_conn()
+    conn.fetchrow = AsyncMock(return_value=fake_row)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.get_broadcast_job("abc123")
+    assert result == {
+        "id": "abc123",  # job_id → id
+        "text_preview": "preview",
+        "full_text_len": 42,
+        "only_active_days": None,
+        "state": "completed",
+        "total": 100,
+        "sent": 95,       # sent_count → sent
+        "blocked": 3,     # blocked_count → blocked
+        "failed": 2,      # failed_count → failed
+        "i": 100,
+        "error": None,
+        "cancel_requested": False,
+        "created_at": created.isoformat(),
+        "started_at": started.isoformat(),
+        "completed_at": completed.isoformat(),
+    }
+
+
+async def test_list_broadcast_jobs_orders_newest_first_and_clamps_limit():
+    """Pin: ORDER BY created_at DESC, LIMIT clamped to
+    ``BROADCAST_JOB_LIST_MAX_LIMIT`` so a pathological caller
+    can't stream the entire table back."""
+    conn = _make_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    # Default limit
+    await db.list_broadcast_jobs()
+    sql = conn.fetch.await_args.args[0]
+    normalized = " ".join(sql.split())
+    assert "ORDER BY created_at DESC, job_id DESC" in normalized
+    assert "LIMIT $1" in normalized
+    assert conn.fetch.await_args.args[1] == (
+        db.BROADCAST_JOB_LIST_DEFAULT_LIMIT
+    )
+
+    # Explicit huge limit gets clamped
+    await db.list_broadcast_jobs(limit=10_000)
+    assert conn.fetch.await_args.args[1] == db.BROADCAST_JOB_LIST_MAX_LIMIT
+
+    # Explicit 0 / negative limit gets floored to 1
+    await db.list_broadcast_jobs(limit=0)
+    assert conn.fetch.await_args.args[1] == 1
+
+
+async def test_mark_orphan_broadcast_jobs_interrupted_filters_by_state():
+    """Pin the orphan-sweep WHERE clause: only flips
+    ``queued`` / ``running`` rows (not ``completed`` / ``failed``
+    / already-``interrupted`` ones), and writes
+    ``state='interrupted'`` + ``completed_at = NOW()``."""
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[
+        {"job_id": "j1"}, {"job_id": "j2"}, {"job_id": "j3"},
+    ])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    n = await db.mark_orphan_broadcast_jobs_interrupted()
+    assert n == 3
+    sql = conn.fetch.await_args.args[0]
+    normalized = " ".join(sql.split())
+    assert "UPDATE broadcast_jobs" in normalized
+    assert "state = 'interrupted'" in normalized
+    assert "completed_at = NOW()" in normalized
+    assert "WHERE state IN ('queued', 'running')" in normalized
+    assert "RETURNING job_id" in normalized
+
+
+async def test_mark_orphan_broadcast_jobs_interrupted_idempotent():
+    """A second call after the first one has already swept the
+    table returns 0 — ensures the orphan sweep is safe to run
+    on every startup, not just the one immediately after a
+    crash."""
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    n = await db.mark_orphan_broadcast_jobs_interrupted()
+    assert n == 0
