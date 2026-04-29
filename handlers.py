@@ -17,7 +17,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from ai_engine import chat_with_model
 from amount_input import normalize_amount
 from database import db
-from fx_rates import convert_toman_to_usd, get_usd_to_toman_snapshot
+from fx_rates import get_usd_to_toman_snapshot
+from wallet_display import format_toman_annotation
 from models_catalog import CatalogModel, get_catalog
 from payments import (
     GLOBAL_MIN_TOPUP_USD,
@@ -409,8 +410,14 @@ async def hub_wallet_handler(callback: CallbackQuery, state: FSMContext):
     user_data = await db.get_user(user_id)
     balance = float(user_data["balance_usd"]) if user_data else 0.0
     builder = _build_wallet_keyboard(lang)
+    # Stage-11-Step-D: append the live USD→Toman annotation to the
+    # USD figure when an FX snapshot is cached. ``format_toman_annotation``
+    # returns ``""`` on a cold cache so a fresh deploy still renders
+    # the wallet — just without the Toman line.
+    snap = await get_usd_to_toman_snapshot()
+    toman_line = format_toman_annotation(lang, balance, snap)
     await callback.message.edit_text(
-        t(lang, "wallet_text", balance=balance),
+        t(lang, "wallet_text", balance=balance, toman_line=toman_line),
         reply_markup=builder.as_markup(),
         parse_mode="Markdown",
     )
@@ -1216,7 +1223,9 @@ async def back_to_wallet_handler(callback: CallbackQuery, state: FSMContext):
     user_data = await db.get_user(user_id)
     balance = float(user_data["balance_usd"]) if user_data else 0.0
     builder = _build_wallet_keyboard(lang)
-    text = t(lang, "wallet_text", balance=balance)
+    snap = await get_usd_to_toman_snapshot()
+    toman_line = format_toman_annotation(lang, balance, snap)
+    text = t(lang, "wallet_text", balance=balance, toman_line=toman_line)
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
     await callback.answer()
 
@@ -1639,11 +1648,21 @@ async def process_toman_amount_input(message: Message, state: FSMContext):
         await message.answer(t(lang, "charge_toman_invalid"))
         return
 
-    usd_amount = await convert_toman_to_usd(entered_toman)
+    # Stage-11-Step-D bundled bug fix: read the FX snapshot ONCE and
+    # compute the USD figure from that single snapshot, instead of
+    # the previous double-read (``convert_toman_to_usd`` then a
+    # separate ``get_usd_to_toman_snapshot``). The pre-fix pair could
+    # observe two different cache values if the background refresher
+    # rotated the snapshot between the two awaits, leaving the
+    # (entered_toman, usd_amount, toman_rate_at_entry) triple
+    # internally inconsistent — the user saw "X TMN ≈ Y USD at Z TMN/USD"
+    # where Y/Z != entered_toman by a few percent. Single read makes
+    # the triple a closed identity again.
     snap = await get_usd_to_toman_snapshot()
-    if usd_amount is None or snap is None:
+    if snap is None or snap.toman_per_usd <= 0:
         await message.answer(t(lang, "charge_toman_no_rate"))
         return
+    usd_amount = entered_toman / snap.toman_per_usd
 
     # Reject fat-fingered entries below $2 equivalent using the same
     # threshold the USD path uses, but render the error in Toman so

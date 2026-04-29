@@ -200,10 +200,10 @@ async def test_toman_input_with_no_rate_refuses_after_user_typed():
     from handlers import process_toman_amount_input
 
     fx_rates._reset_cache_for_tests()
+    # Stage-11-Step-D refactor: the handler now reads the snapshot
+    # exactly once (eliminating the prior race where the cache could
+    # rotate between two reads). Patch only that single accessor.
     with patch(
-        "handlers.convert_toman_to_usd",
-        new=AsyncMock(return_value=None),
-    ), patch(
         "handlers.get_usd_to_toman_snapshot",
         new=AsyncMock(return_value=None),
     ):
