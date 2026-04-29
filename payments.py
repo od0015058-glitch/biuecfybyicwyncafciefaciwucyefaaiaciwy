@@ -411,21 +411,58 @@ async def refresh_min_amounts_once(
     Runs with a small concurrency cap so a multi-currency refresh
     doesn't burst 18 parallel HTTP calls at NowPayments (which has
     per-IP rate limits). Best-effort — individual failures are logged
-    by :func:`_query_min_amount` and simply leave the prior cache
-    entry in place.
+    by :func:`_query_min_amount` and leave the prior known-good cache
+    entry in place (see the "cache preservation" note below).
+
+    **Cache preservation on API outage.** The naive approach of
+    ``pop → fetch`` drops the previously-cached good value the moment
+    the fresh fetch comes back ``None``. NowPayments-side outages /
+    transient rate-limits / DNS blips are all common enough that
+    losing a perfectly valid "BTC min = $10" reading at every hiccup
+    would silently collapse :func:`effective_min_usd` to the $2
+    global floor mid-outage — and that in turn makes
+    :func:`handlers._preflight_min_amount_check` falsely admit
+    sub-min amounts that NowPayments will then reject.
+
+    Fix: snapshot the old value, force a fresh fetch by clearing the
+    entry, and if the fetch returns ``None`` while the snapshot held
+    a real number, put the snapshot back (with the new timestamp so
+    a reader can still tell we tried). Only a successful fresh fetch
+    overwrites a known-good value.
     """
     semaphore = asyncio.Semaphore(max(1, concurrency))
 
     async def _one(ticker: str) -> None:
         async with semaphore:
+            t_lower = ticker.lower()
+            prior = _min_amount_cache.get(t_lower)
+            prior_value = prior[0] if prior is not None else None
             # Force a fresh lookup by expiring the cache entry first.
-            _min_amount_cache.pop(ticker.lower(), None)
+            _min_amount_cache.pop(t_lower, None)
             try:
                 await get_min_amount_usd(ticker)
             except Exception:
                 log.exception(
                     "background refresh of min-amount for %s crashed",
                     ticker,
+                )
+            # If the refresh couldn't produce a real number but we
+            # had one previously, restore it so the pre-flight check
+            # keeps working through the outage. We stamp the restored
+            # entry with ``now`` so the TTL reflects the last refresh
+            # attempt (not the moment the value was originally
+            # observed) — readers that care can spot a stuck value by
+            # watching the cache across ticks.
+            post = _min_amount_cache.get(t_lower)
+            post_value = post[0] if post is not None else None
+            if post_value is None and prior_value is not None:
+                log.info(
+                    "min-amount refresh for %s returned None; "
+                    "preserving prior value $%.2f",
+                    ticker, prior_value,
+                )
+                _min_amount_cache[t_lower] = (
+                    prior_value, asyncio.get_event_loop().time()
                 )
 
     await asyncio.gather(*(_one(t) for t in tickers))

@@ -199,6 +199,72 @@ async def test_refresh_once_tolerates_per_ticker_failure():
         assert btc_cached[0] is None
 
 
+async def test_refresh_once_preserves_prior_value_on_api_failure():
+    """Regression test for the Devin-Review finding on PR #92:
+    a transient NowPayments outage must NOT drop the previously
+    cached good value. Otherwise ``effective_min_usd`` silently
+    collapses to the global $2 floor during an outage, and the
+    checkout pre-flight falsely admits sub-min invoices.
+    """
+    # Seed a known-good "BTC min = $10" reading.
+    _seed("btc", 10.0)
+
+    # Both directions of /v1/min-amount return None (simulated
+    # outage — NowPayments returned a non-numeric body, or both
+    # queries timed out and were handled as None).
+    with patch.object(
+        payments, "_query_min_amount", AsyncMock(return_value=None)
+    ):
+        await payments.refresh_min_amounts_once(["btc"], concurrency=1)
+
+    cached = payments._min_amount_cache.get("btc")
+    assert cached is not None, "cache entry disappeared during outage"
+    assert cached[0] == 10.0, (
+        "refresh during an outage clobbered the prior known-good "
+        f"value; cached[0] = {cached[0]!r}"
+    )
+    # And crucially: effective_min_usd still returns the real floor,
+    # not the $2 global fallback.
+    assert payments.effective_min_usd("btc") == 10.0
+
+
+async def test_refresh_once_overwrites_with_fresh_value_on_success():
+    """Counter-test to the preservation case above: when the refresh
+    succeeds, the new value WINS over the old one — we didn't
+    accidentally make the preservation sticky.
+    """
+    _seed("btc", 10.0)
+
+    with patch.object(
+        payments, "_query_min_amount", AsyncMock(return_value=7.5)
+    ):
+        await payments.refresh_min_amounts_once(["btc"], concurrency=1)
+
+    cached = payments._min_amount_cache.get("btc")
+    assert cached is not None
+    assert cached[0] == 7.5
+    assert payments.effective_min_usd("btc") == 7.5
+
+
+async def test_refresh_once_preserves_prior_value_on_query_exception():
+    """A thrown exception inside get_min_amount_usd / _query_min_amount
+    must also preserve the prior good value. The except-block inside
+    _one swallows the exception, but the cache is empty at that point
+    because we popped — so the preservation branch must fire.
+    """
+    _seed("btc", 11.0)
+
+    async def boom(*_a, **_kw):
+        raise RuntimeError("simulated transient failure")
+
+    with patch.object(payments, "_query_min_amount", AsyncMock(side_effect=boom)):
+        await payments.refresh_min_amounts_once(["btc"], concurrency=1)
+
+    cached = payments._min_amount_cache.get("btc")
+    assert cached is not None
+    assert cached[0] == 11.0
+
+
 async def test_refresh_loop_cancels_cleanly():
     """Spawning and cancelling the forever-loop must not raise."""
     with patch.object(
