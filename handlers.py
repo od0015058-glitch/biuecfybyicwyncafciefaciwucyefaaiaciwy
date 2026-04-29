@@ -17,7 +17,14 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from ai_engine import chat_with_model
 from database import db
 from models_catalog import CatalogModel, get_catalog
-from payments import MinAmountError, create_crypto_invoice
+from payments import (
+    GLOBAL_MIN_TOPUP_USD,
+    MinAmountError,
+    create_crypto_invoice,
+    effective_min_usd,
+    find_cheaper_alternative,
+    get_min_amount_usd,
+)
 from rate_limit import consume_chat_token
 from strings import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, all_button_labels, t
 
@@ -1385,6 +1392,88 @@ async def process_custom_amount_request(callback: CallbackQuery, state: FSMConte
     await callback.answer()
 
 
+def _render_min_amount_refusal(
+    lang: str,
+    *,
+    currency: str,
+    min_usd: float | None,
+    attempted_usd: float,
+) -> str:
+    """Build the user-facing "your top-up is below the minimum" text.
+
+    Picks the richest string the data supports:
+
+    * ``charge_min_amount_with_min_and_alt`` — we know the minimum for
+      the chosen coin AND we have a cheaper coin to suggest.
+    * ``charge_min_amount_with_min`` — we know the minimum but no
+      alternative in our supported list can absorb ``attempted_usd``
+      (typically because ``attempted_usd`` itself is below the
+      ``GLOBAL_MIN_TOPUP_USD`` floor, which applies to every coin).
+    * ``charge_min_amount_unknown`` — lookup failed; we can only tell
+      the user their amount is too small.
+
+    Centralised here so the custom-amount and fixed-amount flows stay
+    in lockstep and the MinAmountError fallback renders the same way
+    as the proactive pre-flight check.
+    """
+    if min_usd is None:
+        return t(lang, "charge_min_amount_unknown", currency=currency.upper())
+    alt = find_cheaper_alternative(
+        requested_usd=attempted_usd,
+        excluded_currency=currency,
+        candidates=list(SUPPORTED_PAY_CURRENCIES),
+    )
+    if alt is not None:
+        alt_label, _alt_ticker = alt
+        return t(
+            lang, "charge_min_amount_with_min_and_alt",
+            currency=currency.upper(),
+            min_usd=min_usd,
+            amount_usd=attempted_usd,
+            alt_currency=alt_label,
+        )
+    return t(
+        lang, "charge_min_amount_with_min",
+        currency=currency.upper(), min_usd=min_usd,
+    )
+
+
+async def _preflight_min_amount_check(
+    currency: str, attempted_usd: float
+) -> tuple[bool, float | None]:
+    """Proactively verify ``attempted_usd`` clears the effective floor
+    for ``currency`` before we spend an HTTP call creating an invoice
+    NowPayments will just reject.
+
+    Returns ``(ok, min_usd)``:
+
+    * ``ok=True``  — the amount is high enough; ``min_usd`` may be
+      ``None`` (we couldn't look up a per-currency floor and only the
+      $2 global floor applied) or a positive float (looked up cleanly).
+    * ``ok=False`` — the amount is below ``max(GLOBAL_MIN_TOPUP_USD,
+      per-currency NowPayments min)``. Callers render the refusal via
+      :func:`_render_min_amount_refusal` with the returned ``min_usd``.
+
+    A lookup failure with ``attempted_usd < GLOBAL_MIN_TOPUP_USD`` is
+    reported as ``(False, None)`` so the UI falls back to the generic
+    "unknown min" message — which is the honest answer when we can't
+    name the coin-specific threshold.
+    """
+    # Ensure the cache has a reasonably fresh number for this coin.
+    # ``get_min_amount_usd`` is a no-op HTTP-wise on a cache hit.
+    per_currency_min = await get_min_amount_usd(currency)
+    effective = effective_min_usd(currency)
+    if attempted_usd + 1e-9 >= effective:
+        return True, per_currency_min
+    # Prefer the per-currency number in the refusal if we got one,
+    # otherwise fall back to the global floor so the user still sees
+    # a concrete minimum.
+    reported_min = per_currency_min if per_currency_min is not None else (
+        effective if effective > 0 else None
+    )
+    return False, reported_min
+
+
 # Step 2 (fixed-amount path): pick a currency
 @router.callback_query(F.data.startswith("amt_"))
 async def process_add_crypto_currency(callback: CallbackQuery):
@@ -1436,7 +1525,7 @@ async def process_custom_amount_input(message: Message, state: FSMContext):
         await message.answer(t(lang, "charge_custom_invalid"))
         return
 
-    if amount < 5:
+    if amount < GLOBAL_MIN_TOPUP_USD:
         await message.answer(t(lang, "charge_custom_min_error"))
         return
 
@@ -1499,6 +1588,29 @@ async def process_custom_currency_selection(callback: CallbackQuery, state: FSMC
     await state.clear()
     await callback.message.edit_text(t(lang, "charge_creating_invoice"))
 
+    # Pre-flight: ask NowPayments if ``amount`` clears the effective
+    # floor for ``currency`` before we spend a POST /v1/payment on it.
+    # This saves a round-trip for the common "user tries $2 in BTC,
+    # min is $10" case and also unlocks the alternative-coin suggestion
+    # without having to wait for the gateway-side rejection.
+    ok, pre_min_usd = await _preflight_min_amount_check(
+        currency, float(amount)
+    )
+    if not ok:
+        builder = InlineKeyboardBuilder()
+        builder.button(text=t(lang, "btn_retry"), callback_data="add_crypto")
+        builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+        builder.adjust(2)
+        text = _render_min_amount_refusal(
+            lang,
+            currency=currency,
+            min_usd=pre_min_usd,
+            attempted_usd=float(amount),
+        )
+        await callback.message.edit_text(text, reply_markup=builder.as_markup())
+        await callback.answer()
+        return
+
     try:
         invoice = await create_crypto_invoice(
             callback.from_user.id,
@@ -1508,20 +1620,20 @@ async def process_custom_currency_selection(callback: CallbackQuery, state: FSMC
             promo_bonus_usd=promo_bonus_usd,
         )
     except MinAmountError as e:
+        # Pre-flight gave us a clean answer but the gateway still
+        # rejected — floor must have shifted between our cache and
+        # the POST. Render the same refusal shape as the pre-flight
+        # path for UX consistency.
         builder = InlineKeyboardBuilder()
         builder.button(text=t(lang, "btn_retry"), callback_data="add_crypto")
         builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
         builder.adjust(2)
-        if e.min_usd is not None:
-            text = t(
-                lang, "charge_min_amount_with_min",
-                currency=e.currency.upper(), min_usd=e.min_usd,
-            )
-        else:
-            text = t(
-                lang, "charge_min_amount_unknown",
-                currency=e.currency.upper(),
-            )
+        text = _render_min_amount_refusal(
+            lang,
+            currency=e.currency,
+            min_usd=e.min_usd,
+            attempted_usd=float(amount),
+        )
         await callback.message.edit_text(text, reply_markup=builder.as_markup())
         await callback.answer()
         return
@@ -1593,6 +1705,27 @@ async def process_final_invoice(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text(t(lang, "charge_creating_invoice"))
 
+    # Pre-flight: identical reasoning to the custom-amount path above.
+    # A $5-preset in BTC can still trip the per-currency min when
+    # network fees spike, so we never skip the check.
+    ok, pre_min_usd = await _preflight_min_amount_check(
+        currency, float(amount)
+    )
+    if not ok:
+        builder = InlineKeyboardBuilder()
+        builder.button(text=t(lang, "btn_back_to_wallet"), callback_data="back_to_wallet")
+        builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+        builder.adjust(2)
+        text = _render_min_amount_refusal(
+            lang,
+            currency=currency,
+            min_usd=pre_min_usd,
+            attempted_usd=float(amount),
+        )
+        await callback.message.edit_text(text, reply_markup=builder.as_markup())
+        await callback.answer()
+        return
+
     try:
         invoice = await create_crypto_invoice(
             callback.from_user.id,
@@ -1606,16 +1739,12 @@ async def process_final_invoice(callback: CallbackQuery, state: FSMContext):
         builder.button(text=t(lang, "btn_back_to_wallet"), callback_data="back_to_wallet")
         builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
         builder.adjust(2)
-        if e.min_usd is not None:
-            text = t(
-                lang, "charge_min_amount_with_min",
-                currency=e.currency.upper(), min_usd=e.min_usd,
-            )
-        else:
-            text = t(
-                lang, "charge_min_amount_unknown",
-                currency=e.currency.upper(),
-            )
+        text = _render_min_amount_refusal(
+            lang,
+            currency=e.currency,
+            min_usd=e.min_usd,
+            attempted_usd=float(amount),
+        )
         await callback.message.edit_text(text, reply_markup=builder.as_markup())
         await callback.answer()
         return

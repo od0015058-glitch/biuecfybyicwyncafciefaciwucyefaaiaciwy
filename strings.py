@@ -159,7 +159,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         # ---- Charge wallet flow ----
         "charge_pick_amount": (
             "💰 مبلغ شارژ را انتخاب کنید:\n\n"
-            "💡 حداقل مبلغ: $5\n"
+            "💡 حداقل مبلغ: $2\n"
             "⚠️ برخی ارزها به دلیل کارمزد شبکه حداقل بالاتری دارند."
         ),
         "btn_amt_5": "💵 $5",
@@ -168,10 +168,10 @@ _STRINGS: dict[str, dict[str, str]] = {
         "btn_amt_custom": "✏️ مبلغ دلخواه",
         "charge_custom_prompt": (
             "✏️ مبلغ دلخواه خود را وارد کنید:\n\n"
-            "💡 حداقل: $5\n"
+            "💡 حداقل: $2\n"
             "💡 مثال: 15 یا 25.5"
         ),
-        "charge_custom_min_error": "❌ حداقل مبلغ $5 است.",
+        "charge_custom_min_error": "❌ حداقل مبلغ $2 است.",
         "charge_custom_invalid": "❌ لطفاً یک عدد معتبر وارد کنید (مثال: 15 یا 20.5)",
         "charge_custom_amount_saved": (
             "💵 مبلغ ${amount:.2f} ثبت شد.\n\n🪙 ارز مورد نظر را انتخاب کنید:"
@@ -198,6 +198,10 @@ _STRINGS: dict[str, dict[str, str]] = {
         "charge_min_amount_with_min": (
             "❌ حداقل مبلغ قابل پرداخت برای {currency} برابر است با ${min_usd:.2f}.\n"
             "لطفاً مبلغ بیشتری وارد کنید یا ارز دیگری انتخاب کنید."
+        ),
+        "charge_min_amount_with_min_and_alt": (
+            "❌ حداقل مبلغ قابل پرداخت برای {currency} برابر است با ${min_usd:.2f}.\n"
+            "💡 برای پرداخت ${amount_usd:.2f} می‌توانید از {alt_currency} استفاده کنید."
         ),
         "charge_min_amount_unknown": (
             "❌ مبلغ شما برای {currency} کمتر از حداقل قابل پرداخت است.\n"
@@ -434,7 +438,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         # ---- Charge wallet flow ----
         "charge_pick_amount": (
             "💰 Choose a top-up amount:\n\n"
-            "💡 Minimum: $5\n"
+            "💡 Minimum: $2\n"
             "⚠️ Some currencies have a higher minimum due to network fees."
         ),
         "btn_amt_5": "💵 $5",
@@ -443,10 +447,10 @@ _STRINGS: dict[str, dict[str, str]] = {
         "btn_amt_custom": "✏️ Custom amount",
         "charge_custom_prompt": (
             "✏️ Enter your custom amount:\n\n"
-            "💡 Minimum: $5\n"
+            "💡 Minimum: $2\n"
             "💡 Examples: 15 or 25.5"
         ),
-        "charge_custom_min_error": "❌ Minimum amount is $5.",
+        "charge_custom_min_error": "❌ Minimum amount is $2.",
         "charge_custom_invalid": "❌ Please enter a valid number (example: 15 or 20.5).",
         "charge_custom_amount_saved": (
             "💵 ${amount:.2f} saved.\n\n🪙 Pick your currency:"
@@ -473,6 +477,10 @@ _STRINGS: dict[str, dict[str, str]] = {
         "charge_min_amount_with_min": (
             "❌ The minimum payable amount for {currency} is ${min_usd:.2f}.\n"
             "Please pick a higher amount or a different currency."
+        ),
+        "charge_min_amount_with_min_and_alt": (
+            "❌ The minimum payable amount for {currency} is ${min_usd:.2f}.\n"
+            "💡 You can pay ${amount_usd:.2f} with {alt_currency} instead."
         ),
         "charge_min_amount_unknown": (
             "❌ Your amount is below the minimum payable for {currency}.\n"

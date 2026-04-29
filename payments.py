@@ -18,12 +18,37 @@ log = logging.getLogger("bot.payments")
 NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY")
 NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET")
 
+# Absolute lower bound on any wallet top-up, in USD. Every supported
+# currency is additionally subject to its own per-currency NowPayments
+# minimum (fetched from ``/v1/min-amount``); the effective floor is
+# ``max(GLOBAL_MIN_TOPUP_USD, per_currency_min_usd)``. We never accept
+# a top-up below ``GLOBAL_MIN_TOPUP_USD`` even if the gateway reports
+# a lower per-currency number, because sub-dollar top-ups don't cover
+# our own processing overhead.
+#
+# Overridable via ``MIN_TOPUP_USD`` so ops can bump it without a
+# redeploy if the economics change (e.g. gateway-fee schedule shifts).
+try:
+    GLOBAL_MIN_TOPUP_USD = max(0.0, float(os.getenv("MIN_TOPUP_USD", "2")))
+except (TypeError, ValueError):
+    GLOBAL_MIN_TOPUP_USD = 2.0
+
 # How long we trust a cached min-amount lookup before re-querying the
 # NowPayments API. The minimums move with the underlying network
 # fee + spot price, so a stale value can falsely accept an invoice
 # that NowPayments will then reject. 1h is conservative.
 _MIN_AMOUNT_CACHE_TTL_SECONDS = 3600
 _min_amount_cache: dict[str, tuple[float | None, float]] = {}
+
+# Background refresher cadence. The minimums shift slowly (they track
+# network-fee + spot-price, not block-by-block), so every 15 minutes
+# keeps the pre-flight check responsive without hammering the API.
+# A deliberately-shorter interval than the 1h cache TTL so a failed
+# refresh pass doesn't strand the cache on the expired-but-still-served
+# side of the TTL window.
+_MIN_AMOUNT_REFRESH_INTERVAL_SECONDS = max(
+    60, int(os.getenv("MIN_AMOUNT_REFRESH_INTERVAL_SECONDS", "900"))
+)
 
 
 class MinAmountError(Exception):
@@ -320,6 +345,121 @@ async def get_min_amount_usd(
         raw_value, asyncio.get_event_loop().time()
     )
     return _apply_trustworthiness(raw_value)
+
+
+def effective_min_usd(pay_currency: str) -> float:
+    """Return the effective floor a top-up in ``pay_currency`` must clear.
+
+    ``max(GLOBAL_MIN_TOPUP_USD, cached per-currency NowPayments min)``.
+    A cache miss / ``None`` cached value means we have no trustworthy
+    per-currency number, so we fall back to the global floor only.
+
+    Synchronous and never does I/O — reads the in-memory cache seeded
+    by :func:`get_min_amount_usd` and the background refresher. Callers
+    that want an on-demand lookup with HTTP fallback should await
+    :func:`get_min_amount_usd` directly.
+    """
+    pay_currency = pay_currency.lower()
+    cached = _min_amount_cache.get(pay_currency)
+    per_currency_min = cached[0] if cached is not None else None
+    if per_currency_min is None:
+        return GLOBAL_MIN_TOPUP_USD
+    return max(GLOBAL_MIN_TOPUP_USD, float(per_currency_min))
+
+
+def find_cheaper_alternative(
+    requested_usd: float,
+    excluded_currency: str,
+    candidates: "list[tuple[str, str]]",
+) -> tuple[str, str] | None:
+    """Suggest an alternative currency whose effective min ≤ ``requested_usd``.
+
+    ``candidates`` is a list of ``(label, ticker)`` pairs — same shape
+    as ``handlers.SUPPORTED_PAY_CURRENCIES`` — so the caller can render
+    the bot's user-facing label directly. We iterate sorted ascending
+    by effective min and return the **cheapest** alternative that
+    clears the requested amount. Returning the cheapest (rather than
+    the first) gives users the widest future headroom if they retry
+    with a slightly different amount.
+
+    Returns ``None`` if no candidate's min covers the request (either
+    the request itself is below ``GLOBAL_MIN_TOPUP_USD`` across every
+    coin, or we have no cached min data at all and the global floor
+    already rejected the request).
+    """
+    excluded = excluded_currency.lower()
+    viable: list[tuple[float, str, str]] = []
+    for label, ticker in candidates:
+        tl = ticker.lower()
+        if tl == excluded:
+            continue
+        eff = effective_min_usd(tl)
+        if eff <= requested_usd + 1e-9:
+            viable.append((eff, label, ticker))
+    if not viable:
+        return None
+    viable.sort(key=lambda item: (item[0], item[2]))
+    _, label, ticker = viable[0]
+    return (label, ticker)
+
+
+async def refresh_min_amounts_once(
+    tickers: "list[str]", *, concurrency: int = 3
+) -> None:
+    """Re-query ``/v1/min-amount`` for every supplied ticker once.
+
+    Runs with a small concurrency cap so a multi-currency refresh
+    doesn't burst 18 parallel HTTP calls at NowPayments (which has
+    per-IP rate limits). Best-effort — individual failures are logged
+    by :func:`_query_min_amount` and simply leave the prior cache
+    entry in place.
+    """
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+
+    async def _one(ticker: str) -> None:
+        async with semaphore:
+            # Force a fresh lookup by expiring the cache entry first.
+            _min_amount_cache.pop(ticker.lower(), None)
+            try:
+                await get_min_amount_usd(ticker)
+            except Exception:
+                log.exception(
+                    "background refresh of min-amount for %s crashed",
+                    ticker,
+                )
+
+    await asyncio.gather(*(_one(t) for t in tickers))
+
+
+async def refresh_min_amounts_loop(
+    tickers: "list[str]",
+    *,
+    interval_seconds: int | None = None,
+) -> None:
+    """Forever-loop wrapper around :func:`refresh_min_amounts_once`.
+
+    Intended to be spawned as a background task from ``main.py``. The
+    first refresh runs immediately so the cache is warm before the
+    first user reaches the currency picker; subsequent passes wait
+    ``interval_seconds`` (default
+    ``_MIN_AMOUNT_REFRESH_INTERVAL_SECONDS`` = 15 min).
+
+    Swallows every exception except ``CancelledError`` so a transient
+    network hiccup doesn't take the refresher off the air for the
+    remainder of the process's lifetime.
+    """
+    interval = interval_seconds or _MIN_AMOUNT_REFRESH_INTERVAL_SECONDS
+    while True:
+        try:
+            await refresh_min_amounts_once(tickers)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("min-amount refresher iteration failed; retrying")
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
 
 
 async def create_crypto_invoice(
