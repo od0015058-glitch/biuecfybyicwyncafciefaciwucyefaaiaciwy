@@ -56,7 +56,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
 
 from admin import get_admin_user_ids
 from database import db
-from models_catalog import CatalogModel, get_catalog
+from models_catalog import CatalogModel, force_refresh
 
 log = logging.getLogger("bot.model_discovery")
 
@@ -73,6 +73,29 @@ _DISCOVERY_INTERVAL_SECONDS: int = int(
 # "<id> — <name>" comfortably fits with the header / footer.
 _MAX_NEW_MODELS_PER_NOTIFICATION: int = int(
     os.getenv("DISCOVERY_MAX_MODELS_PER_DM", "10")
+)
+
+
+def _parse_float_env(name: str, default: float) -> float:
+    """Tolerant float env parser: blank / malformed → ``default``."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning("%s=%r is not a float; using default %.2f", name, raw, default)
+        return default
+
+
+# Threshold (percent) above which a per-side price move becomes an
+# alert. 20% catches dishonest / silent-bump scenarios without
+# firing on the small floating-point wobble OpenRouter sometimes
+# emits when they re-denominate tokens-per-dollar. Per-side
+# (compared independently) because a provider can cut input prices
+# by 50% while raising output by 10% and we want both legs named.
+_PRICE_ALERT_THRESHOLD_PERCENT: float = _parse_float_env(
+    "PRICE_ALERT_THRESHOLD_PERCENT", 20.0
 )
 
 
@@ -106,6 +129,28 @@ def _is_notifiable(model: CatalogModel) -> bool:
 
 
 @dataclass(frozen=True)
+class PriceDelta:
+    """One model's price move between the prior snapshot and the live
+    catalog. Only populated when at least one side moved by more than
+    :data:`_PRICE_ALERT_THRESHOLD_PERCENT`.
+
+    ``input_delta_pct`` / ``output_delta_pct`` are percent deltas
+    computed as ``(new - old) / old * 100`` per side. Positive means
+    the upstream price went UP; negative means it went DOWN (great
+    for margin, but still worth surfacing so the operator can
+    recompute their average margin).
+    """
+
+    model_id: str
+    old_input_per_1m_usd: float
+    new_input_per_1m_usd: float
+    old_output_per_1m_usd: float
+    new_output_per_1m_usd: float
+    input_delta_pct: float
+    output_delta_pct: float
+
+
+@dataclass(frozen=True)
 class DiscoveryResult:
     """Structured output of one discovery pass.
 
@@ -120,6 +165,7 @@ class DiscoveryResult:
     newly_seen_ids: frozenset[str]
     notified_models: tuple[CatalogModel, ...]
     bootstrap: bool  # True when the prior seen-set was empty.
+    price_deltas: tuple[PriceDelta, ...] = ()
 
 
 async def _compute_discovery(
@@ -154,6 +200,148 @@ async def _compute_discovery(
         notified_models=notified,
         bootstrap=False,
     )
+
+
+def _compute_price_deltas(
+    *,
+    live_models: tuple[CatalogModel, ...],
+    prior_prices: dict[str, tuple[float, float]],
+    threshold_pct: float,
+) -> tuple[PriceDelta, ...]:
+    """Return the subset of models whose price moved by more than
+    ``threshold_pct`` on at least one side.
+
+    Skips:
+
+    * models that have no prior snapshot (first time we've seen them
+      — those are reported via the Step-C "new model" path, not here);
+    * models whose prior snapshot had a zero on the side that moved
+      (percent-change is undefined for old=0; the new-model DM path
+      already flagged zero-priced models if relevant);
+    * non-finite / negative live prices (defensive — the catalog
+      parser should already filter these out).
+    """
+    deltas: list[PriceDelta] = []
+    for model in live_models:
+        prior = prior_prices.get(model.id)
+        if prior is None:
+            continue
+        old_input, old_output = prior
+        new_input = model.price.input_per_1m_usd
+        new_output = model.price.output_per_1m_usd
+
+        input_delta_pct = 0.0
+        output_delta_pct = 0.0
+        input_alerted = False
+        output_alerted = False
+
+        if old_input > 0.0:
+            input_delta_pct = (new_input - old_input) / old_input * 100.0
+            if abs(input_delta_pct) >= threshold_pct:
+                input_alerted = True
+        if old_output > 0.0:
+            output_delta_pct = (new_output - old_output) / old_output * 100.0
+            if abs(output_delta_pct) >= threshold_pct:
+                output_alerted = True
+
+        if input_alerted or output_alerted:
+            deltas.append(
+                PriceDelta(
+                    model_id=model.id,
+                    old_input_per_1m_usd=old_input,
+                    new_input_per_1m_usd=new_input,
+                    old_output_per_1m_usd=old_output,
+                    new_output_per_1m_usd=new_output,
+                    input_delta_pct=input_delta_pct,
+                    output_delta_pct=output_delta_pct,
+                )
+            )
+    # Sort by the largest absolute side-move first so the operator
+    # sees the most dramatic change at the top of the DM.
+    deltas.sort(
+        key=lambda d: max(abs(d.input_delta_pct), abs(d.output_delta_pct)),
+        reverse=True,
+    )
+    return tuple(deltas)
+
+
+def _format_price_delta_notification(
+    deltas: tuple[PriceDelta, ...], threshold_pct: float
+) -> str:
+    """Render the price-delta DM. Plain text (no Markdown) so slugs
+    with ``_`` / ``*`` don't need escaping."""
+    head = (
+        f"⚠️ {len(deltas)} OpenRouter model(s) moved price by "
+        f"more than {threshold_pct:.0f}% since last check:\n\n"
+    )
+    shown = deltas[:_MAX_NEW_MODELS_PER_NOTIFICATION]
+    lines: list[str] = []
+    for d in shown:
+        # A model can enter the delta tuple because only ONE side
+        # moved past the threshold; the other side's pct is 0.0
+        # (unchanged) or sub-threshold. Render 0.0 as a flat arrow
+        # ``→`` so the operator doesn't see a misleading ``↓0.0%``
+        # next to an unchanged price.
+        in_arrow = (
+            "↑" if d.input_delta_pct > 0
+            else ("↓" if d.input_delta_pct < 0 else "→")
+        )
+        out_arrow = (
+            "↑" if d.output_delta_pct > 0
+            else ("↓" if d.output_delta_pct < 0 else "→")
+        )
+        lines.append(
+            f"• {d.model_id}\n"
+            f"    input:  ${d.old_input_per_1m_usd:.4f} → "
+            f"${d.new_input_per_1m_usd:.4f} / 1M "
+            f"({in_arrow}{abs(d.input_delta_pct):.1f}%)\n"
+            f"    output: ${d.old_output_per_1m_usd:.4f} → "
+            f"${d.new_output_per_1m_usd:.4f} / 1M "
+            f"({out_arrow}{abs(d.output_delta_pct):.1f}%)"
+        )
+    overflow = len(deltas) - len(shown)
+    footer = ""
+    if overflow > 0:
+        footer = f"\n\n…and {overflow} more (DB has the full list)."
+    return head + "\n".join(lines) + footer
+
+
+async def notify_admins_of_price_deltas(
+    bot: Bot, deltas: tuple[PriceDelta, ...], threshold_pct: float
+) -> int:
+    """Send a price-delta DM to each admin. Returns successful sends.
+
+    Separate from :func:`notify_admins` so the two notifications can
+    be read independently. Shares the same per-admin fault isolation
+    policy.
+    """
+    if not deltas:
+        return 0
+    admin_ids = get_admin_user_ids()
+    if not admin_ids:
+        log.warning(
+            "Detected %d price-delta event(s) but ADMIN_USER_IDS is empty "
+            "— nothing to notify. Set ADMIN_USER_IDS to receive these.",
+            len(deltas),
+        )
+        return 0
+    text = _format_price_delta_notification(deltas, threshold_pct)
+    sent = 0
+    for admin_id in admin_ids:
+        try:
+            await bot.send_message(admin_id, text, disable_web_page_preview=True)
+            sent += 1
+        except TelegramForbiddenError:
+            log.info(
+                "Admin %d blocked the bot; skipping price-delta notification",
+                admin_id,
+            )
+        except TelegramAPIError:
+            log.exception(
+                "Failed to send price-delta notification to admin %d",
+                admin_id,
+            )
+    return sent
 
 
 def _format_notification(notified: tuple[CatalogModel, ...]) -> str:
@@ -211,20 +399,45 @@ async def notify_admins(bot: Bot, notified: tuple[CatalogModel, ...]) -> int:
 
 
 async def run_discovery_pass(bot: Bot) -> DiscoveryResult:
-    """One discovery pass: fetch catalog, diff, notify, persist.
+    """One discovery pass: fetch catalog, diff seen + prices, notify, persist.
 
-    Extracted from the forever-loop so the boot path (or a manual
-    ``/admin/refresh_models`` trigger in the future) can run exactly
-    one pass on demand.
+    Force-refreshes the catalog (bypassing the 24h TTL) so price
+    deltas are detected on the loop's cadence rather than at the
+    slower catalog-TTL cadence. Extracted from the forever-loop so
+    the boot path (or a manual ``/admin/refresh_models`` trigger in
+    the future) can run exactly one pass on demand.
+
+    Two independent notification streams:
+
+    * **New-model DM** (Stage-10-Step-C) — fires when a previously
+      unseen model id appears in the catalog's prominent-provider
+      allowlist. Bootstrap-suppressed on first run.
+    * **Price-delta DM** (Stage-10-Step-D) — fires when a previously
+      snapshotted model's per-1M price moved by more than
+      ``PRICE_ALERT_THRESHOLD_PERCENT`` on either side. Always
+      suppressed for models we've never priced before (those are
+      reported via the new-model path) so a first deploy doesn't
+      fire a 200-row delta DM.
     """
-    catalog = await get_catalog()
-    prior = await db.get_seen_model_ids()
+    catalog = await force_refresh()
+    prior_seen = await db.get_seen_model_ids()
+    prior_prices = await db.get_model_prices()
+
     result = await _compute_discovery(
-        live_models=catalog.models, prior_seen=prior
+        live_models=catalog.models, prior_seen=prior_seen
+    )
+    deltas = _compute_price_deltas(
+        live_models=catalog.models,
+        prior_prices=prior_prices,
+        threshold_pct=_PRICE_ALERT_THRESHOLD_PERCENT,
     )
 
     if result.notified_models:
         await notify_admins(bot, result.notified_models)
+    if deltas:
+        await notify_admins_of_price_deltas(
+            bot, deltas, _PRICE_ALERT_THRESHOLD_PERCENT
+        )
 
     if result.newly_seen_ids:
         inserted = await db.record_seen_models(result.newly_seen_ids)
@@ -241,7 +454,33 @@ async def run_discovery_pass(bot: Bot) -> DiscoveryResult:
                 inserted,
                 len(result.notified_models),
             )
-    return result
+
+    # Always upsert the live price snapshot — including on bootstrap
+    # — so the NEXT pass has a baseline to diff against. Skipping the
+    # upsert on bootstrap would postpone all price alerts by one
+    # interval (6h default) for no good reason.
+    current_prices = {
+        m.id: (m.price.input_per_1m_usd, m.price.output_per_1m_usd)
+        for m in catalog.models
+    }
+    if current_prices:
+        processed = await db.upsert_model_prices(current_prices)
+        if deltas:
+            log.info(
+                "Discovery: upserted %d model price snapshot(s); %d above "
+                "the %.1f%% delta threshold",
+                processed,
+                len(deltas),
+                _PRICE_ALERT_THRESHOLD_PERCENT,
+            )
+
+    return DiscoveryResult(
+        total_live_models=result.total_live_models,
+        newly_seen_ids=result.newly_seen_ids,
+        notified_models=result.notified_models,
+        bootstrap=result.bootstrap,
+        price_deltas=deltas,
+    )
 
 
 async def discover_new_models_loop(

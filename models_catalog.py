@@ -249,12 +249,30 @@ async def _fetch_from_openrouter() -> Catalog:
     return _finalize_catalog(models, is_fallback=False)
 
 
-async def _refresh_if_stale() -> Catalog:
-    """Refresh the catalog if it's empty or older than the TTL."""
+async def _refresh(*, force: bool) -> Catalog:
+    """Refresh the catalog. ``force=True`` bypasses the TTL check.
+
+    Behaviour on fetch failure:
+
+    * If we have no catalog at all (cold start, OpenRouter down at
+      boot), fall back to the static :func:`_build_fallback_catalog`.
+    * If we have a stale-but-real catalog, keep serving it rather
+      than downgrading the UX to the small static list.
+
+    The log messages reflect which branch actually fired so an
+    operator tailing logs can tell a "stayed on stale live data"
+    event apart from a "degraded to static fallback" event — earlier
+    versions logged "using static fallback" for both cases, which
+    was misleading when we actually kept the last live snapshot.
+    """
     global _catalog
     async with _lock:
         now = time.time()
-        if _catalog.models and (now - _catalog.fetched_at) < CATALOG_TTL_SECONDS:
+        if (
+            not force
+            and _catalog.models
+            and (now - _catalog.fetched_at) < CATALOG_TTL_SECONDS
+        ):
             return _catalog
         try:
             _catalog = await _fetch_from_openrouter()
@@ -264,13 +282,41 @@ async def _refresh_if_stale() -> Catalog:
                 len(_catalog.by_provider),
             )
         except Exception:
-            log.exception("OpenRouter /models fetch failed; using static fallback")
-            # Only fall back if we have *no* catalog at all. If we have a
-            # stale-but-real one, keep serving it rather than downgrading
-            # the UX to the small static list.
             if not _catalog.models:
+                log.exception(
+                    "OpenRouter /models fetch failed on a cold catalog; "
+                    "falling back to the static pricing table"
+                )
                 _catalog = _build_fallback_catalog()
+            else:
+                log.warning(
+                    "OpenRouter /models fetch failed; keeping the previous "
+                    "live catalog (%d models, age %.0fs) rather than "
+                    "downgrading to the static fallback",
+                    len(_catalog.models),
+                    now - _catalog.fetched_at,
+                    exc_info=True,
+                )
         return _catalog
+
+
+async def _refresh_if_stale() -> Catalog:
+    """Refresh the catalog if it's empty or older than the TTL."""
+    return await _refresh(force=False)
+
+
+async def force_refresh() -> Catalog:
+    """Bypass the TTL and pull a fresh catalog from OpenRouter.
+
+    Used by the background discovery loop (Stage-10-Step-C/D) so
+    price-delta alerts fire on the loop's cadence (default 6h)
+    rather than waiting up to 24h for the in-memory TTL to expire.
+    Respects the same failure semantics as
+    :func:`_refresh_if_stale` — a failed fetch with a warm catalog
+    keeps serving the previous snapshot (does NOT downgrade to the
+    static fallback).
+    """
+    return await _refresh(force=True)
 
 
 async def get_catalog() -> Catalog:

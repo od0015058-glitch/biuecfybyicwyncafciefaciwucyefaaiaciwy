@@ -7,7 +7,7 @@ Covers:
 * ``_format_notification`` rendering (cap + overflow footer).
 * ``notify_admins`` fan-out (per-admin fault isolation, empty
   admin-set short-circuit, empty-notified short-circuit).
-* ``run_discovery_pass`` integration through mocked ``get_catalog``
+* ``run_discovery_pass`` integration through mocked ``force_refresh``
   and the database layer.
 * ``discover_new_models_loop`` cancellation & error swallowing.
 """
@@ -247,19 +247,26 @@ async def test_run_discovery_pass_bootstrap_records_but_does_not_notify():
     with (
         patch.object(
             model_discovery,
-            "get_catalog",
+            "force_refresh",
             AsyncMock(return_value=await _fake_catalog(live)),
         ),
         patch.object(model_discovery.db, "get_seen_model_ids", AsyncMock(return_value=set())),
         patch.object(
             model_discovery.db, "record_seen_models", AsyncMock(return_value=2)
         ) as record_mock,
+        patch.object(
+            model_discovery.db, "get_model_prices", AsyncMock(return_value={})
+        ),
+        patch.object(
+            model_discovery.db, "upsert_model_prices", AsyncMock(return_value=2)
+        ),
         patch.object(model_discovery, "get_admin_user_ids", return_value=frozenset({42})),
     ):
         result = await model_discovery.run_discovery_pass(bot)
 
     assert result.bootstrap is True
     assert result.notified_models == ()
+    assert result.price_deltas == ()
     bot.send_message.assert_not_called()
     # The ids we recorded must match the live set verbatim.
     (args, _) = record_mock.call_args
@@ -276,7 +283,7 @@ async def test_run_discovery_pass_notifies_on_new_prominent_model():
     with (
         patch.object(
             model_discovery,
-            "get_catalog",
+            "force_refresh",
             AsyncMock(return_value=await _fake_catalog(live)),
         ),
         patch.object(
@@ -286,6 +293,14 @@ async def test_run_discovery_pass_notifies_on_new_prominent_model():
             model_discovery.db, "record_seen_models", AsyncMock(return_value=1)
         ),
         patch.object(
+            model_discovery.db,
+            "get_model_prices",
+            AsyncMock(return_value={"openai/gpt-4o": (1.0, 2.0)}),
+        ),
+        patch.object(
+            model_discovery.db, "upsert_model_prices", AsyncMock(return_value=2)
+        ),
+        patch.object(
             model_discovery, "get_admin_user_ids", return_value=frozenset({42})
         ),
     ):
@@ -293,6 +308,7 @@ async def test_run_discovery_pass_notifies_on_new_prominent_model():
 
     assert result.bootstrap is False
     assert len(result.notified_models) == 1
+    assert result.price_deltas == ()  # existing model's price was a match
     bot.send_message.assert_awaited_once()
     call_args = bot.send_message.await_args
     assert call_args.args[0] == 42
@@ -307,7 +323,7 @@ async def test_run_discovery_pass_no_new_models_skips_db_write_and_notify():
     with (
         patch.object(
             model_discovery,
-            "get_catalog",
+            "force_refresh",
             AsyncMock(return_value=await _fake_catalog(live)),
         ),
         patch.object(
@@ -318,10 +334,19 @@ async def test_run_discovery_pass_no_new_models_skips_db_write_and_notify():
         patch.object(
             model_discovery.db, "record_seen_models", AsyncMock(return_value=0)
         ) as record_mock,
+        patch.object(
+            model_discovery.db,
+            "get_model_prices",
+            AsyncMock(return_value={"openai/gpt-4o": (1.0, 2.0)}),
+        ),
+        patch.object(
+            model_discovery.db, "upsert_model_prices", AsyncMock(return_value=1)
+        ),
     ):
         result = await model_discovery.run_discovery_pass(bot)
 
     assert result.newly_seen_ids == frozenset()
+    assert result.price_deltas == ()
     bot.send_message.assert_not_called()
     record_mock.assert_not_called()
 
@@ -446,3 +471,294 @@ async def test_record_seen_models_empty_input_short_circuits():
     database_module.db.pool = _FailingPool()
     inserted = await database_module.db.record_seen_models([])
     assert inserted == 0
+
+
+# ---------------------------------------------------------------------
+# _compute_price_deltas + Step-D end-to-end
+# ---------------------------------------------------------------------
+
+
+def _cm_priced(model_id: str, input_per_1m: float, output_per_1m: float) -> CatalogModel:
+    provider, _, _ = model_id.partition("/")
+    return CatalogModel(
+        id=model_id,
+        name=model_id,
+        provider=provider,
+        price=ModelPrice(
+            input_per_1m_usd=input_per_1m, output_per_1m_usd=output_per_1m
+        ),
+    )
+
+
+def test_compute_price_deltas_flags_above_threshold():
+    """A 40% input-side move with threshold=20% must land in the
+    output tuple."""
+    live = (_cm_priced("openai/gpt-5", 1.4, 2.0),)
+    prior = {"openai/gpt-5": (1.0, 2.0)}
+    deltas = model_discovery._compute_price_deltas(
+        live_models=live, prior_prices=prior, threshold_pct=20.0
+    )
+    assert len(deltas) == 1
+    d = deltas[0]
+    assert d.model_id == "openai/gpt-5"
+    assert d.input_delta_pct == pytest.approx(40.0)
+    assert d.output_delta_pct == pytest.approx(0.0)
+
+
+def test_compute_price_deltas_ignores_moves_below_threshold():
+    """A 5% wobble when threshold=20% must NOT trigger an alert —
+    OpenRouter re-denominates tokens-per-dollar occasionally and we
+    don't want a 0.5¢ adjustment to spam every admin."""
+    live = (_cm_priced("openai/gpt-5", 1.05, 2.0),)
+    prior = {"openai/gpt-5": (1.0, 2.0)}
+    deltas = model_discovery._compute_price_deltas(
+        live_models=live, prior_prices=prior, threshold_pct=20.0
+    )
+    assert deltas == ()
+
+
+def test_compute_price_deltas_ignores_models_with_no_prior():
+    """A model we've never priced before belongs to the Step-C
+    new-model path, not the Step-D delta path. Otherwise a first
+    deploy that populates ``model_prices`` would emit a 200-row
+    delta DM for every model — the exact anti-pattern the Step-C
+    bootstrap was designed to prevent."""
+    live = (_cm_priced("openai/gpt-5", 99.0, 99.0),)
+    deltas = model_discovery._compute_price_deltas(
+        live_models=live, prior_prices={}, threshold_pct=20.0
+    )
+    assert deltas == ()
+
+
+def test_compute_price_deltas_skips_zero_prior_side():
+    """A model that was previously ``$0`` on a side (free tier) and
+    is now paid produces an undefined percent change — skip it
+    rather than crash with ZeroDivisionError. The new-model /
+    non-free transition is rare; if it does happen, the operator
+    can spot it in the price-upsert logs."""
+    live = (_cm_priced("meta-llama/llama", 1.0, 1.0),)
+    prior = {"meta-llama/llama": (0.0, 0.0)}
+    deltas = model_discovery._compute_price_deltas(
+        live_models=live, prior_prices=prior, threshold_pct=20.0
+    )
+    assert deltas == ()
+
+
+def test_compute_price_deltas_catches_output_side_moves():
+    """Both sides are evaluated independently — an input price that
+    stays flat with a big output-side move must still fire."""
+    live = (_cm_priced("anthropic/claude-4", 3.0, 15.0),)
+    prior = {"anthropic/claude-4": (3.0, 10.0)}
+    deltas = model_discovery._compute_price_deltas(
+        live_models=live, prior_prices=prior, threshold_pct=20.0
+    )
+    assert len(deltas) == 1
+    assert deltas[0].input_delta_pct == pytest.approx(0.0)
+    assert deltas[0].output_delta_pct == pytest.approx(50.0)
+
+
+def test_compute_price_deltas_detects_price_cuts():
+    """A negative move (upstream cut) is also worth surfacing so
+    the operator can recompute average margin."""
+    live = (_cm_priced("openai/gpt-5", 0.5, 1.0),)
+    prior = {"openai/gpt-5": (1.0, 1.0)}
+    deltas = model_discovery._compute_price_deltas(
+        live_models=live, prior_prices=prior, threshold_pct=20.0
+    )
+    assert len(deltas) == 1
+    assert deltas[0].input_delta_pct == pytest.approx(-50.0)
+
+
+def test_compute_price_deltas_sorts_by_largest_absolute_move_first():
+    """When multiple models move, the biggest swing should be at
+    the top of the DM so the operator sees it without scrolling."""
+    live = (
+        _cm_priced("openai/a", 1.25, 1.0),  # +25%
+        _cm_priced("openai/b", 2.0, 1.0),  # +100%
+        _cm_priced("openai/c", 1.5, 1.0),  # +50%
+    )
+    prior = {
+        "openai/a": (1.0, 1.0),
+        "openai/b": (1.0, 1.0),
+        "openai/c": (1.0, 1.0),
+    }
+    deltas = model_discovery._compute_price_deltas(
+        live_models=live, prior_prices=prior, threshold_pct=20.0
+    )
+    assert [d.model_id for d in deltas] == ["openai/b", "openai/c", "openai/a"]
+
+
+def test_format_price_delta_notification_renders_arrows_and_percents():
+    deltas = (
+        model_discovery.PriceDelta(
+            model_id="openai/gpt-5",
+            old_input_per_1m_usd=1.0,
+            new_input_per_1m_usd=1.5,
+            old_output_per_1m_usd=2.0,
+            new_output_per_1m_usd=2.0,
+            input_delta_pct=50.0,
+            output_delta_pct=0.0,
+        ),
+    )
+    text = model_discovery._format_price_delta_notification(deltas, 20.0)
+    assert "moved price by more than 20%" in text
+    assert "openai/gpt-5" in text
+    assert "↑50.0%" in text
+    # The unchanged output side must render as a flat arrow, not
+    # ``↓0.0%`` — that would imply a downward move where none exists.
+    assert "→0.0%" in text
+
+
+def test_format_price_delta_notification_caps_and_adds_overflow(monkeypatch):
+    monkeypatch.setattr(model_discovery, "_MAX_NEW_MODELS_PER_NOTIFICATION", 2)
+    deltas = tuple(
+        model_discovery.PriceDelta(
+            model_id=f"openai/m{i}",
+            old_input_per_1m_usd=1.0,
+            new_input_per_1m_usd=2.0,
+            old_output_per_1m_usd=1.0,
+            new_output_per_1m_usd=1.0,
+            input_delta_pct=100.0,
+            output_delta_pct=0.0,
+        )
+        for i in range(5)
+    )
+    text = model_discovery._format_price_delta_notification(deltas, 20.0)
+    assert "openai/m0" in text
+    assert "openai/m1" in text
+    assert "openai/m2" not in text
+    assert "…and 3 more" in text
+
+
+async def test_notify_admins_of_price_deltas_fans_out_and_isolates_failures():
+    bot = MagicMock()
+
+    async def side_effect(admin_id, text, **kwargs):
+        if admin_id == 20:
+            raise TelegramForbiddenError(method=None, message="blocked")
+        return None
+
+    bot.send_message = AsyncMock(side_effect=side_effect)
+    d = model_discovery.PriceDelta(
+        model_id="openai/gpt-5",
+        old_input_per_1m_usd=1.0,
+        new_input_per_1m_usd=2.0,
+        old_output_per_1m_usd=1.0,
+        new_output_per_1m_usd=1.0,
+        input_delta_pct=100.0,
+        output_delta_pct=0.0,
+    )
+    with patch.object(
+        model_discovery, "get_admin_user_ids", return_value=frozenset({10, 20, 30})
+    ):
+        sent = await model_discovery.notify_admins_of_price_deltas(
+            bot, (d,), threshold_pct=20.0
+        )
+    assert sent == 2
+
+
+async def test_run_discovery_pass_fires_delta_dm_alongside_new_model_dm():
+    """End-to-end: a pass that simultaneously discovers a new model
+    AND sees a big price move on an existing one produces two
+    independent DMs (one per code path)."""
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    live = [
+        _cm_priced("openai/gpt-4o", 3.0, 20.0),  # price MOVED: +50% / +100%
+        _cm_priced("openai/gpt-5-mini", 1.0, 2.0),  # NEW model
+    ]
+    prior_seen = {"openai/gpt-4o"}
+    prior_prices = {"openai/gpt-4o": (2.0, 10.0)}
+
+    with (
+        patch.object(
+            model_discovery,
+            "force_refresh",
+            AsyncMock(return_value=await _fake_catalog(live)),
+        ),
+        patch.object(
+            model_discovery.db,
+            "get_seen_model_ids",
+            AsyncMock(return_value=prior_seen),
+        ),
+        patch.object(
+            model_discovery.db, "record_seen_models", AsyncMock(return_value=1)
+        ),
+        patch.object(
+            model_discovery.db,
+            "get_model_prices",
+            AsyncMock(return_value=prior_prices),
+        ),
+        patch.object(
+            model_discovery.db, "upsert_model_prices", AsyncMock(return_value=2)
+        ) as upsert_mock,
+        patch.object(
+            model_discovery, "get_admin_user_ids", return_value=frozenset({42})
+        ),
+    ):
+        result = await model_discovery.run_discovery_pass(bot)
+
+    # Two DMs: one new-model, one price-delta.
+    assert bot.send_message.await_count == 2
+    sent_bodies = [call.args[1] for call in bot.send_message.await_args_list]
+    assert any("Discovered 1 new OpenRouter" in body for body in sent_bodies)
+    assert any("moved price by more than 20%" in body for body in sent_bodies)
+    # Prices upserted for every live model (new + existing).
+    upsert_mock.assert_awaited_once()
+    (args, _) = upsert_mock.call_args
+    assert set(args[0].keys()) == {"openai/gpt-4o", "openai/gpt-5-mini"}
+    assert result.price_deltas[0].model_id == "openai/gpt-4o"
+
+
+# ---------------------------------------------------------------------
+# database.upsert_model_prices / get_model_prices SQL shape
+# ---------------------------------------------------------------------
+
+
+async def test_upsert_model_prices_uses_single_query_and_on_conflict():
+    """Bulk upsert must be a single INSERT with ON CONFLICT DO
+    UPDATE — otherwise a 200-model catalog pays 200 round-trips."""
+    import database as database_module
+
+    class _Ctx:
+        def __init__(self, conn):
+            self.conn = conn
+
+        async def __aenter__(self):
+            return self.conn
+
+        async def __aexit__(self, *_):
+            return False
+
+    class _Pool:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def acquire(self):
+            return _Ctx(self.conn)
+
+    conn = MagicMock()
+    conn.execute = AsyncMock(return_value=None)
+    database_module.db.pool = _Pool(conn)
+
+    n = await database_module.db.upsert_model_prices(
+        {"openai/x": (1.0, 2.0), "anthropic/y": (3.0, 4.0)}
+    )
+    assert n == 2
+    conn.execute.assert_awaited_once()
+    sql = conn.execute.await_args.args[0]
+    assert "ON CONFLICT" in sql
+    assert "DO UPDATE" in sql
+    assert "model_prices" in sql
+
+
+async def test_upsert_model_prices_empty_short_circuits():
+    import database as database_module
+
+    class _FailingPool:
+        def acquire(self):
+            pytest.fail("upsert_model_prices should NOT acquire for empty input")
+
+    database_module.db.pool = _FailingPool()
+    n = await database_module.db.upsert_model_prices({})
+    assert n == 0
