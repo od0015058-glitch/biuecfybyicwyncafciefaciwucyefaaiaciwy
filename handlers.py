@@ -43,6 +43,7 @@ from rate_limit import (
     release_chat_slot,
     try_claim_chat_slot,
 )
+from referral import build_share_url, parse_referral_payload
 from strings import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, all_button_labels, t
 from tetrapay import create_order as tetrapay_create_order
 
@@ -281,12 +282,62 @@ async def cmd_start(message: Message, state: FSMContext):
         return
     await db.create_user(message.from_user.id, message.from_user.username or "Unknown")
     lang = await _get_user_language(message.from_user.id)
+    # Stage-13-Step-C: process ``/start ref_<code>`` deep-link payload.
+    # Pre-PR-110 ``cmd_start`` ignored ``message.text`` past the slash
+    # command itself, so referral deep-links arrived but never wired
+    # the invitee to a referrer. The bundled bug fix from the audit
+    # findings (HANDOFF §5) now consults :func:`parse_referral_payload`
+    # and calls ``db.claim_referral``. The claim flashes a localised
+    # acknowledgement *before* the hub greeting so the invitee
+    # understands a friend's bonus is on the line. Failures (unknown
+    # code, self-referral, already-claimed) flash a one-line note
+    # instead of blocking — the hub still renders unconditionally so
+    # a typo in a deep-link can't strand the user on a dead screen.
+    referral_code = parse_referral_payload(message.text)
+    if referral_code is not None:
+        try:
+            claim = await db.claim_referral(
+                invitee_telegram_id=message.from_user.id,
+                code=referral_code,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "claim_referral raised for telegram_id=%s code=%s",
+                message.from_user.id, referral_code,
+            )
+        else:
+            flash_key = _REFERRAL_CLAIM_FLASH_KEYS.get(claim["status"])
+            if flash_key:
+                try:
+                    await message.answer(t(lang, flash_key))
+                except Exception:  # noqa: BLE001
+                    # Never let a flash-message failure block the
+                    # /start handler from rendering the hub.
+                    log.exception(
+                        "referral claim flash failed for telegram_id=%s",
+                        message.from_user.id,
+                    )
     # Quick greeting first (one-shot bubble), then the hub. Greeting is
     # short and addressable so users feel acknowledged before the menu
     # appears. Also strips the legacy bottom keyboard from old clients.
     greeting = t(lang, "start_greeting", first_name=message.from_user.first_name or "")
     await message.answer(greeting, reply_markup=ReplyKeyboardRemove())
     await _send_hub(message, lang, remove_kb=False)
+
+
+# Stage-13-Step-C — map ``db.claim_referral`` status keys to
+# user-facing string keys. Unknown / self-referral / already-claimed
+# statuses get a soft flash; everything else (PENDING success, the
+# infra-level ``unknown_invitee``) doesn't surface a flash because
+# either we already have the desired side effect (PENDING grant
+# created — the user will see the bonus when they top up) or the
+# situation is a programming error we'd rather log than expose.
+_REFERRAL_CLAIM_FLASH_KEYS: dict[str, str] = {
+    "ok": "referral_claim_ok",
+    "self": "referral_claim_self",
+    "already_claimed": "referral_claim_already",
+    "unknown": "referral_claim_unknown",
+}
 
 
 # ==========================================
@@ -1243,8 +1294,17 @@ def _build_wallet_keyboard(lang: str) -> InlineKeyboardBuilder:
     builder.button(
         text=t(lang, "btn_receipts"), callback_data="hub_receipts"
     )
+    # Stage-13-Step-C: invite-a-friend entry point. Routes to the
+    # ``hub_invite`` handler which renders the user's referral code +
+    # share link. Hidden / inert when ``BOT_USERNAME`` is unset is
+    # NOT done here — the screen itself degrades gracefully (shows
+    # the bare code with copy-paste instructions) so the wallet
+    # keyboard layout stays stable across deploys.
+    builder.button(
+        text=t(lang, "btn_invite_friend"), callback_data="hub_invite"
+    )
     _back_to_menu_button(builder, lang)
-    builder.adjust(1, 1, 1, 1)
+    builder.adjust(1, 1, 1, 1, 1)
     return builder
 
 
@@ -1422,6 +1482,107 @@ async def back_to_wallet_handler(callback: CallbackQuery, state: FSMContext):
     toman_line = format_toman_annotation(lang, balance, snap)
     text = t(lang, "wallet_text", balance=balance, toman_line=toman_line)
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+    await callback.answer()
+
+
+# ==========================================
+# Stage-13-Step-C: invite-a-friend referral screen.
+#
+# Routes:
+#   "hub_invite"        → render the user's code + share link + stats
+#   "back_to_wallet"    → existing wallet-view callback (re-used so the
+#                         user can bounce between invite and wallet
+#                         without losing the in-flight FSM state)
+#
+# Why we render the code unconditionally even when ``BOT_USERNAME``
+# is not set: the user can still copy the code and DM it to a friend,
+# who can then type ``/start ref_<code>`` manually. The deep-link is
+# a convenience, not a requirement of the feature.
+# ==========================================
+
+
+def _build_invite_keyboard(lang: str) -> InlineKeyboardBuilder:
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text=t(lang, "btn_back_to_wallet"), callback_data="back_to_wallet"
+    )
+    builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+    builder.adjust(2)
+    return builder
+
+
+@router.callback_query(F.data == "hub_invite")
+async def hub_invite_handler(callback: CallbackQuery, state: FSMContext):
+    """Render the user's referral code + share link + earned-bonus stats.
+
+    First call lazily creates a code (see
+    :meth:`Database.get_or_create_referral_code`) so users who never
+    open this screen don't pollute the table. Subsequent calls
+    return the same code.
+
+    The screen always renders even on a partial-config deploy
+    (``BOT_USERNAME`` unset → no deep link, just the bare code).
+    Stats line is rendered from :meth:`Database.get_referral_stats`,
+    which is a single round-trip thanks to the partial index added
+    in migration ``0014_referral_codes``.
+    """
+    await state.clear()
+    user_id = callback.from_user.id
+    lang = await _get_user_language(user_id)
+    code = await db.get_or_create_referral_code(user_id)
+    share_url = build_share_url(code)
+    stats = await db.get_referral_stats(user_id)
+
+    # Bonus figures are read at render time so an env-var bump
+    # (e.g. ops doubles the percent for a marketing push) is visible
+    # without a redeploy. The values are clamped + finite-guarded
+    # at parse time (see ``referral._safe_float_env``).
+    from referral import (
+        get_referral_bonus_max_usd,
+        get_referral_bonus_percent,
+    )
+    bonus_pct = get_referral_bonus_percent()
+    bonus_max = get_referral_bonus_max_usd()
+
+    if share_url is None:
+        # Degraded path: BOT_USERNAME unset, so we can't synthesise
+        # the deep-link. Show the code with copy-paste instructions
+        # so the feature is still usable.
+        text = t(
+            lang,
+            "invite_text_no_link",
+            code=code,
+            pending=stats["pending"],
+            paid=stats["paid"],
+            total_bonus=stats["total_bonus_usd"],
+            bonus_percent=int(bonus_pct),
+            bonus_max=bonus_max,
+        )
+    else:
+        text = t(
+            lang,
+            "invite_text",
+            code=code,
+            share_url=share_url,
+            pending=stats["pending"],
+            paid=stats["paid"],
+            total_bonus=stats["total_bonus_usd"],
+            bonus_percent=int(bonus_pct),
+            bonus_max=bonus_max,
+        )
+
+    builder = _build_invite_keyboard(lang)
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=builder.as_markup(),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest:
+        # ``message is not modified`` when the user re-taps the
+        # button on the same screen — silently swallow + ack.
+        pass
     await callback.answer()
 
 

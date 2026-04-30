@@ -1115,11 +1115,33 @@ class Database:
                         delta,
                         row["telegram_id"],
                     )
+                # Stage-13-Step-C: invitee's first paid top-up
+                # unlocks the referral bonus for both sides.
+                # ``_grant_referral_in_tx`` no-ops if there's no
+                # pending grant for this user, so this is safe to
+                # call on every credit. Inside the same TX as the
+                # wallet credit so a crash mid-flow either commits
+                # both legs or rolls back both — critical because
+                # the grant row's ``status='PAID'`` flip is the
+                # idempotency key against IPN replays.
+                referral_credit = None
+                if delta > 0:
+                    from referral import (
+                        grant_referral_after_credit as _grant_after,
+                    )
+                    referral_credit = await _grant_after(
+                        self,
+                        connection,
+                        invitee_telegram_id=row["telegram_id"],
+                        amount_usd=delta,
+                        transaction_id=None,
+                    )
                 return {
                     "telegram_id": row["telegram_id"],
                     "currency_used": row["currency_used"],
                     "amount_usd_credited": new_credited,
                     "delta_credited": delta,
+                    "referral_credit": referral_credit,
                 }
 
     async def finalize_payment(
@@ -1236,11 +1258,33 @@ class Database:
                         total_credit,
                         row["telegram_id"],
                     )
+                # Stage-13-Step-C: same hook
+                # ``finalize_partial_payment`` calls. ``delta`` is the
+                # USD that just landed in the wallet on this exact
+                # transition (excluding the promo bonus, which is
+                # NOT a real top-up — referral economics need to
+                # track actually-paid value, not gifts on top).
+                # ``transaction_id`` available here from the FOR
+                # UPDATE row, so we can pin the grant to its
+                # triggering transaction in the audit trail.
+                referral_credit = None
+                if delta > 0:
+                    from referral import (
+                        grant_referral_after_credit as _grant_after,
+                    )
+                    referral_credit = await _grant_after(
+                        self,
+                        connection,
+                        invitee_telegram_id=row["telegram_id"],
+                        amount_usd=delta,
+                        transaction_id=row["transaction_id"],
+                    )
                 return {
                     "telegram_id": row["telegram_id"],
                     "amount_usd_credited": new_credited,
                     "delta_credited": delta,
                     "promo_bonus_credited": bonus_credited,
+                    "referral_credit": referral_credit,
                 }
 
     # ----------------------------------------------------------------- #
@@ -3816,6 +3860,345 @@ class Database:
         if result is None:
             return None
         return {"changed": dict(fields)}
+
+    # ------------------------------------------------------------------
+    # Stage-13-Step-C: referral codes
+    # ------------------------------------------------------------------
+    #
+    # Two tables, one verb each:
+    #
+    # * ``get_or_create_referral_code(owner_id)`` — look up the user's
+    #   code, generating + storing one on first call. The code is a
+    #   short ASCII alphanumeric string the user can comfortably DM
+    #   to a friend; collisions are vanishingly rare at the chosen
+    #   length but ``ON CONFLICT (code) DO NOTHING`` + retry covers
+    #   the worst case.
+    #
+    # * ``claim_referral(invitee_id, code)`` — invitee taps the
+    #   referrer's deep link. Inserts a PENDING grant row; first
+    #   referral wins (UNIQUE on ``invitee_telegram_id``), self-
+    #   referral and unknown codes return a non-OK status string.
+    #   Idempotent: a replay returns the same status the first call
+    #   would have, no double-create.
+    #
+    # * ``_grant_referral_in_tx(connection, invitee_id, amount,
+    #   transaction_id)`` — INTERNAL, called from inside the open
+    #   ``finalize_payment`` / ``finalize_partial_payment``
+    #   transaction the moment the invitee crosses their first paid
+    #   credit. Locks the grant row FOR UPDATE so a concurrent IPN
+    #   replay can't double-credit; flips PENDING → PAID and credits
+    #   both wallets in the same TX as the original payment.
+    #
+    # No public "list grants" reader yet — that's the next sub-step
+    # (a "/wallet → invite stats" view). v1 just wires the credit
+    # path; the data is queryable by raw SQL for debugging.
+
+    REFERRAL_CODE_LEN: int = 8
+    # ASCII alphanumeric, excluding the visually-ambiguous
+    # ``0/O`` / ``1/I/l``. Same alphabet the gift-code generator
+    # uses one module over (see ``web_admin.parse_gift_form``).
+    REFERRAL_CODE_ALPHABET: str = (
+        "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    )
+
+    @classmethod
+    def _generate_referral_code(cls) -> str:
+        """Random 8-char code from the curated alphabet.
+
+        Not cryptographic — just unique enough at deployment scale
+        (32**8 ≈ 1.1e12 codes). The DB ``UNIQUE`` constraint on
+        ``code`` is the source of truth; collision retry handled by
+        the caller.
+        """
+        import secrets
+        return "".join(
+            secrets.choice(cls.REFERRAL_CODE_ALPHABET)
+            for _ in range(cls.REFERRAL_CODE_LEN)
+        )
+
+    async def get_or_create_referral_code(self, owner_telegram_id: int) -> str:
+        """Return the user's referral code, generating + persisting one
+        on first call. Idempotent: subsequent calls return the same
+        code.
+
+        Race: two parallel "/wallet → invite friend" taps from the
+        same user could each generate a fresh code; ``ON CONFLICT
+        (owner_telegram_id) DO NOTHING`` lets the loser silently fall
+        back to the winner's code on the SELECT-after-insert.
+
+        Collision: the random code might collide with an existing
+        row (vanishingly rare). The UNIQUE constraint on ``code``
+        rejects the duplicate; we re-roll up to a few times before
+        giving up. In practice the first attempt always wins.
+        """
+        async with self.pool.acquire() as connection:
+            existing = await connection.fetchval(
+                "SELECT code FROM referral_codes WHERE owner_telegram_id = $1",
+                owner_telegram_id,
+            )
+            if existing:
+                return existing
+            for _attempt in range(8):
+                code = self._generate_referral_code()
+                row = await connection.fetchrow(
+                    """
+                    INSERT INTO referral_codes (owner_telegram_id, code)
+                         VALUES ($1, $2)
+                    ON CONFLICT DO NOTHING
+                    RETURNING code
+                    """,
+                    owner_telegram_id,
+                    code,
+                )
+                if row is not None:
+                    return row["code"]
+                # Two ways the insert can no-op:
+                #   1. owner already has a row (lost the race) — read it back.
+                #   2. code collided with a different owner — re-roll.
+                already = await connection.fetchval(
+                    "SELECT code FROM referral_codes "
+                    "WHERE owner_telegram_id = $1",
+                    owner_telegram_id,
+                )
+                if already:
+                    return already
+            raise RuntimeError(
+                "could not generate a unique referral code after 8 attempts"
+            )
+
+    async def lookup_referral_code(
+        self, code: str
+    ) -> "asyncpg.Record | None":
+        """Resolve a referral code to its owner row, or ``None`` if the
+        code doesn't exist. Codes are stored verbatim (mixed case
+        possible if a future migration loosens the alphabet); we
+        match exactly to avoid a false-positive on a typo'd code.
+        """
+        if not code or len(code) > 64:
+            # Defensive bound — way over the configured length, just
+            # so an attacker-supplied huge string can't pin an
+            # unindexed scan. The PRIMARY/UNIQUE indexes handle the
+            # well-formed lookup.
+            return None
+        async with self.pool.acquire() as connection:
+            return await connection.fetchrow(
+                """
+                SELECT rc.code, rc.owner_telegram_id, rc.created_at
+                  FROM referral_codes rc
+                 WHERE rc.code = $1
+                """,
+                code,
+            )
+
+    async def claim_referral(
+        self, *, invitee_telegram_id: int, code: str
+    ) -> dict:
+        """Try to attach *invitee* to the referrer who owns *code*.
+
+        Returns a dict ``{"status": "..."}`` — one of:
+
+        * ``"ok"`` — fresh PENDING grant created (referrer_id in result).
+        * ``"unknown"`` — code does not exist.
+        * ``"self"`` — owner of the code IS the invitee (self-referral).
+        * ``"already_claimed"`` — the invitee already has a grant
+          (PENDING or PAID), even from a different code.
+        * ``"unknown_invitee"`` — no users row for the invitee
+          (shouldn't happen because UserUpsertMiddleware runs first,
+          but the FK would raise so we surface a typed error).
+        """
+        owner_row = await self.lookup_referral_code(code)
+        if owner_row is None:
+            return {"status": "unknown"}
+        owner_id = int(owner_row["owner_telegram_id"])
+        if owner_id == invitee_telegram_id:
+            return {"status": "self"}
+        async with self.pool.acquire() as connection:
+            user_exists = await connection.fetchval(
+                "SELECT 1 FROM users WHERE telegram_id = $1",
+                invitee_telegram_id,
+            )
+            if not user_exists:
+                return {"status": "unknown_invitee"}
+            existing = await connection.fetchrow(
+                """
+                SELECT id, status, referrer_telegram_id
+                  FROM referral_grants
+                 WHERE invitee_telegram_id = $1
+                """,
+                invitee_telegram_id,
+            )
+            if existing is not None:
+                return {
+                    "status": "already_claimed",
+                    "existing_status": existing["status"],
+                    "referrer_telegram_id": int(
+                        existing["referrer_telegram_id"]
+                    ),
+                }
+            try:
+                await connection.execute(
+                    """
+                    INSERT INTO referral_grants (
+                        referrer_telegram_id, invitee_telegram_id,
+                        code, status
+                    ) VALUES ($1, $2, $3, 'PENDING')
+                    """,
+                    owner_id,
+                    invitee_telegram_id,
+                    str(owner_row["code"]),
+                )
+            except asyncpg.UniqueViolationError:
+                # Lost a race against another concurrent claim for
+                # the same invitee — surface the same status the
+                # winner would have seen on a replay.
+                return {"status": "already_claimed"}
+            except asyncpg.exceptions.CheckViolationError:
+                # Self-referral protection at the DB layer (we already
+                # check above; this is defence in depth in case a
+                # future caller bypasses the application check).
+                return {"status": "self"}
+        return {
+            "status": "ok",
+            "referrer_telegram_id": owner_id,
+        }
+
+    @staticmethod
+    def compute_referral_bonus(
+        amount_usd: float,
+        *,
+        percent: float,
+        max_usd: float,
+    ) -> float:
+        """Bonus to credit each side. Percentage of the triggering
+        top-up, capped at ``max_usd``. Defensive against non-finite
+        inputs (returns 0.0)."""
+        if not _is_finite_amount(amount_usd) or amount_usd <= 0:
+            return 0.0
+        if not _is_finite_amount(percent) or percent <= 0:
+            return 0.0
+        if not _is_finite_amount(max_usd) or max_usd <= 0:
+            return 0.0
+        bonus = amount_usd * (percent / 100.0)
+        if bonus > max_usd:
+            bonus = max_usd
+        return round(bonus, 4)
+
+    async def _grant_referral_in_tx(
+        self,
+        connection,
+        *,
+        invitee_telegram_id: int,
+        amount_usd: float,
+        transaction_id: int | None,
+        bonus_percent: float,
+        bonus_max_usd: float,
+    ) -> dict | None:
+        """If *invitee* has a PENDING referral grant, flip it to PAID
+        and credit both wallets. Returns the bonus + referrer info
+        on credit, or ``None`` if nothing to do.
+
+        Called from inside an already-open transaction (the same one
+        that's crediting the invitee's top-up). Locks the grant row
+        ``FOR UPDATE`` so a concurrent IPN replay can't double-credit
+        — only the first writer to flip PENDING → PAID actually
+        credits the wallets.
+
+        Defence in depth: refuses (returns ``None``) for non-finite
+        / non-positive ``amount_usd``. The callers
+        (``finalize_payment`` / ``finalize_partial_payment``) already
+        guard at entry, but a future caller bypassing that path can't
+        poison either wallet here.
+        """
+        if not _is_finite_amount(amount_usd) or amount_usd <= 0:
+            return None
+        bonus = self.compute_referral_bonus(
+            amount_usd, percent=bonus_percent, max_usd=bonus_max_usd
+        )
+        if bonus <= 0:
+            return None
+        grant = await connection.fetchrow(
+            """
+            SELECT id, referrer_telegram_id, invitee_telegram_id, status
+              FROM referral_grants
+             WHERE invitee_telegram_id = $1
+               AND status = 'PENDING'
+             FOR UPDATE
+            """,
+            invitee_telegram_id,
+        )
+        if grant is None:
+            return None
+        referrer_id = int(grant["referrer_telegram_id"])
+        await connection.execute(
+            """
+            UPDATE referral_grants
+               SET status = 'PAID',
+                   paid_at = NOW(),
+                   bonus_usd_referrer = $2,
+                   bonus_usd_invitee = $3,
+                   triggering_transaction_id = $4,
+                   triggering_amount_usd = $5
+             WHERE id = $1
+            """,
+            grant["id"],
+            bonus,
+            bonus,
+            transaction_id,
+            amount_usd,
+        )
+        await connection.execute(
+            """
+            UPDATE users
+               SET balance_usd = balance_usd + $1
+             WHERE telegram_id = $2
+            """,
+            bonus,
+            referrer_id,
+        )
+        await connection.execute(
+            """
+            UPDATE users
+               SET balance_usd = balance_usd + $1
+             WHERE telegram_id = $2
+            """,
+            bonus,
+            invitee_telegram_id,
+        )
+        return {
+            "grant_id": int(grant["id"]),
+            "referrer_telegram_id": referrer_id,
+            "bonus_usd": bonus,
+            "amount_usd": amount_usd,
+        }
+
+    async def get_referral_stats(self, owner_telegram_id: int) -> dict:
+        """Counts of PENDING / PAID grants + total bonus earned.
+
+        Used by the "/wallet → invite stats" screen so the user can
+        see how many friends are still considering the offer vs
+        already converted. Single round trip; the partial index on
+        ``referrer_telegram_id, status`` keeps this cheap.
+        """
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE status = 'PENDING') AS pending,
+                    COUNT(*) FILTER (WHERE status = 'PAID')    AS paid,
+                    COALESCE(
+                        SUM(bonus_usd_referrer) FILTER (WHERE status = 'PAID'),
+                        0
+                    ) AS total_bonus_usd
+                  FROM referral_grants
+                 WHERE referrer_telegram_id = $1
+                """,
+                owner_telegram_id,
+            )
+        return {
+            "pending": int(row["pending"] or 0),
+            "paid": int(row["paid"] or 0),
+            "total_bonus_usd": float(row["total_bonus_usd"] or 0.0),
+        }
 
 
 # Export a single instance to be used across the app
