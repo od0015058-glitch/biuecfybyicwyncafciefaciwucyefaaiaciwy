@@ -19,9 +19,7 @@ At boot the module loads every non-empty key into a list:
 Key selection for a given user is **sticky**: the user's Telegram id
 is hashed into a pool index, so the same user always routes to the
 same key. This keeps conversation context (on OpenRouter's side)
-consistent and avoids mid-conversation key switches. If a key
-errors with 429, the next key in round-robin order is tried once
-before surfacing the rate-limit error to the user.
+consistent and avoids mid-conversation key switches.
 
 Public surface:
 
