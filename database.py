@@ -4200,6 +4200,58 @@ class Database:
             "total_bonus_usd": float(row["total_bonus_usd"] or 0.0),
         }
 
+    # ------------------------------------------------------------------
+    # Disabled models / gateways (Stage-14)
+    # ------------------------------------------------------------------
+
+    async def get_disabled_models(self) -> set[str]:
+        """Return the set of model ids currently disabled by the admin."""
+        rows = await self.pool.fetch(
+            "SELECT model_id FROM disabled_models"
+        )
+        return {r["model_id"] for r in rows}
+
+    async def disable_model(self, model_id: str, *, actor: str = "web") -> bool:
+        """Disable a model. Returns True if it was newly disabled."""
+        result = await self.pool.execute(
+            "INSERT INTO disabled_models (model_id, disabled_by) "
+            "VALUES ($1, $2) ON CONFLICT (model_id) DO NOTHING",
+            model_id, actor,
+        )
+        return result.endswith("1")
+
+    async def enable_model(self, model_id: str) -> bool:
+        """Re-enable a model. Returns True if it was previously disabled."""
+        result = await self.pool.execute(
+            "DELETE FROM disabled_models WHERE model_id = $1",
+            model_id,
+        )
+        return result.endswith("1")
+
+    async def get_disabled_gateways(self) -> set[str]:
+        """Return the set of gateway keys currently disabled by the admin."""
+        rows = await self.pool.fetch(
+            "SELECT gateway_key FROM disabled_gateways"
+        )
+        return {r["gateway_key"] for r in rows}
+
+    async def disable_gateway(self, gateway_key: str, *, actor: str = "web") -> bool:
+        """Disable a gateway/currency. Returns True if newly disabled."""
+        result = await self.pool.execute(
+            "INSERT INTO disabled_gateways (gateway_key, disabled_by) "
+            "VALUES ($1, $2) ON CONFLICT (gateway_key) DO NOTHING",
+            gateway_key, actor,
+        )
+        return result.endswith("1")
+
+    async def enable_gateway(self, gateway_key: str) -> bool:
+        """Re-enable a gateway/currency. Returns True if previously disabled."""
+        result = await self.pool.execute(
+            "DELETE FROM disabled_gateways WHERE gateway_key = $1",
+            gateway_key,
+        )
+        return result.endswith("1")
+
 
 # Export a single instance to be used across the app
 db = Database()

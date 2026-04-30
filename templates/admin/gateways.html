@@ -1,0 +1,105 @@
+{% extends "_layout.html" %}
+
+{% block title %}Payment gateway toggles{% endblock %}
+
+{% block extra_head %}
+<style>
+  .gw-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .gw-row:last-child { border-bottom: none; }
+  .gw-label { font-size: 14px; }
+  .gw-label.disabled { opacity: 0.5; text-decoration: line-through; }
+  .gw-key {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-left: 8px;
+  }
+  form.inline { display: inline; margin: 0; }
+  .btn-enable {
+    background: var(--success);
+    color: #111;
+    border: none;
+    border-radius: 4px;
+    padding: 4px 12px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .btn-disable {
+    background: transparent;
+    color: var(--danger);
+    border: 1px solid var(--danger);
+    border-radius: 4px;
+    padding: 4px 12px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .btn-disable:hover { background: rgba(255,107,107,0.1); }
+  .summary { color: var(--text-muted); font-size: 13px; margin-bottom: 16px; }
+  .section-title { font-size: 14px; color: var(--text-muted); margin: 20px 0 8px; }
+</style>
+{% endblock %}
+
+{% block main %}
+<h2>Payment gateway toggles</h2>
+
+{% if flash %}
+<div class="alert alert-{{ flash.kind }}">{{ flash.message }}</div>
+{% endif %}
+
+<p class="summary">
+  Disabled gateways/currencies are hidden from the Telegram bot's payment picker.
+  Pending invoices on a disabled gateway are not affected.
+</p>
+
+<div class="panel">
+  <h3>Card gateway</h3>
+  {% for gw in card_gateways %}
+  <div class="gw-row">
+    <span class="gw-label {% if gw.key in disabled %}disabled{% endif %}">
+      {{ gw.label }} <span class="gw-key">({{ gw.key }})</span>
+    </span>
+    {% if gw.key in disabled %}
+    <form class="inline" method="post" action="/admin/gateways/enable">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="gateway_key" value="{{ gw.key }}">
+      <button type="submit" class="btn-enable">Enable</button>
+    </form>
+    {% else %}
+    <form class="inline" method="post" action="/admin/gateways/disable">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="gateway_key" value="{{ gw.key }}">
+      <button type="submit" class="btn-disable">Disable</button>
+    </form>
+    {% endif %}
+  </div>
+  {% endfor %}
+
+  <h3 class="section-title">Crypto currencies (NowPayments)</h3>
+  {% for gw in crypto_gateways %}
+  <div class="gw-row">
+    <span class="gw-label {% if gw.key in disabled %}disabled{% endif %}">
+      {{ gw.label }} <span class="gw-key">({{ gw.key }})</span>
+    </span>
+    {% if gw.key in disabled %}
+    <form class="inline" method="post" action="/admin/gateways/enable">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="gateway_key" value="{{ gw.key }}">
+      <button type="submit" class="btn-enable">Enable</button>
+    </form>
+    {% else %}
+    <form class="inline" method="post" action="/admin/gateways/disable">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="gateway_key" value="{{ gw.key }}">
+      <button type="submit" class="btn-disable">Disable</button>
+    </form>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}

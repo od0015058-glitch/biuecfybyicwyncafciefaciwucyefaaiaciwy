@@ -120,8 +120,9 @@ jobs:
             "SELECT count(*) FROM information_schema.tables
              WHERE table_schema='public' AND table_name IN
                ('users','transactions','usage_logs','system_settings',
-                'promo_codes','promo_usage','conversation_messages')" \
-            | grep -qx 7
+                'promo_codes','promo_usage','conversation_messages',
+                'disabled_models','disabled_gateways')" \
+            | grep -qx 9
 
       - name: alembic downgrade base
         run: alembic downgrade base
@@ -132,5 +133,6 @@ jobs:
             "SELECT count(*) FROM information_schema.tables
              WHERE table_schema='public' AND table_name IN
                ('users','transactions','usage_logs','system_settings',
-                'promo_codes','promo_usage','conversation_messages')" \
+                'promo_codes','promo_usage','conversation_messages',
+                'disabled_models','disabled_gateways')" \
             | grep -qx 0

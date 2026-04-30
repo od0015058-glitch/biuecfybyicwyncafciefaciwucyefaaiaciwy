@@ -195,6 +195,7 @@ _STRINGS: dict[str, dict[str, str]] = {
             "✅ مدل فعال شما به `{model_id}` تغییر یافت."
         ),
         "models_set_unknown": "❌ این مدل در فهرست یافت نشد.",
+        "models_set_disabled": "❌ این مدل توسط ادمین غیرفعال شده است. لطفاً مدل دیگری انتخاب کنید.",
         "models_offline_warning": (
             "⚠️ ارتباط با OpenRouter برقرار نشد؛ از فهرست محلی استفاده می‌شود."
         ),
@@ -324,6 +325,8 @@ _STRINGS: dict[str, dict[str, str]] = {
         # ---- AI engine error replies ----
         "ai_no_account": "❌ حساب کاربری شما یافت نشد. لطفا ابتدا ربات را /start کنید.",
         "ai_insufficient_balance": "⚠️ اعتبار شما کافی نیست. لطفا از منوی کیف پول، حساب خود را شارژ کنید.",
+        "ai_model_disabled": "⚠️ مدل فعلی شما توسط ادمین غیرفعال شده است. لطفاً از منوی مدل‌ها یک مدل دیگر انتخاب کنید.",
+        "gateway_disabled": "⚠️ این روش پرداخت در حال حاضر غیرفعال است.",
         "ai_provider_unavailable": "❌ سرور هوش مصنوعی موقتاً در دسترس نیست. لطفاً دوباره تلاش کنید.",
         "ai_rate_limited": (
             "⏳ این مدل در حال حاضر در سمت سرور با محدودیت نرخ مواجه شده است.\n"
@@ -592,6 +595,7 @@ _STRINGS: dict[str, dict[str, str]] = {
             "✅ Active model switched to `{model_id}`."
         ),
         "models_set_unknown": "❌ This model is not in the catalog.",
+        "models_set_disabled": "❌ This model has been disabled by the admin. Please choose another model.",
         "models_offline_warning": (
             "⚠️ Couldn't reach OpenRouter; showing the cached fallback list."
         ),
@@ -717,6 +721,8 @@ _STRINGS: dict[str, dict[str, str]] = {
         # ---- AI engine error replies ----
         "ai_no_account": "❌ Your account was not found. Please /start the bot first.",
         "ai_insufficient_balance": "⚠️ Insufficient balance. Please top up from the wallet menu.",
+        "ai_model_disabled": "⚠️ Your active model has been disabled by the admin. Please choose another model from the Models menu.",
+        "gateway_disabled": "⚠️ This payment method is currently disabled.",
         "ai_provider_unavailable": "❌ AI provider is temporarily unavailable. Please try again.",
         "ai_rate_limited": (
             "⏳ This model is currently rate-limited upstream.\n"

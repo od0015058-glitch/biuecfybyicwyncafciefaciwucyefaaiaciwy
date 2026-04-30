@@ -305,6 +305,23 @@ User direction (2026-04-30): *"specify our steps forward and at last make someth
 | **Stage-13-Step-C** (this PR) | **Referral codes** — user-to-user invite codes that credit both wallets on the invitee's first paid top-up. New `referral_codes` + `referral_grants` tables (alembic `0014_referral_codes`), new `referral.py` module that owns env-var config (`BOT_USERNAME` / `REFERRAL_BONUS_PERCENT` / `REFERRAL_BONUS_MAX_USD`) + the `/start <payload>` parser. Wallet keyboard gets a `🎁 Invite a friend` button routing to a new `hub_invite_handler` that renders the user's code, share deep-link (or copy-paste-only fallback if `BOT_USERNAME` is unset), and lifetime stats (pending / paid / total bonus earned). The invitee deep-link (`/start ref_<code>`) lands on a new `cmd_start` branch that calls `db.claim_referral` to insert a PENDING grant row — with localised flash messages for `unknown` / `self` / `already_claimed`. The bonus credit fires inside the `finalize_payment` / `finalize_partial_payment` open transaction the moment the invitee crosses their first paid USD credit (PARTIAL or SUCCESS, whichever fires first); both referrer and invitee wallets get `min(amount * percent, max_usd)` (default 10% capped at $5). The flip is idempotent against IPN replays via `SELECT ... FOR UPDATE` on the grant row + a `status='PAID'` write that's only valid against a `'PENDING'` row. **Bundled bug fix:** `cmd_start` previously ignored `message.text` past the slash command itself; the audit findings (HANDOFF §5) had this pencilled in as the bundled bug, and this PR closes it — referral deep-links would have arrived but never wired the invitee to a referrer. **Defence in depth:** `compute_referral_bonus` rejects NaN / Inf / non-positive amounts and percents and caps; `_grant_referral_in_tx` short-circuits before the lock if the amount is bad; the `referral_grants.invitee_telegram_id` UNIQUE constraint prevents an invitee from being claimed by two different referrers; the `referral_grants` CHECK constraint prevents self-referral at the DB layer too. New tests in `tests/test_referral.py` (1305 total, was 1239 baseline): payload parser branches, env-var config fallbacks, share-URL builder, bonus computation matrix, `_grant_referral_in_tx` SQL flow with a fake connection, `hub_invite_handler` link / no-link rendering, `cmd_start` referral wiring (happy path + unknown / self / claim-failure resilience), wallet-keyboard pin. | P2 product | ✅ this PR |
 | **Stage-13-Step-D** | **Prometheus-style `/metrics` endpoint** for the IPN drop counters + reaper / alert / FX-loop heartbeats already accumulating in-memory. Mounted on the same aiohttp server, gated by an `IP_ALLOWLIST` env var (private-network observability only — no admin auth needed). Bug-fix candidate: the existing per-loop "last successful tick" timestamps are tracked in-process but never exposed; a stuck reaper / alert task is currently invisible until the dashboard tile diverges from reality. | P3 ops | pending |
 
+### Stage-14 — admin toggles & multi-key OpenRouter (queued 2026-04-30)
+
+| Step | Description | Priority | Status |
+|------|-------------|----------|--------|
+| **Stage-14-Step-A** | **AI model on/off toggle in admin web panel.** New `disabled_models` table (alembic 0015). `/admin/models` page lists every OpenRouter catalog model grouped by provider with enable/disable buttons. Disabled models are filtered from the Telegram picker (`_eligible_model`) and refused at chat time (`ai_engine.chat_with_model`). Audit-logged. In-memory cache (`admin_toggles.py`) avoids DB round-trips on the hot path. | P2 product | **shipped** |
+| **Stage-14-Step-B** | **Payment gateway on/off toggle in admin web panel.** New `disabled_gateways` table (alembic 0015). `/admin/gateways` page lists TetraPay + all NowPayments currencies with enable/disable buttons. Disabled gateways are hidden from the currency picker and refused at invoice-creation time. Audit-logged. Same in-memory cache pattern. | P2 product | **shipped** |
+| **Stage-14-Step-C** | **Multi-key OpenRouter load balancing.** Support `OPENROUTER_API_KEY_1..10` env vars. Sticky per-user assignment (`telegram_id % N`). Backward-compatible: if only the bare `OPENROUTER_API_KEY` exists, all traffic goes there. Module `openrouter_keys.py`. | P3 ops | **shipped** |
+
+New files added in Stage-14:
+- `admin_toggles.py` — in-memory cache for disabled models/gateways.
+- `openrouter_keys.py` — multi-key pool with sticky per-user routing.
+- `alembic/versions/0015_disabled_models_gateways.py` — migration for both tables.
+- `templates/admin/models.html` — model toggle UI.
+- `templates/admin/gateways.html` — gateway toggle UI.
+- `tests/test_admin_toggles.py` — unit tests for toggle cache + handler helpers.
+- `tests/test_openrouter_keys.py` — unit tests for multi-key routing.
+
 Audit findings (2026-04-30) noted by reading every file — kept here so a future AI / human can pick the highest-leverage one next:
 
 * **`cmd_start` has a redundant `db.create_user` call** (handlers.py ~278) — `UserUpsertMiddleware` already runs first. Inspected during the Stage-13-Step-Aplus audit and decided NOT to remove: the middleware swallows upsert exceptions (logged + handler still runs), so the explicit retry in `cmd_start` is the only safety net for a transient DB issue at the moment of `/start`. Belt-and-braces; leave it.
@@ -629,7 +646,17 @@ The user's process for this project — **do not deviate**:
    <payload>` deep-link bug fix, P2 product) shipped this PR.
    Remaining: D (Prometheus `/metrics` endpoint, P3 ops). User
    direction 2026-04-30: walk down the list one PR at a time.
-9. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
-   update this doc + README in each, do NOT block on user approval. The
-   user merges them when they wake up.
-10. **Read the §11 working agreement before doing anything.**
+9. **Stage-14 is fully shipped** — A+B (admin model & gateway toggles,
+   `disabled_models` + `disabled_gateways` tables, web panel pages at
+   `/admin/models` + `/admin/gateways`, alembic 0015, audit-logged
+   enable/disable actions, in-memory caches for zero-cost hot-path
+   checks, disabled-model guard in `ai_engine.chat_with_model` +
+   `handlers._eligible_model`, disabled-gateway guard in currency
+   pickers). C (multi-key OpenRouter load balancing via
+   `OPENROUTER_API_KEY_1..10` env vars, sticky per-user key
+   assignment `telegram_id % N`, backward-compatible with single
+   `OPENROUTER_API_KEY`, module `openrouter_keys.py`).
+10. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+    update this doc + README in each, do NOT block on user approval. The
+    user merges them when they wake up.
+11. **Read the §11 working agreement before doing anything.**
