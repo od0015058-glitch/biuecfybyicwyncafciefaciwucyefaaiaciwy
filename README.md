@@ -288,6 +288,38 @@ pytest tests/
 | `templates/admin/` | Jinja2 templates for the web admin (login, dashboard, promos, gifts, gift_redemptions, users, user_detail, user_usage, broadcast, broadcast_detail, transactions, strings, string_detail, audit, enroll_2fa). |
 | `alembic/` | Schema migrations. `alembic upgrade head` runs idempotently in `entrypoint.sh` on every container start. New schema changes: `alembic revision -m "..."`. |
 
+## Updating the live server
+
+One-command update with automatic backup rotation (keeps 2 backups):
+
+```bash
+cd /opt/meowassist && sudo bash scripts/update-server.sh
+```
+
+The script:
+1. Backs up the current version to `/opt/meowassist-backups/YYYY-MM-DD_HH-MM/`
+2. Pulls latest code from `origin/main`
+3. Rebuilds Docker containers (`docker compose up -d --build`)
+4. Restarts Caddy if `docker-compose.caddy.yml` exists
+5. Rotates old backups (keeps latest 2, deletes the rest)
+
+**Your `.env` is never touched.** Database and Redis data live in Docker volumes — also untouched.
+
+See `scripts/update-server.sh` for the full implementation, or
+[HANDOFF.md](./HANDOFF.md) §Stage-15-Step-B for the design rationale.
+
+## Roadmap
+
+See [HANDOFF.md](./HANDOFF.md) §Stage-15 for the full queue:
+
+| Step | Title | Status |
+|------|-------|--------|
+| **Stage-15-A** | Prometheus `/metrics` endpoint | pending |
+| **Stage-15-B** | Server update script with backup rotation | pending |
+| **Stage-15-C** | Logos & posters AI prompt folder | pending |
+| **Stage-15-D** | Bug-fix sweep | pending |
+| **Stage-15-E** | Future project suggestions (12 items) | documented |
+
 ## License / contributing
 
 Internal project — see HANDOFF.md for the priority queue before opening a PR.
