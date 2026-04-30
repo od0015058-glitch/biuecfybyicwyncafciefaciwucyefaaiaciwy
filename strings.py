@@ -296,6 +296,10 @@ _STRINGS: dict[str, dict[str, str]] = {
         "ai_local_rate_limited": (
             "⏳ سرعت ارسال پیام‌های شما زیاد است. لطفاً یک لحظه صبر کنید."
         ),
+        "ai_chat_busy": (
+            "⏳ پاسخ پیام قبلی شما هنوز در حال پردازش است.\n"
+            "لطفاً تا تکمیل آن صبر کنید و سپس پیام بعدی را بفرستید."
+        ),
         # ---- Payment notifications ----
         "pay_credited_full": "✅ پرداخت تایید شد! مبلغ ${delta:.4f} به حساب شما اضافه شد.",
         "pay_credited_total_only": (
@@ -643,6 +647,10 @@ _STRINGS: dict[str, dict[str, str]] = {
         "ai_transient_error": "❌ A temporary connectivity error occurred. Please try again in a moment.",
         "ai_local_rate_limited": (
             "⏳ You're sending messages too quickly. Please wait a moment."
+        ),
+        "ai_chat_busy": (
+            "⏳ Your previous message is still being processed.\n"
+            "Please wait for it to finish before sending another one."
         ),
         # ---- Payment notifications ----
         "pay_credited_full": "✅ Payment confirmed! ${delta:.4f} has been added to your wallet.",

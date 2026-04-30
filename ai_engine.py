@@ -177,6 +177,29 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
                         telegram_id, active_model, data,
                     )
                     return t(lang, "ai_provider_unavailable")
+
+                # Stage-13-Step-B: ``content`` is allowed to be ``null``
+                # in the OpenAI-compatible chat-completion spec — tool
+                # calls return ``{"role": "assistant", "content": null,
+                # "tool_calls": [...]}``, and upstream policy refusals
+                # / safety blocks at OpenRouter sometimes surface as
+                # 200s with ``content: null`` rather than the
+                # ``{"error": ...}`` body shape the guard above
+                # catches. Without this branch the bot would forward
+                # ``None`` (or an empty string) to the handler, which
+                # then hands it to Telegram and gets back ``Bad
+                # Request: message text is empty``. Treat empty /
+                # falsy reply text as the same provider-unavailable
+                # condition the explicit error-body branch already
+                # surfaces, so the user gets a useful message and we
+                # don't bill them for a non-reply.
+                if not reply_text or not str(reply_text).strip():
+                    log.warning(
+                        "OpenRouter 200 with empty/null content for user %d "
+                        "model=%s: %.500r",
+                        telegram_id, active_model, data,
+                    )
+                    return t(lang, "ai_provider_unavailable")
                 
                 # 4. Economic Settlement
                 #

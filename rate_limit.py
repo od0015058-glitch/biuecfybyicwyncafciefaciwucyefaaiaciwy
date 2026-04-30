@@ -156,6 +156,104 @@ async def consume_chat_token(user_id: int) -> bool:
     return await _chat_rate_limiter.consume(user_id)
 
 
+# ---------------------------------------------------------------------
+# Stage-13-Step-B: per-user in-flight chat slot
+# ---------------------------------------------------------------------
+#
+# The token bucket above gates *throughput* — it ensures a sustained
+# spend rate. But the default (5 tokens, 1/sec refill) lets a user
+# fire 5 prompts back-to-back, all of which immediately hit
+# OpenRouter in parallel before the bucket has a chance to react.
+# Each in-flight request charges the wallet on settlement (or burns
+# a free message), so a fast burst can drain $5+ from the wallet
+# in under a second on a paid model — well above what the user
+# actually intended.
+#
+# This module-level set is the second layer: at most ONE in-flight
+# OpenRouter request per ``user_id``. A second prompt that arrives
+# while the first is still being awaited is rejected with the
+# ``ai_chat_busy`` flash (the user gets clear feedback rather than
+# silent loss + a delayed cost they can't predict).
+#
+# Implementation notes:
+#
+# * Membership is in a plain ``set[int]`` guarded by an
+#   ``asyncio.Lock`` so the test-and-add is atomic. ``set.add`` itself
+#   is thread-safe under the GIL but the *test-and-add* across two
+#   statements isn't — without the lock two prompts arriving on the
+#   same poller tick would both see the user as "not in set" and
+#   both proceed. The whole point is to prevent that.
+# * The set is bounded at ``_CHAT_INFLIGHT_MAX`` entries to defend
+#   against a slow leak from a forgotten ``release_chat_slot`` call;
+#   eviction is FIFO when the cap is exceeded. In practice the set
+#   should hover around 0–N where N is the number of users actively
+#   awaiting an OpenRouter response, which on a single-process bot
+#   is bounded by the asyncio event loop's scheduling fairness — but
+#   defence in depth.
+# * ``release_chat_slot`` is idempotent (``set.discard`` is a no-op
+#   on a missing key). Callers MUST call it in a ``finally`` block
+#   so an exception in ``chat_with_model`` doesn't permanently lock
+#   the user out of further chats.
+# * The slot is per-process. If the bot is ever scaled horizontally
+#   the slot moves to Redis with the same primitives — for now
+#   single-process is the deployment shape and an in-memory set is
+#   enough.
+
+_CHAT_INFLIGHT_MAX = 10_000
+_chat_inflight: set[int] = set()
+_chat_inflight_lock = asyncio.Lock()
+
+
+async def try_claim_chat_slot(user_id: int) -> bool:
+    """Attempt to claim the in-flight chat slot for ``user_id``.
+
+    Returns True if the slot was free and is now held by the caller
+    (the caller MUST call :func:`release_chat_slot` when the
+    OpenRouter request finishes — success, failure, or exception).
+    Returns False if the user already has a request in flight.
+
+    Non-blocking: never awaits longer than the lock-acquire roundtrip.
+    """
+    async with _chat_inflight_lock:
+        if user_id in _chat_inflight:
+            return False
+        # Defend against a slow leak from a forgotten release. FIFO
+        # eviction so the oldest stuck slot drops first; the
+        # legitimate user whose slot got evicted can simply send
+        # another prompt — the worst case is one bonus chat for a
+        # truly stuck request, which is far better than a permanent
+        # lockout.
+        if len(_chat_inflight) >= _CHAT_INFLIGHT_MAX:
+            evicted = next(iter(_chat_inflight))
+            _chat_inflight.discard(evicted)
+            log.warning(
+                "chat-inflight slot capacity (%d) exceeded; evicting "
+                "stale slot for user_id=%s",
+                _CHAT_INFLIGHT_MAX,
+                evicted,
+            )
+        _chat_inflight.add(user_id)
+        return True
+
+
+async def release_chat_slot(user_id: int) -> None:
+    """Release the in-flight chat slot for ``user_id``.
+
+    Idempotent: releasing a slot that was never claimed (or already
+    released) is a no-op. Always call this in a ``finally`` block
+    paired with :func:`try_claim_chat_slot`.
+    """
+    async with _chat_inflight_lock:
+        _chat_inflight.discard(user_id)
+
+
+def reset_chat_inflight_slots_for_tests() -> None:
+    """Clear the in-flight slot set. Tests-only — call between tests
+    so a leaked slot from a previous test doesn't bleed into the
+    next one. NOT for production use."""
+    _chat_inflight.clear()
+
+
 # The NowPayments IPN path. Exported so tests — and the middleware —
 # agree on the single URL whose traffic this limiter is meant to bound.
 # Kept as a module-level constant rather than inlined so a future

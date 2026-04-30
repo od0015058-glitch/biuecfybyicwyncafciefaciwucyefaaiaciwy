@@ -72,6 +72,20 @@ NowPayments crypto invoices.
   (back-compat default). For private channels, also set
   `REQUIRED_CHANNEL_INVITE_LINK=https://t.me/+abcdefINVITE` so the
   Join button has somewhere to deep-link.
+- **Per-user in-flight cap on AI chat** — at most one OpenRouter
+  request per Telegram user can be in flight at any moment. The
+  existing per-user *token bucket* (`consume_chat_token`) gates
+  sustained spend, but its 5-token capacity lets a fast burst of 5
+  prompts hit OpenRouter in parallel before the bucket reacts — on
+  a paid model that drains $5+ from the wallet in under a second
+  before the user can react. The in-flight slot is the second
+  layer: a second prompt arriving while the first is still being
+  awaited gets the `ai_chat_busy` flash ("Your previous message
+  is still being processed. Please wait…") instead of silently
+  hitting OpenRouter again. Slot is released in a `try…finally`
+  so an exception can't permanently lock the user out, and the
+  set is bounded at 10 000 entries with FIFO eviction as defence
+  against a slow leak.
 - **TOTP / 2FA on admin login** — set `ADMIN_2FA_SECRET` to a base32
   string and `/admin/login` will require a 6-digit code from your
   authenticator app (Google Authenticator, Authy, 1Password,
@@ -214,7 +228,7 @@ pytest tests/
 | `models_catalog.py` | Live `/v1/models` fetch from OpenRouter with 24 h cache, provider whitelist, free/paid split. |
 | `middlewares.py` | `UserUpsertMiddleware` — ensures `users` row exists before any handler runs. |
 | `force_join.py` | `RequiredChannelMiddleware` + the `force_join_check` callback handler. When `REQUIRED_CHANNEL` is set, every non-admin user is gated behind a "join the channel" screen until Telegram confirms membership. Admins bypass; API errors fail open. |
-| `rate_limit.py` | Token-bucket primitives + `ChatRateLimitMiddleware` (per-user) and `webhook_rate_limit_middleware` (per-IP). Guards `/chat` against runaway OpenRouter spend and the `/nowpayments-webhook` endpoint against DoS bursts. |
+| `rate_limit.py` | Token-bucket primitives + `consume_chat_token` (per-user throughput throttle) + `try_claim_chat_slot` / `release_chat_slot` (per-user in-flight cap) and `webhook_rate_limit_middleware` (per-IP). Guards the AI chat path against runaway OpenRouter spend on both axes (sustained rate and burst concurrency) and the `/nowpayments-webhook` endpoint against DoS bursts. |
 | `strings.py` | Two-locale (fa/en) compiled string table + `t(lang, key, **kwargs)` helper. Layered with a runtime override cache populated from the `bot_strings` DB table — admin edits at `/admin/strings` shadow the compiled defaults until reverted. Missing-slug lookups now log a one-shot WARNING per `(lang, key)` instead of silently returning the bare slug. |
 | `wallet_display.py` | Stage-11-Step-D. `format_toman_annotation(lang, balance_usd, snap)` returns the `\n≈ N تومان` (fa) / `\n≈ N TMN` (en) line spliced onto every wallet view's `$X.YZ` figure when an FX snapshot is cached. Stale snapshots get the `(نرخ تقریبی)` / `(approx)` suffix; cold cache returns `""` so the wallet still renders without the line; non-finite balances and arithmetic-overflow products are rejected with `""` rather than rendering `≈ nan تومان`. `format_balance_block(lang, balance_usd, snap)` packages `$X.YZ` + the annotation for callers (post-credit DMs, future wallet sub-screens) that don't go through `strings.t` — and substitutes `$0.00` for the head string on a non-finite balance so a corrupted upstream can't leak `$nan` either (the annotation guard already covered the Toman line). |
 | `wallet_receipts.py` | **Stage-12-Step-C.** Renders the new "🧾 Recent top-ups" wallet sub-screen. `get_receipts_page_size()` reads the `RECEIPTS_PAGE_SIZE` env var (default 5, max 20). `format_receipt_line(row, lang)` renders one row as `<status badge> — $X.YZ — <gateway label> — YYYY-MM-DD`; TetraPay rows append `(≈ N TMN)` using the per-transaction `gateway_locked_rate_toman_per_usd` (NOT the live snapshot — the user verifies against what they actually paid). Same NaN-defense policy as `wallet_display`: a non-finite `amount_usd` renders `$0.00`, a non-finite locked rate omits the Toman annotation. Backed by `Database.list_user_transactions(*, telegram_id, limit, before_id=None)`, which **hard-codes the `WHERE telegram_id = …` clause** and `raise ValueError` on a missing/zero/negative `telegram_id` — separate method from the admin-side `list_transactions` so a future buggy caller can't drop the user-scope filter and leak someone else's transactions. Cursor pagination via `before_id` over `transaction_id` (stable when fresh top-ups land mid-browse). Status whitelist is `{"SUCCESS", "PARTIAL", "REFUNDED"}` — PENDING / EXPIRED / FAILED are operational state, not user-facing receipts. |
