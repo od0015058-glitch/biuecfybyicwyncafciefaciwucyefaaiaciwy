@@ -587,6 +587,8 @@ Systematic sweep of the codebase for latent bugs. Candidates identified during a
 
 5. **`tetrapay.py` IPN drop counters are process-local** — same pattern as `payments.py`. Both reset to zero on bot restart. The Prometheus `/metrics` endpoint (Step-A) will export them, but the admin dashboard at `/admin/` doesn't show them anywhere. Consider adding a "IPN health" section to the dashboard.
 
+6. **`rate_limit._chat_inflight` was a `set[int]` but eviction expected FIFO order.** When `_CHAT_INFLIGHT_MAX` (10 000) is exceeded the eviction branch did `next(iter(_chat_inflight))`, which the comment described as "FIFO so the oldest stuck slot drops first" — but `set` iteration is hash-bucket-ordered, not insertion-ordered. For real Telegram ids (10-digit ints) the first-iter element is essentially arbitrary and frequently happens to be the *most recent* claim, i.e. an actively-in-flight user whose request has not finished. Pre-fix, a leak that filled the slot dict could evict the wrong users in a loop, simultaneously (a) leaving the truly stuck slots in place and (b) cancelling the in-flight requests of innocent active users. Fix: switch the container from `set[int]` to `dict[int, None]`. `dict` iteration is insertion-ordered (CPython 3.6 / Python 3.7 spec), so `next(iter(...))` returns the *actually* oldest slot. Same lock, same idempotent release semantics, same test surface — just a backing-store swap. Shipped Stage-15-Step-D #3-extension-2.
+
 #### Stage-15-Step-E: Future project suggestions
 
 **Priority:** info / planning
