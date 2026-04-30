@@ -64,9 +64,11 @@ jobs:
         run: |
           docker run --rm --entrypoint python meowassist-bot:ci -c "
           import payments, handlers, ai_engine, database, pricing
-          import models_catalog, strings, middlewares, main
+          import models_catalog, strings, middlewares, force_join, main
           from payments import verify_ipn_signature
+          from force_join import RequiredChannelMiddleware
           assert callable(verify_ipn_signature)
+          assert RequiredChannelMiddleware is not None
           print('all imports + verify_ipn_signature OK')
           "
 

@@ -14,6 +14,7 @@ from bot_commands import publish_bot_commands
 from database import db
 from handlers import SUPPORTED_PAY_CURRENCIES, router
 from middlewares import UserUpsertMiddleware
+from force_join import RequiredChannelMiddleware, get_required_channel
 from fx_rates import refresh_usd_to_toman_loop
 from model_discovery import discover_new_models_loop
 from payments import payment_webhook, refresh_min_amounts_loop
@@ -124,6 +125,24 @@ async def main():
     upsert = UserUpsertMiddleware()
     dp.message.outer_middleware(upsert)
     dp.callback_query.outer_middleware(upsert)
+
+    # Stage-13-Step-A: required-channel subscription gate. Registered
+    # AFTER UserUpsertMiddleware so the users row (and therefore the
+    # preferred-language column) is available when the gate renders
+    # the join screen. When REQUIRED_CHANNEL is unset the middleware
+    # short-circuits so existing deploys see no behaviour change. See
+    # force_join.py for the full contract (admin escape hatch,
+    # fail-open on Telegram-API errors, etc.).
+    required_channel = get_required_channel()
+    if required_channel:
+        log.info(
+            "force-join: enabled — required channel %r", required_channel
+        )
+        join_gate = RequiredChannelMiddleware()
+        dp.message.outer_middleware(join_gate)
+        dp.callback_query.outer_middleware(join_gate)
+    else:
+        log.info("force-join: disabled (REQUIRED_CHANNEL unset)")
 
     # Per-user chat rate limiting is implemented INSIDE the AI catch-all
     # handler via ``rate_limit.consume_chat_token`` — not as a

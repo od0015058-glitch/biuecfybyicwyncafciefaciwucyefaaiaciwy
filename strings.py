@@ -115,6 +115,17 @@ _STRINGS: dict[str, dict[str, str]] = {
             "سلام {first_name}!\n\n"
             "به دروازه هوش مصنوعی ما خوش آمدید."
         ),
+        # ---- Required-channel gate (Stage-13-Step-A) ----
+        "force_join_text": (
+            "📢 **برای استفاده از ربات ابتدا باید عضو کانال ما شوید.**\n\n"
+            "لطفاً کانال {channel} را عضو شوید و سپس روی دکمهٔ \"عضو شدم\" بزنید."
+        ),
+        "force_join_not_yet": (
+            "❌ هنوز عضو کانال نشده‌اید.\n\n"
+            "لطفاً ابتدا کانال {channel} را عضو شوید و سپس دوباره دکمهٔ \"عضو شدم\" را بزنید."
+        ),
+        "btn_force_join_join": "📢 عضویت در کانال",
+        "btn_force_join_check": "✅ عضو شدم",
         # ---- Support ----
         "support_text": (
             "🎧 **پشتیبانی فنی**\n\n"
@@ -456,6 +467,17 @@ _STRINGS: dict[str, dict[str, str]] = {
             "Hi {first_name}!\n\n"
             "Welcome to our AI gateway."
         ),
+        # ---- Required-channel gate (Stage-13-Step-A) ----
+        "force_join_text": (
+            "📢 **Please join our channel to use the bot.**\n\n"
+            "Join {channel} and then tap \"I've joined\" below."
+        ),
+        "force_join_not_yet": (
+            "❌ You're not a member of the channel yet.\n\n"
+            "Please join {channel} first, then tap \"I've joined\" again."
+        ),
+        "btn_force_join_join": "📢 Join channel",
+        "btn_force_join_check": "✅ I've joined",
         # ---- Support ----
         "support_text": (
             "🎧 **Technical support**\n\n"
