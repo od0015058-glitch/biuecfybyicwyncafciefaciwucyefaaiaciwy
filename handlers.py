@@ -165,9 +165,11 @@ async def _hub_text_and_kb(
     # value as ``${balance:.2f}`` directly, and ``f"${math.nan:.2f}"``
     # renders literally ``$nan`` — so a corrupted ``users.balance_usd``
     # row (legacy NaN, manual SQL fix gone wrong, etc.) would leak
-    # ``$nan`` into the user's hub view. PR #101 already shipped this
-    # exact guard for ``wallet_text`` via ``format_balance_block``;
-    # the hub template was missed. ``$0.00`` is the closest sensible
+    # ``$nan`` into the user's hub view. The same regression applies
+    # to ``wallet_text`` (``hub_wallet_handler`` /
+    # ``back_to_wallet_handler``) and ``redeem_ok``
+    # (:func:`_redeem_code_for_user`); both call sites get the same
+    # ``math.isfinite`` guard. ``$0.00`` is the closest sensible
     # rendering of "we don't know your balance" — the upstream that
     # handed us a NaN has a real bug, not a UI string.
     raw_balance = float(user["balance_usd"]) if user else 0.0
@@ -360,7 +362,19 @@ async def _redeem_code_for_user(
     status = result.get("status")
     if status == "ok":
         amount = float(result["amount_usd"])
-        new_balance = float(result["new_balance_usd"])
+        # Same NaN-guard as :func:`_hub_text_and_kb` — ``redeem_ok``
+        # formats ``new_balance`` as ``${balance:.2f}`` directly, and
+        # ``f"${math.nan:.2f}"`` renders literally ``$nan``. Defence in
+        # depth: ``redeem_gift_code`` itself only credits a positive
+        # amount onto a row that's already been rejected at every
+        # write site that could mint a NaN, so the worst real-world
+        # path is a legacy NaN row that never got swept. Falling back
+        # to ``$0.00`` matches the hub view's policy: "we don't know
+        # your balance" is a real bug upstream, not a UI string.
+        raw_new_balance = float(result["new_balance_usd"])
+        new_balance = (
+            raw_new_balance if math.isfinite(raw_new_balance) else 0.0
+        )
         log.info(
             "redeem ok telegram_id=%s code=%s amount=%s new_balance=%s",
             user_id, code_arg.upper(), amount, new_balance,
@@ -443,7 +457,17 @@ async def hub_wallet_handler(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     lang = await _get_user_language(user_id)
     user_data = await db.get_user(user_id)
-    balance = float(user_data["balance_usd"]) if user_data else 0.0
+    # NaN guard — ``wallet_text`` formats ``${balance:.2f}`` directly,
+    # so a corrupted ``users.balance_usd`` row would otherwise leak
+    # ``$nan`` into the wallet view. Same regression Stage-13-Step-A
+    # fixed for ``hub_title`` (see :func:`_hub_text_and_kb`); the
+    # comment there mistakenly claimed ``wallet_text`` was already
+    # protected via ``format_balance_block``, but ``format_balance_block``
+    # was never wired into this handler — the wallet template still
+    # goes through ``strings.t`` with the raw float. Falling back to
+    # ``$0.00`` matches the hub policy.
+    raw_balance = float(user_data["balance_usd"]) if user_data else 0.0
+    balance = raw_balance if math.isfinite(raw_balance) else 0.0
     builder = _build_wallet_keyboard(lang)
     # Stage-11-Step-D: append the live USD→Toman annotation to the
     # USD figure when an FX snapshot is cached. ``format_toman_annotation``
@@ -1389,7 +1413,10 @@ async def back_to_wallet_handler(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     lang = await _get_user_language(user_id)
     user_data = await db.get_user(user_id)
-    balance = float(user_data["balance_usd"]) if user_data else 0.0
+    # Same NaN guard the primary ``hub_wallet_handler`` uses; this
+    # exit path lands on the same ``wallet_text`` template.
+    raw_balance = float(user_data["balance_usd"]) if user_data else 0.0
+    balance = raw_balance if math.isfinite(raw_balance) else 0.0
     builder = _build_wallet_keyboard(lang)
     snap = await get_usd_to_toman_snapshot()
     toman_line = format_toman_annotation(lang, balance, snap)
