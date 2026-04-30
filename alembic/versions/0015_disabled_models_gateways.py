@@ -21,14 +21,14 @@ Both tables are append-only (INSERT to disable, DELETE to enable),
 so re-enabling a model or gateway is a clean row removal rather
 than a boolean flip — simpler audit trail and no stale rows.
 
-Revision ID: 0015
-Revises: 0014
+Revision ID: 0015_disabled_models_gateways
+Revises: 0014_referral_codes
 """
 
 from alembic import op
 
-revision = "0015"
-down_revision = "0014"
+revision = "0015_disabled_models_gateways"
+down_revision = "0014_referral_codes"
 branch_labels = None
 depends_on = None
 
