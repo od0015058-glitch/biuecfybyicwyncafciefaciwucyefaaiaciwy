@@ -51,15 +51,46 @@ async def load_disabled_gateways(db) -> None:
 
 
 async def refresh_disabled_models(db) -> None:
-    """Re-sync the in-memory cache after an admin toggle."""
+    """Re-sync the in-memory cache after an admin toggle.
+
+    Fail-soft on a DB read error: log the exception and **preserve the
+    previous cache** (do NOT clear it). The admin path that calls this
+    already issued the canonical write to the ``disabled_models`` table,
+    so the source of truth is correct — the cache will resync on the
+    next successful refresh (or process restart). Clearing the cache
+    on a transient SELECT blip would falsely re-enable every disabled
+    model in the meantime, which is the opposite of fail-safe.
+
+    Stage-15-Step-D #3-extension. Pre-fix, the bare ``await`` would
+    propagate up to the aiohttp ``_models_toggle_post`` handler and
+    return a 500 to the admin even though the toggle itself succeeded
+    on the DB row — confusing the admin into clicking again.
+    """
     global _disabled_models
-    _disabled_models = await db.get_disabled_models()
+    try:
+        _disabled_models = await db.get_disabled_models()
+    except Exception:
+        log.exception(
+            "refresh_disabled_models failed; preserving previous "
+            "in-memory cache (size=%d) until next successful refresh.",
+            len(_disabled_models),
+        )
 
 
 async def refresh_disabled_gateways(db) -> None:
-    """Re-sync the in-memory cache after an admin toggle."""
+    """Re-sync the in-memory cache after an admin toggle.
+
+    See :func:`refresh_disabled_models` for the fail-soft rationale.
+    """
     global _disabled_gateways
-    _disabled_gateways = await db.get_disabled_gateways()
+    try:
+        _disabled_gateways = await db.get_disabled_gateways()
+    except Exception:
+        log.exception(
+            "refresh_disabled_gateways failed; preserving previous "
+            "in-memory cache (size=%d) until next successful refresh.",
+            len(_disabled_gateways),
+        )
 
 
 def is_model_disabled(model_id: str) -> bool:
