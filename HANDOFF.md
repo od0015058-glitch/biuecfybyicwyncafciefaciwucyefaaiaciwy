@@ -586,7 +586,7 @@ Systematic sweep of the codebase for latent bugs. Candidates identified during a
 
 1. ~~**`_active_pay_currencies()` in handlers.py doesn't filter by whether NowPayments API key is actually configured.**~~ ✅ **shipped (Stage-15-Step-A bundle)** — `_active_pay_currencies` now also drops every NowPayments-routed ticker when `NOWPAYMENTS_API_KEY` is unset / whitespace-only, so the picker no longer surfaces options whose invoice-creation path would 401. Implementation reads the env var fresh on every call so a `.env` edit + restart picks it up without a code change. Tests: `tests/test_admin_toggles.py::test_active_pay_currencies_empty_when_nowpayments_unset` (new) + `test_active_pay_currencies_filters_disabled` (updated to monkeypatch `NOWPAYMENTS_API_KEY=dummy` so it stays scoped to the toggle-filter behaviour).
 
-2. **`openrouter_keys.py` `load_keys()` runs at module import time.** If the module is imported during tests or by a script that doesn't need OpenRouter, missing env vars cause a `RuntimeError` at import. Fix: lazy-load on first call to `key_for_user()` instead of at import.
+2. ~~**`openrouter_keys.py` `load_keys()` runs at module import time.**~~ ✅ **shipped (Stage-15-Step-D #2 PR)** — `load_keys()` is now triggered lazily by the first call to `key_for_user()` / `key_count()`, so an importer that doesn't need OpenRouter (a small DB-only script, a focused test suite) gets a silent import instead of a spurious "No OPENROUTER_API_KEY* env vars found." WARNING. The eager-at-import load also forced tests that `monkeypatch.setenv("OPENROUTER_API_KEY", ...)` to manually call `openrouter_keys.load_keys()` after the patch (because the cold-import snapshot already happened); the lazy contract makes that boilerplate unnecessary. A second access does NOT re-read env (the contract is "lazy *first* load") — explicit `load_keys()` remains the supported path for a hot reload. **Bundled bug fix:** Prometheus label-value escaping in `metrics._format_labelled_counter`. Per the [text-exposition spec](https://prometheus.io/docs/instrumenting/exposition_formats/) label values must escape `\` → `\\`, `"` → `\"` and `\n` → `\n`; the previous implementation skipped escaping with a comment claiming the only callers (`_IPN_DROP_COUNTERS`, `_TETRAPAY_DROP_COUNTERS`) emit ASCII-safe identifiers, which is true *today* but is one defensive check away from "any future caller passing a string poisons the entire scrape". A `"` in a label value would close the quoted region early and the line `meowassist_x{reason="bad"value"} 1` parses as malformed, blanking every metric in the response. New `_escape_label_value(value)` helper escapes the three required sequences in the right order (backslashes first, otherwise the quote-escape would be double-escaped); 2 new tests in `tests/test_metrics.py` (`test_format_labelled_counter_escapes_quotes_backslash_newlines`, `test_escape_label_value_unit`); 5 new tests in `tests/test_openrouter_keys.py` exercising the lazy-load contract. Total: 1358 (was 1351).
 
 3. **Race condition in `admin_toggles.py` refresh.** `refresh_disabled_models(db)` replaces `_disabled_models` with a new set from DB. Between the DB query and the set assignment, a concurrent `is_model_disabled()` call reads stale data. In practice harmless (single-process, async not threaded) but a future `uvloop` + thread pool change could surface it. Fix: document the single-process assumption or use `asyncio.Lock`.
 
@@ -960,14 +960,19 @@ The user's process for this project — **do not deviate**:
 10. **Stage-15 in progress** — see §"Stage-15" in this file.
     B (server update script with backup rotation) and C
     (logos/posters AI prompt folder) shipped as PR #112.
-    A (Prometheus `/metrics` endpoint) shipped this PR with bundled
+    A (Prometheus `/metrics` endpoint) shipped PR #113 with bundled
     bug fix Stage-15-Step-D #1 (`_active_pay_currencies` no longer
     surfaces NowPayments tickers when `NOWPAYMENTS_API_KEY` is
-    unset). Remaining: Stage-15-Step-D candidates #2–#5 (lazy-load
-    `openrouter_keys`, `admin_toggles` refresh race-condition
-    documentation, model-id `/` slash routing audit, IPN-health
-    dashboard tile), Stage-15-Step-E (12 future project
-    suggestions, doc-only).
+    unset). D #3-extension (`admin_toggles` refresh fail-soft) PR
+    #114; D #6 (FIFO inflight eviction switch from `set` to `dict`)
+    PR #115. **D #2 (lazy-load `openrouter_keys`) shipped this
+    PR** with bundled bug fix: Prometheus label-value escaping in
+    `metrics._format_labelled_counter`. Remaining:
+    Stage-15-Step-D candidates #3 / #4 (race-condition assumption
+    doc + model-id slash routing audit, both doc-only since the
+    code is already correct) and #5 (IPN-health dashboard tile).
+    Stage-15-Step-E is doc-only and the 12 suggestions are
+    already enumerated above.
 11. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.

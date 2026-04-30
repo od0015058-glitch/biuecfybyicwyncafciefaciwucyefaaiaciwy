@@ -197,6 +197,25 @@ def _format_help_and_type(
     ]
 
 
+def _escape_label_value(value: str) -> str:
+    """Escape a Prometheus label value per the text-exposition spec.
+
+    Per https://prometheus.io/docs/instrumenting/exposition_formats/
+    label values must escape ``\\`` as ``\\\\``, ``"`` as ``\\"`` and
+    newline as ``\\n``. The current callers (``_IPN_DROP_COUNTERS``,
+    ``_TETRAPAY_DROP_COUNTERS``) only emit ASCII-safe identifiers like
+    ``"bad_signature"`` so escaping is a no-op for them — but a
+    future caller passing an arbitrary key (e.g. an OpenRouter model
+    id with a literal ``"`` from a malicious or buggy upstream
+    response) would otherwise produce a ``meowassist_x{label="bad
+    "value"} 1`` line that Prometheus' parser rejects with a
+    ``unexpected character ...`` error and the whole scrape fails —
+    blanking every metric in the response. A quick escape pass keeps
+    the endpoint robust against that class of poisoning.
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
 def _format_labelled_counter(
     metric_name: str,
     help_text: str,
@@ -209,16 +228,20 @@ def _format_labelled_counter(
     Prometheus happy when an operator runs a ``rate(...)`` query
     against a counter that has not yet been incremented this process
     lifetime.
+
+    Label values are escaped per the exposition spec
+    (:func:`_escape_label_value`) so a future caller passing a label
+    that contains ``"`` / ``\\`` / newline can't poison the rendered
+    body and break the whole ``/metrics`` response.
     """
     lines = _format_help_and_type(metric_name, help_text, "counter")
     for label_value, count in sorted(counters.items()):
-        # Labels are pure ASCII keys (e.g. "bad_signature") — no
-        # escaping needed, but we still wrap them in quotes to satisfy
-        # the format. Counter values are non-negative integers in our
-        # case, but we render via int() to defend against a future
-        # caller passing a float.
+        escaped = _escape_label_value(label_value)
+        # Counter values are non-negative integers in our case, but
+        # we render via int() to defend against a future caller
+        # passing a float.
         lines.append(
-            f'{metric_name}{{{label_key}="{label_value}"}} {int(count)}'
+            f'{metric_name}{{{label_key}="{escaped}"}} {int(count)}'
         )
     return lines
 

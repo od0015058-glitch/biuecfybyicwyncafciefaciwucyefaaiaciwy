@@ -122,7 +122,11 @@ NowPayments crypto invoices.
   accounts. Each user sticks to one key (`telegram_id % N`) so
   conversation context stays consistent. If only the bare
   `OPENROUTER_API_KEY` is set, all traffic goes there (backward-
-  compatible). See `.env.example` for details.
+  compatible). See `.env.example` for details. Keys are read
+  **lazily** on the first call to `key_for_user()` / `key_count()`
+  so an importer that never needs OpenRouter (a small DB-only
+  script, a focused test) doesn't trigger a spurious "no keys
+  configured" warning at import time.
 - **Prometheus `/metrics` endpoint** — the same aiohttp server that
   hosts the IPN webhooks publishes `GET /metrics` in Prometheus
   text-exposition format for internal scraping (Prometheus,
