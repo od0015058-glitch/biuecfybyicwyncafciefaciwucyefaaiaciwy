@@ -297,6 +297,36 @@ def test_parse_balance_args_bad_user_id():
     assert parse_balance_args("/admin_credit foo 5 reason") == "bad_user_id"
 
 
+# Stage-15-Step-E #5 bundled bug fix — Telegram user ids are positive
+# 64-bit integers; reject 0 and negatives at the parser. Pre-fix the
+# parser only required "is an integer", so a typo (dropped digit
+# landing on 0, or a stray minus sign) would pass the parser, hit
+# the DB layer, and return a generic "no such user" reply.
+
+
+def test_parse_balance_args_rejects_zero_user_id():
+    assert (
+        parse_balance_args("/admin_credit 0 5 reason") == "bad_user_id"
+    )
+
+
+def test_parse_balance_args_rejects_negative_user_id():
+    assert (
+        parse_balance_args("/admin_credit -12345 5 reason") == "bad_user_id"
+    )
+
+
+def test_parse_balance_args_accepts_large_positive_user_id():
+    """A real Telegram user id can be up to ~2^53. Pin that the
+    new positivity check doesn't accidentally clamp the upper end.
+    """
+    out = parse_balance_args(
+        "/admin_credit 9999999999 5 reason"
+    )
+    assert isinstance(out, tuple)
+    assert out[0] == 9999999999
+
+
 def test_parse_balance_args_bad_amount_text():
     assert (
         parse_balance_args("/admin_credit 12345 not_a_num reason")

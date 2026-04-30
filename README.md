@@ -179,6 +179,20 @@ NowPayments crypto invoices.
   hard-codes `WHERE telegram_id = $1` on every sub-query so a
   buggy caller can't leak someone else's totals. First slice of
   Stage-15-Step-E #2.
+- **Admin role hierarchy** — three-level role split for the
+  Telegram-side admin surface: `VIEWER` (read-only dashboard /
+  metrics / balance lookup), `OPERATOR` (VIEWER + broadcast +
+  promo create/list/revoke), `SUPER` (OPERATOR + admin_credit /
+  admin_debit and other money-touching commands). The new
+  `admin_roles.py` module ships the predicates
+  (`get_user_role`, `has_role`, `get_admins_for_role`,
+  `role_status_snapshot`) sourced from the new
+  `ADMIN_VIEWER_USER_IDS` and `ADMIN_OPERATOR_USER_IDS` env vars
+  alongside the existing `ADMIN_USER_IDS` (which now grants
+  SUPER for back-compat — existing deploys flip over with no
+  config change). First slice of Stage-15-Step-E #5; per-handler
+  refactor and DB-backed storage are explicit follow-ups
+  documented in HANDOFF.md §5.
 - **Opt-in Telegram webhook mode** — set `TELEGRAM_WEBHOOK_SECRET`
   to switch from long-polling to webhook delivery. The bot mounts
   a `POST /telegram-webhook/<secret>` route on the same aiohttp
@@ -388,7 +402,7 @@ See [HANDOFF.md](./HANDOFF.md) §Stage-15 for the full queue:
 | **Stage-15-B** | Server update script with backup rotation | shipped |
 | **Stage-15-C** | Logos & posters AI prompt folder | shipped |
 | **Stage-15-D** | Bug-fix sweep | shipped (PRs #113–#118, all 6 candidates closed) |
-| **Stage-15-E** | Future project suggestions (12 items) | **#1 MERGED** (conversation history export, first slice) · **#2 MERGED** (per-user spending dashboard, first slice) · **#3 STARTED** (opt-in webhook mode) |
+| **Stage-15-E** | Future project suggestions (12 items) | **#1 MERGED** (conversation history export, first slice) · **#2 MERGED** (per-user spending dashboard, first slice) · **#3 MERGED** (opt-in webhook mode) · **#4 STARTED** (per-key 429 cooldown, in flight as PR #122) · **#5 STARTED** (admin role hierarchy) |
 
 ## License / contributing
 

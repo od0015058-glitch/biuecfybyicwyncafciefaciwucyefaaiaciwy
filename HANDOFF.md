@@ -646,6 +646,38 @@ What remains (next AI's TODO):
 * **Rate limiting** — the menu button is fine (Telegram debounces callback queries). If `/history` text command lands, gate it behind the same chat-token bucket as `cmd_chat` so a user can't spam-export their buffer to DoS the DB.
 * **Schema-rotation hook** — if the operator ever needs to comply with a "delete all my data" request, `Database.clear_conversation` already exists. Document that the export button is the user-facing read side and `mem_reset` is the user-facing delete side.
 
+##### Stage-15-Step-E #5 — what's shipped vs. what remains (STARTED, not finished)
+
+**Step-E #5 (Admin role system) — STARTED in PR-after-Step-E-#4.**
+
+Original spec (Step-E table row 5): "Admin role system — currently all admins have full access. Add roles: viewer (read-only dashboard), operator (can broadcast, manage promos), super (can edit users, refund). Store in DB, not env."
+
+What's shipped this PR:
+
+* New module `admin_roles.py` — env-backed first slice of the role hierarchy. Module docstring (lines 1-105) lays out the design rationale and explicitly enumerates what's NOT in this slice (DB storage, per-handler refactor, web admin UI for roles, audit log of role-elevation attempts).
+* `class Role(IntEnum)` — `VIEWER=10`, `OPERATOR=20`, `SUPER=30`. Strict numeric ordering so `has_role(uid, OPERATOR)` is implemented as a numeric comparison, with values intentionally spaced 10/20/30 so a future intermediate role (`MODERATOR=15`, etc.) can be inserted without renumbering anything.
+* Env vars: `ADMIN_VIEWER_USER_IDS` (new), `ADMIN_OPERATOR_USER_IDS` (new), `ADMIN_USER_IDS` (existing — kept its semantics: ids there are granted SUPER role for back-compat). The two new vars are opt-in; an existing deploy with only `ADMIN_USER_IDS` set continues to work unchanged.
+* `_parse_role_user_ids(raw, env_name)` — comma-separated parser. Tolerant of empty / whitespace / non-integer entries (logs WARNING with the env-name so the operator can identify which var has the typo); rejects `0` and negative ids (Telegram user ids are positive 64-bit integers — negatives are aiogram chat / supergroup ids).
+* `get_user_role(telegram_id) -> Role | None` — return the highest role granted. "Highest" by numeric value, so an id listed in both `ADMIN_USER_IDS` and `ADMIN_VIEWER_USER_IDS` resolves to SUPER (defends against a half-completed demote leaving the SUPER entry behind). Returns None for non-admins, for `None` input, and for any id ≤ 0.
+* `has_role(telegram_id, required) -> bool` — predicate honouring the hierarchy. SUPER passes any check, OPERATOR passes VIEWER and OPERATOR, VIEWER passes only VIEWER, non-admin fails everything.
+* `get_admins_for_role(required) -> frozenset[int]` — for notifiers that want to fan-out only to OPERATOR-and-above. The first slice does NOT rewire the existing notifiers (`model_discovery`, `pending_alert`, `fx_rates`); they continue to call `admin.get_admin_user_ids()` (= every admin = every role) so behaviour is unchanged.
+* `set_admin_role_user_ids(role, ids)` and `reload_from_env()` — runtime overrides for tests / hot-reload.
+* `role_status_snapshot()` — diagnostic dict `role_name -> sorted_id_list`. Stable shape for ops dashboards and a future `/admin_roles` command.
+* 32 new tests in `tests/test_admin_roles.py` covering: enum ordering / value spacing pin, `_parse_role_user_ids` (empty / strip / dedupe / non-integer / non-positive), `get_user_role` (each role / unknown / None / 0 / negative / multi-bucket-resolves-to-highest), `has_role` (each level + non-admin + None), `get_admins_for_role` (each threshold), `set_admin_role_user_ids` (override / drops non-positive / drops non-int), `role_status_snapshot` (shape + sorted lists), `reload_from_env` (picks up new vars + reset clears).
+
+What remains (next AI's TODO):
+
+* **Per-handler role-gate refactor** — every existing admin handler still calls `admin.is_admin`. The natural mapping is: `admin_hub` / `admin_metrics` / `admin_balance` / `admin_promo_list` → VIEWER; `admin_promo_create` / `admin_promo_revoke` / `admin_broadcast` → OPERATOR; `admin_credit` / `admin_debit` → SUPER. This is intentionally NOT bundled into the role-introduction PR — wiring the predicates and the call-site refactor in the same PR multiplies the surface area for a typo that nukes admin access. Do it as a separate PR with a careful diff.
+* **DB-backed role storage** — the spec explicitly asks for "Store in DB, not env". This is the larger follow-up: alembic migration adding an `admin_roles` table (`telegram_id BIGINT PRIMARY KEY, role TEXT NOT NULL CHECK (role IN ('VIEWER','OPERATOR','SUPER'))`), `Database.get_admin_role(telegram_id)` and `set_admin_role(telegram_id, role)` methods, and swapping `_parse_role_user_ids` out for a DB-backed cache. The env vars stay as a bootstrap fallback (so the operator can recover access if the DB is corrupt). Pin the env→DB precedence test so the policy is unambiguous.
+* **Web admin UI for editing role assignments** — once the DB table exists, add a `/admin/roles` page to `web_admin.py` listing current admins by role with add/remove buttons. Gate the page itself behind SUPER role (only super-admins can edit role assignments).
+* **Audit log of role-elevation attempts** — when a non-OPERATOR tries to use an OPERATOR-level command, log the attempt at WARNING. Useful forensic signal for a misconfigured deploy or a stale admin who shouldn't be poking the surface anymore.
+* **Swap the existing notifier fan-outs** (`model_discovery`, `pending_alert`, `fx_rates`) to use `get_admins_for_role(Role.OPERATOR)` so VIEWERs don't get pinged for ops-level events. Pure UX change but worth the audit.
+* **`/admin_roles` Telegram command** — render `role_status_snapshot()` so a SUPER admin can see who's at what level without having to read env files. Trivial once the predicates exist.
+
+Bundled bug fix in this PR: **`parse_balance_args` and `admin_balance` now reject non-positive Telegram user ids.** Pre-fix the parser only required "is an integer", so `/admin_credit 0 5.00 oops` (admin typing zero by mistake) or `/admin_credit -12345 5.00 typo` (admin slipping a minus sign — chat / supergroup id format) would pass the parser, hit `db.admin_adjust_balance(telegram_id=0, ...)` or similar, and return the generic "❌ No user with id `0`" reply. The negative case is the more concerning one: a real Telegram chat id (e.g. `-1001234567890` for a supergroup) would parse fine, definitely not match any users.telegram_id row, and surface the same generic error — the admin now has to remember the difference between user id and chat id. Failing earlier with a clearer "❌ user_id must be a positive Telegram user id." saves the DB round-trip AND surfaces a more actionable error message. Mirrors the equivalent positivity invariant introduced in `admin_roles._parse_role_user_ids` so the admin parser surface is consistent across env and command-line input paths. Three new test cases in `test_admin.py` pin the fix (rejects 0 / rejects negative / accepts large positive).
+
+---
+
 ##### Stage-15-Step-E #3 — what's shipped vs. what remains (STARTED, not finished)
 
 **Step-E #3 (Webhook mode instead of long-polling) — STARTED in PR-after-Step-E-#2.**
@@ -1068,22 +1100,38 @@ The user's process for this project — **do not deviate**:
     `conversation_export.format_history_as_text` now returns
     `(text, kept_count)` so the memory-export caption + toast
     report the actually-kept count after a 1 MB trim.
-    **Stage-15-Step-E #3 STARTED (this PR)** — first slice of
+    **Stage-15-Step-E #3 MERGED** (PR #121) — first slice of
     "webhook mode instead of long-polling": new
     `telegram_webhook.py` module gates Telegram updates behind a
-    secret token (header AND path), validates the secret's
-    charset/length per Telegram's documented spec, and shares the
-    aiohttp app + per-IP rate limiter with the IPN webhooks.
-    Opt-in via `TELEGRAM_WEBHOOK_SECRET`; default behaviour
-    (long-polling) is unchanged. Bundled bug fix in #3:
+    secret token (header AND path). Bundled bug fix in #3:
     `webhook_rate_limit_middleware` now protects the TetraPay
     endpoint (and the new opt-in Telegram webhook) instead of
-    just `/nowpayments-webhook` — pre-fix the TetraPay endpoint
-    bypassed the per-IP token bucket entirely so a flood of
-    forged callbacks could DoS the JSON-parse + signature-verify
-    path. See "Stage-15-Step-E #3 — what's shipped vs. what
-    remains" section above for the precise boundary so the next
-    AI can continue.
+    just `/nowpayments-webhook`.
+    **Stage-15-Step-E #4 STARTED** (PR #122 — in flight) — first
+    slice of "rate limiting per OpenRouter key": `openrouter_keys.py`
+    extended with a per-key 429 cooldown table and a fall-through
+    selection policy, `ai_engine.chat_with_model` calls the marker
+    on a 429. Bundled bug fix in #4: `pricing._apply_markup` now
+    NaN-guards the token-count side too.
+    **Stage-15-Step-E #5 STARTED (this PR)** — first slice of
+    "Admin role system": new `admin_roles.py` module ships a
+    `Role` IntEnum hierarchy (`VIEWER < OPERATOR < SUPER`),
+    env-backed buckets sourced from `ADMIN_VIEWER_USER_IDS`,
+    `ADMIN_OPERATOR_USER_IDS`, and the long-standing
+    `ADMIN_USER_IDS` (back-compat: ids there are now SUPER), and
+    the predicates `get_user_role` / `has_role` /
+    `get_admins_for_role` / `role_status_snapshot` so the next PR
+    can wire each admin command at the appropriate level. The
+    DB-backed role storage and the per-handler refactor are
+    explicit follow-ups (see "Stage-15-Step-E #5 — what's shipped
+    vs. what remains" section above). Bundled bug fix in #5:
+    `parse_balance_args` and `admin_balance` now reject
+    non-positive Telegram user ids — pre-fix a typo (dropped
+    digit landing on `0`, or a stray minus sign) passed the
+    parser, hit the DB layer, and returned a generic "no such
+    user" reply; rejecting at the parser saves the round-trip
+    and matches the equivalent invariant on the
+    `parse_admin_user_ids` side.
 11. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.

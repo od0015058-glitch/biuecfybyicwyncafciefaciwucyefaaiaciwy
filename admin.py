@@ -251,6 +251,16 @@ def parse_balance_args(text: str) -> tuple[int, float, str] | str:
 
     The leading word (the command itself) is stripped before parsing
     so callers can pass ``message.text`` directly.
+
+    User ids are validated to be **positive integers** (Telegram's
+    documented user id space). ``0`` and negative values are rejected
+    with ``"bad_user_id"`` — pre-fix the parser only required
+    "is an integer", so a typo like ``-12345`` (admin slipping a
+    minus sign) or a dropped digit landing on ``0`` would pass the
+    parser, hit the DB layer, and return a generic "no such user"
+    reply. Failing earlier with a clearer message saves the admin
+    the round-trip and matches the equivalent invariant on the
+    parse_admin_user_ids side (Stage-15-Step-E #5 bundled bug fix).
     """
     parts = text.strip().split(None, 3)
     if len(parts) < 4:
@@ -264,6 +274,8 @@ def parse_balance_args(text: str) -> tuple[int, float, str] | str:
     try:
         user_id = int(user_id_raw)
     except ValueError:
+        return "bad_user_id"
+    if user_id <= 0:
         return "bad_user_id"
     try:
         amount = float(amount_raw)
@@ -346,6 +358,15 @@ async def admin_balance(message: Message) -> None:
         user_id = int(parts[1].strip())
     except ValueError:
         await message.answer("❌ user_id must be an integer Telegram id.")
+        return
+    # Stage-15-Step-E #5 bundled bug fix: reject user_id <= 0 here
+    # too — same reasoning as parse_balance_args. A negative id is
+    # a Telegram chat / supergroup id, not a user id, and ``0`` is
+    # impossible for any real user.
+    if user_id <= 0:
+        await message.answer(
+            "❌ user_id must be a positive Telegram user id."
+        )
         return
     try:
         summary = await db.get_user_admin_summary(user_id)
