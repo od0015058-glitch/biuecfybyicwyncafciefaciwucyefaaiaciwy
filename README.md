@@ -354,11 +354,11 @@ See [HANDOFF.md](./HANDOFF.md) §Stage-15 for the full queue:
 
 | Step | Title | Status |
 |------|-------|--------|
-| **Stage-15-A** | Prometheus `/metrics` endpoint | pending |
-| **Stage-15-B** | Server update script with backup rotation | pending |
-| **Stage-15-C** | Logos & posters AI prompt folder | pending |
-| **Stage-15-D** | Bug-fix sweep | in progress (per-PR bundled fixes) |
-| **Stage-15-E** | Future project suggestions (12 items) | documented |
+| **Stage-15-A** | Prometheus `/metrics` endpoint | shipped |
+| **Stage-15-B** | Server update script with backup rotation | shipped |
+| **Stage-15-C** | Logos & posters AI prompt folder | shipped |
+| **Stage-15-D** | Bug-fix sweep | shipped (PRs #113–#118, all 6 candidates closed) |
+| **Stage-15-E** | Future project suggestions (12 items) | **#1 STARTED** (conversation history export, first slice) |
 
 ## License / contributing
 

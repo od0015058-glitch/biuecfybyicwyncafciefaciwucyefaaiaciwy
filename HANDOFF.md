@@ -624,6 +624,28 @@ Systematic sweep of the codebase for latent bugs. Candidates identified during a
 
 ---
 
+##### Stage-15-Step-E #1 — what's shipped vs. what remains (STARTED, not finished)
+
+User direction (2026-04-30): walk down the Step-E table and **start** every item one by one, marking each as STARTED in this doc so the next AI can continue the work. Each PR ships a meaningful first slice + a real bundled bug fix.
+
+**Step-E #1 (Conversation history persistence & export) — STARTED in PR-after-#118.**
+
+What's shipped this PR:
+
+* `conversation_export.py` — new module with `format_history_as_text(rows, user_handle)` and `export_filename_for(telegram_id)`. Renders the persisted buffer as a plain-text export with role labels, ISO-8601 UTC timestamps, and a header. Defensive against naive `datetime` (forces UTC), unknown roles (capitalised fallback), and missing timestamps (`(unknown time)` placeholder). 1 MB hard cap with **oldest-first truncation** and a header note showing kept-vs-trimmed counts.
+* `Database.get_full_conversation(telegram_id)` — new DB method, **separate** from `get_recent_messages`. Returns every row with `created_at`, ordered oldest-first, no `LIMIT`. Intentionally does NOT consult `memory_enabled` — the user owns the data even after they disable the feature.
+* `handlers.memory_export_handler` (`mem_export` callback) wired up. Empty-buffer → toast alert instead of empty file. Persisted under both memory states (the button is always visible on the memory screen).
+* New i18n strings (FA + EN): `btn_memory_export`, `memory_export_empty`, `memory_export_caption`, `memory_export_done`.
+* 13 new tests in `tests/test_conversation_export.py` covering formatter, filename, handler happy path, empty buffer, missing username, button visibility on both memory states.
+
+What remains (next AI's TODO):
+
+* **`.pdf` export** — the original spec mentioned both `.txt` and `.pdf`. PDF needs `reportlab` or `weasyprint` added to `requirements.txt`. **Important for Persian users:** RTL rendering is a known PDF pain point — `reportlab` needs an Arabic shaping library (`python-bidi` + `arabic-reshaper`). Confirm with the operator which dependency surface is acceptable before adding.
+* **`/history` command alias** — currently the only entry point is the inline-keyboard button on the memory screen. Add a `Command("history")` handler (~5 lines) that calls `memory_export_handler`'s body. Keep it in the same file.
+* **Pagination for very long buffers** — current 1 MB cap drops oldest rows. A heavy user with months of memory ON could legitimately want all of it; chunk the rendered text into multiple `.txt` files (`-part-1.txt`, `-part-2.txt`, ...) when above ~10 MB. Telegram's document cap is 50 MB.
+* **Rate limiting** — the menu button is fine (Telegram debounces callback queries). If `/history` text command lands, gate it behind the same chat-token bucket as `cmd_chat` so a user can't spam-export their buffer to DoS the DB.
+* **Schema-rotation hook** — if the operator ever needs to comply with a "delete all my data" request, `Database.clear_conversation` already exists. Document that the export button is the user-facing read side and `mem_reset` is the user-facing delete side.
+
 Audit findings (2026-04-30) noted by reading every file — kept here so a future AI / human can pick the highest-leverage one next:
 
 * **`cmd_start` has a redundant `db.create_user` call** (handlers.py ~278) — `UserUpsertMiddleware` already runs first. Inspected during the Stage-13-Step-Aplus audit and decided NOT to remove: the middleware swallows upsert exceptions (logged + handler still runs), so the explicit retry in `cmd_start` is the only safety net for a transient DB issue at the moment of `/start`. Belt-and-braces; leave it.
@@ -983,6 +1005,18 @@ The user's process for this project — **do not deviate**:
     PR #114 which only made the *post-write resync* fail-soft.
     Remaining: nothing in Stage-15-Step-D. Stage-15-Step-E is
     doc-only and the 12 suggestions are already enumerated above.
+    **Stage-15-Step-E #1 STARTED (this PR)** — first slice of
+    "conversation history persistence & export": new
+    `conversation_export.py` module renders the full buffer as a
+    plain-text export, new `Database.get_full_conversation` reads
+    every row with timestamps, new "📥 Export conversation" button
+    on the memory screen wires it up end-to-end. Bundled bug fix:
+    `metrics._format_help_and_type` now escapes `\` and newline in
+    HELP text per the Prometheus exposition spec — same defensive
+    pattern as the label-value escape closed in PR #116, but for
+    the unquoted HELP line. See "Stage-15-Step-E #1 — what's
+    shipped vs. what remains" section below for the precise
+    boundary so the next AI can continue.
 11. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.

@@ -187,12 +187,36 @@ def is_ip_allowed(
 # ── Exposition rendering ───────────────────────────────────────────
 
 
+def _escape_help_text(help_text: str) -> str:
+    """Escape a Prometheus ``# HELP`` text value per the text-exposition spec.
+
+    Per https://prometheus.io/docs/instrumenting/exposition_formats/
+    the only escaping required inside a HELP value is ``\\`` →
+    ``\\\\`` and newline → ``\\n``. (Quotes are NOT escaped — unlike
+    label values, the HELP text isn't quoted.)
+
+    Defensive pair to :func:`_escape_label_value`. PR #116 closed
+    the label-value gap but left this side untouched: the current
+    in-tree callers all pass static ASCII English strings ("``IPN
+    POSTs dropped, broken down by reason.``" etc.), so escaping is
+    a no-op today. But a future caller building a HELP line from
+    config / DB / a translated string with a literal newline (or
+    a Windows path with backslashes) would split the scrape: the
+    second half of the HELP text would parse as a fresh metric
+    line ("``line2 ...``") and either render bogus data or crash
+    Prometheus' line parser, blanking the entire response. Same
+    class of bug as the label-value escape, fixed for the same
+    reason.
+    """
+    return help_text.replace("\\", "\\\\").replace("\n", "\\n")
+
+
 def _format_help_and_type(
     name: str, help_text: str, metric_type: str
 ) -> list[str]:
     """Return the ``# HELP`` and ``# TYPE`` lines for a metric."""
     return [
-        f"# HELP {name} {help_text}",
+        f"# HELP {name} {_escape_help_text(help_text)}",
         f"# TYPE {name} {metric_type}",
     ]
 

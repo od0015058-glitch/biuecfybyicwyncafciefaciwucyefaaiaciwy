@@ -270,6 +270,60 @@ def test_escape_label_value_unit():
     )
 
 
+def test_escape_help_text_unit():
+    """``_escape_help_text`` is a pure function — only ``\\`` and
+    newline are escaped; quotes are NOT (HELP text is unquoted).
+
+    Bundled bug fix (Stage-15-Step-E #1 PR): same defensive escape
+    pattern as :func:`_escape_label_value`, applied to the HELP
+    line. Today's callers all pass static ASCII English strings so
+    escaping is a no-op, but a future caller passing arbitrary text
+    (a translated message, a config-derived description, a Windows
+    path with ``\\``) would otherwise split the scrape on the
+    embedded newline — and Prometheus would parse the second half
+    as a new metric line, returning bogus data or blanking the
+    entire response.
+    """
+    assert metrics._escape_help_text("plain text") == "plain text"
+    # Quotes pass through unchanged.
+    assert metrics._escape_help_text('a "quoted" word') == 'a "quoted" word'
+    # Backslashes get doubled.
+    assert metrics._escape_help_text("c:\\path") == "c:\\\\path"
+    # Newlines become \\n.
+    assert (
+        metrics._escape_help_text("line1\nline2")
+        == "line1\\nline2"
+    )
+    # Backslash + newline ordering: escape backslashes first so the
+    # ``\\n`` we emit for newline doesn't get re-escaped.
+    assert (
+        metrics._escape_help_text("c:\\path\nfile")
+        == "c:\\\\path\\nfile"
+    )
+
+
+def test_format_help_and_type_escapes_help_text_with_newline():
+    """``_format_help_and_type`` must escape newlines in the HELP
+    text. A raw ``\\n`` would split the line and break parsing.
+    """
+    lines = metrics._format_help_and_type(
+        "meowassist_x", "first half\nsecond half", "counter"
+    )
+    # Exactly two lines emitted (HELP + TYPE), no spurious split.
+    assert len(lines) == 2
+    assert lines[0] == "# HELP meowassist_x first half\\nsecond half"
+    assert lines[1] == "# TYPE meowassist_x counter"
+
+
+def test_format_help_and_type_escapes_help_text_with_backslash():
+    """A Windows-style path or a raw regex in the HELP text must
+    have its backslashes doubled."""
+    lines = metrics._format_help_and_type(
+        "meowassist_x", "regex \\d+ count", "gauge"
+    )
+    assert lines[0] == "# HELP meowassist_x regex \\\\d+ count"
+
+
 def test_render_metrics_empty_counter_still_emits_preamble(monkeypatch):
     """A counter with zero rows still emits HELP/TYPE — consumers
     running ``rate(...)`` against the empty counter need to see
