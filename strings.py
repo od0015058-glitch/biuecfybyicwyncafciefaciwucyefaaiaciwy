@@ -93,6 +93,11 @@ _STRINGS: dict[str, dict[str, str]] = {
         "memory_toggled_off": "⚪ حافظه خاموش شد",
         "memory_reset_done": "🆕 گفتگو پاک شد ({count} پیام)",
         "memory_reset_empty": "💭 گفتگویی برای پاک کردن وجود ندارد.",
+        # Stage-15-Step-E #1 (conversation history export — first slice).
+        "btn_memory_export": "📥 دریافت تاریخچه گفتگو",
+        "memory_export_empty": "📭 تاریخچه‌ای برای دریافت وجود ندارد.",
+        "memory_export_caption": "📥 تاریخچه گفتگو ({count} پیام)",
+        "memory_export_done": "✅ {count} پیام به صورت فایل ارسال شد",
         # ---- Wallet redeem button (Stage-8-Part-3.5) ----
         "btn_redeem_gift": "🎁 استفاده از کد هدیه",
         "redeem_input_prompt": (
@@ -493,6 +498,11 @@ _STRINGS: dict[str, dict[str, str]] = {
         "memory_toggled_off": "⚪ Memory disabled",
         "memory_reset_done": "🆕 Conversation cleared ({count} messages)",
         "memory_reset_empty": "💭 No conversation to clear.",
+        # Stage-15-Step-E #1 (conversation history export — first slice).
+        "btn_memory_export": "📥 Export conversation",
+        "memory_export_empty": "📭 No conversation history to export yet.",
+        "memory_export_caption": "📥 Conversation history ({count} messages)",
+        "memory_export_done": "✅ Sent {count} messages as a file",
         # ---- Wallet redeem button (Stage-8-Part-3.5) ----
         "btn_redeem_gift": "🎁 Redeem gift code",
         "redeem_input_prompt": (

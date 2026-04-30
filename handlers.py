@@ -8,6 +8,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     KeyboardButton,
     Message,
@@ -19,6 +20,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from admin_toggles import is_gateway_disabled, is_model_disabled
 from ai_engine import chat_with_model
 from amount_input import normalize_amount
+from conversation_export import (
+    export_filename_for,
+    format_history_as_text,
+)
 from database import db
 from force_join import (
     FORCE_JOIN_CHECK_CALLBACK,
@@ -645,6 +650,15 @@ async def _render_memory_screen(callback: CallbackQuery, lang: str) -> None:
         builder.button(
             text=t(lang, "btn_memory_enable"), callback_data="mem_toggle"
         )
+    # Stage-15-Step-E #1 (started, not finished): export the
+    # persisted buffer as a ``.txt`` file. Always show the button
+    # — even when memory is currently OFF a user may have a buffer
+    # from before the toggle was flipped, and they own that data.
+    # Empty-buffer case is handled in the callback itself with a
+    # toast.
+    builder.button(
+        text=t(lang, "btn_memory_export"), callback_data="mem_export"
+    )
     _back_to_menu_button(builder, lang)
     builder.adjust(1)
     # Wipe ("🆕 New chat") followed by a re-render is the canonical
@@ -745,6 +759,49 @@ async def memory_reset_handler(callback: CallbackQuery, state: FSMContext):
     # ("conversation reset, 0 messages cleared").
     await callback.answer(t(lang, "memory_reset_done", count=deleted))
     await _render_memory_screen(callback, lang)
+
+
+@router.callback_query(F.data == "mem_export")
+async def memory_export_handler(callback: CallbackQuery, state: FSMContext):
+    """Stage-15-Step-E #1 (started, not finished): export the
+    persisted conversation buffer as a ``.txt`` document.
+
+    Pulls the full history (with timestamps) from the DB, renders
+    it via :func:`conversation_export.format_history_as_text`, and
+    sends it back as a Telegram document. The original memory
+    screen is left in place so the user can hit "Back" or export
+    again. Empty-buffer case is communicated via toast — the
+    button stays visible so it's discoverable, but tapping it
+    when there's nothing to export yields a clear "no history"
+    message rather than an empty file.
+
+    Future work tracked in ``conversation_export.py``'s module
+    docstring: ``.pdf`` export, ``/history`` command alias, paginated
+    multi-file export for very long buffers, rate limiting.
+    """
+    await state.clear()
+    lang = await _get_user_language(callback.from_user.id)
+    rows = await db.get_full_conversation(callback.from_user.id)
+    if not rows:
+        await callback.answer(
+            t(lang, "memory_export_empty"), show_alert=True
+        )
+        return
+    rendered = format_history_as_text(
+        rows, user_handle=callback.from_user.username
+    )
+    document = BufferedInputFile(
+        rendered.encode("utf-8"),
+        filename=export_filename_for(callback.from_user.id),
+    )
+    # ``answer_document`` lives on Message, not on CallbackQuery —
+    # send it via the bot itself so we can target the chat
+    # without disturbing the memory-screen message above it.
+    await callback.message.answer_document(
+        document,
+        caption=t(lang, "memory_export_caption", count=len(rows)),
+    )
+    await callback.answer(t(lang, "memory_export_done", count=len(rows)))
 
 
 @router.callback_query(F.data.startswith("set_lang_"))

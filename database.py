@@ -187,6 +187,43 @@ class Database:
         except (ValueError, IndexError):
             return 0
 
+    async def get_full_conversation(
+        self, telegram_id: int
+    ) -> list[dict]:
+        """Return every persisted message for the user, ordered
+        oldest-first, with the ``created_at`` timestamp included.
+
+        Stage-15-Step-E #1 (conversation history export, first
+        slice): the running-window read path
+        (:meth:`get_recent_messages`) drops the timestamp because
+        the LLM doesn't need it. Export needs it. This method is
+        the export-specific counterpart — same table, same filter,
+        no ``LIMIT``, ``ASC`` order, and the timestamp column
+        included.
+
+        Returns an empty list for a user with no buffer (no
+        special-case for ``memory_enabled`` because exporting
+        history that *was* recorded before the toggle was flipped
+        off is a legitimate use case — the user owns the data
+        even after they disable the feature).
+        """
+        query = """
+            SELECT role, content, created_at
+              FROM conversation_messages
+             WHERE telegram_id = $1
+             ORDER BY created_at ASC, id ASC
+        """
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(query, telegram_id)
+        return [
+            {
+                "role": r["role"],
+                "content": r["content"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+
     async def set_active_model(self, telegram_id: int, model_id: str) -> bool:
         """Updates the user's active OpenRouter model id.
 
