@@ -594,7 +594,7 @@ Systematic sweep of the codebase for latent bugs. Candidates identified during a
 
 4. **`web_admin.py` model toggle routes use URL path `{model_id}` but model IDs contain `/` characters** (e.g. `openai/gpt-4o`). aiohttp path parameters don't match `/` by default. Verify the current implementation handles this correctly (likely uses a catch-all `{model_id:.+}` pattern or POST body). If not, fix the route.
 
-5. **`tetrapay.py` IPN drop counters are process-local** — same pattern as `payments.py`. Both reset to zero on bot restart. The Prometheus `/metrics` endpoint (Step-A) will export them, but the admin dashboard at `/admin/` doesn't show them anywhere. Consider adding a "IPN health" section to the dashboard.
+5. ~~**`tetrapay.py` IPN drop counters are process-local** — same pattern as `payments.py`. Both reset to zero on bot restart. The Prometheus `/metrics` endpoint (Step-A) will export them, but the admin dashboard at `/admin/` doesn't show them anywhere.~~ ✅ **shipped (Stage-15-Step-D #5 PR)** — new "IPN health" panel on `/admin/` lists every drop-counter reason for both NowPayments and TetraPay with current count, labelled "since last restart" so an operator understands the volatility. New `_collect_ipn_health()` helper in `web_admin.py` snapshots both gateways behind their own `try` so a future regression in one accessor cannot blank the other half. Each gateway's tile shows an "all zero" caveat when the totals are zero (so a fresh restart with no traffic doesn't *look* broken) and a "counters unavailable" fallback when the accessor itself raises (so a future bug in `payments.get_ipn_drop_counters` doesn't 500 the entire dashboard). For long-running history beyond a single process lifetime, scrape `/metrics` into Prometheus — the panel intentionally does not persist counters to DB. **Bundled bug fix:** parity gap between `admin.format_metrics` (Telegram-side `/admin_metrics`) and the web dashboard. Stage-12-Step-B added `pending_payments_over_threshold_count` + `pending_alert_threshold_hours` to `Database.get_system_metrics` and wired both into `dashboard.html` but missed `format_metrics`, so an operator on Telegram saw "5 pending" with no signal that 3 of those 5 were already past the proactive-DM threshold and were triggering separate alert DMs. The web operator saw both. Now `format_metrics` renders an `↳ {N} over {threshold}h` sub-line whenever the over-threshold count is non-zero, matching the dashboard's tile. The sub-line is suppressed on zero (terse digest) and skipped entirely if the keys are missing (backward compat with pre-Stage-12-B callers / a half-populated dict from an upgrade-in-flight). 3 new `format_metrics` tests in `tests/test_admin.py`; 3 new dashboard tests in `tests/test_web_admin.py` covering the populated tile, the all-zero message, and the resilient-to-accessor-failure path. Total: ~1364.
 
 6. **`rate_limit._chat_inflight` was a `set[int]` but eviction expected FIFO order.** When `_CHAT_INFLIGHT_MAX` (10 000) is exceeded the eviction branch did `next(iter(_chat_inflight))`, which the comment described as "FIFO so the oldest stuck slot drops first" — but `set` iteration is hash-bucket-ordered, not insertion-ordered. For real Telegram ids (10-digit ints) the first-iter element is essentially arbitrary and frequently happens to be the *most recent* claim, i.e. an actively-in-flight user whose request has not finished. Pre-fix, a leak that filled the slot dict could evict the wrong users in a loop, simultaneously (a) leaving the truly stuck slots in place and (b) cancelling the in-flight requests of innocent active users. Fix: switch the container from `set[int]` to `dict[int, None]`. `dict` iteration is insertion-ordered (CPython 3.6 / Python 3.7 spec), so `next(iter(...))` returns the *actually* oldest slot. Same lock, same idempotent release semantics, same test surface — just a backing-store swap. Shipped Stage-15-Step-D #3-extension-2.
 
@@ -965,14 +965,19 @@ The user's process for this project — **do not deviate**:
     surfaces NowPayments tickers when `NOWPAYMENTS_API_KEY` is
     unset). D #3-extension (`admin_toggles` refresh fail-soft) PR
     #114; D #6 (FIFO inflight eviction switch from `set` to `dict`)
-    PR #115. **D #2 (lazy-load `openrouter_keys`) shipped this
-    PR** with bundled bug fix: Prometheus label-value escaping in
-    `metrics._format_labelled_counter`. Remaining:
-    Stage-15-Step-D candidates #3 / #4 (race-condition assumption
-    doc + model-id slash routing audit, both doc-only since the
-    code is already correct) and #5 (IPN-health dashboard tile).
-    Stage-15-Step-E is doc-only and the 12 suggestions are
-    already enumerated above.
+    PR #115. D #2 (lazy-load `openrouter_keys`) PR #116 with
+    bundled bug fix: Prometheus label-value escaping in
+    `metrics._format_labelled_counter`. **D #5 (IPN-health
+    dashboard tile) shipped this PR** with bundled bug fix:
+    `admin.format_metrics` now surfaces the
+    `pending_payments_over_threshold_count` sub-line that the web
+    dashboard already rendered, closing a Stage-12-Step-B parity
+    gap between the Telegram-side `/admin_metrics` digest and the
+    web `/admin/` dashboard. Remaining: Stage-15-Step-D candidates
+    #3 / #4 (race-condition assumption doc + model-id slash
+    routing audit, both doc-only since the code is already
+    correct). Stage-15-Step-E is doc-only and the 12 suggestions
+    are already enumerated above.
 11. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.

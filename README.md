@@ -154,6 +154,14 @@ NowPayments crypto invoices.
     expr: time() - meowassist_pending_reaper_last_run_epoch > 900
     for: 5m
   ```
+- **IPN-health dashboard tile** — `/admin/` shows a per-process
+  drop-counter table for both NowPayments and TetraPay so an
+  operator can spot a misconfigured webhook (signature mismatch,
+  unknown invoice, transient verify failures) at a glance without
+  shelling into the Prometheus scrape. Counters reset on every
+  bot restart; for long-running history, pull `/metrics` into
+  Prometheus. Gateway tiles are independently fault-isolated — a
+  future regression in one accessor cannot blank the other half.
 
 For the full project history, file map, and roadmap **read [HANDOFF.md](./HANDOFF.md)**.
 

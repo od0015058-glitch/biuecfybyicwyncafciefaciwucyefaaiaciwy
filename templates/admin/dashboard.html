@@ -43,6 +43,74 @@
 </div>
 
 <div class="panel">
+  <h3>IPN health <span style="font-weight: normal; font-size: 0.7em; color: var(--text-muted);">(drop counters since last restart)</span></h3>
+  <p style="color: var(--text-muted); margin: 0 0 0.75em 0; font-size: 0.85em;">
+    Each row is a per-process counter that increments when an IPN
+    delivery is rejected before reaching <code>finalize_payment</code>.
+    Counters reset on every bot restart — for long-running history
+    scrape <code>/metrics</code> into Prometheus.
+  </p>
+
+  <h4 style="margin: 0.5em 0 0.25em 0;">NowPayments</h4>
+  {% if ipn_health.nowpayments %}
+  <table>
+    <thead>
+      <tr>
+        <th>Reason</th>
+        <th>Count</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for reason, count in ipn_health.nowpayments.items()|sort %}
+      <tr>
+        <td><code>{{ reason }}</code></td>
+        <td>{{ "{:,}".format(count) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if ipn_health.nowpayments_total == 0 %}
+  <p style="color: var(--text-muted); margin: 0.25em 0; font-size: 0.85em;">
+    All zero — no NowPayments IPN drops recorded since startup.
+  </p>
+  {% endif %}
+  {% else %}
+  <p style="color: var(--text-muted); margin: 0;">
+    NowPayments counters unavailable (module import failed — see logs).
+  </p>
+  {% endif %}
+
+  <h4 style="margin: 1em 0 0.25em 0;">TetraPay</h4>
+  {% if ipn_health.tetrapay %}
+  <table>
+    <thead>
+      <tr>
+        <th>Reason</th>
+        <th>Count</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for reason, count in ipn_health.tetrapay.items()|sort %}
+      <tr>
+        <td><code>{{ reason }}</code></td>
+        <td>{{ "{:,}".format(count) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if ipn_health.tetrapay_total == 0 %}
+  <p style="color: var(--text-muted); margin: 0.25em 0; font-size: 0.85em;">
+    All zero — no TetraPay webhook drops recorded since startup.
+  </p>
+  {% endif %}
+  {% else %}
+  <p style="color: var(--text-muted); margin: 0;">
+    TetraPay counters unavailable (module import failed — see logs).
+  </p>
+  {% endif %}
+</div>
+
+<div class="panel">
   <h3>Top models (last 30d, by request count)</h3>
   {% if metrics.top_models %}
   <table>

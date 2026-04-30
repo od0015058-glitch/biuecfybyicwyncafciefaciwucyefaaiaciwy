@@ -1352,6 +1352,148 @@ async def test_dashboard_pending_zero_hides_oldest_age(
     )
 
 
+async def test_dashboard_renders_ipn_health_tile_with_drop_counts(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """Stage-15-Step-D #5: the new IPN-health panel surfaces every
+    drop-counter reason with its current count.
+
+    The counters live in :mod:`payments` and :mod:`tetrapay` and
+    are read each render via :func:`web_admin._collect_ipn_health`.
+    Patching the accessors gives us deterministic values for the
+    template assertions.
+    """
+    import payments
+    import tetrapay
+    monkeypatch.setattr(
+        payments,
+        "get_ipn_drop_counters",
+        lambda: {
+            "bad_signature": 7,
+            "bad_json": 3,
+            "missing_payment_id": 0,
+            "replay": 1,
+        },
+    )
+    monkeypatch.setattr(
+        tetrapay,
+        "get_tetrapay_drop_counters",
+        lambda: {
+            "bad_json": 0,
+            "missing_authority": 0,
+            "non_success_callback": 5,
+            "unknown_invoice": 2,
+            "verify_failed": 0,
+        },
+    )
+
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login",
+        data={"password": "letmein"},
+        allow_redirects=False,
+    )
+    resp = await client.get("/admin/")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+
+    # Section heading + the "since last restart" caveat are both
+    # part of the contract — operators must understand the
+    # counters reset on every redeploy.
+    assert "IPN health" in body
+    assert "since last restart" in body
+
+    # Per-gateway sub-headings + the reason-code rows.
+    assert "NowPayments" in body
+    assert "TetraPay" in body
+    for reason in (
+        "bad_signature", "bad_json", "missing_payment_id", "replay",
+        "missing_authority", "non_success_callback",
+        "unknown_invoice", "verify_failed",
+    ):
+        assert reason in body, f"missing reason {reason!r} in IPN tile"
+
+    # Numeric values render with thousands-sep (we picked small
+    # numbers so the formatter is identity, but the assertions
+    # still pin the format).
+    assert "7" in body
+    assert "5" in body
+
+
+async def test_dashboard_renders_ipn_health_all_zero_message(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """When every counter is zero (fresh restart, no traffic), the
+    panel must still render — and explain *why* it's empty rather
+    than looking broken.
+    """
+    import payments
+    import tetrapay
+    monkeypatch.setattr(
+        payments,
+        "get_ipn_drop_counters",
+        lambda: {"bad_signature": 0, "bad_json": 0, "missing_payment_id": 0, "replay": 0},
+    )
+    monkeypatch.setattr(
+        tetrapay,
+        "get_tetrapay_drop_counters",
+        lambda: {
+            "bad_json": 0, "missing_authority": 0,
+            "non_success_callback": 0, "unknown_invoice": 0,
+            "verify_failed": 0,
+        },
+    )
+
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "no NowPayments IPN drops recorded since startup" in body
+    assert "no TetraPay webhook drops recorded since startup" in body
+
+
+async def test_dashboard_ipn_health_resilient_to_accessor_failure(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """If one accessor raises (e.g. a future regression in payments
+    breaks ``get_ipn_drop_counters``) the dashboard must still
+    render; the broken half just shows a "counters unavailable"
+    line and the other gateway's tile keeps working.
+    """
+    import payments
+    import tetrapay
+    def boom():
+        raise RuntimeError("module regression")
+    monkeypatch.setattr(payments, "get_ipn_drop_counters", boom)
+    monkeypatch.setattr(
+        tetrapay,
+        "get_tetrapay_drop_counters",
+        lambda: {"bad_json": 4, "missing_authority": 0,
+                 "non_success_callback": 0, "unknown_invoice": 0,
+                 "verify_failed": 0},
+    )
+
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+
+    # NowPayments tile shows the failure-mode message.
+    assert "NowPayments counters unavailable" in body
+    # TetraPay tile still renders normally with the live counts.
+    assert "bad_json" in body
+    assert "4" in body
+
+
 async def test_dashboard_fallback_dicts_match_template_keys(
     aiohttp_client, make_admin_app
 ):

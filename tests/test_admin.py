@@ -173,6 +173,57 @@ def test_format_metrics_pending_without_age_renders_count_only():
     assert "2" in out
 
 
+def test_format_metrics_renders_over_threshold_subline():
+    """Stage-15-Step-D #5 bundled fix: the
+    ``pending_payments_over_threshold_count`` sub-line must surface
+    on the Telegram-side ``/admin_metrics`` digest so it matches
+    what ``dashboard.html`` already shows. Stage-12-Step-B added
+    the field but only wired it into the web template — operators
+    on Telegram saw "5 pending" with no signal that 3 were already
+    past the proactive-DM threshold and triggering separate alerts.
+    """
+    metrics = _sample_metrics()
+    metrics["pending_payments_count"] = 5
+    metrics["pending_payments_oldest_age_hours"] = 6.2
+    metrics["pending_payments_over_threshold_count"] = 3
+    metrics["pending_alert_threshold_hours"] = 2
+    out = format_metrics(metrics)
+    assert "Pending payments" in out
+    assert "5" in out
+    # The sub-line must mention both the count and the threshold so
+    # the operator can correlate with the proactive-DM threshold.
+    assert "3 over 2h" in out
+
+
+def test_format_metrics_omits_over_threshold_when_zero():
+    """When zero rows are over the threshold, the sub-line is
+    suppressed — keeps the digest terse on the happy path."""
+    metrics = _sample_metrics()
+    metrics["pending_payments_count"] = 4
+    metrics["pending_payments_oldest_age_hours"] = 0.5
+    metrics["pending_payments_over_threshold_count"] = 0
+    metrics["pending_alert_threshold_hours"] = 2
+    out = format_metrics(metrics)
+    assert "Pending payments" in out
+    assert "4" in out
+    assert "over 2h" not in out
+
+
+def test_format_metrics_skips_over_threshold_when_keys_missing():
+    """Backwards compatibility: a caller passing a pre-Stage-12-B
+    metrics dict (no over-threshold keys) must still get a clean
+    rendering. Defensive ``rows.get(...)`` covers the gap."""
+    metrics = _sample_metrics()
+    metrics["pending_payments_count"] = 7
+    metrics["pending_payments_oldest_age_hours"] = 3.0
+    # Deliberately omit pending_payments_over_threshold_count
+    # and pending_alert_threshold_hours.
+    out = format_metrics(metrics)
+    assert "Pending payments" in out
+    assert "7" in out
+    assert "over" not in out
+
+
 # ---- import-time module state ------------------------------------
 
 
