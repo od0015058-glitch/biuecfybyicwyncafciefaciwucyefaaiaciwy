@@ -4479,7 +4479,31 @@ async def models_get(request: web.Request) -> web.StreamResponse:
 async def _models_toggle_post(
     request: web.Request, *, enable: bool
 ) -> web.StreamResponse:
-    """Shared POST handler for model enable / disable."""
+    """Shared POST handler for model enable / disable.
+
+    Stage-15-Step-D #4 audit: ``model_id`` is read from the POST
+    form body (``form.get("model_id")``) — NOT from a URL path
+    parameter — so model IDs with embedded ``/`` characters
+    (``openai/gpt-4o``, ``anthropic/claude-3-5-sonnet``) work
+    transparently. aiohttp's path-template parameter matchers
+    don't traverse ``/`` by default and would otherwise require
+    the ``{model_id:.+}`` regex form, but the form-body design
+    sidesteps that entirely.
+
+    Stage-15-Step-D #3-extension-2 fix: wraps the canonical DB
+    write in ``try`` / ``except`` so a transient
+    ``asyncpg.ConnectionDoesNotExist`` (or any other
+    ``Exception``) renders a flash error and a clean 302
+    redirect back to the panel instead of bubbling up to a 500
+    response. This complements PR #114 — PR #114 made the
+    *post-write resync* fail-soft, but the **write itself** was
+    still bare-await. On a transient blip the admin panel would
+    return 500 even though the form was a valid request, leaving
+    the operator confused about whether the toggle actually took
+    effect (it usually didn't, since the DB write itself failed).
+    Audit + cache-refresh only run on a successful write so the
+    in-memory cache stays consistent with the DB state.
+    """
     secret = request.app.get(APP_KEY_SESSION_SECRET, "")
     cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
     db = request.app[APP_KEY_DB]
@@ -4502,18 +4526,35 @@ async def _models_toggle_post(
 
     from admin_toggles import refresh_disabled_models
 
-    if enable:
-        await db.enable_model(model_id)
-        await refresh_disabled_models(db)
-        await _record_audit_safe(request, "model_enable", target=model_id)
-        set_flash(response, kind="success", message=f"Enabled model: {model_id}",
-                  secret=secret, cookie_secure=cookie_secure)
-    else:
-        await db.disable_model(model_id)
-        await refresh_disabled_models(db)
-        await _record_audit_safe(request, "model_disable", target=model_id)
-        set_flash(response, kind="success", message=f"Disabled model: {model_id}",
-                  secret=secret, cookie_secure=cookie_secure)
+    try:
+        if enable:
+            await db.enable_model(model_id)
+        else:
+            await db.disable_model(model_id)
+    except Exception:
+        log.exception(
+            "models_toggle: %s_model(%r) failed; rendering flash error",
+            "enable" if enable else "disable",
+            model_id,
+        )
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Failed to {'enable' if enable else 'disable'} model — "
+                "DB error, see logs. The toggle did not take effect."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    await refresh_disabled_models(db)
+    audit_action = "model_enable" if enable else "model_disable"
+    await _record_audit_safe(request, audit_action, target=model_id)
+    verb = "Enabled" if enable else "Disabled"
+    set_flash(
+        response, kind="success", message=f"{verb} model: {model_id}",
+        secret=secret, cookie_secure=cookie_secure,
+    )
     return response
 
 
@@ -4552,7 +4593,14 @@ async def gateways_get(request: web.Request) -> web.StreamResponse:
 async def _gateways_toggle_post(
     request: web.Request, *, enable: bool
 ) -> web.StreamResponse:
-    """Shared POST handler for gateway enable / disable."""
+    """Shared POST handler for gateway enable / disable.
+
+    Stage-15-Step-D #3-extension-2 fix: same write-side fail-soft
+    pattern as :func:`_models_toggle_post`. The canonical
+    ``db.disable_gateway`` / ``db.enable_gateway`` call is wrapped
+    in ``try`` / ``except`` so a transient DB blip renders a
+    flash error and a clean 302 instead of a 500.
+    """
     secret = request.app.get(APP_KEY_SESSION_SECRET, "")
     cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
     db = request.app[APP_KEY_DB]
@@ -4575,18 +4623,35 @@ async def _gateways_toggle_post(
 
     from admin_toggles import refresh_disabled_gateways
 
-    if enable:
-        await db.enable_gateway(gateway_key)
-        await refresh_disabled_gateways(db)
-        await _record_audit_safe(request, "gateway_enable", target=gateway_key)
-        set_flash(response, kind="success", message=f"Enabled gateway: {gateway_key}",
-                  secret=secret, cookie_secure=cookie_secure)
-    else:
-        await db.disable_gateway(gateway_key)
-        await refresh_disabled_gateways(db)
-        await _record_audit_safe(request, "gateway_disable", target=gateway_key)
-        set_flash(response, kind="success", message=f"Disabled gateway: {gateway_key}",
-                  secret=secret, cookie_secure=cookie_secure)
+    try:
+        if enable:
+            await db.enable_gateway(gateway_key)
+        else:
+            await db.disable_gateway(gateway_key)
+    except Exception:
+        log.exception(
+            "gateways_toggle: %s_gateway(%r) failed; rendering flash error",
+            "enable" if enable else "disable",
+            gateway_key,
+        )
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Failed to {'enable' if enable else 'disable'} gateway — "
+                "DB error, see logs. The toggle did not take effect."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    await refresh_disabled_gateways(db)
+    audit_action = "gateway_enable" if enable else "gateway_disable"
+    await _record_audit_safe(request, audit_action, target=gateway_key)
+    verb = "Enabled" if enable else "Disabled"
+    set_flash(
+        response, kind="success", message=f"{verb} gateway: {gateway_key}",
+        secret=secret, cookie_secure=cookie_secure,
+    )
     return response
 
 

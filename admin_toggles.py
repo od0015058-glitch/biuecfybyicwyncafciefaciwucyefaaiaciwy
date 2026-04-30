@@ -16,6 +16,63 @@ Public surface:
   lock-free read from the in-memory set.
 * :func:`get_disabled_models` / :func:`get_disabled_gateways` —
   return a snapshot copy for the admin UI.
+
+Concurrency model (Stage-15-Step-D #3 audit)
+============================================
+
+The bot runs a **single asyncio event loop in a single OS process**;
+the deploy unit is one Docker container per bot host. Within that
+process, all reads and writes to ``_disabled_models`` and
+``_disabled_gateways`` happen as plain Python statements
+(``model_id in _disabled_models``, ``_disabled_models = ...``)
+which are atomic under CPython's GIL — there is no lock-free
+race here because there is no parallel writer.
+
+Possible "races" considered and rejected:
+
+1. **Admin toggle write vs. concurrent hot-path read.** When
+   ``refresh_disabled_models`` finishes, the assignment
+   ``_disabled_models = await db.get_disabled_models()`` is a
+   single GIL-protected ref store. Concurrent
+   ``is_model_disabled`` calls see *either* the old set *or* the
+   new set in full — never a partially-populated set, never a
+   torn write. The "race window" lasts at most one event-loop
+   tick (sub-millisecond) and the only observable effect is that
+   a chat request issued in the same tick as the toggle may see
+   the pre-toggle answer. That is well within the latency
+   admins already accept for "I clicked Disable, give me a
+   second" and is no worse than the equivalent two-replica DB
+   transaction order.
+
+2. **Two admin tabs toggling the same model simultaneously.**
+   Each tab issues a POST that writes the canonical row in
+   ``disabled_models`` then refreshes the cache. The DB acts as
+   the serialization point — last-write-wins on the row — and
+   each handler then refreshes the cache from the post-write
+   state. There is no in-memory race because the cache is only
+   *read* by hot paths and *written* by toggles; the toggle
+   handler awaits the DB write *before* the cache refresh, so
+   any interleaving still ends with the cache reflecting
+   whichever DB row write landed last.
+
+3. **Multi-process deploy.** Not supported. If a future stage
+   adds a second bot replica behind a load balancer (a
+   meaningful but unrelated change), each process will have its
+   own independent in-memory cache, and the staleness window
+   between an admin toggle and *all* replicas seeing the new
+   value will widen to "next refresh tick". A Redis pub-sub
+   notification or a periodic poll would close that gap; this
+   is documented in ``HANDOFF.md`` Stage-15-Step-E (future
+   project suggestions).
+
+In short: the single-process design eliminates the race surface
+the disabled-set cache *would* have if it were shared across
+worker processes. The fail-soft pattern in
+:func:`refresh_disabled_models` /
+:func:`refresh_disabled_gateways` (preserve the previous cache
+on a transient DB read error) is the only meaningful resilience
+behavior; everything else falls out of the GIL + single-loop
+deploy.
 """
 
 from __future__ import annotations
