@@ -26,7 +26,7 @@ def _row(role: str, content: str, ts: datetime) -> dict:
 
 def test_format_history_renders_role_label_timestamp_and_content():
     ts = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
-    out = format_history_as_text(
+    out, kept = format_history_as_text(
         [_row("user", "hello", ts), _row("assistant", "hi there", ts)],
         user_handle="alice",
     )
@@ -36,16 +36,18 @@ def test_format_history_renders_role_label_timestamp_and_content():
     assert "[2026-01-02 03:04:05 UTC] Assistant:" in out
     assert "hello" in out
     assert "hi there" in out
+    assert kept == 2
 
 
 def test_format_history_handles_missing_username():
     ts = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
-    out = format_history_as_text(
+    out, kept = format_history_as_text(
         [_row("user", "hi", ts)], user_handle=None
     )
     # No "for @None" or stray @ in the header.
     assert "for @" not in out
     assert "Conversation history" in out
+    assert kept == 1
 
 
 def test_format_history_naive_timestamp_treated_as_utc():
@@ -54,7 +56,7 @@ def test_format_history_naive_timestamp_treated_as_utc():
     must NOT silently render in local time. We force UTC so the
     file is reproducible across deploys."""
     ts = datetime(2026, 1, 2, 3, 4, 5)  # naive
-    out = format_history_as_text([_row("user", "hi", ts)])
+    out, _ = format_history_as_text([_row("user", "hi", ts)])
     assert "[2026-01-02 03:04:05 UTC]" in out
 
 
@@ -63,14 +65,14 @@ def test_format_history_unknown_role_falls_back_to_capitalised_label():
     formatter must not crash — render the role with a capitalised
     label so the file is still readable."""
     ts = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
-    out = format_history_as_text(
+    out, _ = format_history_as_text(
         [_row("system", "boot", ts)]
     )
     assert "System:" in out
 
 
 def test_format_history_missing_timestamp_renders_placeholder():
-    out = format_history_as_text(
+    out, _ = format_history_as_text(
         [{"role": "user", "content": "x", "created_at": None}]
     )
     assert "(unknown time)" in out
@@ -84,7 +86,7 @@ def test_format_history_truncates_oldest_first_on_oversize():
     ts = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
     big = "x" * 100_000  # 100KB per message
     rows = [_row("user", big, ts) for _ in range(20)]  # 2MB total
-    out = format_history_as_text(rows)
+    out, kept = format_history_as_text(rows)
     assert len(out.encode("utf-8")) <= EXPORT_MAX_BYTES
     assert "trimmed" in out
     # Header must reflect the *kept* count, not the original count.
@@ -94,17 +96,38 @@ def test_format_history_truncates_oldest_first_on_oversize():
     import re
     m = re.search(r"Messages: (\d+) \(trimmed (\d+) oldest\)", out)
     assert m is not None, f"missing trim header: {out[:500]!r}"
-    kept, dropped = int(m.group(1)), int(m.group(2))
-    assert kept + dropped == 20
-    assert kept >= 1 and dropped >= 1
+    kept_in_header, dropped_in_header = int(m.group(1)), int(m.group(2))
+    assert kept_in_header + dropped_in_header == 20
+    assert kept_in_header >= 1 and dropped_in_header >= 1
+    # Bundled bug fix in this PR: the second element of the tuple
+    # must be the *kept* count (matches the header), not the
+    # original input count. Pre-fix the handler wrote
+    # ``count=len(rows)`` to the caption while the .txt itself
+    # contained ``kept`` messages — caption lied to the user.
+    assert kept == kept_in_header
+    assert kept < 20
+
+
+def test_format_history_returns_kept_count_equal_to_input_when_no_trim():
+    """When the rendered text fits under ``EXPORT_MAX_BYTES`` no trim
+    happens and ``kept`` equals the input row count.
+
+    This is the common case (the running window is capped at 30
+    messages × 8000 chars ≈ 240 KB, well below the 1 MB limit) so
+    the new return shape must not regress it."""
+    ts = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    rows = [_row("user", "small", ts) for _ in range(5)]
+    _, kept = format_history_as_text(rows)
+    assert kept == 5
 
 
 def test_format_history_empty_rows_renders_empty_body():
     """No history → header still renders so the user knows what
     the file is, but the body is empty."""
-    out = format_history_as_text([])
+    out, kept = format_history_as_text([])
     assert "Conversation history" in out
     assert "Messages: 0" in out
+    assert kept == 0
 
 
 # ---------------------------------------------------------------------
@@ -196,6 +219,56 @@ async def test_memory_export_handler_empty_buffer_shows_alert_no_document():
     cb.answer.assert_awaited_once()
     # Show alert (not toast).
     assert cb.answer.await_args.kwargs.get("show_alert") is True
+
+
+@pytest.mark.asyncio
+async def test_memory_export_handler_caption_uses_kept_count_after_trim():
+    """Bundled bug fix in this PR (Stage-15-Step-E #2): when the
+    rendered .txt would exceed ``EXPORT_MAX_BYTES`` and
+    ``format_history_as_text`` trims the oldest messages, the
+    caption + toast must report the *kept* count (what's actually
+    in the file), not ``len(rows)`` (the untrimmed input count).
+
+    Pre-fix a heavy user with 20 large turns would see
+    "Conversation history (20 messages)" in the caption while the
+    .txt only contained ~10 of the most recent messages — the
+    in-file header said the truth ("Messages: 10 (trimmed 10
+    oldest)") but the caption lied."""
+    from handlers import memory_export_handler
+
+    cb = _make_callback()
+    state = _make_state()
+    ts = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    big = "x" * 100_000  # 100KB per message
+    rows = [
+        {"role": "user", "content": big, "created_at": ts}
+        for _ in range(20)  # 2 MB total — well over the 1 MB cap
+    ]
+    with patch(
+        "handlers._get_user_language", new=AsyncMock(return_value="en")
+    ), patch(
+        "handlers.db.get_full_conversation",
+        new=AsyncMock(return_value=rows),
+    ):
+        await memory_export_handler(cb, state)
+
+    # The caption / toast count must equal the kept count (parsed
+    # out of the in-file header), not the original 20.
+    sent_doc = cb.message.answer_document.await_args.args[0]
+    body = sent_doc.data.decode("utf-8")
+    import re
+    m = re.search(r"Messages: (\d+) \(trimmed (\d+) oldest\)", body)
+    assert m is not None, f"missing trim header: {body[:500]!r}"
+    kept = int(m.group(1))
+    assert kept < 20  # sanity: the trim actually happened
+    caption = cb.message.answer_document.await_args.kwargs["caption"]
+    assert f"({kept} messages)" in caption, (
+        f"caption {caption!r} should report kept count {kept}, not 20"
+    )
+    assert "(20 messages)" not in caption
+    toast = cb.answer.await_args.args[0]
+    assert str(kept) in toast
+    assert "20" not in toast.split()
 
 
 @pytest.mark.asyncio
