@@ -257,6 +257,37 @@ def test_render_metrics_loop_epoch_after_tick(monkeypatch):
     assert "meowassist_fx_refresh_last_run_epoch 1700000123\n" in body
 
 
+def test_render_metrics_loop_epoch_preserves_subsecond_precision(monkeypatch):
+    """Regression: ``time.time()`` returns a non-integer float in
+    production, and ``f"{value:g}"`` truncates a ~1.78e9 Unix
+    epoch to 6 significant digits (e.g. ``1.77756e+09``), erasing
+    ~2 000 s of precision. That breaks the heartbeat gauges' whole
+    purpose: a staleness alert tuned for a 15-minute window would
+    misfire on the ``:g``-induced precision loss alone.
+
+    Pin the rendered output to the round-trip-safe ``str(float)``
+    representation so a future refactor can't reintroduce ``:g``.
+    """
+    metrics.reset_loop_ticks_for_tests()
+    _patch_collectors(monkeypatch)
+    metrics.record_loop_tick("fx_refresh", ts=1777562092.857)
+
+    body = metrics.render_metrics()
+    # The full timestamp must round-trip — no scientific notation
+    # / ``e+09`` truncation, no integer-cast precision loss.
+    assert "meowassist_fx_refresh_last_run_epoch 1777562092.857\n" in body
+    assert "1.77756e+09" not in body
+    assert "1.77756e09" not in body
+    # Round-trip back to the original float to prove the rendered
+    # value is precise enough for ``time() - x > N`` alerting.
+    line = next(
+        l for l in body.splitlines()
+        if l.startswith("meowassist_fx_refresh_last_run_epoch ")
+    )
+    rendered_value = float(line.split(" ", 1)[1])
+    assert abs(rendered_value - 1777562092.857) < 1e-3
+
+
 def test_render_metrics_gauge_values(monkeypatch):
     metrics.reset_loop_ticks_for_tests()
     _patch_collectors(

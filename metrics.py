@@ -236,7 +236,16 @@ def _format_gauge(metric_name: str, help_text: str, value: float) -> list[str]:
     elif float(value).is_integer():
         rendered = str(int(value))
     else:
-        rendered = f"{value:g}"
+        # ``str(float)`` returns the shortest round-trip-safe
+        # repr (e.g. ``str(1777562092.857)`` → ``'1777562092.857'``).
+        # We deliberately do NOT use ``f"{value:g}"`` here — Python's
+        # ``g`` format defaults to 6 significant digits, which on a
+        # current Unix epoch (~1.78e9) collapses to ``1.77756e+09``
+        # and erases ~2 000 s of precision. That's a fatal bug for
+        # the heartbeat gauges: a stuck-loop alert tuned for a
+        # 15-minute staleness window would misfire on the
+        # ``:g``-induced ~35-minute precision error alone.
+        rendered = str(float(value))
     return [
         *_format_help_and_type(metric_name, help_text, "gauge"),
         f"{metric_name} {rendered}",
