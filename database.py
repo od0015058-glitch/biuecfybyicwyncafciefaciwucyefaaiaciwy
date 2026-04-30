@@ -2998,6 +2998,167 @@ class Database:
             "total_cost_usd": float(row["cost"] or 0),
         }
 
+    # ------------------------------------------------------------------
+    # Stage-15-Step-E #2: per-user spending analytics (first slice).
+    #
+    # The admin-side ``get_system_metrics`` already aggregates global
+    # spend + top models for the dashboard tile; this method is the
+    # per-user counterpart for the new ``hub_stats`` wallet sub-screen.
+    # Single connection round-trip with three fetches against the
+    # ``usage_logs`` index — same shape as ``get_system_metrics`` so a
+    # future caller building a richer "stats v2" surface (per-day
+    # graphs, weekly bars) can extend the same dict without breaking
+    # the first-slice consumer.
+    # ------------------------------------------------------------------
+    USER_STATS_TOP_MODELS_LIMIT: int = 5
+    USER_STATS_WINDOW_DAYS_DEFAULT: int = 30
+    USER_STATS_WINDOW_DAYS_MAX: int = 365
+
+    async def get_user_spending_summary(
+        self,
+        telegram_id: int,
+        *,
+        window_days: int | None = None,
+        top_models_limit: int | None = None,
+    ) -> dict:
+        """Stage-15-Step-E #2: per-user spending dashboard data.
+
+        Returns the snapshot rendered by the new ``hub_stats``
+        wallet sub-screen — lifetime totals, a recent-window total,
+        and the user's top models by call count over the same
+        window. Shape::
+
+            {
+              "lifetime": {
+                "total_calls": int,
+                "total_tokens": int,
+                "total_cost_usd": float,
+              },
+              "window_days": int,
+              "window": {
+                "total_calls": int,
+                "total_tokens": int,
+                "total_cost_usd": float,
+              },
+              "top_models": [
+                {"model": str, "calls": int, "cost_usd": float},
+                ...  # up to ``top_models_limit`` rows
+              ],
+            }
+
+        Hard-codes the ``WHERE telegram_id = …`` filter on every
+        sub-query — same defensive shape as
+        :meth:`list_user_transactions`. A buggy caller passing a
+        non-positive id raises ``ValueError`` rather than silently
+        returning everyone's data.
+
+        ``window_days`` defaults to
+        :attr:`USER_STATS_WINDOW_DAYS_DEFAULT` (30) and is clamped
+        to ``[1, USER_STATS_WINDOW_DAYS_MAX]``. The "window"
+        bucket is the most-actionable horizon for a user
+        wondering "how much did I spend recently?" — lifetime is
+        kept separate so a fresh-but-active user doesn't see
+        their first month's spend reported as both numbers.
+
+        ``top_models_limit`` defaults to
+        :attr:`USER_STATS_TOP_MODELS_LIMIT` (5) and is clamped to
+        ``[1, USER_STATS_TOP_MODELS_LIMIT]`` — a Telegram message
+        is the render target so a long list isn't useful.
+
+        Empty-data case: a user with zero ``usage_logs`` rows
+        gets all-zero scalars + an empty ``top_models`` list.
+        """
+        if not isinstance(telegram_id, int) or telegram_id <= 0:
+            raise ValueError(
+                "telegram_id is required and must be a positive integer; "
+                f"got {telegram_id!r}"
+            )
+        if window_days is None:
+            window_days = self.USER_STATS_WINDOW_DAYS_DEFAULT
+        window_days = max(
+            1, min(int(window_days), self.USER_STATS_WINDOW_DAYS_MAX)
+        )
+        if top_models_limit is None:
+            top_models_limit = self.USER_STATS_TOP_MODELS_LIMIT
+        top_models_limit = max(
+            1, min(int(top_models_limit), self.USER_STATS_TOP_MODELS_LIMIT)
+        )
+        tid = int(telegram_id)
+
+        # Single ``acquire`` for all three reads — they're snapshot-
+        # style aggregates and the admin-dashboard pattern in
+        # ``get_system_metrics`` already does the same. Slight drift
+        # between the queries (a row landing mid-fetch) is tolerable
+        # for a stats screen.
+        async with self.pool.acquire() as connection:
+            lifetime = await connection.fetchrow(
+                """
+                SELECT COUNT(*) AS calls,
+                       COALESCE(SUM(prompt_tokens + completion_tokens), 0)
+                           AS tokens,
+                       COALESCE(SUM(cost_deducted_usd), 0) AS cost
+                FROM usage_logs
+                WHERE telegram_id = $1
+                """,
+                tid,
+            )
+            window = await connection.fetchrow(
+                """
+                SELECT COUNT(*) AS calls,
+                       COALESCE(SUM(prompt_tokens + completion_tokens), 0)
+                           AS tokens,
+                       COALESCE(SUM(cost_deducted_usd), 0) AS cost
+                FROM usage_logs
+                WHERE telegram_id = $1
+                  AND created_at >= NOW() - ($2 || ' days')::interval
+                """,
+                tid,
+                str(int(window_days)),
+            )
+            top_rows = await connection.fetch(
+                """
+                SELECT model_used AS model,
+                       COUNT(*)::int AS calls,
+                       COALESCE(SUM(cost_deducted_usd), 0) AS cost
+                FROM usage_logs
+                WHERE telegram_id = $1
+                  AND created_at >= NOW() - ($2 || ' days')::interval
+                GROUP BY model_used
+                ORDER BY calls DESC, cost DESC
+                LIMIT $3
+                """,
+                tid,
+                str(int(window_days)),
+                top_models_limit,
+            )
+
+        def _agg_row(row) -> dict:
+            if row is None:
+                return {
+                    "total_calls": 0,
+                    "total_tokens": 0,
+                    "total_cost_usd": 0.0,
+                }
+            return {
+                "total_calls": int(row["calls"] or 0),
+                "total_tokens": int(row["tokens"] or 0),
+                "total_cost_usd": float(row["cost"] or 0),
+            }
+
+        return {
+            "lifetime": _agg_row(lifetime),
+            "window_days": window_days,
+            "window": _agg_row(window),
+            "top_models": [
+                {
+                    "model": r["model"],
+                    "calls": int(r["calls"]),
+                    "cost_usd": float(r["cost"] or 0),
+                }
+                for r in top_rows
+            ],
+        }
+
     async def get_system_metrics(
         self, *, pending_alert_threshold_hours: int = 2
     ) -> dict:

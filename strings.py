@@ -98,6 +98,30 @@ _STRINGS: dict[str, dict[str, str]] = {
         "memory_export_empty": "📭 تاریخچه‌ای برای دریافت وجود ندارد.",
         "memory_export_caption": "📥 تاریخچه گفتگو ({count} پیام)",
         "memory_export_done": "✅ {count} پیام به صورت فایل ارسال شد",
+        # ---- User spending analytics (Stage-15-Step-E #2 — first slice) ----
+        "btn_my_stats": "📊 آمار مصرف من",
+        "stats_title": "📊 **آمار مصرف شما**",
+        "stats_balance_line": "💰 موجودی فعلی: *${balance:.2f}*",
+        "stats_empty": (
+            "_هنوز هیچ مصرفی ثبت نشده است._\n"
+            "بعد از اولین گفتگو با مدل، آمار اینجا نمایش داده می‌شود."
+        ),
+        "stats_lifetime_header": "📈 *مجموع از ابتدا*",
+        "stats_lifetime_line": (
+            "  • تعداد درخواست: *{calls:,}*\n"
+            "  • مجموع توکن: *{tokens:,}*\n"
+            "  • هزینهٔ کل: *${cost:.4f}*"
+        ),
+        "stats_window_header": "🕒 *{days} روز اخیر*",
+        "stats_window_line": (
+            "  • تعداد درخواست: *{calls:,}*\n"
+            "  • مجموع توکن: *{tokens:,}*\n"
+            "  • هزینه: *${cost:.4f}*"
+        ),
+        "stats_top_models_header": "🔝 *مدل‌های پرکاربرد ({days} روز اخیر)*",
+        "stats_top_models_line": (
+            "  {rank}. `{model}` — {calls:,} درخواست، ${cost:.4f}"
+        ),
         # ---- Wallet redeem button (Stage-8-Part-3.5) ----
         "btn_redeem_gift": "🎁 استفاده از کد هدیه",
         "redeem_input_prompt": (
@@ -503,6 +527,30 @@ _STRINGS: dict[str, dict[str, str]] = {
         "memory_export_empty": "📭 No conversation history to export yet.",
         "memory_export_caption": "📥 Conversation history ({count} messages)",
         "memory_export_done": "✅ Sent {count} messages as a file",
+        # ---- User spending analytics (Stage-15-Step-E #2 — first slice) ----
+        "btn_my_stats": "📊 My usage stats",
+        "stats_title": "📊 **Your usage stats**",
+        "stats_balance_line": "💰 Current balance: *${balance:.2f}*",
+        "stats_empty": (
+            "_No usage logged yet._\n"
+            "Stats will show up here once you've chatted with a model."
+        ),
+        "stats_lifetime_header": "📈 *Lifetime totals*",
+        "stats_lifetime_line": (
+            "  • Calls: *{calls:,}*\n"
+            "  • Tokens: *{tokens:,}*\n"
+            "  • Spent: *${cost:.4f}*"
+        ),
+        "stats_window_header": "🕒 *Last {days} days*",
+        "stats_window_line": (
+            "  • Calls: *{calls:,}*\n"
+            "  • Tokens: *{tokens:,}*\n"
+            "  • Spent: *${cost:.4f}*"
+        ),
+        "stats_top_models_header": "🔝 *Top models (last {days} days)*",
+        "stats_top_models_line": (
+            "  {rank}. `{model}` — {calls:,} calls, ${cost:.4f}"
+        ),
         # ---- Wallet redeem button (Stage-8-Part-3.5) ----
         "btn_redeem_gift": "🎁 Redeem gift code",
         "redeem_input_prompt": (
