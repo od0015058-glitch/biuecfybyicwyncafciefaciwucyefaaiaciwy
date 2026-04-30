@@ -38,7 +38,11 @@ from payments import (
     get_min_amount_usd,
 )
 from pricing import apply_markup_to_price
-from rate_limit import consume_chat_token
+from rate_limit import (
+    consume_chat_token,
+    release_chat_slot,
+    try_claim_chat_slot,
+)
 from strings import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, all_button_labels, t
 from tetrapay import create_order as tetrapay_create_order
 
@@ -2304,8 +2308,59 @@ async def process_chat(message: Message):
         await message.answer(t(lang, "ai_local_rate_limited"))
         return
 
-    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    reply = await chat_with_model(user_id, message.text)
+    # Stage-13-Step-B: at most ONE in-flight OpenRouter request per
+    # user. The token bucket above gates throughput; this slot gates
+    # *concurrency*. A user firing 5 prompts back-to-back without
+    # this slot would otherwise drain $5+ from their wallet in under
+    # a second before the bucket reacts. Reject the second prompt
+    # with the ``ai_chat_busy`` flash so the user gets clear feedback
+    # instead of silent loss + a delayed cost they can't predict.
+    if not await try_claim_chat_slot(user_id):
+        lang = await _get_user_language(user_id)
+        log.info(
+            "chat in-flight rejected telegram_id=%s text=%r",
+            user_id,
+            (message.text or "")[:40],
+        )
+        await message.answer(t(lang, "ai_chat_busy"))
+        return
+
+    try:
+        await message.bot.send_chat_action(
+            chat_id=message.chat.id, action="typing"
+        )
+        reply = await chat_with_model(user_id, message.text)
+    finally:
+        # Idempotent — release in a finally so an OpenRouter
+        # exception, a TelegramAPIError on send_chat_action, or any
+        # other unexpected raise can't permanently lock the user
+        # out of further chats.
+        await release_chat_slot(user_id)
+
+    # Stage-13-Step-B bundled bug fix: defend against
+    # ``chat_with_model`` returning ``None`` or an empty string.
+    # OpenRouter's chat-completion shape carries ``content`` as
+    # required, but the spec also lets it be ``null`` for tool-call
+    # responses or upstream-policy refusals; the existing 200-with-
+    # error guard at ``ai_engine.py`` catches the explicit
+    # ``{"error": ...}`` shape but not the ``content: null`` case.
+    # Pre-fix, an upstream refusal would surface a literal ``None``
+    # → ``_split_for_telegram(None, ...)`` → ``[""]`` → Telegram
+    # rejects the send with ``Bad Request: message text is empty``,
+    # bubbling up as a poller-level crash for that user with no
+    # actionable message back. Treat empty / falsy as the same
+    # ``ai_provider_unavailable`` we already render for the explicit
+    # error-body shape.
+    if not reply:
+        lang = await _get_user_language(user_id)
+        log.warning(
+            "chat_with_model returned empty/None reply for user_id=%s; "
+            "falling back to provider-unavailable text",
+            user_id,
+        )
+        await message.answer(t(lang, "ai_provider_unavailable"))
+        return
+
     # Telegram caps a single message at 4096 characters. Long-form
     # AI replies (essay-style answers, code blocks, etc.) routinely
     # exceed that and were crashing the send with
