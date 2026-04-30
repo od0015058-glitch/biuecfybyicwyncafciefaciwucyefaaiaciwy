@@ -603,14 +603,19 @@ Systematic sweep of the codebase for latent bugs. Candidates identified during a
 #### Stage-15-Step-E: Future project suggestions
 
 **Priority:** info / planning
-**Status:** pending — document only, no implementation
+**Status:** STARTED — first slices being shipped one at a time, each PR bundles a real bug fix and marks the item as `STARTED, not finished` so the next AI can continue.
+
+**Progress so far:**
+
+* **E#1 — Conversation history export.** STARTED in PR #119. Shipped: `.txt` export (memory-screen "📥 Export conversation" button + `conversation_export.format_history_as_text` + `database.get_full_conversation` + 13 tests + bundled `metrics._escape_help_text` defensive escape). Remains: `.pdf` export, `/history` text command alias, pagination for very large buffers, rate-limiting the export button to prevent abuse.
+* **E#2 — User spending dashboard.** STARTED in this PR. Shipped: `database.get_user_spending_summary` (per-user roll-up — total / 7d / 30d / top-models), `user_stats.format_user_stats` (Markdown digest with empty-state), wallet-screen "📊 My usage stats" button + `/stats` text command, 12 tests, bundled `admin_adjust_balance` NaN-balance repair fix (3 new tests). Remains: per-day / per-week chart, CSV export, daily breakdown inline keyboard, locale-formatted timestamps for first/last call lines, admin-impersonation `/admin_user_stats <id>` view that reuses the same digest.
 
 **Suggested roadmap for future development (post Stage-15):**
 
 | # | Suggestion | Priority | Effort | Notes |
 |---|-----------|----------|--------|-------|
-| 1 | **Conversation history persistence & export** — let users download their chat history as `.txt` / `.pdf`. Currently conversations are in-memory buffer only (`conversation_messages` table). Add a `/history` command or wallet-menu button. | P2 product | Medium | Users on paid models want records of expensive conversations |
-| 2 | **Spending analytics for users** — show users their own spending dashboard: total spent, per-model breakdown, daily/weekly graphs. Currently only admins see metrics. Add a `/stats` command or inline menu. | P2 product | Medium | Builds trust + reduces support questions about "where did my money go" |
+| 1 | **Conversation history persistence & export** — STARTED PR #119: `.txt` export from memory screen shipped. Remains: `.pdf` export, `/history` text alias, pagination for huge buffers, rate-limit the button. | P2 product | Medium | Users on paid models want records of expensive conversations |
+| 2 | **Spending analytics for users** — STARTED this PR: per-user `/stats` digest + wallet button shipped. Remains: per-day / per-week chart, CSV export, daily-breakdown sub-screen, admin-impersonation view. | P2 product | Medium | Builds trust + reduces support questions about "where did my money go" |
 | 3 | **Webhook mode instead of long-polling** — switch from aiogram long-polling to webhook mode. The aiohttp server already runs; register a `/telegram-webhook` route. Reduces latency, uses fewer resources. | P3 ops | Low | Only worthwhile if the bot gets >100 concurrent users |
 | 4 | **Rate limiting per OpenRouter key** — extend `openrouter_keys.py` with per-key 429 detection. If a key gets rate-limited, temporarily redistribute its users to other keys. Current sticky assignment doesn't handle key exhaustion. | P3 ops | Medium | Only matters with 10+ keys and heavy traffic |
 | 5 | **Admin role system** — currently all admins have full access. Add roles: `viewer` (read-only dashboard), `operator` (can broadcast, manage promos), `super` (can edit users, refund). Store in DB, not env. | P2 product | High | Only needed if the team grows beyond 1 admin |

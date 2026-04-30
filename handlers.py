@@ -48,6 +48,7 @@ from rate_limit import (
 from referral import build_share_url, parse_referral_payload
 from strings import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, all_button_labels, t
 from tetrapay import create_order as tetrapay_create_order
+from user_stats import format_user_stats
 
 log = logging.getLogger("bot.handlers")
 
@@ -389,6 +390,32 @@ _REFERRAL_CLAIM_FLASH_KEYS: dict[str, str] = {
 # ==========================================
 # /redeem — gift code redemption (Stage-8-Part-3)
 # ==========================================
+@router.message(Command("stats"))
+async def cmd_stats(message: Message, state: FSMContext) -> None:
+    """Stage-15-Step-E #2 (started, not finished): user-facing
+    ``/stats`` slash command — same data surface as the
+    ``hub_stats`` inline button on the wallet screen.
+
+    Provides a discoverable text-command alias for power users
+    who prefer typing over the menu, mirroring the same pattern
+    as ``/redeem`` (text alias for the wallet "🎁 Redeem gift
+    code" button). Empty-buffer state renders the same friendly
+    empty-state string from ``user_stats_empty``.
+
+    The DB layer hard-codes the per-user filter so this command
+    can't leak another user's stats; it intentionally does NOT
+    require admin privileges.
+    """
+    await state.clear()
+    if message.from_user is None:
+        return
+    user_id = message.from_user.id
+    lang = await _get_user_language(user_id)
+    summary = await db.get_user_spending_summary(user_id)
+    text = format_user_stats(summary, lang)
+    await message.answer(text, parse_mode="Markdown")
+
+
 @router.message(Command("redeem"))
 async def cmd_redeem(message: Message, state: FSMContext):
     """Redeem a gift code: ``/redeem CODE``.
@@ -587,6 +614,52 @@ async def hub_models_handler(callback: CallbackQuery, state: FSMContext):
     user = await db.get_user(callback.from_user.id)
     active_model = user["active_model"] if user else "—"
     await _send_provider_list(callback, edit=True, lang=lang, active_model=active_model)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "hub_stats")
+async def hub_stats_handler(callback: CallbackQuery, state: FSMContext):
+    """Stage-15-Step-E #2 (started, not finished): user-facing
+    spending dashboard — total messages, total spent, per-model
+    breakdown, 7d / 30d windows.
+
+    Distinct from the admin-only ``/admin_metrics`` digest
+    (which aggregates across all users). The DB layer
+    (:meth:`Database.get_user_spending_summary`) hard-codes the
+    ``WHERE telegram_id = …`` filter so this handler can't
+    accidentally leak another user's data.
+
+    Empty buffer (zero usage rows) renders the empty-state
+    string from ``user_stats_empty`` instead of zero-padded
+    fields — feels more welcoming for a brand-new user who
+    hasn't sent their first prompt yet.
+
+    Future work tracked in ``user_stats.py``'s module
+    docstring: ASCII / image graphs, week-over-week trend, CSV
+    export of the user's full ``usage_logs``.
+    """
+    await state.clear()
+    user_id = callback.from_user.id
+    lang = await _get_user_language(user_id)
+    summary = await db.get_user_spending_summary(user_id)
+    text = format_user_stats(summary, lang)
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text=t(lang, "btn_back_to_wallet"), callback_data="back_to_wallet"
+    )
+    builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+    builder.adjust(2)
+    try:
+        await callback.message.edit_text(
+            text, parse_mode="Markdown", reply_markup=builder.as_markup()
+        )
+    except TelegramBadRequest:
+        # Same defensive narrow-catch as the memory screen — the
+        # only legitimate exception here is "Message is not
+        # modified" if the user double-taps the button before the
+        # first edit lands. DB / network errors must propagate so
+        # the dispatcher logs them.
+        log.debug("user-stats edit_text was a no-op", exc_info=True)
     await callback.answer()
 
 
@@ -1356,8 +1429,16 @@ def _build_wallet_keyboard(lang: str) -> InlineKeyboardBuilder:
     builder.button(
         text=t(lang, "btn_invite_friend"), callback_data="hub_invite"
     )
+    # Stage-15-Step-E #2 (started, not finished): per-user usage
+    # stats — total spent, per-model breakdown, 7d / 30d windows.
+    # Lives on the wallet screen (next to "Recent top-ups") because
+    # it complements the same balance / spend mental model the
+    # wallet already shows.
+    builder.button(
+        text=t(lang, "btn_user_stats"), callback_data="hub_stats"
+    )
     _back_to_menu_button(builder, lang)
-    builder.adjust(1, 1, 1, 1, 1)
+    builder.adjust(1, 1, 1, 1, 1, 1)
     return builder
 
 

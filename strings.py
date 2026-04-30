@@ -93,6 +93,23 @@ _STRINGS: dict[str, dict[str, str]] = {
         "memory_toggled_off": "⚪ حافظه خاموش شد",
         "memory_reset_done": "🆕 گفتگو پاک شد ({count} پیام)",
         "memory_reset_empty": "💭 گفتگویی برای پاک کردن وجود ندارد.",
+        # Stage-15-Step-E #2 (user spending dashboard — first slice).
+        "btn_user_stats": "📊 آمار مصرف من",
+        "user_stats_title": "📊 *آمار مصرف شما*",
+        "user_stats_empty": (
+            "📭 هنوز پیامی به مدل ارسال نکرده‌اید.\n"
+            "بعد از اولین گفتگو، آمار مصرف اینجا نمایش داده می‌شود."
+        ),
+        "user_stats_total_line": (
+            "📨 مجموع پیام‌ها: *{calls}*  •  💸 خرج: *{spent}*"
+        ),
+        "user_stats_tokens_line": (
+            "🔤 توکن‌ها: *{prompt}* پرامپت + *{completion}* پاسخ"
+        ),
+        "user_stats_window_line": (
+            "🗓 *{window}*: {calls} پیام، {spent}"
+        ),
+        "user_stats_top_models_header": "🔝 *مدل‌های پرکاربرد*",
         # ---- Wallet redeem button (Stage-8-Part-3.5) ----
         "btn_redeem_gift": "🎁 استفاده از کد هدیه",
         "redeem_input_prompt": (
@@ -493,6 +510,23 @@ _STRINGS: dict[str, dict[str, str]] = {
         "memory_toggled_off": "⚪ Memory disabled",
         "memory_reset_done": "🆕 Conversation cleared ({count} messages)",
         "memory_reset_empty": "💭 No conversation to clear.",
+        # Stage-15-Step-E #2 (user spending dashboard — first slice).
+        "btn_user_stats": "📊 My usage stats",
+        "user_stats_title": "📊 *Your usage stats*",
+        "user_stats_empty": (
+            "📭 No AI calls yet.\n"
+            "Your stats will show up here after the first chat."
+        ),
+        "user_stats_total_line": (
+            "📨 Total messages: *{calls}*  •  💸 Spent: *{spent}*"
+        ),
+        "user_stats_tokens_line": (
+            "🔤 Tokens: *{prompt}* prompt + *{completion}* completion"
+        ),
+        "user_stats_window_line": (
+            "🗓 *{window}*: {calls} calls, {spent}"
+        ),
+        "user_stats_top_models_header": "🔝 *Top models*",
         # ---- Wallet redeem button (Stage-8-Part-3.5) ----
         "btn_redeem_gift": "🎁 Redeem gift code",
         "redeem_input_prompt": (

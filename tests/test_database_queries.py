@@ -1018,6 +1018,115 @@ async def test_admin_adjust_balance_still_raises_on_zero_delta():
         )
 
 
+async def test_admin_adjust_balance_repairs_nan_balance():
+    """Stage-15-Step-E #2 bundled bug fix: a wallet poisoned by a
+    pre-fix legacy row / direct SQL / migration mishap reads NaN at
+    the FOR UPDATE step. Pre-fix this slipped past the
+    ``new_balance < 0`` insufficient-funds gate (NaN comparisons are
+    always ``False``), wrote NaN back to ``balance_usd``, and inserted
+    a ``transactions`` row claiming the delta was credited — i.e. the
+    admin's natural recovery action *propagated* the corruption rather
+    than fixing it. Post-fix the function treats a non-finite
+    ``current`` as $0, so the wallet is repaired to ``delta`` and the
+    ledger row matches reality.
+    """
+    import math
+
+    conn = _make_conn()
+    # FOR UPDATE row returns NaN balance — simulating the poisoned wallet.
+    conn.fetchrow = AsyncMock(return_value={"balance_usd": float("nan")})
+    conn.execute = AsyncMock(return_value="UPDATE 1")
+    conn.fetchval = AsyncMock(return_value=999)
+    class _TxCtx:
+        async def __aenter__(self_inner): return None
+        async def __aexit__(self_inner, *a): return False
+    conn.transaction = MagicMock(return_value=_TxCtx())
+
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.admin_adjust_balance(
+        telegram_id=777,
+        delta_usd=5.0,
+        reason="manual repair",
+        admin_telegram_id=42,
+    )
+
+    # Op succeeds and returns a finite new balance equal to the delta
+    # (current was NaN, treated as 0, so 0 + 5 = 5).
+    assert result is not None
+    assert result["new_balance"] == 5.0
+    assert math.isfinite(result["new_balance"])
+
+    # The UPDATE writes the *finite* repaired balance back, NOT NaN.
+    update_calls = [
+        c.args for c in conn.execute.await_args_list
+        if "UPDATE users SET balance_usd" in c.args[0]
+    ]
+    assert update_calls, "expected an UPDATE users SET balance_usd"
+    update_balance_arg = update_calls[0][1]
+    assert update_balance_arg == 5.0
+    assert math.isfinite(update_balance_arg)
+
+
+async def test_admin_adjust_balance_repairs_positive_infinity_balance():
+    """Same bug class as the NaN case — ``+Infinity`` slips past the
+    ``new_balance < 0`` gate (``+inf + 5 < 0`` is ``False``) and would
+    write infinity back. Post-fix the read is treated as $0 and the
+    wallet repairs cleanly.
+    """
+    import math
+
+    conn = _make_conn()
+    conn.fetchrow = AsyncMock(return_value={"balance_usd": float("inf")})
+    conn.execute = AsyncMock(return_value="UPDATE 1")
+    conn.fetchval = AsyncMock(return_value=1000)
+    class _TxCtx:
+        async def __aenter__(self_inner): return None
+        async def __aexit__(self_inner, *a): return False
+    conn.transaction = MagicMock(return_value=_TxCtx())
+
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.admin_adjust_balance(
+        telegram_id=778,
+        delta_usd=3.0,
+        reason="manual repair",
+        admin_telegram_id=42,
+    )
+
+    assert result is not None
+    assert result["new_balance"] == 3.0
+    assert math.isfinite(result["new_balance"])
+
+
+async def test_admin_adjust_balance_finite_current_is_unaffected():
+    """Regression pin: the new repair branch must NOT alter the path
+    for a normal finite balance — that's the common case and the
+    semantics (``current + delta``) must be preserved exactly."""
+    conn = _make_conn()
+    conn.fetchrow = AsyncMock(return_value={"balance_usd": 10.0})
+    conn.execute = AsyncMock(return_value="UPDATE 1")
+    conn.fetchval = AsyncMock(return_value=2001)
+    class _TxCtx:
+        async def __aenter__(self_inner): return None
+        async def __aexit__(self_inner, *a): return False
+    conn.transaction = MagicMock(return_value=_TxCtx())
+
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.admin_adjust_balance(
+        telegram_id=779,
+        delta_usd=5.0,
+        reason="manual top-up",
+        admin_telegram_id=42,
+    )
+
+    assert result["new_balance"] == 15.0
+
+
 async def test_finalize_payment_refuses_nan_full_price():
     """Defense-in-depth: PR #75 already validates at the IPN layer,
     but the DB function refuses too so a future internal caller can't

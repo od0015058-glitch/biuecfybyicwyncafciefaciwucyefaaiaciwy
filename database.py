@@ -323,6 +323,119 @@ class Database:
         async with self.pool.acquire() as connection:
             await connection.execute(query, telegram_id, model, prompt_tokens, completion_tokens, cost)
 
+    async def get_user_spending_summary(
+        self,
+        telegram_id: int,
+        *,
+        top_n_models: int = 5,
+    ) -> dict:
+        """Stage-15-Step-E #2 (user spending dashboard, first slice).
+
+        Returns a per-user usage roll-up suitable for the
+        user-facing ``/stats`` command. Distinct from the
+        admin-only :meth:`get_user_admin_payload` (which is the
+        full ledger including transactions) — this is purely
+        usage-side and intentionally excludes top-up history.
+
+        Shape::
+
+            {
+              "total_calls": int,
+              "total_prompt_tokens": int,
+              "total_completion_tokens": int,
+              "total_spent_usd": float,
+              "calls_last_7d": int,
+              "spent_last_7d_usd": float,
+              "calls_last_30d": int,
+              "spent_last_30d_usd": float,
+              "top_models": [
+                {"model": str, "count": int, "cost_usd": float}, ...
+              ],
+              "first_call_at": str | None,   # ISO 8601, UTC
+              "last_call_at":  str | None,
+            }
+
+        ``top_models`` is sorted by ``count DESC, cost_usd DESC`` and
+        capped at ``top_n_models``. The all-time / 7d / 30d windows
+        are computed in a single CTE pass to avoid three separate
+        index scans.
+
+        A user with zero usage rows gets all-zero counters and an
+        empty ``top_models`` list — the caller renders the
+        empty-state message rather than crashing on missing keys.
+        """
+        top_n = max(1, min(int(top_n_models), 50))
+        async with self.pool.acquire() as connection:
+            totals = await connection.fetchrow(
+                """
+                SELECT
+                    COUNT(*)::bigint                                AS total_calls,
+                    COALESCE(SUM(prompt_tokens), 0)::bigint         AS total_prompt_tokens,
+                    COALESCE(SUM(completion_tokens), 0)::bigint     AS total_completion_tokens,
+                    COALESCE(SUM(cost_deducted_usd), 0)::numeric    AS total_spent_usd,
+                    COUNT(*) FILTER (
+                        WHERE created_at >= NOW() - INTERVAL '7 days'
+                    )::bigint                                       AS calls_last_7d,
+                    COALESCE(SUM(cost_deducted_usd) FILTER (
+                        WHERE created_at >= NOW() - INTERVAL '7 days'
+                    ), 0)::numeric                                  AS spent_last_7d_usd,
+                    COUNT(*) FILTER (
+                        WHERE created_at >= NOW() - INTERVAL '30 days'
+                    )::bigint                                       AS calls_last_30d,
+                    COALESCE(SUM(cost_deducted_usd) FILTER (
+                        WHERE created_at >= NOW() - INTERVAL '30 days'
+                    ), 0)::numeric                                  AS spent_last_30d_usd,
+                    MIN(created_at)                                 AS first_call_at,
+                    MAX(created_at)                                 AS last_call_at
+                FROM usage_logs
+                WHERE telegram_id = $1
+                """,
+                telegram_id,
+            )
+            top = await connection.fetch(
+                """
+                SELECT model_used,
+                       COUNT(*)::bigint                AS call_count,
+                       COALESCE(SUM(cost_deducted_usd), 0)::numeric AS cost_usd
+                FROM usage_logs
+                WHERE telegram_id = $1
+                GROUP BY model_used
+                ORDER BY call_count DESC, cost_usd DESC
+                LIMIT $2
+                """,
+                telegram_id, top_n,
+            )
+        return {
+            "total_calls": int(totals["total_calls"]) if totals else 0,
+            "total_prompt_tokens": int(
+                totals["total_prompt_tokens"]) if totals else 0,
+            "total_completion_tokens": int(
+                totals["total_completion_tokens"]) if totals else 0,
+            "total_spent_usd": float(totals["total_spent_usd"] or 0),
+            "calls_last_7d": int(totals["calls_last_7d"]) if totals else 0,
+            "spent_last_7d_usd": float(totals["spent_last_7d_usd"] or 0),
+            "calls_last_30d": int(totals["calls_last_30d"]) if totals else 0,
+            "spent_last_30d_usd": float(totals["spent_last_30d_usd"] or 0),
+            "top_models": [
+                {
+                    "model": r["model_used"],
+                    "count": int(r["call_count"]),
+                    "cost_usd": float(r["cost_usd"] or 0),
+                }
+                for r in top
+            ],
+            "first_call_at": (
+                totals["first_call_at"].isoformat()
+                if totals and totals["first_call_at"] is not None
+                else None
+            ),
+            "last_call_at": (
+                totals["last_call_at"].isoformat()
+                if totals and totals["last_call_at"] is not None
+                else None
+            ),
+        }
+
     async def create_pending_transaction(
         self,
         telegram_id: int,
@@ -2299,6 +2412,41 @@ class Database:
                 if row is None:
                     return None
                 current = float(row["balance_usd"])
+                # Stage-15-Step-E #2 bundled bug fix: defend against a
+                # pre-fix poisoned ``balance_usd`` (NaN / ±Infinity).
+                # Every *write* path into the column already rejects
+                # non-finite values (``deduct_balance``,
+                # ``finalize_payment`` / ``finalize_partial_payment``,
+                # ``redeem_gift_code``, this function's own
+                # ``delta_usd`` guard above), but the *read* side here
+                # took the row at face value: a legacy row predating
+                # the write guards (or one corrupted by direct SQL or
+                # a future caller bypass) read NaN, computed
+                # ``NaN + delta = NaN``, slipped past
+                # ``new_balance < 0`` (every comparison against NaN
+                # is ``False`` so the gate is a silent no-op), wrote
+                # ``NaN`` back to ``balance_usd``, and INSERTed a
+                # ``transactions`` row claiming the delta was
+                # credited. Net effect: the audit trail diverged
+                # from reality (ledger says ``+5``, wallet says
+                # ``NaN``) and the admin's natural recovery action
+                # — using ``/admin_credit`` to repair a stuck wallet
+                # — *propagated* the corruption rather than fixing
+                # it. Treat a non-finite ``current`` as ``0`` for
+                # the addition so the operation actually repairs the
+                # wallet to ``delta``; the loud log line below tells
+                # ops the prior state so the audit trail can be
+                # reconciled.
+                if not _is_finite_amount(current):
+                    log.error(
+                        "admin_adjust_balance: telegram_id=%s had "
+                        "non-finite balance_usd=%r in DB; treating "
+                        "as $0 for the +%r adjustment so the wallet "
+                        "is repaired to a finite value. Investigate "
+                        "row corruption.",
+                        telegram_id, row["balance_usd"], delta_usd,
+                    )
+                    current = 0.0
                 new_balance = current + delta_usd
                 if new_balance < 0:
                     # Insufficient funds for the debit. Don't write
