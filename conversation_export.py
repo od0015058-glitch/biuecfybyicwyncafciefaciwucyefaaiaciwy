@@ -91,7 +91,7 @@ def format_history_as_text(
     rows: Iterable[dict],
     *,
     user_handle: str | None = None,
-) -> str:
+) -> tuple[str, int]:
     """Render a user's conversation buffer as a plain-text export.
 
     ``rows`` is an iterable of dicts shaped like
@@ -103,6 +103,16 @@ def format_history_as_text(
     text would exceed :data:`EXPORT_MAX_BYTES` we drop whole
     *oldest* messages until it fits, prepending a one-line note so
     the user knows trimming happened.
+
+    Returns ``(text, kept_count)``. ``kept_count`` is the number of
+    messages that actually survived the trim (== ``len(rows)`` when
+    the buffer fits; smaller when the body had to be trimmed). The
+    caller is expected to surface ``kept_count`` to the user
+    instead of ``len(rows)`` so the caption / toast match what's
+    actually in the file — pre-fix the handler reported the
+    untrimmed input count to a heavy user whose buffer just got
+    rewritten under them ("Conversation history (1500 messages)"
+    when the .txt only contained the most recent ~500).
     """
     rendered = [_format_one_message(r) for r in rows]
     original_count = len(rendered)
@@ -123,7 +133,7 @@ def format_history_as_text(
 
     text = _build(0)
     if len(text.encode("utf-8")) <= EXPORT_MAX_BYTES:
-        return text
+        return text, original_count
 
     # Truncate from the front (oldest messages first) until the
     # body fits. The header always reflects the *kept* count plus
@@ -134,7 +144,7 @@ def format_history_as_text(
         rendered.pop(0)
         dropped += 1
         text = _build(dropped)
-    return text
+    return text, original_count - dropped
 
 
 def export_filename_for(telegram_id: int) -> str:

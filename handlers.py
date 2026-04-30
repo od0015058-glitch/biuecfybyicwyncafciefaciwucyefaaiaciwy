@@ -787,7 +787,7 @@ async def memory_export_handler(callback: CallbackQuery, state: FSMContext):
             t(lang, "memory_export_empty"), show_alert=True
         )
         return
-    rendered = format_history_as_text(
+    rendered, kept = format_history_as_text(
         rows, user_handle=callback.from_user.username
     )
     document = BufferedInputFile(
@@ -797,11 +797,20 @@ async def memory_export_handler(callback: CallbackQuery, state: FSMContext):
     # ``answer_document`` lives on Message, not on CallbackQuery —
     # send it via the bot itself so we can target the chat
     # without disturbing the memory-screen message above it.
+    #
+    # ``kept`` is the count that actually landed in the file —
+    # ``format_history_as_text`` may have trimmed the oldest
+    # messages to stay under ``EXPORT_MAX_BYTES`` (1 MB). Pre-fix
+    # the caption + toast both said ``len(rows)`` (the untrimmed
+    # input count), so a heavy user whose buffer was just trimmed
+    # would see "Conversation history (1500 messages)" while the
+    # .txt itself only contained the most recent ~500. Use
+    # ``kept`` so the user-facing count matches reality.
     await callback.message.answer_document(
         document,
-        caption=t(lang, "memory_export_caption", count=len(rows)),
+        caption=t(lang, "memory_export_caption", count=kept),
     )
-    await callback.answer(t(lang, "memory_export_done", count=len(rows)))
+    await callback.answer(t(lang, "memory_export_done", count=kept))
 
 
 @router.callback_query(F.data.startswith("set_lang_"))
@@ -1404,6 +1413,16 @@ def _build_wallet_keyboard(lang: str) -> InlineKeyboardBuilder:
     builder.button(
         text=t(lang, "btn_receipts"), callback_data="hub_receipts"
     )
+    # Stage-15-Step-E #2 (started, not finished): per-user spending
+    # analytics. Mirrors the ``hub_receipts`` shape — dedicated DB
+    # method (``Database.get_user_spending_summary``) hard-codes the
+    # ``WHERE telegram_id = …`` filter so a future caller can't
+    # leak someone else's totals. The screen itself degrades
+    # gracefully for users with zero usage (renders an empty-state
+    # placeholder rather than walls of zeroes).
+    builder.button(
+        text=t(lang, "btn_my_stats"), callback_data="hub_stats"
+    )
     # Stage-13-Step-C: invite-a-friend entry point. Routes to the
     # ``hub_invite`` handler which renders the user's referral code +
     # share link. Hidden / inert when ``BOT_USERNAME`` is unset is
@@ -1414,7 +1433,7 @@ def _build_wallet_keyboard(lang: str) -> InlineKeyboardBuilder:
         text=t(lang, "btn_invite_friend"), callback_data="hub_invite"
     )
     _back_to_menu_button(builder, lang)
-    builder.adjust(1, 1, 1, 1, 1)
+    builder.adjust(1, 1, 1, 1, 1, 1)
     return builder
 
 
@@ -1539,6 +1558,103 @@ async def receipts_more_handler(callback: CallbackQuery, state: FSMContext):
     except (TypeError, ValueError):
         before_id = None
     await _render_receipts_page(callback, before_id=before_id)
+    await callback.answer()
+
+
+# ==========================================
+# Stage-15-Step-E #2: wallet → my usage stats (first slice).
+# Per-user spending dashboard. Pulls a snapshot from the dedicated
+# DB method (which hard-codes the ``WHERE telegram_id = …`` filter
+# so a future caller can't accidentally leak someone else's totals)
+# and renders it via the pure ``user_stats.format_stats_summary``.
+# Empty-data case (a user with zero usage_logs rows) renders the
+# ``stats_empty`` placeholder rather than a wall of zeroes.
+# ==========================================
+
+
+def _build_stats_keyboard(lang: str) -> InlineKeyboardBuilder:
+    """Two-row keyboard for the stats screen: back-to-wallet + home.
+
+    Mirrors the receipts-screen tail keyboard (no "Show more" — the
+    stats screen is a single-page snapshot, not a paginated feed).
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text=t(lang, "btn_back_to_wallet"), callback_data="back_to_wallet"
+    )
+    builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+    builder.adjust(2)
+    return builder
+
+
+@router.callback_query(F.data == "hub_stats")
+async def hub_stats_handler(callback: CallbackQuery, state: FSMContext):
+    """Render the user's spending dashboard.
+
+    Pulls the snapshot via ``Database.get_user_spending_summary``
+    (single connection round-trip with three fetches against the
+    ``usage_logs`` index) and renders it via the pure
+    ``user_stats.format_stats_summary``. The current wallet
+    balance is fetched alongside so the user has the
+    "spent vs. remaining" comparison in one screen without
+    bouncing back to the wallet view.
+
+    Defensive against the same NaN class as ``hub_wallet_handler``:
+    a corrupted ``balance_usd`` column gets clamped to 0 before
+    being handed to the formatter (which has its own NaN guard,
+    but defense in depth never hurts).
+    """
+    # Same defensive FSM clear as ``hub_receipts_handler`` — the
+    # wallet menu is reachable from inside the charge flows.
+    await state.clear()
+    user_id = callback.from_user.id
+    lang = await _get_user_language(user_id)
+    try:
+        snapshot = await db.get_user_spending_summary(user_id)
+    except ValueError:
+        # Defensive — get_user_spending_summary raises on a missing
+        # / zero / negative ``telegram_id`` to keep a future buggy
+        # caller from leaking other users' totals. Same fallback
+        # shape as ``_render_receipts_page``.
+        log.exception(
+            "get_user_spending_summary refused for user %r", user_id
+        )
+        snapshot = {
+            "lifetime": {
+                "total_calls": 0, "total_tokens": 0, "total_cost_usd": 0.0,
+            },
+            "window_days": 30,
+            "window": {
+                "total_calls": 0, "total_tokens": 0, "total_cost_usd": 0.0,
+            },
+            "top_models": [],
+        }
+    user_data = await db.get_user(user_id)
+    raw_balance = float(user_data["balance_usd"]) if user_data else 0.0
+    balance = raw_balance if math.isfinite(raw_balance) else 0.0
+
+    # Imported lazily to keep the module-import graph thin — the
+    # full ``handlers`` module already pulls in everything else;
+    # ``user_stats`` is a pure-function module so the import is
+    # cheap, but localising it makes the dependency obvious in
+    # code review.
+    from user_stats import format_stats_summary
+
+    text = format_stats_summary(snapshot, lang, balance_usd=balance)
+    builder = _build_stats_keyboard(lang)
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=builder.as_markup(),
+            parse_mode="Markdown",
+        )
+    except TelegramBadRequest:
+        # Same "message is not modified" race as the wallet /
+        # receipts screens: a double-tap renders identical text +
+        # keyboard, which Telegram refuses to edit. Toast was
+        # already going to be answered below, so the UX is fine —
+        # just swallow the no-op.
+        log.debug("hub_stats edit was a no-op", exc_info=True)
     await callback.answer()
 
 

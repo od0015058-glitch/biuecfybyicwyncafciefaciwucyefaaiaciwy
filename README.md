@@ -162,6 +162,23 @@ NowPayments crypto invoices.
   bot restart; for long-running history, pull `/metrics` into
   Prometheus. Gateway tiles are independently fault-isolated — a
   future regression in one accessor cannot blank the other half.
+- **Conversation history export** — the memory screen now has a
+  "📥 Export conversation" button that ships the user's full
+  persisted buffer back as a `.txt` document (role labels +
+  ISO-8601 UTC timestamps + a summary header). Hard 1 MB cap;
+  oldest messages are trimmed first when a heavy buffer
+  overflows, with the trim count surfaced in both the in-file
+  header and the upload caption (caption used to lie pre-Step-E
+  #2 — see HANDOFF §5 Step-E #2 bundled bug fix).
+- **Per-user spending dashboard** — a new "📊 My usage stats"
+  button on the wallet menu opens a per-user analytics screen
+  showing lifetime totals (calls / tokens / spent), the same
+  totals over a rolling 30-day window, and the user's top 5
+  models by call count. Same SQL shape as the admin-side
+  dashboard; the DB method (`Database.get_user_spending_summary`)
+  hard-codes `WHERE telegram_id = $1` on every sub-query so a
+  buggy caller can't leak someone else's totals. First slice of
+  Stage-15-Step-E #2.
 
 For the full project history, file map, and roadmap **read [HANDOFF.md](./HANDOFF.md)**.
 
@@ -358,7 +375,7 @@ See [HANDOFF.md](./HANDOFF.md) §Stage-15 for the full queue:
 | **Stage-15-B** | Server update script with backup rotation | shipped |
 | **Stage-15-C** | Logos & posters AI prompt folder | shipped |
 | **Stage-15-D** | Bug-fix sweep | shipped (PRs #113–#118, all 6 candidates closed) |
-| **Stage-15-E** | Future project suggestions (12 items) | **#1 STARTED** (conversation history export, first slice) |
+| **Stage-15-E** | Future project suggestions (12 items) | **#1 MERGED** (conversation history export, first slice) · **#2 STARTED** (per-user spending dashboard, first slice) |
 
 ## License / contributing
 

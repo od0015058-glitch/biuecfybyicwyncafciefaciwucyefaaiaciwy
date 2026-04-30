@@ -646,6 +646,32 @@ What remains (next AI's TODO):
 * **Rate limiting** — the menu button is fine (Telegram debounces callback queries). If `/history` text command lands, gate it behind the same chat-token bucket as `cmd_chat` so a user can't spam-export their buffer to DoS the DB.
 * **Schema-rotation hook** — if the operator ever needs to comply with a "delete all my data" request, `Database.clear_conversation` already exists. Document that the export button is the user-facing read side and `mem_reset` is the user-facing delete side.
 
+##### Stage-15-Step-E #2 — what's shipped vs. what remains (STARTED, not finished)
+
+**Step-E #2 (Spending analytics for users) — STARTED in PR-after-Step-E-#1.**
+
+Original spec (Step-E table row 2): "show users their own spending dashboard: total spent, per-model breakdown, daily/weekly graphs. Currently only admins see metrics. Add a `/stats` command or wallet-menu button."
+
+What's shipped this PR:
+
+* `Database.get_user_spending_summary(telegram_id, *, window_days=30, top_models_limit=5)` — new aggregate method returning `{lifetime, window_days, window, top_models}`. Hard-codes `WHERE telegram_id = $1` on every sub-query (same defensive shape as `list_user_transactions`); raises `ValueError` on a non-positive `telegram_id` so a buggy caller can't leak someone else's totals. Window-days clamped to `[1, 365]`; top-models limit clamped to `[1, 5]`.
+* `user_stats.py` — new pure-function module. `format_stats_summary(snapshot, lang, *, balance_usd=None)` renders the snapshot as a Markdown body for the new wallet sub-screen. Empty-data short-circuit (zero usage logged → friendly placeholder, not a wall of zeroes). NaN/Inf defence on every numeric field. Long OpenRouter slugs truncated to 50 chars with ellipsis to keep the message under Telegram's 4 KB cap. Skips the balance line entirely when `balance_usd` is non-finite or negative — same "no row beats a misleading row" policy as `wallet_display.format_toman_annotation`.
+* `handlers.hub_stats_handler` — new `hub_stats` callback wired to a "📊 My usage stats" button on the wallet menu. Fetches the snapshot + the user's wallet balance in one screen so a user looking at "how much have I spent" doesn't have to bounce back to the wallet to see "how much do I have left". Defensive against `ValueError` from the DB layer (renders empty-state instead of 500), against NaN balance (clamped to 0 + then dropped by the formatter's own guard), against the `TelegramBadRequest: message is not modified` race that hits any edit-back-to-same-text screen.
+* New i18n strings (FA + EN): `btn_my_stats`, `stats_title`, `stats_balance_line`, `stats_empty`, `stats_lifetime_header`, `stats_lifetime_line`, `stats_window_header`, `stats_window_line`, `stats_top_models_header`, `stats_top_models_line`.
+* 26 new tests in `tests/test_user_stats.py` covering the DB method (zeros / populated / clamping / user-scope filter / refusal on non-positive id), the formatter (every section + every defensive guard), and the handler (populated / empty / FSM clear / DB ValueError / NaN balance). Plus a smoke test ensuring every new string key exists in both `fa` and `en`.
+
+What remains (next AI's TODO):
+
+* **`/stats` slash-command alias** — currently the only entry point is the wallet-menu button. Add a `Command("stats")` handler that calls into `hub_stats_handler`'s body (~5 lines, factor the body into a private `_render_stats_screen` helper first). Gate behind the same chat-token bucket as `cmd_chat` to prevent spam.
+* **Per-day / per-week breakdowns** — the original spec mentioned "daily/weekly graphs". This PR ships rolling 30-day totals + lifetime totals. A real day-over-day series would need a new query: `SELECT date_trunc('day', created_at), SUM(cost_deducted_usd) FROM usage_logs WHERE telegram_id = $1 AND created_at >= NOW() - INTERVAL '30 days' GROUP BY 1 ORDER BY 1`. Render as ASCII bars (one row per day) in Telegram — image-based graphs would need a separate dependency surface (`matplotlib` / `Pillow`) which is **explicitly out of scope for the first slice** until the operator approves the new dep.
+* **CSV export of full `usage_logs`** — pairs nicely with the conversation export from Step-E #1. The admin panel already has a JSON view at `/admin/users/<id>/usage`; a user-facing CSV button on the stats screen would close the loop.
+* **Window selector buttons (7d / 30d / 90d / lifetime)** — the DB method already accepts a `window_days` parameter; just wire up an inline keyboard with rotating options. Re-uses the same render pipeline.
+* **Schema-rotation hook** — if the operator ever needs to "reset" a user's stats without deleting their wallet history, document that this is `DELETE FROM usage_logs WHERE telegram_id = $1`. Currently the only data-deletion surfaces are `mem_reset` (conversation buffer) and the admin panel's user-deletion flow.
+
+Bundled bug fix in this PR (real, found during code review of the Step-E #1 export module): **`conversation_export.format_history_as_text` now returns `(text, kept_count)` instead of just `text`.** Pre-fix, the handler called `t(lang, "memory_export_caption", count=len(rows))` and `t(lang, "memory_export_done", count=len(rows))` — but `format_history_as_text` may have trimmed older messages to stay under the 1 MB `EXPORT_MAX_BYTES` cap. The in-file header reflected the truth (`Messages: 10 (trimmed 10 oldest)`) but the caption + toast both lied (`Conversation history (20 messages)`) for any user heavy enough to trigger the trim. Fix returns the actually-kept count alongside the rendered text and the handler now uses that. Test `test_memory_export_handler_caption_uses_kept_count_after_trim` pins the regression with a 2 MB simulated buffer.
+
+---
+
 Audit findings (2026-04-30) noted by reading every file — kept here so a future AI / human can pick the highest-leverage one next:
 
 * **`cmd_start` has a redundant `db.create_user` call** (handlers.py ~278) — `UserUpsertMiddleware` already runs first. Inspected during the Stage-13-Step-Aplus audit and decided NOT to remove: the middleware swallows upsert exceptions (logged + handler still runs), so the explicit retry in `cmd_start` is the only safety net for a transient DB issue at the moment of `/start`. Belt-and-braces; leave it.
@@ -1005,18 +1031,34 @@ The user's process for this project — **do not deviate**:
     PR #114 which only made the *post-write resync* fail-soft.
     Remaining: nothing in Stage-15-Step-D. Stage-15-Step-E is
     doc-only and the 12 suggestions are already enumerated above.
-    **Stage-15-Step-E #1 STARTED (this PR)** — first slice of
-    "conversation history persistence & export": new
-    `conversation_export.py` module renders the full buffer as a
-    plain-text export, new `Database.get_full_conversation` reads
-    every row with timestamps, new "📥 Export conversation" button
-    on the memory screen wires it up end-to-end. Bundled bug fix:
-    `metrics._format_help_and_type` now escapes `\` and newline in
-    HELP text per the Prometheus exposition spec — same defensive
-    pattern as the label-value escape closed in PR #116, but for
-    the unquoted HELP line. See "Stage-15-Step-E #1 — what's
-    shipped vs. what remains" section below for the precise
-    boundary so the next AI can continue.
+    **Stage-15-Step-E #1 MERGED** — first slice of "conversation
+    history persistence & export": new `conversation_export.py`
+    module renders the full buffer as a plain-text export, new
+    `Database.get_full_conversation` reads every row with
+    timestamps, new "📥 Export conversation" button on the memory
+    screen wires it up end-to-end. Bundled bug fix in #1:
+    `metrics._format_help_and_type` now escapes `\` and newline
+    in HELP text per the Prometheus exposition spec.
+    **Stage-15-Step-E #2 STARTED (this PR)** — first slice of
+    "spending analytics for users": new
+    `Database.get_user_spending_summary` aggregates lifetime +
+    rolling-30d + top-5 models per user (hard-codes
+    `WHERE telegram_id = $1` on every sub-query and raises
+    `ValueError` on a non-positive id so a buggy caller can't
+    leak someone else's totals); new pure-function `user_stats`
+    module formats the snapshot for the new "📊 My usage stats"
+    button on the wallet menu; new `hub_stats_handler` wires it
+    up end-to-end. Bundled bug fix in #2:
+    `conversation_export.format_history_as_text` now returns
+    `(text, kept_count)` and the memory-export handler uses the
+    actual kept count in the caption + toast — pre-fix, a heavy
+    user whose buffer was trimmed to fit under the 1 MB
+    `EXPORT_MAX_BYTES` cap would see "Conversation history (1500
+    messages)" in the caption while the .txt only contained the
+    most recent ~500 (the in-file header was correct, the caption
+    lied). See "Stage-15-Step-E #2 — what's shipped vs. what
+    remains" section below for the precise boundary so the next
+    AI can continue.
 11. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
