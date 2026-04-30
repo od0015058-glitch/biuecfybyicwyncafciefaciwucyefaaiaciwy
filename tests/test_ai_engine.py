@@ -104,6 +104,8 @@ def stub_db(monkeypatch):
     db.append_conversation_message = AsyncMock()
     db.get_recent_messages = AsyncMock(return_value=[])
     monkeypatch.setattr(ai_engine, "db", db)
+    # Stage-14: stub multi-key routing so tests don't need real env vars.
+    monkeypatch.setattr(ai_engine, "key_for_user", lambda tid: "test-key")
     return db
 
 

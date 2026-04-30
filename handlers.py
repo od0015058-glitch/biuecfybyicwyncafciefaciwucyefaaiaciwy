@@ -15,6 +15,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from admin_toggles import is_gateway_disabled, is_model_disabled
 from ai_engine import chat_with_model
 from amount_input import normalize_amount
 from database import db
@@ -97,6 +98,24 @@ SUPPORTED_PAY_CURRENCIES: tuple[tuple[str, str], ...] = (
 )
 # Layout: 3-wide grid for the 9 currencies above.
 _CURRENCY_ROWS_LAYOUT = (3, 3, 3)
+
+
+def _active_pay_currencies() -> list[tuple[str, str]]:
+    """Return SUPPORTED_PAY_CURRENCIES minus admin-disabled gateways."""
+    return [
+        (label, ticker)
+        for label, ticker in SUPPORTED_PAY_CURRENCIES
+        if not is_gateway_disabled(ticker)
+    ]
+
+
+def _currency_grid_layout(count: int) -> tuple[int, ...]:
+    """Build a 3-wide grid layout tuple for *count* currency buttons."""
+    full_rows, remainder = divmod(count, 3)
+    layout = (3,) * full_rows
+    if remainder:
+        layout = layout + (remainder,)
+    return layout
 
 
 async def _get_user_language(telegram_id: int) -> str:
@@ -810,7 +829,10 @@ def _provider_display(provider: str) -> str:
 
 
 def _eligible_model(model: CatalogModel) -> bool:
-    """Filter out models whose callback data wouldn't fit in 64 bytes."""
+    """Filter out models whose callback data wouldn't fit in 64 bytes
+    or that the admin has disabled via the web panel."""
+    if is_model_disabled(model.id):
+        return False
     return len(f"sm:{model.id}".encode("utf-8")) <= _CB_MAX_BYTES
 
 
@@ -1213,6 +1235,10 @@ async def set_active_model_handler(callback: CallbackQuery):
     catalog = await get_catalog()
     if catalog.get(model_id) is None:
         await callback.answer(t(lang, "models_set_unknown"), show_alert=True)
+        return
+
+    if is_model_disabled(model_id):
+        await callback.answer(t(lang, "models_set_disabled"), show_alert=True)
         return
 
     updated = await db.set_active_model(callback.from_user.id, model_id)
@@ -1845,7 +1871,7 @@ def _render_min_amount_refusal(
     alt = find_cheaper_alternative(
         requested_usd=attempted_usd,
         excluded_currency=currency,
-        candidates=list(SUPPORTED_PAY_CURRENCIES),
+        candidates=_active_pay_currencies(),
     )
     if alt is not None:
         alt_label, _alt_ticker = alt
@@ -1904,12 +1930,13 @@ async def process_add_crypto_currency(callback: CallbackQuery):
     amount = callback.data.split("_")[1]
     lang = await _get_user_language(callback.from_user.id)
     builder = InlineKeyboardBuilder()
-    for label, ticker in SUPPORTED_PAY_CURRENCIES:
+    active_currencies = _active_pay_currencies()
+    for label, ticker in active_currencies:
         builder.button(text=label, callback_data=f"pay_{ticker}_{amount}")
     builder.button(text=t(lang, "btn_back"), callback_data="add_crypto")
     builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
     # Currency grid first, then the back / home footer on its own row.
-    builder.adjust(*_CURRENCY_ROWS_LAYOUT, 2)
+    builder.adjust(*_currency_grid_layout(len(active_currencies)), 2)
     await callback.message.edit_text(
         t(lang, "charge_pick_currency", amount=amount),
         parse_mode="Markdown",
@@ -1965,14 +1992,15 @@ async def process_custom_amount_input(message: Message, state: FSMContext):
     await state.update_data(custom_amount=amount)
 
     builder = InlineKeyboardBuilder()
-    for label, ticker in SUPPORTED_PAY_CURRENCIES:
+    active_currencies = _active_pay_currencies()
+    for label, ticker in active_currencies:
         builder.button(text=label, callback_data=f"cur_{ticker}")
     # Footer: back to amount entry + home. Going back to amt_custom
     # re-prompts for the amount (without dropping promo state) so the
     # user can pick a different value without restarting from the wallet.
     builder.button(text=t(lang, "btn_back"), callback_data="amt_custom")
     builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
-    builder.adjust(*_CURRENCY_ROWS_LAYOUT, 2)
+    builder.adjust(*_currency_grid_layout(len(active_currencies)), 2)
 
     await message.answer(
         t(lang, "charge_custom_amount_saved", amount=amount),
@@ -2062,15 +2090,22 @@ async def process_toman_amount_input(message: Message, state: FSMContext):
     # (``process_custom_amount_input``) deliberately does NOT show
     # this button: paying $5 of arbitrary rial without an entry-side
     # rate lock would expose users to settlement-time rate moves.
-    builder.button(text=t(lang, "tetrapay_button"), callback_data="cur_tetrapay")
-    for label, ticker in SUPPORTED_PAY_CURRENCIES:
+    active_currencies = _active_pay_currencies()
+    tetrapay_enabled = not is_gateway_disabled("tetrapay")
+    if tetrapay_enabled:
+        builder.button(text=t(lang, "tetrapay_button"), callback_data="cur_tetrapay")
+    for label, ticker in active_currencies:
         builder.button(text=label, callback_data=f"cur_{ticker}")
     # Back returns to the Toman prompt, not the USD one.
     builder.button(text=t(lang, "btn_back"), callback_data="amt_toman")
     builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
-    # Layout: TetraPay button alone on top, then the existing 3-wide
-    # crypto grid, then the back/home footer.
-    builder.adjust(1, *_CURRENCY_ROWS_LAYOUT, 2)
+    # Layout: TetraPay button alone on top (when enabled), then the
+    # 3-wide crypto grid, then the back/home footer.
+    crypto_layout = _currency_grid_layout(len(active_currencies))
+    if tetrapay_enabled:
+        builder.adjust(1, *crypto_layout, 2)
+    else:
+        builder.adjust(*crypto_layout, 2)
 
     await message.answer(
         t(
@@ -2219,6 +2254,10 @@ async def process_custom_currency_selection(callback: CallbackQuery, state: FSMC
     currency = callback.data.split("_", 1)[1]
     lang = await _get_user_language(callback.from_user.id)
 
+    if is_gateway_disabled(currency):
+        await callback.answer(t(lang, "gateway_disabled"), show_alert=True)
+        return
+
     data = await state.get_data()
     amount = data.get("custom_amount")
     if not amount:
@@ -2359,6 +2398,10 @@ async def process_final_invoice(callback: CallbackQuery, state: FSMContext):
 
     currency = parts[1]
     amount = parts[2]
+
+    if is_gateway_disabled(currency):
+        await callback.answer(t(lang, "gateway_disabled"), show_alert=True)
+        return
 
     # Pull any active promo from FSM data and compute the bonus before
     # invoice creation (see process_custom_currency_selection for the

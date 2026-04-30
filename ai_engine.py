@@ -4,12 +4,16 @@ import os
 
 import aiohttp
 
+from admin_toggles import is_model_disabled
 from database import db
+from openrouter_keys import key_for_user
 from pricing import calculate_cost_async
 from strings import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, t
 
 log = logging.getLogger("bot.ai_engine")
 
+# Legacy single-key env var kept for reference in comments/tests.
+# Actual key selection now routes through openrouter_keys.key_for_user.
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 # Schema default from ``alembic/versions/0001_baseline.py``:
@@ -101,6 +105,10 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
     # operational while the DBA applies the migration.
     memory_enabled = bool(user["memory_enabled"]) if "memory_enabled" in user else False
 
+    # Stage-14: admin can disable individual models at runtime.
+    if is_model_disabled(active_model):
+        return t(lang, "ai_model_disabled")
+
     # 2. Hard block if they are out of free messages and out of money
     if free_msgs <= 0 and balance < 0.05:
         return t(lang, "ai_insufficient_balance")
@@ -116,8 +124,9 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
     messages.append({"role": "user", "content": user_prompt})
 
     # 4. Call OpenRouter API
+    api_key = key_for_user(telegram_id)
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
 

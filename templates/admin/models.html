@@ -1,0 +1,121 @@
+{% extends "_layout.html" %}
+
+{% block title %}AI model toggles{% endblock %}
+
+{% block extra_head %}
+<style>
+  .toggle-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
+  .provider-section { margin-bottom: 8px; }
+  .provider-section h3 {
+    margin: 0 0 8px;
+    font-size: 15px;
+    color: var(--text-muted);
+  }
+  .model-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border);
+    gap: 12px;
+  }
+  .model-row:last-child { border-bottom: none; }
+  .model-id {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    word-break: break-all;
+    flex: 1;
+  }
+  .model-id.disabled { opacity: 0.5; text-decoration: line-through; }
+  form.inline { display: inline; margin: 0; }
+  .btn-enable {
+    background: var(--success);
+    color: #111;
+    border: none;
+    border-radius: 4px;
+    padding: 4px 12px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .btn-disable {
+    background: transparent;
+    color: var(--danger);
+    border: 1px solid var(--danger);
+    border-radius: 4px;
+    padding: 4px 12px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .btn-disable:hover { background: rgba(255,107,107,0.1); }
+  .summary { color: var(--text-muted); font-size: 13px; margin-bottom: 16px; }
+  .search-box {
+    width: 100%;
+    padding: 8px 12px;
+    margin-bottom: 12px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 14px;
+  }
+</style>
+{% endblock %}
+
+{% block main %}
+<h2>AI model toggles</h2>
+
+{% if flash %}
+<div class="alert alert-{{ flash.kind }}">{{ flash.message }}</div>
+{% endif %}
+
+<p class="summary">
+  {{ total_models }} model(s) in catalog, {{ disabled_count }} disabled.
+  Disabled models are hidden from the Telegram bot's model picker.
+</p>
+
+<input type="text" class="search-box" id="modelFilter"
+       placeholder="Filter models…" autocomplete="off">
+
+<div class="toggle-grid">
+  {% for provider, models in providers %}
+  <div class="panel provider-section" data-provider="{{ provider }}">
+    <h3>{{ provider_labels.get(provider, provider) }}</h3>
+    {% for m in models %}
+    <div class="model-row" data-model="{{ m.id|lower }}">
+      <span class="model-id {% if m.id in disabled %}disabled{% endif %}">{{ m.id }}</span>
+      {% if m.id in disabled %}
+      <form class="inline" method="post" action="/admin/models/enable">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="model_id" value="{{ m.id }}">
+        <button type="submit" class="btn-enable">Enable</button>
+      </form>
+      {% else %}
+      <form class="inline" method="post" action="/admin/models/disable">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="model_id" value="{{ m.id }}">
+        <button type="submit" class="btn-disable">Disable</button>
+      </form>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% endfor %}
+</div>
+
+<script>
+document.getElementById('modelFilter').addEventListener('input', function() {
+  var q = this.value.toLowerCase();
+  document.querySelectorAll('.model-row').forEach(function(row) {
+    row.style.display = row.dataset.model.includes(q) ? '' : 'none';
+  });
+  document.querySelectorAll('.provider-section').forEach(function(sec) {
+    var visible = sec.querySelectorAll('.model-row[style=""], .model-row:not([style])');
+    sec.style.display = visible.length ? '' : 'none';
+  });
+});
+</script>
+{% endblock %}

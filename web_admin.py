@@ -4368,6 +4368,196 @@ async def enroll_2fa_get(request: web.Request) -> web.StreamResponse:
 
 
 # ---------------------------------------------------------------------
+# Stage-14: model & gateway toggle pages
+# ---------------------------------------------------------------------
+
+# Gateway labels for the admin UI. Matches handlers.SUPPORTED_PAY_CURRENCIES
+# plus "tetrapay" for the Rial card gateway.
+_GATEWAY_CARD_LIST: list[dict[str, str]] = [
+    {"key": "tetrapay", "label": "TetraPay (Rial card)"},
+]
+_GATEWAY_CRYPTO_LIST: list[dict[str, str]] = [
+    {"key": "btc", "label": "₿ Bitcoin"},
+    {"key": "eth", "label": "Ξ Ethereum"},
+    {"key": "ltc", "label": "🔷 Litecoin"},
+    {"key": "ton", "label": "💎 TON"},
+    {"key": "trx", "label": "⚡ TRON (TRX)"},
+    {"key": "usdttrc20", "label": "💵 USDT (TRC20)"},
+    {"key": "usdterc20", "label": "💵 USDT (ERC20)"},
+    {"key": "usdtbsc", "label": "💵 USDT (BEP20)"},
+    {"key": "usdtton", "label": "💵 USDT (TON)"},
+]
+
+# Provider display labels reused from handlers.py; importing them would
+# create a circular import (handlers → web_admin), so duplicate the
+# small map here.
+_ADMIN_PROVIDER_LABELS: dict[str, str] = {
+    "openai": "🟢 OpenAI",
+    "anthropic": "🟣 Anthropic",
+    "google": "🔵 Google",
+    "x-ai": "⚫ xAI",
+    "deepseek": "🐋 DeepSeek",
+}
+
+
+async def models_get(request: web.Request) -> web.StreamResponse:
+    """GET /admin/models — list all catalog models with disable/enable toggles."""
+    from admin_toggles import get_disabled_models
+    from models_catalog import get_catalog
+
+    disabled = get_disabled_models()
+    catalog = await get_catalog()
+
+    providers: list[tuple[str, list]] = []
+    for provider in sorted(catalog.by_provider.keys()):
+        models = sorted(catalog.by_provider[provider], key=lambda m: m.id)
+        providers.append((provider, models))
+
+    total_models = sum(len(ms) for _, ms in providers)
+
+    ctx = {
+        "active_page": "models",
+        "csrf_token": csrf_token_for(request),
+        "flash": None,
+        "providers": providers,
+        "provider_labels": _ADMIN_PROVIDER_LABELS,
+        "disabled": disabled,
+        "disabled_count": len(disabled),
+        "total_models": total_models,
+    }
+    response = aiohttp_jinja2.render_template("models.html", request, ctx)
+    flash = pop_flash(request, response)
+    if flash is not None:
+        ctx["flash"] = flash
+        response = aiohttp_jinja2.render_template("models.html", request, ctx)
+    return response
+
+
+async def _models_toggle_post(
+    request: web.Request, *, enable: bool
+) -> web.StreamResponse:
+    """Shared POST handler for model enable / disable."""
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app[APP_KEY_DB]
+    form = await request.post()
+
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning("models_toggle: CSRF token mismatch from %s", request.remote)
+        response = web.HTTPFound(location="/admin/models")
+        set_flash(response, kind="error",
+                  message="Form submission was rejected (CSRF). Refresh and try again.",
+                  secret=secret, cookie_secure=cookie_secure)
+        return response
+
+    model_id = str(form.get("model_id", "")).strip()
+    response = web.HTTPFound(location="/admin/models")
+    if not model_id:
+        set_flash(response, kind="warn", message="Missing model id.",
+                  secret=secret, cookie_secure=cookie_secure)
+        return response
+
+    from admin_toggles import refresh_disabled_models
+
+    if enable:
+        await db.enable_model(model_id)
+        await refresh_disabled_models(db)
+        await _record_audit_safe(request, "model_enable", target=model_id)
+        set_flash(response, kind="success", message=f"Enabled model: {model_id}",
+                  secret=secret, cookie_secure=cookie_secure)
+    else:
+        await db.disable_model(model_id)
+        await refresh_disabled_models(db)
+        await _record_audit_safe(request, "model_disable", target=model_id)
+        set_flash(response, kind="success", message=f"Disabled model: {model_id}",
+                  secret=secret, cookie_secure=cookie_secure)
+    return response
+
+
+async def models_disable_post(request: web.Request) -> web.StreamResponse:
+    """POST /admin/models/disable."""
+    return await _models_toggle_post(request, enable=False)
+
+
+async def models_enable_post(request: web.Request) -> web.StreamResponse:
+    """POST /admin/models/enable."""
+    return await _models_toggle_post(request, enable=True)
+
+
+async def gateways_get(request: web.Request) -> web.StreamResponse:
+    """GET /admin/gateways — list all payment gateways with toggles."""
+    from admin_toggles import get_disabled_gateways
+
+    disabled = get_disabled_gateways()
+
+    ctx = {
+        "active_page": "gateways",
+        "csrf_token": csrf_token_for(request),
+        "flash": None,
+        "card_gateways": _GATEWAY_CARD_LIST,
+        "crypto_gateways": _GATEWAY_CRYPTO_LIST,
+        "disabled": disabled,
+    }
+    response = aiohttp_jinja2.render_template("gateways.html", request, ctx)
+    flash = pop_flash(request, response)
+    if flash is not None:
+        ctx["flash"] = flash
+        response = aiohttp_jinja2.render_template("gateways.html", request, ctx)
+    return response
+
+
+async def _gateways_toggle_post(
+    request: web.Request, *, enable: bool
+) -> web.StreamResponse:
+    """Shared POST handler for gateway enable / disable."""
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app[APP_KEY_DB]
+    form = await request.post()
+
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning("gateways_toggle: CSRF token mismatch from %s", request.remote)
+        response = web.HTTPFound(location="/admin/gateways")
+        set_flash(response, kind="error",
+                  message="Form submission was rejected (CSRF). Refresh and try again.",
+                  secret=secret, cookie_secure=cookie_secure)
+        return response
+
+    gateway_key = str(form.get("gateway_key", "")).strip()
+    response = web.HTTPFound(location="/admin/gateways")
+    if not gateway_key:
+        set_flash(response, kind="warn", message="Missing gateway key.",
+                  secret=secret, cookie_secure=cookie_secure)
+        return response
+
+    from admin_toggles import refresh_disabled_gateways
+
+    if enable:
+        await db.enable_gateway(gateway_key)
+        await refresh_disabled_gateways(db)
+        await _record_audit_safe(request, "gateway_enable", target=gateway_key)
+        set_flash(response, kind="success", message=f"Enabled gateway: {gateway_key}",
+                  secret=secret, cookie_secure=cookie_secure)
+    else:
+        await db.disable_gateway(gateway_key)
+        await refresh_disabled_gateways(db)
+        await _record_audit_safe(request, "gateway_disable", target=gateway_key)
+        set_flash(response, kind="success", message=f"Disabled gateway: {gateway_key}",
+                  secret=secret, cookie_secure=cookie_secure)
+    return response
+
+
+async def gateways_disable_post(request: web.Request) -> web.StreamResponse:
+    """POST /admin/gateways/disable."""
+    return await _gateways_toggle_post(request, enable=False)
+
+
+async def gateways_enable_post(request: web.Request) -> web.StreamResponse:
+    """POST /admin/gateways/enable."""
+    return await _gateways_toggle_post(request, enable=True)
+
+
+# ---------------------------------------------------------------------
 # App wiring
 # ---------------------------------------------------------------------
 
@@ -4620,6 +4810,14 @@ def setup_admin_routes(
         "/admin/enroll_2fa",
         _require_auth(enroll_2fa_get),
     )
+
+    # Stage-14: model & gateway toggle pages.
+    app.router.add_get("/admin/models", _require_auth(models_get))
+    app.router.add_post("/admin/models/disable", _require_auth(models_disable_post))
+    app.router.add_post("/admin/models/enable", _require_auth(models_enable_post))
+    app.router.add_get("/admin/gateways", _require_auth(gateways_get))
+    app.router.add_post("/admin/gateways/disable", _require_auth(gateways_disable_post))
+    app.router.add_post("/admin/gateways/enable", _require_auth(gateways_enable_post))
 
     # Stage-9-Step-10: durable broadcast registry orphan sweep.
     # Any row left in ``queued`` / ``running`` from before the

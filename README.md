@@ -108,6 +108,21 @@ NowPayments crypto invoices.
   `${WEBHOOK_BASE_URL}/admin/enroll_2fa` (renders an inline-SVG QR
   + the manual key + an `otpauth://` URI). Leave `ADMIN_2FA_SECRET`
   unset to keep the existing password-only login flow.
+- **AI model toggles** — admin can disable individual OpenRouter models
+  at `${WEBHOOK_BASE_URL}/admin/models`. Disabled models disappear
+  from the Telegram model picker and are refused at chat time. Models
+  are grouped by provider (OpenAI, Anthropic, Google, xAI, DeepSeek)
+  with a live search filter. Toggle actions are audit-logged.
+- **Payment gateway toggles** — admin can disable TetraPay or any
+  NowPayments crypto currency at `${WEBHOOK_BASE_URL}/admin/gateways`.
+  Disabled gateways/currencies disappear from the payment picker.
+  Pending invoices on a disabled gateway are not affected.
+- **Multi-key OpenRouter load balancing** — set `OPENROUTER_API_KEY_1`
+  through `OPENROUTER_API_KEY_10` to spread traffic across multiple
+  accounts. Each user sticks to one key (`telegram_id % N`) so
+  conversation context stays consistent. If only the bare
+  `OPENROUTER_API_KEY` is set, all traffic goes there (backward-
+  compatible). See `.env.example` for details.
 
 For the full project history, file map, and roadmap **read [HANDOFF.md](./HANDOFF.md)**.
 

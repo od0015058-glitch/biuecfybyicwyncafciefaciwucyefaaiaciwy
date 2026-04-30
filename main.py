@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 import strings
 from admin import parse_admin_user_ids, router as admin_router
+from admin_toggles import load_disabled_gateways, load_disabled_models
 from bot_commands import publish_bot_commands
 from database import db
 from handlers import SUPPORTED_PAY_CURRENCIES, router
@@ -175,6 +176,11 @@ async def main():
         log.exception(
             "failed to load bot_strings overrides — using compiled defaults"
         )
+
+    # Stage-14: warm the admin-toggle caches so disabled models and
+    # gateways are filtered from the very first request.
+    await load_disabled_models(db)
+    await load_disabled_gateways(db)
 
     # Overwrite BotFather's cached slash-command list with the
     # canonical one. Without this, Telegram shows whatever was last

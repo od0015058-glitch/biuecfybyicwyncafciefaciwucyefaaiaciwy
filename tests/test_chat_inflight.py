@@ -413,6 +413,7 @@ async def test_ai_engine_returns_unavailable_for_null_content():
 
     with (
         patch.object(ai_engine, "OPENROUTER_API_KEY", "test-key"),
+        patch("ai_engine.key_for_user", return_value="test-key"),
         patch.object(
             ai_engine.db, "get_user", AsyncMock(return_value=fake_user)
         ),
@@ -474,6 +475,7 @@ async def test_ai_engine_returns_unavailable_for_empty_string_content():
 
     with (
         patch.object(ai_engine, "OPENROUTER_API_KEY", "test-key"),
+        patch("ai_engine.key_for_user", return_value="test-key"),
         patch.object(
             ai_engine.db, "get_user", AsyncMock(return_value=fake_user)
         ),
