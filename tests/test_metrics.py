@@ -222,6 +222,54 @@ def test_render_metrics_labelled_counter_format(monkeypatch):
     assert body.index('"bad_json"') < body.index('"bad_signature"')
 
 
+def test_format_labelled_counter_escapes_quotes_backslash_newlines(monkeypatch):
+    """Bundled bug fix (PR Stage-15-Step-D #2): label values with ``"``,
+    ``\\`` or newline must be escaped per the Prometheus
+    text-exposition spec, otherwise a single poisoned label breaks
+    the parser and the entire scrape returns blank.
+    """
+    metrics.reset_loop_ticks_for_tests()
+    _patch_collectors(
+        monkeypatch,
+        ipn_drops={
+            'has"quote': 1,
+            "has\\backslash": 2,
+            "has\nnewline": 3,
+        },
+    )
+
+    body = metrics.render_metrics()
+    # Each escape must be present in its rendered form.
+    assert 'meowassist_ipn_drops_total{reason="has\\"quote"} 1' in body
+    assert 'meowassist_ipn_drops_total{reason="has\\\\backslash"} 2' in body
+    assert 'meowassist_ipn_drops_total{reason="has\\nnewline"} 3' in body
+    # The newline label MUST NOT split the line. Find the newline-row
+    # and verify it lives on a single physical line.
+    newline_rows = [
+        l for l in body.splitlines()
+        if l.startswith("meowassist_ipn_drops_total{") and "newline" in l
+    ]
+    assert len(newline_rows) == 1, (
+        "label with raw newline must render on exactly one line, got: "
+        f"{newline_rows!r}"
+    )
+
+
+def test_escape_label_value_unit():
+    """``_escape_label_value`` is a pure function — exercise the
+    three escape paths directly."""
+    assert metrics._escape_label_value("plain") == "plain"
+    assert metrics._escape_label_value('with"quote') == 'with\\"quote'
+    assert metrics._escape_label_value("with\\backslash") == "with\\\\backslash"
+    assert metrics._escape_label_value("line1\nline2") == "line1\\nline2"
+    # All three at once — backslashes must be escaped first to avoid
+    # double-escaping the quote-escape sequence.
+    assert (
+        metrics._escape_label_value('a\\b"c\nd')
+        == 'a\\\\b\\"c\\nd'
+    )
+
+
 def test_render_metrics_empty_counter_still_emits_preamble(monkeypatch):
     """A counter with zero rows still emits HELP/TYPE — consumers
     running ``rate(...)`` against the empty counter need to see
