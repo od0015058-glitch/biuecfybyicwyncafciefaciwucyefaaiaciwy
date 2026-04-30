@@ -1,4 +1,5 @@
 import logging
+import math
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -17,6 +18,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from ai_engine import chat_with_model
 from amount_input import normalize_amount
 from database import db
+from force_join import (
+    FORCE_JOIN_CHECK_CALLBACK,
+    force_join_check_callback,
+)
 from fx_rates import get_usd_to_toman_snapshot
 from wallet_display import format_toman_annotation
 from wallet_receipts import (
@@ -151,7 +156,18 @@ async def _hub_text_and_kb(
         if user and user.get("active_model")
         else t(lang, "hub_no_active_model")
     )
-    balance = float(user["balance_usd"]) if user else 0.0
+    # Stage-13-Step-A bundled bug fix: NaN-guard the balance figure
+    # before format-string interpolation. ``hub_title`` formats the
+    # value as ``${balance:.2f}`` directly, and ``f"${math.nan:.2f}"``
+    # renders literally ``$nan`` — so a corrupted ``users.balance_usd``
+    # row (legacy NaN, manual SQL fix gone wrong, etc.) would leak
+    # ``$nan`` into the user's hub view. PR #101 already shipped this
+    # exact guard for ``wallet_text`` via ``format_balance_block``;
+    # the hub template was missed. ``$0.00`` is the closest sensible
+    # rendering of "we don't know your balance" — the upstream that
+    # handed us a NaN has a real bug, not a UI string.
+    raw_balance = float(user["balance_usd"]) if user else 0.0
+    balance = raw_balance if math.isfinite(raw_balance) else 0.0
     lang_label = t(lang, f"hub_lang_label_{lang}")
     # asyncpg.Record supports "key in record"; the migration may not
     # have run yet on the production DB so be defensive.
@@ -405,6 +421,16 @@ async def back_to_hub_handler(callback: CallbackQuery, state: FSMContext):
     lang = await _get_user_language(callback.from_user.id)
     await _edit_to_hub(callback, lang)
     await callback.answer()
+
+
+# Stage-13-Step-A: ``✅ I've joined`` button on the required-channel
+# gate. The middleware in ``force_join.py`` skips this exact callback
+# so the handler can re-check membership without an infinite loop.
+# Registered here (the public router) — admins skip the gate entirely
+# in the middleware so they'd never tap this button.
+@router.callback_query(F.data == FORCE_JOIN_CHECK_CALLBACK)
+async def _force_join_check_handler(callback: CallbackQuery):
+    await force_join_check_callback(callback)
 
 
 @router.callback_query(F.data == "hub_wallet")

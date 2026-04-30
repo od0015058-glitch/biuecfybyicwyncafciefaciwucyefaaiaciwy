@@ -57,6 +57,21 @@ NowPayments crypto invoices.
   informational, not a quote. Cold-cache deploys silently drop the
   line until the first refresh lands, rather than rendering `≈ 0
   تومان`.
+- **Required-channel subscription gate** — set `REQUIRED_CHANNEL`
+  (e.g. `@MeowAssist_Channel`, or a `-100…` numeric id for a
+  private channel) to force every non-admin user to join your
+  announcement channel before they can use the bot. They get a
+  "Please join @channel" screen with a Join button + an "✅ I've
+  joined" re-check button until Telegram confirms membership.
+  Admins (`ADMIN_USER_IDS`) always bypass so you can't lock
+  yourself out. The bot must be added as an administrator of the
+  channel — Telegram only exposes membership status for chats the
+  bot administers. If the bot isn't admin yet, the gate fails OPEN
+  with a logged WARNING so a misconfiguration doesn't brick every
+  user. Leave `REQUIRED_CHANNEL` unset to keep the bot fully open
+  (back-compat default). For private channels, also set
+  `REQUIRED_CHANNEL_INVITE_LINK=https://t.me/+abcdefINVITE` so the
+  Join button has somewhere to deep-link.
 - **TOTP / 2FA on admin login** — set `ADMIN_2FA_SECRET` to a base32
   string and `/admin/login` will require a 6-digit code from your
   authenticator app (Google Authenticator, Authy, 1Password,
@@ -153,6 +168,16 @@ To roll back: `docker compose down && git checkout <previous-sha> && docker comp
      so a login sprayer can't use the tunnel IP to bucket-share
      with legitimate admins. Leave unset on direct-internet deploys
      because the header can be spoofed by arbitrary clients.
+   - `REQUIRED_CHANNEL` (optional, Stage-13-Step-A) — when set to a
+     public `@handle` (e.g. `@MeowAssist_Channel`) or a numeric
+     `-100…` chat id for a private channel, every non-admin user
+     must join that channel before the bot becomes interactive.
+     The bot must be added as an **administrator** of the channel
+     so Telegram lets it call `getChatMember`. Pair with
+     `REQUIRED_CHANNEL_INVITE_LINK` for private channels so the
+     join button has a deep-link target. Leave unset to keep the
+     bot fully open (default). Admins (`ADMIN_USER_IDS`) always
+     bypass the gate.
 
 4. **Run**
    ```bash
@@ -188,6 +213,7 @@ pytest tests/
 | `pricing.py` | Per-model price table + `COST_MARKUP` env var (default 1.5×). |
 | `models_catalog.py` | Live `/v1/models` fetch from OpenRouter with 24 h cache, provider whitelist, free/paid split. |
 | `middlewares.py` | `UserUpsertMiddleware` — ensures `users` row exists before any handler runs. |
+| `force_join.py` | `RequiredChannelMiddleware` + the `force_join_check` callback handler. When `REQUIRED_CHANNEL` is set, every non-admin user is gated behind a "join the channel" screen until Telegram confirms membership. Admins bypass; API errors fail open. |
 | `rate_limit.py` | Token-bucket primitives + `ChatRateLimitMiddleware` (per-user) and `webhook_rate_limit_middleware` (per-IP). Guards `/chat` against runaway OpenRouter spend and the `/nowpayments-webhook` endpoint against DoS bursts. |
 | `strings.py` | Two-locale (fa/en) compiled string table + `t(lang, key, **kwargs)` helper. Layered with a runtime override cache populated from the `bot_strings` DB table — admin edits at `/admin/strings` shadow the compiled defaults until reverted. Missing-slug lookups now log a one-shot WARNING per `(lang, key)` instead of silently returning the bare slug. |
 | `wallet_display.py` | Stage-11-Step-D. `format_toman_annotation(lang, balance_usd, snap)` returns the `\n≈ N تومان` (fa) / `\n≈ N TMN` (en) line spliced onto every wallet view's `$X.YZ` figure when an FX snapshot is cached. Stale snapshots get the `(نرخ تقریبی)` / `(approx)` suffix; cold cache returns `""` so the wallet still renders without the line; non-finite balances and arithmetic-overflow products are rejected with `""` rather than rendering `≈ nan تومان`. `format_balance_block(lang, balance_usd, snap)` packages `$X.YZ` + the annotation for callers (post-credit DMs, future wallet sub-screens) that don't go through `strings.t` — and substitutes `$0.00` for the head string on a non-finite balance so a corrupted upstream can't leak `$nan` either (the annotation guard already covered the Toman line). |

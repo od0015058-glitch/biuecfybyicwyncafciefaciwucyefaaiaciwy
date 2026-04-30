@@ -41,6 +41,7 @@ ai_engine.py        OpenRouter call + cost settlement      ~140 LoC
 pricing.py          per-model price + markup               ~110 LoC
 models_catalog.py   live OpenRouter /v1/models cache       ~290 LoC
 middlewares.py      user-upsert middleware                  ~60 LoC
+force_join.py       required-channel subscription gate     ~360 LoC
 strings.py          fa/en string table                     ~600 LoC
 admin.py            Telegram-side admin commands           ~870 LoC
 rate_limit.py       chat + webhook rate limiters           ~270 LoC
@@ -291,6 +292,26 @@ User direction (2026-04-29): *"prioritize all of them first and note them in han
 Dependency order: A is independent and gates the others (refunds is a P0 because a user dispute today has no in-product path). B can ship anytime after A (independent). C and D are independent leaves.
 
 Deferred / explicitly out of Stage-12 scope: (a) the live TetraPay `/api/refund` call (gateway-side automated refund — Step-A.5 follow-up if user asks); (b) multi-step approval workflows on refunds (single admin's signature is fine for the bot's current scale); (c) user-initiated refund requests from the bot side (would require a dispute UX + admin queue — much larger scope).
+
+### Stage-13 queue — post-Stage-12 (queued 2026-04-30 after PR #106 merged)
+
+User direction (2026-04-30): *"specify our steps forward and at last make something for me that when my users start the bot it asks them for join the channel."* Per §3 priority framework — product surface first this round (the user explicitly asked for the channel gate), then operational hardening.
+
+| # | Title | Priority | Status |
+| --- | --- | --- | --- |
+| **Stage-13-Step-A** (this PR) | **Required-channel subscription gate.** New `force_join.py` module with `RequiredChannelMiddleware` (registered after `UserUpsertMiddleware` so the users row is available to render localised text) + the `force_join_check` callback handler. When `REQUIRED_CHANNEL` env var is set (public `@handle` or numeric `-100…` chat id), every non-admin user must be a member of the channel before *any* handler — including `/start` — runs; non-members get a "Please join @channel" screen with a Join button (URL-deep-linked to `https://t.me/<handle>` for public channels, or `REQUIRED_CHANNEL_INVITE_LINK` for private channels) + an "✅ I've joined" callback that re-checks membership via `bot.get_chat_member` and drops the user at the hub on success. Admins (`ADMIN_USER_IDS`) bypass the gate so the operator can never lock themselves out. **Fail-open semantics:** on a `TelegramBadRequest` ("chat not found", "user not found", bot not yet admin of the channel) or any other `TelegramAPIError`, the gate logs a WARNING and lets the user through — failing closed would brick every user during the bootstrap window when the operator hasn't promoted the bot to channel admin yet. New strings (`force_join_text`, `force_join_not_yet`, `btn_force_join_join`, `btn_force_join_check`) ship in fa + en and are editable via `/admin/strings` like every other user-facing label. New env vars `REQUIRED_CHANNEL` + `REQUIRED_CHANNEL_INVITE_LINK` documented in `.env.example`; both default to empty so existing deploys see no behaviour change. **Bug fix bundled:** `_hub_text_and_kb` directly formats `${balance:.2f}` from `float(user["balance_usd"])` — same regression PR #101 fixed for `wallet_text` via `format_balance_block`. The hub template was missed; a corrupted `users.balance_usd` row (legacy NaN, manual SQL fix gone wrong) would leak literally `$nan` into the user's hub view. Now NaN-guarded with `math.isfinite` → `$0.00` fallback (the closest sensible rendering of "we don't know your balance" — the upstream that handed us a NaN has a real bug, not a UI string). 36 new tests in `tests/test_force_join.py` (1212 total, was 1176): env-string parser branches, `ChatMember.status` predicate matrix, fail-open path, admin bypass, non-member rendering, callback-loop escape hatch, hub_title NaN/Inf regression pins. | P2 product | ✅ this PR |
+| **Stage-13-Step-B** | **Per-message rate limit on the AI chat path** (currently per-user *token bucket* via `consume_chat_token` — fine for sustained spend but a burst of 10 prompts in 1 second still drains the wallet at full speed). Hard cap: ≤1 in-flight OpenRouter request per user, queue depth 1. Bug-fix candidate: `ai_engine.chat_with_model` doesn't NaN-guard `balance_usd` before the insufficient-funds compare — already guarded in `_hub_text_and_kb` and `wallet_display`, missing one layer deeper at the spend gate. | P1 correctness | pending |
+| **Stage-13-Step-C** | **Referral codes** — user-to-user invite codes that credit both wallets on the invitee's first paid top-up. New `referral_codes` + `referral_grants` tables, `/wallet → "🎁 Invite a friend"` button, deep-link `/start` payload (`/start ref_<code>`) wires the new user to the referrer. Bug-fix candidate: `cmd_start` ignores deep-link payloads entirely (`message.text.split()[1]` is never inspected) — pre-existing latent bug, not new in this PR. | P2 product | pending |
+| **Stage-13-Step-D** | **Prometheus-style `/metrics` endpoint** for the IPN drop counters + reaper / alert / FX-loop heartbeats already accumulating in-memory. Mounted on the same aiohttp server, gated by an `IP_ALLOWLIST` env var (private-network observability only — no admin auth needed). Bug-fix candidate: the existing per-loop "last successful tick" timestamps are tracked in-process but never exposed; a stuck reaper / alert task is currently invisible until the dashboard tile diverges from reality. | P3 ops | pending |
+
+Audit findings (2026-04-30) noted by reading every file — kept here so a future AI / human can pick the highest-leverage one next:
+
+* **`cmd_start` has a redundant `db.create_user` call** (handlers.py ~260) — `UserUpsertMiddleware` already runs first. Not a bug, dead code; safe to drop in a cleanup PR but not worth its own PR.
+* **`cmd_start` ignores `/start <payload>`** — the deep-link payload that's supposed to wire referral codes / promo auto-redeem. Will become the bundled bug-fix when Stage-13-Step-C ships.
+* **`ai_engine.chat_with_model` doesn't NaN-guard `balance_usd`** before the insufficient-funds gate. Already guarded one layer up in the hub view (Stage-13-Step-A) and one layer down in the DB ledger (`deduct_balance` rejects non-finite cost). Becomes the bundled bug-fix for Stage-13-Step-B.
+* **No structured metrics export** for the per-loop drop counters / heartbeats — `payments.py` and `tetrapay.py` both already expose `get_ipn_drop_counters()` but nothing reads them outside the admin DM body. Becomes Stage-13-Step-D.
+* **Pre-commit hooks not configured.** No `.pre-commit-config.yaml`. Not a bug; the user's working agreement (§11) doesn't require them, and CI runs the same checks on every PR. Noted for completeness.
+* **`docker-compose.yml` doesn't mount the alembic migrations as a volume** — every schema change requires a `--build`. Acceptable for the user's deploy cadence (manual `git pull && docker compose up -d --build` per §11). Noted for completeness.
 
 ---
 
@@ -593,13 +614,16 @@ The user's process for this project — **do not deviate**:
    per-invoice rate lock, PR #100), D (wallet shows USD + live Toman
    annotation, PR #99). Toman is display/input only; wallet stays
    USD-denominated.
-7. **Stage-12 queue is set** — see new §5 "Stage-12 queue" table.
-   Prioritised per §3: A (refunds/chargebacks UI, P0 correctness),
-   B (stuck-payment proactive admin DM, P1 ops), C (user-side TetraPay
-   receipts in `/wallet`, P2 product), D (gift-code redemption stats
-   web page, P3 product). User direction 2026-04-29: do all four,
-   one PR each, in that order.
-8. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+7. **Stage-12 fully shipped** — A (refunds/chargebacks UI),
+   B (stuck-payment proactive admin DM), C (user-side TetraPay
+   receipts in `/wallet`), D (gift-code redemption stats web page).
+8. **Stage-13 queue is set** — see new §5 "Stage-13 queue" table.
+   A (required-channel subscription gate, P2 product) shipped this
+   PR. Remaining: B (per-message rate limit on AI chat, P1
+   correctness), C (referral codes, P2 product), D (Prometheus
+   `/metrics` endpoint, P3 ops). User direction 2026-04-30: A first
+   (the channel gate), then walk down the list one PR at a time.
+9. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
    update this doc + README in each, do NOT block on user approval. The
    user merges them when they wake up.
-9. **Read the §11 working agreement before doing anything.**
+10. **Read the §11 working agreement before doing anything.**
