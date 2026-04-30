@@ -7904,3 +7904,258 @@ async def test_transactions_refund_db_exception_yields_friendly_error(
     )
     assert resp.status == 302
     assert resp.headers["Location"] == "/admin/transactions"
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-D #3-extension-2: toggle-write fail-soft
+# ---------------------------------------------------------------------
+
+
+async def _login_and_get_models_csrf(client, password: str = "pw") -> str:
+    """Log in, fetch /admin/models, scrape its CSRF token."""
+    await client.post(
+        "/admin/login", data={"password": password}, allow_redirects=False
+    )
+    resp = await client.get("/admin/models")
+    body = await resp.text()
+    import re
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+    assert m, "Expected CSRF token in /admin/models form"
+    return m.group(1)
+
+
+async def _login_and_get_gateways_csrf(client, password: str = "pw") -> str:
+    """Log in, fetch /admin/gateways, scrape its CSRF token."""
+    await client.post(
+        "/admin/login", data={"password": password}, allow_redirects=False
+    )
+    resp = await client.get("/admin/gateways")
+    body = await resp.text()
+    import re
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+    assert m, "Expected CSRF token in /admin/gateways form"
+    return m.group(1)
+
+
+def _stub_toggle_db(
+    *,
+    disable_model_result=True,
+    enable_model_result=True,
+    disable_gateway_result=True,
+    enable_gateway_result=True,
+):
+    """A minimal Database stub with the toggle methods + the
+    methods needed to render /admin/models and /admin/gateways."""
+    db = _stub_db()
+    if isinstance(disable_model_result, Exception):
+        db.disable_model = AsyncMock(side_effect=disable_model_result)
+    else:
+        db.disable_model = AsyncMock(return_value=disable_model_result)
+    if isinstance(enable_model_result, Exception):
+        db.enable_model = AsyncMock(side_effect=enable_model_result)
+    else:
+        db.enable_model = AsyncMock(return_value=enable_model_result)
+    if isinstance(disable_gateway_result, Exception):
+        db.disable_gateway = AsyncMock(side_effect=disable_gateway_result)
+    else:
+        db.disable_gateway = AsyncMock(return_value=disable_gateway_result)
+    if isinstance(enable_gateway_result, Exception):
+        db.enable_gateway = AsyncMock(side_effect=enable_gateway_result)
+    else:
+        db.enable_gateway = AsyncMock(return_value=enable_gateway_result)
+    db.get_disabled_models = AsyncMock(return_value=set())
+    db.get_disabled_gateways = AsyncMock(return_value=set())
+    return db
+
+
+async def test_models_disable_post_renders_500_to_flash_on_db_failure(
+    aiohttp_client, make_admin_app
+):
+    """Stage-15-Step-D #3-extension-2: a transient DB error in
+    ``db.disable_model`` must NOT propagate up to a 500 response.
+    The handler swallows the exception, renders a flash error,
+    and returns a clean 302 back to /admin/models so the admin
+    can retry. Audit + cache refresh are skipped (because the DB
+    write didn't actually take effect).
+    """
+    db = _stub_toggle_db(
+        disable_model_result=RuntimeError("transient asyncpg error"),
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_models_csrf(client, "pw")
+    # The login + GET render call ``record_admin_audit`` for the
+    # ``login_success`` action; reset the mock so the post-toggle
+    # assertions only see calls from the toggle handler itself.
+    db.record_admin_audit.reset_mock()
+
+    resp = await client.post(
+        "/admin/models/disable",
+        data={"csrf_token": csrf, "model_id": "openai/gpt-4o"},
+        allow_redirects=False,
+    )
+    # 302 — NOT 500.
+    assert resp.status == 302, await resp.text()
+    assert resp.headers["Location"] == "/admin/models"
+
+    # The DB write was attempted exactly once.
+    db.disable_model.assert_awaited_once_with("openai/gpt-4o")
+    # Cache refresh MUST NOT run when the write failed (cache is
+    # already in sync with the DB row state).
+    db.get_disabled_models.assert_not_awaited()
+    # No audit row written for a failed toggle.
+    db.record_admin_audit.assert_not_awaited()
+
+    # Follow the redirect — the admin sees an error flash.
+    resp2 = await client.get("/admin/models")
+    body = await resp2.text()
+    assert "alert-error" in body or "error" in body.lower()
+    assert "Failed to disable model" in body
+
+
+async def test_models_enable_post_renders_500_to_flash_on_db_failure(
+    aiohttp_client, make_admin_app
+):
+    """Mirror test for the enable-side write path."""
+    db = _stub_toggle_db(
+        enable_model_result=RuntimeError("simulated DB blip"),
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_models_csrf(client, "pw")
+    db.record_admin_audit.reset_mock()
+
+    resp = await client.post(
+        "/admin/models/enable",
+        data={"csrf_token": csrf, "model_id": "openai/gpt-4o"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/models"
+    db.enable_model.assert_awaited_once_with("openai/gpt-4o")
+    db.record_admin_audit.assert_not_awaited()
+
+    resp2 = await client.get("/admin/models")
+    body = await resp2.text()
+    assert "Failed to enable model" in body
+
+
+async def test_models_disable_post_happy_path_writes_audit_and_refreshes(
+    aiohttp_client, make_admin_app
+):
+    """Sanity check the happy path is unchanged: a successful
+    ``db.disable_model`` triggers cache refresh + audit log +
+    success flash."""
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_models_csrf(client, "pw")
+
+    resp = await client.post(
+        "/admin/models/disable",
+        data={"csrf_token": csrf, "model_id": "openai/gpt-4o"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302, await resp.text()
+    db.disable_model.assert_awaited_once_with("openai/gpt-4o")
+    # Refresh DID run — cache is now consistent with the DB write.
+    db.get_disabled_models.assert_awaited()
+    # Audit DID run — the operation completed.
+    db.record_admin_audit.assert_awaited()
+
+    resp2 = await client.get("/admin/models")
+    body = await resp2.text()
+    assert "Disabled model" in body
+    assert "openai/gpt-4o" in body
+
+
+async def test_gateways_disable_post_renders_500_to_flash_on_db_failure(
+    aiohttp_client, make_admin_app
+):
+    """Stage-15-Step-D #3-extension-2 mirror for the gateway
+    side. Same fail-soft contract: 302 + flash error, no audit,
+    no cache refresh."""
+    db = _stub_toggle_db(
+        disable_gateway_result=RuntimeError("transient outage"),
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_gateways_csrf(client, "pw")
+    db.record_admin_audit.reset_mock()
+
+    resp = await client.post(
+        "/admin/gateways/disable",
+        data={"csrf_token": csrf, "gateway_key": "btc"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302, await resp.text()
+    assert resp.headers["Location"] == "/admin/gateways"
+    db.disable_gateway.assert_awaited_once_with("btc")
+    db.get_disabled_gateways.assert_not_awaited()
+    db.record_admin_audit.assert_not_awaited()
+
+    resp2 = await client.get("/admin/gateways")
+    body = await resp2.text()
+    assert "Failed to disable gateway" in body
+
+
+async def test_gateways_enable_post_renders_500_to_flash_on_db_failure(
+    aiohttp_client, make_admin_app
+):
+    """Gateway enable-side mirror."""
+    db = _stub_toggle_db(
+        enable_gateway_result=RuntimeError("simulated DB blip"),
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_gateways_csrf(client, "pw")
+    db.record_admin_audit.reset_mock()
+
+    resp = await client.post(
+        "/admin/gateways/enable",
+        data={"csrf_token": csrf, "gateway_key": "btc"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.enable_gateway.assert_awaited_once_with("btc")
+    db.record_admin_audit.assert_not_awaited()
+
+    resp2 = await client.get("/admin/gateways")
+    body = await resp2.text()
+    assert "Failed to enable gateway" in body
+
+
+async def test_models_disable_post_handles_model_id_with_slash(
+    aiohttp_client, make_admin_app
+):
+    """Stage-15-Step-D #4 audit: model IDs with embedded ``/``
+    characters (the canonical OpenRouter format) round-trip
+    cleanly because the handler reads ``model_id`` from the POST
+    form body — NOT from a URL path parameter. Pin this design
+    so a future refactor that switches to ``/admin/models/{model_id}``
+    URL paths can't silently regress on slash-bearing IDs.
+    """
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_models_csrf(client, "pw")
+
+    # Model IDs typically have one slash, but verify two-segment
+    # IDs work too (some OpenRouter variants like
+    # ``anthropic/claude-3-5-sonnet`` are single slash; a
+    # hypothetical ``provider/family/variant`` form is also
+    # protected by this test).
+    for mid in (
+        "openai/gpt-4o",
+        "anthropic/claude-3-5-sonnet",
+        "openrouter/auto",
+    ):
+        resp = await client.post(
+            "/admin/models/disable",
+            data={"csrf_token": csrf, "model_id": mid},
+            allow_redirects=False,
+        )
+        assert resp.status == 302, (
+            f"model_id {mid!r} did not POST cleanly — route may have "
+            "regressed to URL-path parameter form"
+        )
+        # The exact value POSTed must be the value the DB receives —
+        # no truncation at slash boundaries.
+        await_args = db.disable_model.await_args
+        assert await_args.args == (mid,), (
+            f"db.disable_model received {await_args.args} but expected {(mid,)}"
+        )
