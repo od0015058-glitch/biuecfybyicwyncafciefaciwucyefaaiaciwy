@@ -14,9 +14,12 @@ MARKUP is read from the ``COST_MARKUP`` env var (default 1.5x).
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from dataclasses import dataclass
+
+log = logging.getLogger("bot.pricing")
 
 
 @dataclass(frozen=True)
@@ -117,11 +120,75 @@ def _apply_markup(price: ModelPrice, prompt_tokens: int, completion_tokens: int)
         and price.output_per_1m_usd >= 0.0
     ):
         price = FALLBACK_PRICE
+    # Stage-15-Step-E #4 bundled bug fix: the price half was
+    # already NaN-guarded above, but the ``prompt_tokens`` /
+    # ``completion_tokens`` half was not. They flow in straight
+    # from ``data["usage"]["prompt_tokens"]`` /
+    # ``["completion_tokens"]`` in ``ai_engine.chat_with_model``,
+    # where Python's stdlib ``json.loads`` accepts the literal
+    # ``NaN`` token by default — meaning a quirky OpenRouter 200
+    # response (or, more realistically, a misbehaving stub /
+    # custom proxy / future internal billing path) with a
+    # non-finite token count would propagate NaN through the
+    # multiplication, through ``raw * markup``, and finally
+    # through ``max(NaN, 0.0)`` — which returns NaN in CPython
+    # because the comparison ``NaN < 0.0`` is False, so ``max``
+    # treats NaN as the maximum. The downstream impact mirrors
+    # the price-side hole: ``deduct_balance`` refuses the NaN,
+    # ``log_usage`` refuses the NaN, the user gets free chat
+    # AND there's no row in ``usage_logs`` so the audit trail
+    # has a hole. Defence-in-depth: clamp non-finite / negative
+    # token counts to 0 (a zero-cost row keeps the audit trail
+    # intact and lets the caller see "this call had corrupt
+    # token counts" via the log line below). Genuine free
+    # models are charged at the static price already; this only
+    # affects the corrupted-input path.
+    safe_prompt_tokens = _coerce_token_count(prompt_tokens, "prompt_tokens")
+    safe_completion_tokens = _coerce_token_count(
+        completion_tokens, "completion_tokens"
+    )
     raw = (
-        prompt_tokens * price.input_per_1m_usd
-        + completion_tokens * price.output_per_1m_usd
+        safe_prompt_tokens * price.input_per_1m_usd
+        + safe_completion_tokens * price.output_per_1m_usd
     ) / 1_000_000.0
     return max(raw * get_markup(), 0.0)
+
+
+def _coerce_token_count(value: object, label: str) -> float:
+    """Clamp a token count to ``[0, +inf)`` and to a finite float.
+
+    Defensive helper for :func:`_apply_markup` (Stage-15-Step-E #4
+    bundled bug fix). Non-finite / non-numeric values become ``0.0``
+    with a logged warning so ops can investigate the upstream source
+    of the corrupt count. Negative ints / floats also clamp to ``0``.
+    """
+    try:
+        coerced = float(value)
+    except (TypeError, ValueError):
+        log.warning(
+            "Refusing non-numeric %s=%r in cost computation; "
+            "treating as 0. Investigate upstream caller.",
+            label,
+            value,
+        )
+        return 0.0
+    if not math.isfinite(coerced):
+        log.warning(
+            "Refusing non-finite %s=%r in cost computation; "
+            "treating as 0. Investigate upstream caller.",
+            label,
+            value,
+        )
+        return 0.0
+    if coerced < 0.0:
+        log.warning(
+            "Refusing negative %s=%r in cost computation; "
+            "treating as 0. Investigate upstream caller.",
+            label,
+            value,
+        )
+        return 0.0
+    return coerced
 
 
 def apply_markup_to_price(price: ModelPrice) -> ModelPrice:

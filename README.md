@@ -192,6 +192,18 @@ NowPayments crypto invoices.
   the bot continues to use long-polling exactly as before. See
   `.env.example` (Stage-15-Step-E #3 block) for the recovery
   procedure if you flip back.
+- **Per-key 429 cooldown for OpenRouter** — when OpenRouter
+  returns 429 for one of the configured pool keys (the upstream
+  provider rate-limited it, or the key hit its OpenRouter plan
+  ceiling), `openrouter_keys` puts that key in a short cooldown
+  (default 60s, honours `Retry-After`, clamped to 1h max).
+  Subsequent users routed there fall through to the next
+  available pool member instead of seeing "rate-limited" every
+  time their sticky key is the one under pressure. When **all**
+  keys are in cooldown the picker returns the sticky pick
+  anyway with a warning, so the user gets at least one attempt
+  rather than a hard "no service" error. First slice of
+  Stage-15-Step-E #4.
 
 For the full project history, file map, and roadmap **read [HANDOFF.md](./HANDOFF.md)**.
 
@@ -388,7 +400,7 @@ See [HANDOFF.md](./HANDOFF.md) §Stage-15 for the full queue:
 | **Stage-15-B** | Server update script with backup rotation | shipped |
 | **Stage-15-C** | Logos & posters AI prompt folder | shipped |
 | **Stage-15-D** | Bug-fix sweep | shipped (PRs #113–#118, all 6 candidates closed) |
-| **Stage-15-E** | Future project suggestions (12 items) | **#1 MERGED** (conversation history export, first slice) · **#2 MERGED** (per-user spending dashboard, first slice) · **#3 STARTED** (opt-in webhook mode) |
+| **Stage-15-E** | Future project suggestions (12 items) | **#1 MERGED** (conversation history export, first slice) · **#2 MERGED** (per-user spending dashboard, first slice) · **#3 MERGED** (opt-in webhook mode) · **#4 STARTED** (per-key 429 cooldown) |
 
 ## License / contributing
 
