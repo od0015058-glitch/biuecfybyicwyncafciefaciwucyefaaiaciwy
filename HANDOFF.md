@@ -322,6 +322,295 @@ New files added in Stage-14:
 - `tests/test_admin_toggles.py` — unit tests for toggle cache + handler helpers.
 - `tests/test_openrouter_keys.py` — unit tests for multi-key routing.
 
+### Stage-15 — Prometheus metrics, ops tooling, branding & future roadmap (queued 2026-04-30)
+
+User direction (2026-04-30): *"finish all the things left… run a bug fix… create a folder called logos and posters… create prompts for logo using Nano Banana Pro… full guide on how to update server repo… suggest some steps for future of project in handoff."*
+
+#### Stage-15-Step-A: Prometheus `/metrics` endpoint (carried from Stage-13-Step-D)
+
+**Priority:** P3 ops
+**Status:** pending
+
+**What:**
+Mount a `/metrics` route on the existing aiohttp server that returns Prometheus text-format metrics. Gate by `METRICS_IP_ALLOWLIST` env var (comma-separated CIDRs, default `127.0.0.1,::1` — localhost only). No admin cookie auth needed since this is for internal scraping (Prometheus / Grafana / VictoriaMetrics).
+
+**Metrics to expose (all already tracked in-process, just not exported):**
+1. `meowassist_ipn_drops_total{reason="bad_signature|bad_json|missing_payment_id|replay"}` — from `payments.get_ipn_drop_counters()`
+2. `meowassist_tetrapay_ipn_drops_total{reason=...}` — from `tetrapay.get_ipn_drop_counters()` (if exists)
+3. `meowassist_pending_reaper_last_run_epoch` — timestamp of last successful reaper loop tick
+4. `meowassist_fx_refresh_last_run_epoch` — timestamp of last successful FX rate refresh
+5. `meowassist_model_discovery_last_run_epoch` — timestamp of last model discovery loop
+6. `meowassist_catalog_refresh_last_run_epoch` — timestamp of last catalog price refresh
+7. `meowassist_min_amount_refresh_last_run_epoch` — timestamp of last NowPayments min-amount refresh
+8. `meowassist_chat_inflight_active` — current size of the in-flight chat slot set (`rate_limit`)
+9. `meowassist_disabled_models_count` — count of admin-disabled AI models
+10. `meowassist_disabled_gateways_count` — count of admin-disabled gateways
+11. `meowassist_openrouter_keys_count` — number of active OpenRouter API keys loaded
+
+**Implementation plan:**
+- New file: `metrics.py` — `render_metrics()` function that collects all the above into Prometheus exposition format (plain text, no third-party deps like `prometheus_client` — keep deps minimal)
+- New aiohttp route: `GET /metrics` with IP allowlist middleware
+- New env var: `METRICS_IP_ALLOWLIST` (default `127.0.0.1,::1`)
+- `.env.example` documentation
+- Tests: verify output format, verify IP gating rejects non-allowed IPs, verify counters render correctly
+- **Bug-fix candidate (bundle):** the existing per-loop "last successful tick" timestamps are tracked in-process but never exposed — a stuck reaper / alert / FX-refresh task is currently invisible until the dashboard tile diverges from reality. The metrics endpoint makes this observable.
+
+#### Stage-15-Step-B: Server update script with backup rotation
+
+**Priority:** P3 ops
+**Status:** pending
+
+**What:**
+Create `scripts/update-server.sh` — a one-command script the admin runs on their VPS to:
+1. Create a timestamped backup of the current running version
+2. Pull the latest code from GitHub
+3. Rebuild and restart Docker containers
+4. Preserve `.env` (never overwrite)
+5. Keep exactly 2 backups (current-1 and current-2); delete older ones
+
+**Implementation plan:**
+```bash
+#!/usr/bin/env bash
+# Usage: sudo bash scripts/update-server.sh
+# Run from the project root (e.g. /opt/meowassist)
+#
+# What it does:
+#   1. Stops the bot containers gracefully
+#   2. Creates a backup of the current version at /opt/meowassist-backups/YYYY-MM-DD_HH-MM/
+#      (copies everything EXCEPT .env, docker volumes, and __pycache__)
+#   3. Pulls the latest code from origin/main
+#   4. Rebuilds Docker images and restarts containers
+#   5. Rotates backups: keeps the 2 most recent, deletes older ones
+#
+# Your .env is NEVER touched — it stays in place across updates.
+# The database lives in a Docker volume — also untouched.
+#
+# Backup structure:
+#   /opt/meowassist-backups/
+#   ├── 2026-04-30_14-30/    ← most recent (before this update)
+#   └── 2026-04-29_09-15/    ← previous
+#   (older backups are automatically deleted)
+
+set -euo pipefail
+
+PROJECT_DIR="${PROJECT_DIR:-/opt/meowassist}"
+BACKUP_ROOT="${BACKUP_ROOT:-/opt/meowassist-backups}"
+KEEP_BACKUPS=2
+
+TIMESTAMP=$(date +%F_%H-%M)
+BACKUP_DIR="$BACKUP_ROOT/$TIMESTAMP"
+
+echo "=== Meowassist update — $TIMESTAMP ==="
+
+# 1. Back up current version
+mkdir -p "$BACKUP_DIR"
+rsync -a --exclude='.env' --exclude='__pycache__' --exclude='.git' \
+    "$PROJECT_DIR/" "$BACKUP_DIR/"
+echo "✓ Backup created: $BACKUP_DIR"
+
+# 2. Rotate — keep only the N most recent
+cd "$BACKUP_ROOT"
+ls -dt */ | tail -n +$((KEEP_BACKUPS + 1)) | xargs -r rm -rf
+echo "✓ Old backups rotated (keeping $KEEP_BACKUPS)"
+
+# 3. Pull latest code
+cd "$PROJECT_DIR"
+git fetch origin main
+git checkout main
+git reset --hard origin/main
+echo "✓ Code updated to $(git rev-parse --short HEAD)"
+
+# 4. Rebuild & restart
+docker compose up -d --build
+echo "✓ Containers rebuilt and restarted"
+
+# 5. Also restart Caddy if its compose file exists
+if [ -f docker-compose.caddy.yml ]; then
+    docker compose -f docker-compose.caddy.yml up -d
+    echo "✓ Caddy restarted"
+fi
+
+echo ""
+echo "=== Update complete ==="
+echo "Run 'docker compose logs -f bot' to verify health."
+```
+
+**Key behaviors:**
+- `.env` is excluded from the backup (it stays in place and is never overwritten by `git pull`)
+- Docker volumes (Postgres data, Redis data) live outside the project dir — untouched
+- The backup contains the full source tree (minus `.env`, `.git`, `__pycache__`) so you can manually restore by copying it back
+- Exactly 2 backups are retained at all times (most recent + previous)
+- `BACKUP_ROOT` and `PROJECT_DIR` are overridable via env vars for non-standard setups
+- Alembic migrations run automatically on container start via `entrypoint.sh` — no manual migration step needed
+
+**Admin cheat sheet (paste into SSH):**
+```bash
+cd /opt/meowassist && sudo bash scripts/update-server.sh
+```
+
+#### Stage-15-Step-C: Logos and posters folder with AI prompts
+
+**Priority:** P2 product / branding
+**Status:** pending
+
+**What:**
+Create `logos_and_posters/` directory in the repo root containing prompt files for generating the Meowassist brand assets using **Nano Banana Pro** (or any image-generation AI).
+
+**Prompts to create (each in its own `.md` file):**
+
+1. **`logos_and_posters/logo-prompt.md`** — Primary logo prompt:
+   ```
+   Project context for AI image generator:
+   Meowassist is a Persian/English Telegram AI assistant bot. It uses a cat (🐱)
+   as its mascot. The bot proxies LLM requests (OpenRouter) and handles crypto
+   payments. The brand identity is: friendly, techy, Persian-influenced, cat-themed.
+   Domain: meowassist.space
+
+   PROMPT — Primary Logo (square, 1024×1024):
+   Minimal, modern logo mark of a stylized cat face merged with a circuit board
+   or neural network pattern. The cat has one eye shaped like a chat bubble and
+   the other like a glowing AI node. Color palette: deep purple (#6C3CE1) as
+   primary, electric cyan (#00E5FF) as accent, on a clean white or transparent
+   background. No text in the logo mark — just the icon. Flat design, no
+   gradients, no shadows. Suitable for use as a Telegram bot avatar (circular
+   crop friendly) and favicon.
+
+   VARIATIONS:
+   - Dark mode version (same icon, on #1A1A2E background)
+   - Monochrome version (single color, for watermarks)
+   ```
+
+2. **`logos_and_posters/logo-text-prompt.md`** — Logo + wordmark prompt:
+   ```
+   PROMPT — Wordmark / Full Logo (horizontal, 2048×512):
+   The cat-circuit icon from the primary logo on the left, followed by
+   "Meowassist" in a clean sans-serif typeface (similar to Inter or SF Pro).
+   The "Meow" part in deep purple (#6C3CE1), the "assist" part in electric
+   cyan (#00E5FF). Subtle spacing between the icon and text. White/transparent
+   background. Persian alternative: same layout but text is "میواسیست" in a
+   modern Persian typeface (Vazirmatn or IRANSans style).
+   ```
+
+3. **`logos_and_posters/channel-banner-prompt.md`** — Telegram channel banner:
+   ```
+   PROMPT — Channel Banner (1280×640 for Telegram channel header):
+   Wide banner with the Meowassist cat-circuit logo centered. Background is a
+   subtle gradient from deep purple (#6C3CE1) to dark navy (#1A1A2E).
+   Floating around the cat: tiny icons representing the bot's features —
+   a wallet icon, a chat bubble, crypto coin symbols (₿ Ξ), a settings gear.
+   Very subtle, almost like constellations. Bottom text: "meowassist.space"
+   in small, elegant white text. Overall feel: premium, techy, trustworthy.
+   ```
+
+4. **`logos_and_posters/promotional-poster-prompt.md`** — Feature poster:
+   ```
+   PROMPT — Promotional Poster (1080×1920 for Instagram/Telegram stories):
+   Top third: Meowassist cat logo glowing with cyan (#00E5FF) halo effect
+   on dark purple background.
+   Middle section: 4 feature cards arranged vertically:
+     🤖 "Access to 100+ AI models" (in Persian: دسترسی به بیش از ۱۰۰ مدل هوش مصنوعی)
+     💳 "Pay with crypto" (پرداخت با ارز دیجیتال)
+     🇮🇷 "Rial payment via Shaparak" (پرداخت ریالی از طریق شاپرک)
+     🆓 "Free messages to start" (پیام‌های رایگان برای شروع)
+   Each card: frosted glass effect, rounded corners, small icon on left.
+   Bottom: "@Meowassist_Ai_bot" with a "Start now" call-to-action button style.
+   Colors: deep purple / cyan / white. Persian text should be primary,
+   English subtitle underneath each line.
+   ```
+
+5. **`logos_and_posters/favicon-prompt.md`** — Favicon / app icon:
+   ```
+   PROMPT — Favicon / App Icon (512×512, will be scaled down to 32×32):
+   The cat face from the primary logo, simplified to work at very small sizes.
+   Only the essential shapes: cat ear silhouette + one glowing eye (cyan dot).
+   Deep purple background, rounded square shape (iOS app icon style corners).
+   Must be recognizable at 16×16 pixels — test by squinting.
+   ```
+
+6. **`logos_and_posters/README.md`** — Instructions for the admin:
+   ```
+   # Meowassist Brand Assets — AI Generation Prompts
+
+   This folder contains prompts for generating Meowassist brand assets
+   using AI image generators (Nano Banana Pro, Midjourney, DALL-E, etc.).
+
+   ## Brand Identity
+   - **Name:** Meowassist (میواسیست)
+   - **Mascot:** Stylized cat with tech/AI elements
+   - **Primary color:** Deep purple #6C3CE1
+   - **Accent color:** Electric cyan #00E5FF
+   - **Background dark:** Dark navy #1A1A2E
+   - **Font suggestion:** Inter / SF Pro (English), Vazirmatn (Persian)
+   - **Telegram handle:** @Meowassist_Ai_bot
+   - **Domain:** meowassist.space
+
+   ## Files
+   | File | What it generates |
+   |------|-------------------|
+   | logo-prompt.md | Square icon/avatar (1024×1024) |
+   | logo-text-prompt.md | Horizontal wordmark (2048×512) |
+   | channel-banner-prompt.md | Telegram channel header (1280×640) |
+   | promotional-poster-prompt.md | Story/poster (1080×1920) |
+   | favicon-prompt.md | Tiny favicon (512×512) |
+
+   ## How to use
+   1. Open your AI image generator (Nano Banana Pro, etc.)
+   2. Copy the PROMPT section from the relevant file
+   3. Paste and generate
+   4. Download the result and place it in this folder
+   5. For the Telegram bot avatar: use the square logo, crop to circle
+
+   ## Color reference
+   | Swatch | Hex | Usage |
+   |--------|-----|-------|
+   | 🟣 | #6C3CE1 | Primary / brand purple |
+   | 🔵 | #00E5FF | Accent / tech cyan |
+   | ⚫ | #1A1A2E | Dark background |
+   | ⚪ | #FFFFFF | Light background / text |
+   ```
+
+#### Stage-15-Step-D: Bug-fix pass
+
+**Priority:** P1 correctness
+**Status:** pending
+
+**What:**
+Systematic sweep of the codebase for latent bugs. Candidates identified during audit:
+
+1. **`_active_pay_currencies()` in handlers.py doesn't filter by whether NowPayments API key is actually configured.** If `NOWPAYMENTS_API_KEY` is empty, crypto currencies still appear in the picker. Users pick BTC, invoice creation fails with a cryptic API error. Fix: early filter in `_active_pay_currencies()` if `NOWPAYMENTS_API_KEY` is unset.
+
+2. **`openrouter_keys.py` `load_keys()` runs at module import time.** If the module is imported during tests or by a script that doesn't need OpenRouter, missing env vars cause a `RuntimeError` at import. Fix: lazy-load on first call to `key_for_user()` instead of at import.
+
+3. **Race condition in `admin_toggles.py` refresh.** `refresh_disabled_models(db)` replaces `_disabled_models` with a new set from DB. Between the DB query and the set assignment, a concurrent `is_model_disabled()` call reads stale data. In practice harmless (single-process, async not threaded) but a future `uvloop` + thread pool change could surface it. Fix: document the single-process assumption or use `asyncio.Lock`.
+
+4. **`web_admin.py` model toggle routes use URL path `{model_id}` but model IDs contain `/` characters** (e.g. `openai/gpt-4o`). aiohttp path parameters don't match `/` by default. Verify the current implementation handles this correctly (likely uses a catch-all `{model_id:.+}` pattern or POST body). If not, fix the route.
+
+5. **`tetrapay.py` IPN drop counters are process-local** — same pattern as `payments.py`. Both reset to zero on bot restart. The Prometheus `/metrics` endpoint (Step-A) will export them, but the admin dashboard at `/admin/` doesn't show them anywhere. Consider adding a "IPN health" section to the dashboard.
+
+#### Stage-15-Step-E: Future project suggestions
+
+**Priority:** info / planning
+**Status:** pending — document only, no implementation
+
+**Suggested roadmap for future development (post Stage-15):**
+
+| # | Suggestion | Priority | Effort | Notes |
+|---|-----------|----------|--------|-------|
+| 1 | **Conversation history persistence & export** — let users download their chat history as `.txt` / `.pdf`. Currently conversations are in-memory buffer only (`conversation_messages` table). Add a `/history` command or wallet-menu button. | P2 product | Medium | Users on paid models want records of expensive conversations |
+| 2 | **Spending analytics for users** — show users their own spending dashboard: total spent, per-model breakdown, daily/weekly graphs. Currently only admins see metrics. Add a `/stats` command or inline menu. | P2 product | Medium | Builds trust + reduces support questions about "where did my money go" |
+| 3 | **Webhook mode instead of long-polling** — switch from aiogram long-polling to webhook mode. The aiohttp server already runs; register a `/telegram-webhook` route. Reduces latency, uses fewer resources. | P3 ops | Low | Only worthwhile if the bot gets >100 concurrent users |
+| 4 | **Rate limiting per OpenRouter key** — extend `openrouter_keys.py` with per-key 429 detection. If a key gets rate-limited, temporarily redistribute its users to other keys. Current sticky assignment doesn't handle key exhaustion. | P3 ops | Medium | Only matters with 10+ keys and heavy traffic |
+| 5 | **Admin role system** — currently all admins have full access. Add roles: `viewer` (read-only dashboard), `operator` (can broadcast, manage promos), `super` (can edit users, refund). Store in DB, not env. | P2 product | High | Only needed if the team grows beyond 1 admin |
+| 6 | **Automated testing with real Telegram** — use `telethon` or `pyrogram` to write integration tests that actually send messages to the bot and verify responses. Currently all tests are unit tests with mocked Telegram. | P3 ops | High | Big investment but catches integration bugs CI can't |
+| 7 | **i18n framework upgrade** — move from the current `strings.py` dict to proper `.po` / `.mo` gettext files. Enables community translations, pluralization rules, and tooling like Crowdin. | P2 product | Medium | Only worthwhile if adding a third language (Arabic, Turkish) |
+| 8 | **Stripe / Zarinpal payment gateway** — add conventional card payment options alongside crypto. Stripe for international, Zarinpal for Iranian cards (alternative to TetraPay). | P2 product | High | Significant gateway integration work |
+| 9 | **Bot monetization dashboard** — admin page showing revenue vs. OpenRouter cost, profit margin per model, break-even analysis. All data already exists in `usage_logs` + `transactions`. | P2 product | Medium | High value for the operator to understand business health |
+| 10 | **Image / vision model support** — let users send photos and have vision models (GPT-4V, Claude 3) analyze them. OpenRouter supports multimodal; need to handle Telegram photo downloads + base64 encoding in `ai_engine`. | P2 product | Medium | Popular user request for AI bots |
+| 11 | **Voice message support** — accept Telegram voice messages, transcribe via Whisper (OpenRouter or direct API), send text to the LLM, optionally TTS the response back. | P2 product | High | Differentiator for Persian-speaking users who prefer voice |
+| 12 | **Group chat mode** — let the bot operate in Telegram groups, responding to mentions or commands. Currently private-chat only. Needs mention parsing, per-group settings, spam prevention. | P2 product | High | Big surface area; defer until single-user mode is rock-solid |
+
+---
+
 Audit findings (2026-04-30) noted by reading every file — kept here so a future AI / human can pick the highest-leverage one next:
 
 * **`cmd_start` has a redundant `db.create_user` call** (handlers.py ~278) — `UserUpsertMiddleware` already runs first. Inspected during the Stage-13-Step-Aplus audit and decided NOT to remove: the middleware swallows upsert exceptions (logged + handler still runs), so the explicit retry in `cmd_start` is the only safety net for a transient DB issue at the moment of `/start`. Belt-and-braces; leave it.
@@ -644,8 +933,9 @@ The user's process for this project — **do not deviate**:
    Step-A's comment claimed was already done) merged as PR #109.
    C (referral codes user-to-user invites + bundled `/start
    <payload>` deep-link bug fix, P2 product) shipped this PR.
-   Remaining: D (Prometheus `/metrics` endpoint, P3 ops). User
-   direction 2026-04-30: walk down the list one PR at a time.
+   Remaining: D (Prometheus `/metrics` endpoint, P3 ops) — carried to
+   Stage-15-Step-A. User direction 2026-04-30: walk down the list one
+   PR at a time.
 9. **Stage-14 is fully shipped** — A+B (admin model & gateway toggles,
    `disabled_models` + `disabled_gateways` tables, web panel pages at
    `/admin/models` + `/admin/gateways`, alembic 0015, audit-logged
@@ -656,7 +946,11 @@ The user's process for this project — **do not deviate**:
    `OPENROUTER_API_KEY_1..10` env vars, sticky per-user key
    assignment `telegram_id % N`, backward-compatible with single
    `OPENROUTER_API_KEY`, module `openrouter_keys.py`).
-10. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+10. **Stage-15 roadmap is documented** — see §"Stage-15" in this file.
+    A (Prometheus `/metrics`), B (server update script with backup
+    rotation), C (logos/posters AI prompt folder), D (bug-fix sweep),
+    E (12 future project suggestions). All pending implementation.
+11. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-11. **Read the §11 working agreement before doing anything.**
+12. **Read the §11 working agreement before doing anything.**
