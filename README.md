@@ -179,6 +179,19 @@ NowPayments crypto invoices.
   hard-codes `WHERE telegram_id = $1` on every sub-query so a
   buggy caller can't leak someone else's totals. First slice of
   Stage-15-Step-E #2.
+- **Opt-in Telegram webhook mode** — set `TELEGRAM_WEBHOOK_SECRET`
+  to switch from long-polling to webhook delivery. The bot mounts
+  a `POST /telegram-webhook/<secret>` route on the same aiohttp
+  app + port as the IPN endpoints, registers the URL with
+  Telegram via `Bot.set_webhook` (with the same secret as the
+  `X-Telegram-Bot-Api-Secret-Token` header — both layers must
+  match for an update to be accepted), and shares the per-IP
+  rate-limit bucket with NowPayments / TetraPay. Reduces latency
+  vs. the long-polling cycle and saves the polling task's idle
+  CPU. **Backward-compatible default**: when the env var is unset,
+  the bot continues to use long-polling exactly as before. See
+  `.env.example` (Stage-15-Step-E #3 block) for the recovery
+  procedure if you flip back.
 
 For the full project history, file map, and roadmap **read [HANDOFF.md](./HANDOFF.md)**.
 
@@ -375,7 +388,7 @@ See [HANDOFF.md](./HANDOFF.md) §Stage-15 for the full queue:
 | **Stage-15-B** | Server update script with backup rotation | shipped |
 | **Stage-15-C** | Logos & posters AI prompt folder | shipped |
 | **Stage-15-D** | Bug-fix sweep | shipped (PRs #113–#118, all 6 candidates closed) |
-| **Stage-15-E** | Future project suggestions (12 items) | **#1 MERGED** (conversation history export, first slice) · **#2 STARTED** (per-user spending dashboard, first slice) |
+| **Stage-15-E** | Future project suggestions (12 items) | **#1 MERGED** (conversation history export, first slice) · **#2 MERGED** (per-user spending dashboard, first slice) · **#3 STARTED** (opt-in webhook mode) |
 
 ## License / contributing
 

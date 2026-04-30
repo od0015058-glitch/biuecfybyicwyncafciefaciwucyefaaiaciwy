@@ -23,7 +23,18 @@ from payments import payment_webhook, refresh_min_amounts_loop
 from tetrapay import tetrapay_webhook
 from pending_alert import start_pending_alert_task
 from pending_expiration import start_pending_expiration_task
-from rate_limit import install_webhook_rate_limit
+from rate_limit import (
+    install_webhook_rate_limit,
+    register_rate_limited_webhook_path,
+)
+from telegram_webhook import (
+    WebhookConfigError,
+    install_telegram_webhook_route,
+    is_webhook_mode_enabled,
+    load_webhook_config,
+    register_webhook_with_telegram,
+    remove_webhook_from_telegram,
+)
 from web_admin import setup_admin_routes
 
 load_dotenv()
@@ -35,8 +46,19 @@ logging.basicConfig(
 log = logging.getLogger("bot.main")
 
 
-async def start_webhook_server(bot: Bot) -> web.AppRunner:
-    """Spins up a background web server to listen for payment IPNs."""
+async def start_webhook_server(
+    bot: Bot, dp: Dispatcher | None = None
+) -> web.AppRunner:
+    """Spins up a background web server to listen for payment IPNs.
+
+    Stage-15-Step-E #3: when ``dp`` is non-None **and**
+    ``TELEGRAM_WEBHOOK_SECRET`` is set, also mounts the Telegram
+    update endpoint at ``/telegram-webhook/<secret>`` on the same
+    aiohttp app — same process, same port, same per-IP rate limiter.
+    Default behaviour (``dp=None`` or env var unset) is unchanged:
+    the IPN endpoints come up on their own and ``main`` continues
+    with long-polling.
+    """
     app = web.Application()
     # Per-IP token-bucket middleware first so a flood can't even reach
     # the JSON parsing / signature verification step. NowPayments'
@@ -87,6 +109,23 @@ async def start_webhook_server(bot: Bot) -> web.AppRunner:
         totp_secret=os.getenv("ADMIN_2FA_SECRET", ""),
         totp_issuer=os.getenv("ADMIN_2FA_ISSUER", "Meowassist Admin"),
     )
+
+    # Stage-15-Step-E #3: opt-in Telegram webhook mode. Mounted on
+    # the same aiohttp app + same port + same per-IP token bucket as
+    # the IPN endpoints. We only mount the route when:
+    #   * the caller passed a Dispatcher (``main`` does iff webhook
+    #     mode is enabled — see the boot check below), and
+    #   * ``load_webhook_config`` returns a non-None config.
+    # When either is false we fall through and ``main`` continues
+    # with the legacy ``dp.start_polling`` path.
+    if dp is not None:
+        webhook_config = load_webhook_config()
+        if webhook_config is not None:
+            install_telegram_webhook_route(
+                app, dispatcher=dp, bot=bot, config=webhook_config
+            )
+            register_rate_limited_webhook_path(app, webhook_config.path)
+            app["telegram_webhook_config"] = webhook_config
 
     port = int(os.getenv("WEBHOOK_PORT", "8080"))
 
@@ -197,7 +236,23 @@ async def main():
     admin_ids = parse_admin_user_ids(os.getenv("ADMIN_USER_IDS"))
     await publish_bot_commands(bot, admin_ids)
 
-    runner = await start_webhook_server(bot)
+    # Stage-15-Step-E #3: pre-resolve the webhook config so a typo in
+    # ``TELEGRAM_WEBHOOK_SECRET`` halts boot here (loud) rather than
+    # silently failing every Telegram update later. When the env var
+    # is unset, ``load_webhook_config`` returns None and the bot
+    # continues in long-polling mode — backward-compatible default.
+    if is_webhook_mode_enabled():
+        try:
+            webhook_config = load_webhook_config()
+        except WebhookConfigError as exc:
+            log.error("Telegram webhook config error: %s", exc)
+            raise
+    else:
+        webhook_config = None
+
+    runner = await start_webhook_server(
+        bot, dp=dp if webhook_config is not None else None
+    )
 
     # Stage-9-Step-5: background reaper for stuck PENDING transactions.
     # Wakes every PENDING_EXPIRATION_INTERVAL_MIN minutes (default 15)
@@ -253,7 +308,28 @@ async def main():
     )
 
     try:
-        await dp.start_polling(bot)
+        if webhook_config is not None:
+            # Stage-15-Step-E #3: webhook mode. The aiohttp app
+            # (mounted in ``start_webhook_server`` above) is already
+            # serving the Telegram update endpoint; tell Telegram
+            # where to deliver updates and then block forever
+            # waiting for shutdown. The dispatcher's startup hooks
+            # were wired in by ``setup_application`` inside
+            # ``install_telegram_webhook_route``.
+            await register_webhook_with_telegram(bot, webhook_config)
+            log.info(
+                "Bot is in webhook mode; updates flow via "
+                "%s. Long-polling is suspended for the duration "
+                "of this process.",
+                webhook_config.url,
+            )
+            stop = asyncio.Event()
+            try:
+                await stop.wait()
+            finally:
+                await remove_webhook_from_telegram(bot)
+        else:
+            await dp.start_polling(bot)
     finally:
         fx_refresher_task.cancel()
         try:
