@@ -600,6 +600,11 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     # Stage-12-Step-A: refund flow on /admin/transactions.
     "refund_issued": "Refund issued",
     "refund_refused": "Refund refused",
+    # Stage-14: model & gateway toggles.
+    "model_disable": "AI model disabled",
+    "model_enable": "AI model enabled",
+    "gateway_disable": "Gateway disabled",
+    "gateway_enable": "Gateway enabled",
 }
 
 
