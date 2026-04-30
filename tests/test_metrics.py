@@ -1,0 +1,364 @@
+"""Stage-15-Step-A: tests for the Prometheus ``/metrics`` endpoint.
+
+Covered surface:
+
+* ``parse_ip_allowlist`` — pure CIDR parser (well-formed,
+  whitespace tolerance, malformed-entry skip, mixed v4 / v6).
+* ``is_ip_allowed`` — empty allowlist locks everyone out, valid v4
+  / v6 membership, missing / unparseable ``request.remote``,
+  v4-vs-v6 mismatches.
+* ``record_loop_tick`` / ``get_loop_last_tick`` — set + read,
+  reset-for-tests.
+* ``render_metrics`` — full output shape: HELP / TYPE preamble per
+  metric, labelled IPN counter rendering, gauge rendering, NaN /
+  Inf gauge defence, trailing newline.
+* ``metrics_handler`` — 200 + ``text/plain`` from an allowed IP,
+  403 from a denied IP, end-to-end aiohttp roundtrip via the
+  ``aiohttp_client`` fixture.
+* ``install_metrics_route`` — registers ``GET /metrics`` and stashes
+  the parsed allowlist under ``app["_metrics_allowlist"]``.
+
+All tests run synchronously where possible and use the standard
+``pytest-aiohttp`` ``aiohttp_client`` fixture for the
+HTTP-roundtrip check.
+"""
+
+from __future__ import annotations
+
+import ipaddress
+from unittest.mock import MagicMock
+
+import pytest
+from aiohttp import web
+
+import metrics
+
+
+# ── parse_ip_allowlist ─────────────────────────────────────────────
+
+
+def test_parse_ip_allowlist_well_formed():
+    out = metrics.parse_ip_allowlist("127.0.0.1, 10.0.0.0/8 ,::1")
+    assert isinstance(out, tuple)
+    assert ipaddress.ip_network("127.0.0.1/32") in out
+    assert ipaddress.ip_network("10.0.0.0/8") in out
+    assert ipaddress.ip_network("::1/128") in out
+
+
+def test_parse_ip_allowlist_skips_blank_and_malformed(caplog):
+    with caplog.at_level("WARNING", logger="bot.metrics"):
+        out = metrics.parse_ip_allowlist("127.0.0.1,,not-an-ip,10.0.0.0/8")
+    assert len(out) == 2
+    assert any("not-an-ip" in r.message for r in caplog.records)
+
+
+def test_parse_ip_allowlist_empty_string_returns_empty_tuple():
+    assert metrics.parse_ip_allowlist("") == ()
+    assert metrics.parse_ip_allowlist("   ") == ()
+
+
+# ── is_ip_allowed ──────────────────────────────────────────────────
+
+
+def _make_request(remote: str | None) -> web.Request:
+    """Build a minimal stub request with a controlled ``remote``."""
+    req = MagicMock(spec=web.Request)
+    req.remote = remote
+    return req
+
+
+def test_is_ip_allowed_empty_allowlist_locks_everyone_out():
+    """Empty allowlist must NEVER mean 'allow all'.
+
+    Fail-closed default — a typoed env var that drops every entry
+    must not silently expose ``/metrics`` publicly.
+    """
+    assert metrics.is_ip_allowed(_make_request("127.0.0.1"), ()) is False
+
+
+def test_is_ip_allowed_loopback_v4_in_default_allowlist():
+    allowlist = metrics.parse_ip_allowlist(metrics.DEFAULT_METRICS_ALLOWLIST)
+    assert metrics.is_ip_allowed(_make_request("127.0.0.1"), allowlist) is True
+
+
+def test_is_ip_allowed_loopback_v6_in_default_allowlist():
+    allowlist = metrics.parse_ip_allowlist(metrics.DEFAULT_METRICS_ALLOWLIST)
+    assert metrics.is_ip_allowed(_make_request("::1"), allowlist) is True
+
+
+def test_is_ip_allowed_outside_allowlist():
+    allowlist = metrics.parse_ip_allowlist("10.0.0.0/8")
+    assert metrics.is_ip_allowed(_make_request("8.8.8.8"), allowlist) is False
+    assert metrics.is_ip_allowed(_make_request("10.1.2.3"), allowlist) is True
+
+
+def test_is_ip_allowed_missing_remote_rejected():
+    allowlist = metrics.parse_ip_allowlist("127.0.0.1")
+    assert metrics.is_ip_allowed(_make_request(None), allowlist) is False
+
+
+def test_is_ip_allowed_unparseable_remote_rejected():
+    allowlist = metrics.parse_ip_allowlist("127.0.0.1")
+    assert metrics.is_ip_allowed(_make_request("not-an-ip"), allowlist) is False
+
+
+def test_is_ip_allowed_v4_vs_v6_membership_does_not_crash():
+    """A v4 address against a v6-only allowlist must reject cleanly.
+
+    ``IPv4Address in IPv6Network`` would raise ``TypeError`` in
+    older Python versions; modern stdlib returns ``False`` but we
+    still defend by catching the exception so a future upgrade
+    can't blow the gate open.
+    """
+    allowlist = metrics.parse_ip_allowlist("::1/128")
+    assert metrics.is_ip_allowed(_make_request("127.0.0.1"), allowlist) is False
+
+
+# ── loop tick registry ─────────────────────────────────────────────
+
+
+def test_record_loop_tick_round_trips():
+    metrics.reset_loop_ticks_for_tests()
+    assert metrics.get_loop_last_tick("fx_refresh") is None
+
+    metrics.record_loop_tick("fx_refresh", ts=1700000000.0)
+    assert metrics.get_loop_last_tick("fx_refresh") == 1700000000.0
+
+    # Re-recording overwrites with the latest value.
+    metrics.record_loop_tick("fx_refresh", ts=1700000999.0)
+    assert metrics.get_loop_last_tick("fx_refresh") == 1700000999.0
+
+    metrics.reset_loop_ticks_for_tests()
+
+
+def test_reset_loop_ticks_clears_all():
+    metrics.record_loop_tick("a", ts=1.0)
+    metrics.record_loop_tick("b", ts=2.0)
+    metrics.reset_loop_ticks_for_tests()
+    assert metrics.get_loop_last_tick("a") is None
+    assert metrics.get_loop_last_tick("b") is None
+
+
+# ── render_metrics ─────────────────────────────────────────────────
+
+
+def _patch_collectors(monkeypatch, *, ipn_drops=None, tetrapay_drops=None,
+                     inflight=0, disabled_models=(), disabled_gateways=(),
+                     key_count=0):
+    """Patch every collector ``render_metrics`` reads so the test
+    output is deterministic.
+    """
+    import admin_toggles
+    import openrouter_keys
+    import payments
+    import rate_limit
+    import tetrapay
+
+    monkeypatch.setattr(
+        payments, "get_ipn_drop_counters", lambda: dict(ipn_drops or {})
+    )
+    monkeypatch.setattr(
+        tetrapay,
+        "get_tetrapay_drop_counters",
+        lambda: dict(tetrapay_drops or {}),
+    )
+    monkeypatch.setattr(
+        rate_limit, "chat_inflight_count", lambda: int(inflight)
+    )
+    monkeypatch.setattr(
+        admin_toggles,
+        "get_disabled_models",
+        lambda: frozenset(disabled_models),
+    )
+    monkeypatch.setattr(
+        admin_toggles,
+        "get_disabled_gateways",
+        lambda: frozenset(disabled_gateways),
+    )
+    monkeypatch.setattr(openrouter_keys, "key_count", lambda: int(key_count))
+
+
+def test_render_metrics_smoke(monkeypatch):
+    """Output contains every expected metric name + a trailing newline."""
+    metrics.reset_loop_ticks_for_tests()
+    _patch_collectors(monkeypatch)
+
+    body = metrics.render_metrics()
+    assert body.endswith("\n")
+
+    # Every metric we promise to expose appears in the output.
+    expected_names = [
+        "meowassist_ipn_drops_total",
+        "meowassist_tetrapay_drops_total",
+        "meowassist_min_amount_refresh_last_run_epoch",
+        "meowassist_fx_refresh_last_run_epoch",
+        "meowassist_model_discovery_last_run_epoch",
+        "meowassist_catalog_refresh_last_run_epoch",
+        "meowassist_pending_alert_last_run_epoch",
+        "meowassist_pending_reaper_last_run_epoch",
+        "meowassist_chat_inflight_active",
+        "meowassist_disabled_models_count",
+        "meowassist_disabled_gateways_count",
+        "meowassist_openrouter_keys_count",
+    ]
+    for name in expected_names:
+        assert f"# HELP {name} " in body, f"missing HELP for {name}"
+        assert f"# TYPE {name} " in body, f"missing TYPE for {name}"
+
+
+def test_render_metrics_labelled_counter_format(monkeypatch):
+    metrics.reset_loop_ticks_for_tests()
+    _patch_collectors(
+        monkeypatch,
+        ipn_drops={"bad_signature": 3, "bad_json": 1, "replay": 7},
+    )
+
+    body = metrics.render_metrics()
+    assert 'meowassist_ipn_drops_total{reason="bad_signature"} 3' in body
+    assert 'meowassist_ipn_drops_total{reason="bad_json"} 1' in body
+    assert 'meowassist_ipn_drops_total{reason="replay"} 7' in body
+    # Sorted-by-label rendering means "bad_json" precedes
+    # "bad_signature" in the body.
+    assert body.index('"bad_json"') < body.index('"bad_signature"')
+
+
+def test_render_metrics_empty_counter_still_emits_preamble(monkeypatch):
+    """A counter with zero rows still emits HELP/TYPE — consumers
+    running ``rate(...)`` against the empty counter need to see
+    the metric name to avoid a 'no data' gap."""
+    metrics.reset_loop_ticks_for_tests()
+    _patch_collectors(monkeypatch, ipn_drops={})
+
+    body = metrics.render_metrics()
+    assert "# TYPE meowassist_ipn_drops_total counter" in body
+
+
+def test_render_metrics_loop_epoch_default_zero(monkeypatch):
+    """A loop that never ticked must render epoch 0, not blank /
+    NaN. Prometheus-side ``time() - last_run_epoch > N`` alerts
+    treat 0 as 'infinitely stale' which is the desired semantic.
+    """
+    metrics.reset_loop_ticks_for_tests()
+    _patch_collectors(monkeypatch)
+
+    body = metrics.render_metrics()
+    assert "meowassist_fx_refresh_last_run_epoch 0\n" in body
+    assert "meowassist_pending_reaper_last_run_epoch 0\n" in body
+
+
+def test_render_metrics_loop_epoch_after_tick(monkeypatch):
+    metrics.reset_loop_ticks_for_tests()
+    _patch_collectors(monkeypatch)
+    metrics.record_loop_tick("fx_refresh", ts=1700000123.0)
+
+    body = metrics.render_metrics()
+    # Integer-valued floats render as ints (clean output, no
+    # ``1700000123.0``).
+    assert "meowassist_fx_refresh_last_run_epoch 1700000123\n" in body
+
+
+def test_render_metrics_gauge_values(monkeypatch):
+    metrics.reset_loop_ticks_for_tests()
+    _patch_collectors(
+        monkeypatch,
+        inflight=42,
+        disabled_models=("openai/gpt-4o", "anthropic/claude-3"),
+        disabled_gateways=("btc",),
+        key_count=5,
+    )
+
+    body = metrics.render_metrics()
+    assert "meowassist_chat_inflight_active 42\n" in body
+    assert "meowassist_disabled_models_count 2\n" in body
+    assert "meowassist_disabled_gateways_count 1\n" in body
+    assert "meowassist_openrouter_keys_count 5\n" in body
+
+
+def test_render_metrics_nan_inf_gauges_render_as_zero(monkeypatch):
+    """NaN / Inf would crash Prometheus' parser. We coerce to 0
+    (mirrors ``wallet_display.format_balance_block``'s NaN defence)."""
+    metrics.reset_loop_ticks_for_tests()
+    _patch_collectors(monkeypatch)
+    metrics.record_loop_tick("fx_refresh", ts=float("nan"))
+    metrics.record_loop_tick("pending_reaper", ts=float("inf"))
+
+    body = metrics.render_metrics()
+    assert "meowassist_fx_refresh_last_run_epoch 0\n" in body
+    assert "meowassist_pending_reaper_last_run_epoch 0\n" in body
+    # Confirm no metric line (i.e. a non-comment, non-empty line)
+    # leaked the literal ``nan`` / ``inf`` token — the HELP /
+    # TYPE comment lines may contain "infinitely stale" prose
+    # which is fine.
+    # Pull just the rendered value off each metric line (everything
+    # after the final whitespace) so we don't false-positive on
+    # metric names like ``meowassist_chat_inflight_active`` that
+    # contain "inf" as a substring.
+    rendered_values = [
+        line.rsplit(" ", 1)[-1]
+        for line in body.splitlines()
+        if line and not line.startswith("#")
+    ]
+    for value in rendered_values:
+        assert value.lower() != "nan"
+        assert value.lower() not in ("inf", "+inf", "-inf")
+
+
+# ── HTTP roundtrip via aiohttp_client ──────────────────────────────
+
+
+@pytest.fixture
+def metrics_app(monkeypatch):
+    """Build a minimal aiohttp app with ``/metrics`` mounted and the
+    collectors stubbed out."""
+    metrics.reset_loop_ticks_for_tests()
+    _patch_collectors(monkeypatch, ipn_drops={"replay": 2})
+
+    app = web.Application()
+    metrics.install_metrics_route(app, allowlist_env="127.0.0.1,::1")
+    return app
+
+
+async def test_metrics_endpoint_serves_allowed_ip(aiohttp_client, metrics_app):
+    client = await aiohttp_client(metrics_app)
+    resp = await client.get("/metrics")
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("text/plain")
+    body = await resp.text()
+    assert 'meowassist_ipn_drops_total{reason="replay"} 2' in body
+
+
+async def test_metrics_endpoint_rejects_disallowed_ip(aiohttp_client, monkeypatch):
+    """An empty allowlist (e.g. operator typoed every entry) locks
+    every request out with a 403."""
+    metrics.reset_loop_ticks_for_tests()
+    _patch_collectors(monkeypatch)
+
+    app = web.Application()
+    metrics.install_metrics_route(app, allowlist_env="")
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/metrics")
+    assert resp.status == 403
+
+
+async def test_metrics_endpoint_rejects_outside_subnet(aiohttp_client, monkeypatch):
+    """An allowlist that doesn't include localhost rejects the
+    ``aiohttp_client`` (which connects from 127.0.0.1)."""
+    metrics.reset_loop_ticks_for_tests()
+    _patch_collectors(monkeypatch)
+
+    app = web.Application()
+    # Restrict to a /32 that the test client isn't using.
+    metrics.install_metrics_route(app, allowlist_env="10.99.0.1/32")
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/metrics")
+    assert resp.status == 403
+
+
+def test_install_metrics_route_stashes_parsed_allowlist():
+    app = web.Application()
+    metrics.install_metrics_route(app, allowlist_env="10.0.0.0/8,192.168.0.0/16")
+    parsed = app[metrics.APP_KEY_ALLOWLIST]
+    assert ipaddress.ip_network("10.0.0.0/8") in parsed
+    assert ipaddress.ip_network("192.168.0.0/16") in parsed

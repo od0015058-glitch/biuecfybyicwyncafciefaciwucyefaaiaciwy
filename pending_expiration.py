@@ -207,6 +207,12 @@ async def _expiration_loop(
                 raise
             except Exception:
                 log.exception("expire_pending_once raised; will retry next tick")
+            else:
+                # Stage-15-Step-A: heartbeat for
+                # ``meowassist_pending_reaper_last_run_epoch``.
+                from metrics import record_loop_tick
+
+                record_loop_tick("pending_reaper")
             await asyncio.sleep(interval_seconds)
     except asyncio.CancelledError:
         log.info("pending-expiration reaper cancelled; exiting cleanly")

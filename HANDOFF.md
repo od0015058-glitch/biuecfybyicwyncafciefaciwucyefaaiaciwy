@@ -45,6 +45,7 @@ force_join.py       required-channel subscription gate     ~360 LoC
 strings.py          fa/en string table                     ~600 LoC
 admin.py            Telegram-side admin commands           ~870 LoC
 rate_limit.py       chat + webhook rate limiters + per-user in-flight slot   ~370 LoC
+metrics.py          Prometheus /metrics exposition + IP allowlist  ~400 LoC
 web_admin.py        web admin panel (aiohttp+jinja2)       ~910 LoC
 templates/admin/    jinja2 templates (base, _layout, login, dashboard, promos, gifts)
 alembic/            schema migrations (owns schema)
@@ -329,36 +330,42 @@ User direction (2026-04-30): *"finish all the things left… run a bug fix… cr
 #### Stage-15-Step-A: Prometheus `/metrics` endpoint (carried from Stage-13-Step-D)
 
 **Priority:** P3 ops
-**Status:** pending
+**Status:** ✅ shipped (this PR)
 
-**What:**
-Mount a `/metrics` route on the existing aiohttp server that returns Prometheus text-format metrics. Gate by `METRICS_IP_ALLOWLIST` env var (comma-separated CIDRs, default `127.0.0.1,::1` — localhost only). No admin cookie auth needed since this is for internal scraping (Prometheus / Grafana / VictoriaMetrics).
+**What shipped:**
+A new `metrics.py` module mounts `GET /metrics` on the existing aiohttp server alongside `/nowpayments-webhook`, `/tetrapay-webhook`, and the `/admin/` panel — same process, same port. Output is Prometheus text-exposition format (no third-party `prometheus_client` dependency; the format is rendered by hand in `metrics.render_metrics`). The endpoint is gated by `METRICS_IP_ALLOWLIST` (comma-separated IPs / CIDRs, default `127.0.0.1,::1` — localhost only). An empty allowlist locks every request out (fail-closed) so a typoed env var can't silently expose internal counters publicly. A v4 source IP against a v6-only allowlist (or vice versa) rejects cleanly rather than tripping a `TypeError`.
 
-**Metrics to expose (all already tracked in-process, just not exported):**
+**Metrics exposed:**
 1. `meowassist_ipn_drops_total{reason="bad_signature|bad_json|missing_payment_id|replay"}` — from `payments.get_ipn_drop_counters()`
-2. `meowassist_tetrapay_ipn_drops_total{reason=...}` — from `tetrapay.get_ipn_drop_counters()` (if exists)
-3. `meowassist_pending_reaper_last_run_epoch` — timestamp of last successful reaper loop tick
-4. `meowassist_fx_refresh_last_run_epoch` — timestamp of last successful FX rate refresh
-5. `meowassist_model_discovery_last_run_epoch` — timestamp of last model discovery loop
-6. `meowassist_catalog_refresh_last_run_epoch` — timestamp of last catalog price refresh
-7. `meowassist_min_amount_refresh_last_run_epoch` — timestamp of last NowPayments min-amount refresh
-8. `meowassist_chat_inflight_active` — current size of the in-flight chat slot set (`rate_limit`)
-9. `meowassist_disabled_models_count` — count of admin-disabled AI models
-10. `meowassist_disabled_gateways_count` — count of admin-disabled gateways
-11. `meowassist_openrouter_keys_count` — number of active OpenRouter API keys loaded
+2. `meowassist_tetrapay_drops_total{reason="bad_json|missing_authority|non_success_callback|unknown_invoice|verify_failed"}` — from `tetrapay.get_tetrapay_drop_counters()`
+3. `meowassist_pending_reaper_last_run_epoch` — recorded on each successful `pending_expiration._expiration_loop` tick
+4. `meowassist_fx_refresh_last_run_epoch` — recorded on each successful `fx_rates.refresh_usd_to_toman_loop` tick
+5. `meowassist_model_discovery_last_run_epoch` — recorded on each successful `model_discovery.discover_new_models_loop` tick
+6. `meowassist_catalog_refresh_last_run_epoch` — recorded inside `models_catalog._refresh` only when `_fetch_from_openrouter` actually succeeded (the warning-path that keeps the previous live snapshot deliberately leaves the gauge stale so operators can alert on it)
+7. `meowassist_min_amount_refresh_last_run_epoch` — recorded on each successful `payments.refresh_min_amounts_loop` tick
+8. `meowassist_pending_alert_last_run_epoch` — recorded on each successful `pending_alert._alert_loop` tick
+9. `meowassist_chat_inflight_active` — gauge over `rate_limit.chat_inflight_count()` (new public read-only accessor)
+10. `meowassist_disabled_models_count` — `len(admin_toggles.get_disabled_models())`
+11. `meowassist_disabled_gateways_count` — `len(admin_toggles.get_disabled_gateways())`
+12. `meowassist_openrouter_keys_count` — `openrouter_keys.key_count()`
 
-**Implementation plan:**
-- New file: `metrics.py` — `render_metrics()` function that collects all the above into Prometheus exposition format (plain text, no third-party deps like `prometheus_client` — keep deps minimal)
-- New aiohttp route: `GET /metrics` with IP allowlist middleware
-- New env var: `METRICS_IP_ALLOWLIST` (default `127.0.0.1,::1`)
-- `.env.example` documentation
-- Tests: verify output format, verify IP gating rejects non-allowed IPs, verify counters render correctly
-- **Bug-fix candidate (bundle):** the existing per-loop "last successful tick" timestamps are tracked in-process but never exposed — a stuck reaper / alert / FX-refresh task is currently invisible until the dashboard tile diverges from reality. The metrics endpoint makes this observable.
+A loop that has not yet ticked renders epoch `0` (Prometheus' typical `time() - last_run_epoch > N` alert expression treats `0` as "infinitely stale", which is exactly the desired semantic). Non-finite gauge values render as `0` (mirrors the wallet-display NaN defence elsewhere in the codebase) so `NaN` / `Inf` can never trip a Prometheus parser.
+
+**Implementation:**
+- `metrics.py` — `record_loop_tick`, `get_loop_last_tick`, `parse_ip_allowlist`, `is_ip_allowed`, `render_metrics`, `metrics_handler`, `install_metrics_route`. Loop heartbeats stored in a process-local `dict[str, float]` (no external state — a restart resets the counters, which is the same semantic the IPN drop counters already carry).
+- `main.py` — calls `install_metrics_route(app)` immediately after the IPN routes register.
+- `rate_limit.py` — new `chat_inflight_count()` accessor. Read is unsynchronised (a concurrent claim/release racing against the read shifts the count by ±1, fine for a metrics gauge — the next scrape settles).
+- `payments.py`, `fx_rates.py`, `model_discovery.py`, `models_catalog.py`, `pending_alert.py`, `pending_expiration.py` — each forever-loop's success-path now calls `record_loop_tick(<loop>)` after the inner pass returns without raising.
+- `.env.example` — new `METRICS_IP_ALLOWLIST` block (default `127.0.0.1,::1`, fail-closed on empty).
+
+**Tests:** new `tests/test_metrics.py` (32 cases): allowlist parsing (well-formed, blank/malformed skip, mixed v4/v6), IP gating (empty == fail-closed, v4 + v6 loopback, outside-subnet, missing remote, unparseable remote, v4-vs-v6 cross-family), loop tick registry round-trip, render output shape (HELP/TYPE preamble, labelled counter format, sorted-by-label rendering, empty-counter still emits preamble, default epoch 0, integer-valued floats render cleanly, NaN/Inf coerce to 0), end-to-end aiohttp roundtrip via `aiohttp_client` (200 + `text/plain` from allowed IP, 403 from empty allowlist, 403 from outside-subnet allowlist), `install_metrics_route` stashes the parsed allowlist under the typed `APP_KEY_ALLOWLIST`. Total: 1344 (was 1320).
+
+**Bug fix bundled (Stage-15-Step-D #1):** `handlers._active_pay_currencies` previously returned every NowPayments crypto ticker even when `NOWPAYMENTS_API_KEY` was unset / empty. A user picking BTC then hit a cryptic "Invalid API key" error from NowPayments on invoice creation, with no signal that the deploy hadn't been wired up — leading them to retry every other ticker until they exhausted the row. Post-fix the helper drops every NowPayments-routed ticker when the API key is absent, so the dual-currency entry / wallet hub falls back to showing only TetraPay (Rial) — the correct UX for a crypto-disabled deploy. Whitespace-only `NOWPAYMENTS_API_KEY=  ` values are treated identically (we `strip()` the env var) so an operator with a trailing-space typo doesn't accidentally re-enable the broken picker. New env-fresh check (no module-load caching) so a runtime `.env` edit followed by a restart picks the change up without a redeploy. Existing `test_active_pay_currencies_filters_disabled` updated to `monkeypatch.setenv("NOWPAYMENTS_API_KEY", "dummy-key-for-test")` so it stays scoped to the toggle-filter behaviour it was originally testing; a new `test_active_pay_currencies_empty_when_nowpayments_unset` covers the new env-gate path.
 
 #### Stage-15-Step-B: Server update script with backup rotation
 
 **Priority:** P3 ops
-**Status:** pending
+**Status:** ✅ shipped (PR #112)
 
 **What:**
 Create `scripts/update-server.sh` — a one-command script the admin runs on their VPS to:
@@ -451,7 +458,7 @@ cd /opt/meowassist && sudo bash scripts/update-server.sh
 #### Stage-15-Step-C: Logos and posters folder with AI prompts
 
 **Priority:** P2 product / branding
-**Status:** pending
+**Status:** ✅ shipped (PR #112)
 
 **What:**
 Create `logos_and_posters/` directory in the repo root containing prompt files for generating the Meowassist brand assets using **Nano Banana Pro** (or any image-generation AI).
@@ -572,12 +579,12 @@ Create `logos_and_posters/` directory in the repo root containing prompt files f
 #### Stage-15-Step-D: Bug-fix pass
 
 **Priority:** P1 correctness
-**Status:** pending
+**Status:** in progress (#1 shipped — bundled with Stage-15-Step-A)
 
 **What:**
 Systematic sweep of the codebase for latent bugs. Candidates identified during audit:
 
-1. **`_active_pay_currencies()` in handlers.py doesn't filter by whether NowPayments API key is actually configured.** If `NOWPAYMENTS_API_KEY` is empty, crypto currencies still appear in the picker. Users pick BTC, invoice creation fails with a cryptic API error. Fix: early filter in `_active_pay_currencies()` if `NOWPAYMENTS_API_KEY` is unset.
+1. ~~**`_active_pay_currencies()` in handlers.py doesn't filter by whether NowPayments API key is actually configured.**~~ ✅ **shipped (Stage-15-Step-A bundle)** — `_active_pay_currencies` now also drops every NowPayments-routed ticker when `NOWPAYMENTS_API_KEY` is unset / whitespace-only, so the picker no longer surfaces options whose invoice-creation path would 401. Implementation reads the env var fresh on every call so a `.env` edit + restart picks it up without a code change. Tests: `tests/test_admin_toggles.py::test_active_pay_currencies_empty_when_nowpayments_unset` (new) + `test_active_pay_currencies_filters_disabled` (updated to monkeypatch `NOWPAYMENTS_API_KEY=dummy` so it stays scoped to the toggle-filter behaviour).
 
 2. **`openrouter_keys.py` `load_keys()` runs at module import time.** If the module is imported during tests or by a script that doesn't need OpenRouter, missing env vars cause a `RuntimeError` at import. Fix: lazy-load on first call to `key_for_user()` instead of at import.
 
@@ -946,10 +953,17 @@ The user's process for this project — **do not deviate**:
    `OPENROUTER_API_KEY_1..10` env vars, sticky per-user key
    assignment `telegram_id % N`, backward-compatible with single
    `OPENROUTER_API_KEY`, module `openrouter_keys.py`).
-10. **Stage-15 roadmap is documented** — see §"Stage-15" in this file.
-    A (Prometheus `/metrics`), B (server update script with backup
-    rotation), C (logos/posters AI prompt folder), D (bug-fix sweep),
-    E (12 future project suggestions). All pending implementation.
+10. **Stage-15 in progress** — see §"Stage-15" in this file.
+    B (server update script with backup rotation) and C
+    (logos/posters AI prompt folder) shipped as PR #112.
+    A (Prometheus `/metrics` endpoint) shipped this PR with bundled
+    bug fix Stage-15-Step-D #1 (`_active_pay_currencies` no longer
+    surfaces NowPayments tickers when `NOWPAYMENTS_API_KEY` is
+    unset). Remaining: Stage-15-Step-D candidates #2–#5 (lazy-load
+    `openrouter_keys`, `admin_toggles` refresh race-condition
+    documentation, model-id `/` slash routing audit, IPN-health
+    dashboard tile), Stage-15-Step-E (12 future project
+    suggestions, doc-only).
 11. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.

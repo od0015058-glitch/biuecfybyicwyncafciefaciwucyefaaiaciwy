@@ -493,6 +493,15 @@ async def refresh_min_amounts_loop(
             raise
         except Exception:
             log.exception("min-amount refresher iteration failed; retrying")
+        else:
+            # Stage-15-Step-A: heartbeat for the Prometheus
+            # ``meowassist_min_amount_refresh_last_run_epoch`` gauge.
+            # Imported lazily so a fresh test runtime that hasn't
+            # imported ``metrics`` yet doesn't pay the cost on every
+            # iteration of this loop.
+            from metrics import record_loop_tick
+
+            record_loop_tick("min_amount_refresh")
         try:
             await asyncio.sleep(interval)
         except asyncio.CancelledError:

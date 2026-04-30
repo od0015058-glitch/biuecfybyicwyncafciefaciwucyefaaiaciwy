@@ -254,6 +254,19 @@ def reset_chat_inflight_slots_for_tests() -> None:
     _chat_inflight.clear()
 
 
+def chat_inflight_count() -> int:
+    """Return the current number of users holding an in-flight chat slot.
+
+    Read-only accessor exposed to ``metrics.render_metrics`` so the
+    Prometheus ``/metrics`` endpoint can publish a gauge without
+    leaking the internal set itself. The read is unsynchronised —
+    a concurrent claim/release racing against the read can shift
+    the count by ±1, which is fine for a metrics gauge (the next
+    scrape settles).
+    """
+    return len(_chat_inflight)
+
+
 # The NowPayments IPN path. Exported so tests — and the middleware —
 # agree on the single URL whose traffic this limiter is meant to bound.
 # Kept as a module-level constant rather than inlined so a future
