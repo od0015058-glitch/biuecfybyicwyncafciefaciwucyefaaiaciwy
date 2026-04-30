@@ -126,6 +126,47 @@ _STRINGS: dict[str, dict[str, str]] = {
         ),
         "btn_force_join_join": "📢 عضویت در کانال",
         "btn_force_join_check": "✅ عضو شدم",
+        # ---- Referral codes (Stage-13-Step-C) ----
+        "btn_invite_friend": "🎁 دعوت از دوستان",
+        "invite_text": (
+            "🎁 **دعوت از دوستان**\n\n"
+            "هر کسی که با کد دعوت شما ربات را شروع کند و اولین شارژ موفق را انجام دهد،\n"
+            "هم شما و هم خودش هرکدام **{bonus_percent}٪ از مبلغ شارژ (تا سقف ${bonus_max:.2f})** هدیه می‌گیرید!\n\n"
+            "🔗 لینک اختصاصی شما:\n"
+            "`{share_url}`\n\n"
+            "🆔 یا کد دعوت شما:\n"
+            "`{code}`\n\n"
+            "📊 آمار شما:\n"
+            "• در انتظار شارژ: {pending}\n"
+            "• تکمیل شده: {paid}\n"
+            "• پاداش دریافتی: ${total_bonus:.2f}"
+        ),
+        "invite_text_no_link": (
+            "🎁 **دعوت از دوستان**\n\n"
+            "هر کسی که با کد دعوت شما ربات را شروع کند و اولین شارژ موفق را انجام دهد،\n"
+            "هم شما و هم خودش هرکدام **{bonus_percent}٪ از مبلغ شارژ (تا سقف ${bonus_max:.2f})** هدیه می‌گیرید!\n\n"
+            "🆔 کد دعوت شما:\n"
+            "`{code}`\n\n"
+            "دوست شما باید این پیام را به ربات بفرستد:\n"
+            "`/start ref_{code}`\n\n"
+            "📊 آمار شما:\n"
+            "• در انتظار شارژ: {pending}\n"
+            "• تکمیل شده: {paid}\n"
+            "• پاداش دریافتی: ${total_bonus:.2f}"
+        ),
+        "referral_claim_ok": (
+            "🎉 از طریق دعوت یک دوست به ربات وارد شدید!\n"
+            "بعد از اولین شارژ موفق، هر دو نفر پاداش می‌گیرید."
+        ),
+        "referral_claim_self": (
+            "ℹ️ نمی‌توانید از کد دعوت خودتان استفاده کنید."
+        ),
+        "referral_claim_already": (
+            "ℹ️ قبلاً با یک کد دعوت ثبت‌نام کرده‌اید."
+        ),
+        "referral_claim_unknown": (
+            "ℹ️ کد دعوت معتبر نیست. به ربات خوش آمدید!"
+        ),
         # ---- Support ----
         "support_text": (
             "🎧 **پشتیبانی فنی**\n\n"
@@ -482,6 +523,47 @@ _STRINGS: dict[str, dict[str, str]] = {
         ),
         "btn_force_join_join": "📢 Join channel",
         "btn_force_join_check": "✅ I've joined",
+        # ---- Referral codes (Stage-13-Step-C) ----
+        "btn_invite_friend": "🎁 Invite a friend",
+        "invite_text": (
+            "🎁 **Invite a friend**\n\n"
+            "When someone starts the bot with your invite code and completes their first paid top-up, "
+            "**both of you get {bonus_percent}% of the top-up amount (up to ${bonus_max:.2f}) as a bonus!**\n\n"
+            "🔗 Your share link:\n"
+            "`{share_url}`\n\n"
+            "🆔 Or your invite code:\n"
+            "`{code}`\n\n"
+            "📊 Your stats:\n"
+            "• Awaiting top-up: {pending}\n"
+            "• Completed: {paid}\n"
+            "• Bonus earned: ${total_bonus:.2f}"
+        ),
+        "invite_text_no_link": (
+            "🎁 **Invite a friend**\n\n"
+            "When someone starts the bot with your invite code and completes their first paid top-up, "
+            "**both of you get {bonus_percent}% of the top-up amount (up to ${bonus_max:.2f}) as a bonus!**\n\n"
+            "🆔 Your invite code:\n"
+            "`{code}`\n\n"
+            "Your friend should send this to the bot:\n"
+            "`/start ref_{code}`\n\n"
+            "📊 Your stats:\n"
+            "• Awaiting top-up: {pending}\n"
+            "• Completed: {paid}\n"
+            "• Bonus earned: ${total_bonus:.2f}"
+        ),
+        "referral_claim_ok": (
+            "🎉 You arrived via a friend's invite!\n"
+            "After your first paid top-up, both of you get a bonus."
+        ),
+        "referral_claim_self": (
+            "ℹ️ You can't use your own invite code."
+        ),
+        "referral_claim_already": (
+            "ℹ️ You've already signed up via an invite code."
+        ),
+        "referral_claim_unknown": (
+            "ℹ️ That invite code isn't valid. Welcome to the bot!"
+        ),
         # ---- Support ----
         "support_text": (
             "🎧 **Technical support**\n\n"

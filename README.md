@@ -72,6 +72,19 @@ NowPayments crypto invoices.
   (back-compat default). For private channels, also set
   `REQUIRED_CHANNEL_INVITE_LINK=https://t.me/+abcdefINVITE` so the
   Join button has somewhere to deep-link.
+- **Referral codes** — every user can generate a one-tap invite
+  deep-link (`/wallet → 🎁 Invite a friend`). When a friend opens
+  the bot via that link and completes their first paid top-up,
+  both wallets get a percentage bonus (defaults to 10% capped at
+  $5 per side). Set `BOT_USERNAME` to the bot's `@handle` (without
+  the `@`) so the screen renders the share URL — leaving it unset
+  falls back to a copy-paste-only flow with the bare code + a
+  `/start ref_<code>` instruction. Tune the economics with
+  `REFERRAL_BONUS_PERCENT` / `REFERRAL_BONUS_MAX_USD`. The credit
+  fires inside the same DB transaction as the triggering top-up
+  (PARTIAL or SUCCESS, whichever comes first), so an IPN replay
+  cannot double-credit, and an invitee can be claimed by at most
+  one referrer (UNIQUE constraint on `referral_grants.invitee_telegram_id`).
 - **Per-user in-flight cap on AI chat** — at most one OpenRouter
   request per Telegram user can be in flight at any moment. The
   existing per-user *token bucket* (`consume_chat_token`) gates
@@ -192,6 +205,23 @@ To roll back: `docker compose down && git checkout <previous-sha> && docker comp
      join button has a deep-link target. Leave unset to keep the
      bot fully open (default). Admins (`ADMIN_USER_IDS`) always
      bypass the gate.
+   - `BOT_USERNAME` (optional, Stage-13-Step-C) — the bot's
+     `@handle` without the leading `@` (e.g. `Meowassist_Ai_bot`).
+     Used to synthesise the share deep-link
+     `https://t.me/<handle>?start=ref_<code>` rendered on the
+     `/wallet → 🎁 Invite a friend` screen. Leave unset and the
+     screen falls back to a copy-paste-only flow (the bare code +
+     a `/start ref_<code>` instruction); the feature still works,
+     just without a one-tap link.
+   - `REFERRAL_BONUS_PERCENT` (optional, default `10`) —
+     percentage of the invitee's first paid top-up credited to
+     **both** wallets (referrer + invitee). Capped by
+     `REFERRAL_BONUS_MAX_USD`. Non-finite / non-positive values
+     fall back to the default with a logged WARNING.
+   - `REFERRAL_BONUS_MAX_USD` (optional, default `5`) — per-side
+     cap on the referral bonus. So a $20 first-top-up triggers
+     10% × $20 = $2 to each side; a $100 first-top-up triggers
+     $5 (the cap), not $10.
 
 4. **Run**
    ```bash
@@ -228,6 +258,7 @@ pytest tests/
 | `models_catalog.py` | Live `/v1/models` fetch from OpenRouter with 24 h cache, provider whitelist, free/paid split. |
 | `middlewares.py` | `UserUpsertMiddleware` — ensures `users` row exists before any handler runs. |
 | `force_join.py` | `RequiredChannelMiddleware` + the `force_join_check` callback handler. When `REQUIRED_CHANNEL` is set, every non-admin user is gated behind a "join the channel" screen until Telegram confirms membership. Admins bypass; API errors fail open. |
+| `referral.py` | Stage-13-Step-C. Env-var config (`BOT_USERNAME` / `REFERRAL_BONUS_PERCENT` / `REFERRAL_BONUS_MAX_USD`), the `/start <payload>` parser (the bundled bug-fix that finally inspects the deep-link payload `cmd_start` ignored pre-PR-110), the share-URL builder, and the thin wrapper around `Database._grant_referral_in_tx` that the finalize-payment open-TX calls. The DB-layer primitives (`get_or_create_referral_code`, `claim_referral`, `_grant_referral_in_tx`, `get_referral_stats`) live in `database.py`. |
 | `rate_limit.py` | Token-bucket primitives + `consume_chat_token` (per-user throughput throttle) + `try_claim_chat_slot` / `release_chat_slot` (per-user in-flight cap) and `webhook_rate_limit_middleware` (per-IP). Guards the AI chat path against runaway OpenRouter spend on both axes (sustained rate and burst concurrency) and the `/nowpayments-webhook` endpoint against DoS bursts. |
 | `strings.py` | Two-locale (fa/en) compiled string table + `t(lang, key, **kwargs)` helper. Layered with a runtime override cache populated from the `bot_strings` DB table — admin edits at `/admin/strings` shadow the compiled defaults until reverted. Missing-slug lookups now log a one-shot WARNING per `(lang, key)` instead of silently returning the bare slug. |
 | `wallet_display.py` | Stage-11-Step-D. `format_toman_annotation(lang, balance_usd, snap)` returns the `\n≈ N تومان` (fa) / `\n≈ N TMN` (en) line spliced onto every wallet view's `$X.YZ` figure when an FX snapshot is cached. Stale snapshots get the `(نرخ تقریبی)` / `(approx)` suffix; cold cache returns `""` so the wallet still renders without the line; non-finite balances and arithmetic-overflow products are rejected with `""` rather than rendering `≈ nan تومان`. `format_balance_block(lang, balance_usd, snap)` packages `$X.YZ` + the annotation for callers (post-credit DMs, future wallet sub-screens) that don't go through `strings.t` — and substitutes `$0.00` for the head string on a non-finite balance so a corrupted upstream can't leak `$nan` either (the annotation guard already covered the Toman line). |
