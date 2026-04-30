@@ -124,6 +124,59 @@ async def test_claim_evicts_when_capacity_exceeded(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_eviction_drops_oldest_with_realistic_telegram_ids(monkeypatch):
+    """Regression for Stage-15-Step-D #3-extension-2: pre-fix the
+    in-flight container was a ``set[int]`` and ``next(iter(set))``
+    returned a hash-bucket-ordered (i.e. arbitrary) element rather
+    than the oldest. The eviction docstring promised FIFO oldest-first
+    but for real Telegram user ids (10-digit ints with fully-mixed
+    hash buckets) the eviction would pick an essentially random
+    user — sometimes the *most recent* one whose request was actively
+    in flight and absolutely should not have been evicted.
+
+    Pinned values: real-shaped Telegram ids whose hash buckets cause
+    a ``set``-backed container to iterate ``newest`` first (verified
+    in 3.10–3.12 against PYTHONHASHSEED-independent integer hashing
+    where ``hash(int) == int``), so a ``set``-backed pre-fix
+    implementation would FAIL this test by evicting the still-active
+    ``newest`` user; a ``dict``-backed one passes because its
+    iteration is insertion-ordered.
+    """
+    monkeypatch.setattr(rl, "_CHAT_INFLIGHT_MAX", 3)
+    # Triple chosen so ``set`` iteration order ≠ insertion order:
+    # for a set built by ``add(a); add(b); add(c)``,
+    # ``next(iter(set))`` is ``c`` (the *last* inserted), not ``a``.
+    oldest = 4245089230
+    middle = 3067507662
+    newest = 6516243702
+    assert await try_claim_chat_slot(oldest) is True
+    assert await try_claim_chat_slot(middle) is True
+    assert await try_claim_chat_slot(newest) is True
+
+    # A new claim pushes over capacity. The eviction MUST drop the
+    # oldest (=first inserted) slot, not the middle or newest.
+    fresh = 5555555555
+    assert await try_claim_chat_slot(fresh) is True
+
+    # Inspect the post-eviction container directly: post-fix the
+    # remaining keys are exactly {middle, newest, fresh}; pre-fix
+    # (set-backed) the same trace would leave {oldest, middle, fresh}
+    # because the set's first-iter element was ``newest``, not
+    # ``oldest``. We test the container shape rather than chaining
+    # more ``try_claim_chat_slot`` calls because each subsequent claim
+    # at full capacity triggers another eviction, which makes a
+    # claim/no-claim assertion ambiguous.
+    assert oldest not in rl._chat_inflight, (
+        "oldest must have been evicted (FIFO); pre-fix it would still "
+        "be present and the most-recently-claimed user would be gone "
+        "instead — exactly the bug we're regressing on."
+    )
+    assert middle in rl._chat_inflight
+    assert newest in rl._chat_inflight
+    assert fresh in rl._chat_inflight
+
+
+@pytest.mark.asyncio
 async def test_reset_for_tests_clears_all_slots():
     """The test-only reset helper must wipe every slot so test
     isolation works."""

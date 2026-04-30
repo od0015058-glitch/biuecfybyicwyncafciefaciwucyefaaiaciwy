@@ -177,30 +177,43 @@ async def consume_chat_token(user_id: int) -> bool:
 #
 # Implementation notes:
 #
-# * Membership is in a plain ``set[int]`` guarded by an
-#   ``asyncio.Lock`` so the test-and-add is atomic. ``set.add`` itself
-#   is thread-safe under the GIL but the *test-and-add* across two
+# * Membership is in a plain ``dict[int, None]`` (used as an
+#   insertion-ordered set, see below) guarded by an ``asyncio.Lock``
+#   so the test-and-add is atomic. ``dict.__setitem__`` itself is
+#   thread-safe under the GIL but the *test-and-add* across two
 #   statements isn't — without the lock two prompts arriving on the
-#   same poller tick would both see the user as "not in set" and
+#   same poller tick would both see the user as "not in dict" and
 #   both proceed. The whole point is to prevent that.
-# * The set is bounded at ``_CHAT_INFLIGHT_MAX`` entries to defend
+# * **Why ``dict[int, None]`` instead of ``set[int]``.** ``dict``
+#   iteration is insertion-ordered (CPython 3.6 implementation /
+#   Python 3.7 language guarantee). ``set`` iteration is
+#   hash-bucket-ordered, i.e. arbitrary from the caller's
+#   perspective. The eviction branch below relies on
+#   ``next(iter(_chat_inflight))`` returning the *oldest* slot so
+#   we drop a presumed-leaked one rather than a still-active user;
+#   with a plain ``set`` it would drop an arbitrary user, sometimes
+#   the most recent one (whose request is in-flight right now and
+#   absolutely shouldn't be evicted). The values are all ``None``
+#   — we only care about keys.
+# * The dict is bounded at ``_CHAT_INFLIGHT_MAX`` entries to defend
 #   against a slow leak from a forgotten ``release_chat_slot`` call;
-#   eviction is FIFO when the cap is exceeded. In practice the set
-#   should hover around 0–N where N is the number of users actively
-#   awaiting an OpenRouter response, which on a single-process bot
-#   is bounded by the asyncio event loop's scheduling fairness — but
-#   defence in depth.
-# * ``release_chat_slot`` is idempotent (``set.discard`` is a no-op
-#   on a missing key). Callers MUST call it in a ``finally`` block
-#   so an exception in ``chat_with_model`` doesn't permanently lock
-#   the user out of further chats.
+#   eviction is FIFO (oldest-first) when the cap is exceeded. In
+#   practice the dict should hover around 0–N where N is the number
+#   of users actively awaiting an OpenRouter response, which on a
+#   single-process bot is bounded by the asyncio event loop's
+#   scheduling fairness — but defence in depth.
+# * ``release_chat_slot`` is idempotent (``dict.pop(key, None)`` is a
+#   no-op on a missing key). Callers MUST call it in a ``finally``
+#   block so an exception in ``chat_with_model`` doesn't permanently
+#   lock the user out of further chats.
 # * The slot is per-process. If the bot is ever scaled horizontally
 #   the slot moves to Redis with the same primitives — for now
-#   single-process is the deployment shape and an in-memory set is
+#   single-process is the deployment shape and an in-memory dict is
 #   enough.
 
 _CHAT_INFLIGHT_MAX = 10_000
-_chat_inflight: set[int] = set()
+# Insertion-ordered set-via-dict; values are unused. See module note.
+_chat_inflight: dict[int, None] = {}
 _chat_inflight_lock = asyncio.Lock()
 
 
@@ -222,17 +235,22 @@ async def try_claim_chat_slot(user_id: int) -> bool:
         # legitimate user whose slot got evicted can simply send
         # another prompt — the worst case is one bonus chat for a
         # truly stuck request, which is far better than a permanent
-        # lockout.
+        # lockout. ``dict`` iteration is insertion-ordered so
+        # ``next(iter(...))`` returns the oldest claim; with a
+        # ``set`` (the pre-fix shape) iteration order was
+        # hash-bucket-arbitrary and the eviction would sometimes
+        # drop the *newest* entry while ancient stuck slots
+        # accumulated.
         if len(_chat_inflight) >= _CHAT_INFLIGHT_MAX:
             evicted = next(iter(_chat_inflight))
-            _chat_inflight.discard(evicted)
+            _chat_inflight.pop(evicted, None)
             log.warning(
                 "chat-inflight slot capacity (%d) exceeded; evicting "
                 "stale slot for user_id=%s",
                 _CHAT_INFLIGHT_MAX,
                 evicted,
             )
-        _chat_inflight.add(user_id)
+        _chat_inflight[user_id] = None
         return True
 
 
@@ -244,7 +262,7 @@ async def release_chat_slot(user_id: int) -> None:
     paired with :func:`try_claim_chat_slot`.
     """
     async with _chat_inflight_lock:
-        _chat_inflight.discard(user_id)
+        _chat_inflight.pop(user_id, None)
 
 
 def reset_chat_inflight_slots_for_tests() -> None:
