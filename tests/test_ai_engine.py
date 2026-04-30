@@ -492,3 +492,114 @@ async def test_chat_with_model_nan_balance_with_free_messages_still_uses_free_pa
     stub_db.decrement_free_message.assert_awaited_once_with(42)
     # Free path: no balance deduction.
     stub_db.deduct_balance.assert_not_awaited()
+
+
+# ---- Stage-15-Step-E #4: 429 → mark_key_rate_limited wiring -------------
+
+
+class _StubResponseWithHeaders(_StubResponse):
+    """Adds a ``headers`` dict so the 429 branch can read ``Retry-After``."""
+
+    def __init__(
+        self,
+        status: int = 429,
+        body: dict | None = None,
+        headers: dict[str, str] | None = None,
+    ):
+        super().__init__(status=status, body=body or {"error": "rate limited"})
+        self.headers = headers or {}
+
+
+@pytest.mark.asyncio
+async def test_chat_429_marks_key_rate_limited(stub_db):
+    """OpenRouter 429 must put the user's key in cooldown so the next
+    user routed to it falls through to a different pool member.
+    """
+    import openrouter_keys
+
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys._keys = ["test-key"]
+    openrouter_keys._loaded = True
+
+    response = _StubResponseWithHeaders(status=429)
+    with _patched_session(response):
+        reply = await ai_engine.chat_with_model(42, "hi")
+
+    assert openrouter_keys.is_key_rate_limited("test-key")
+    assert "rate" in reply.lower() or "limit" in reply.lower() or reply
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys._keys = []
+    openrouter_keys._loaded = False
+
+
+@pytest.mark.asyncio
+async def test_chat_429_honours_retry_after_header(stub_db):
+    """A numeric ``Retry-After`` propagates to the cooldown deadline."""
+    import openrouter_keys
+
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys._keys = ["test-key"]
+    openrouter_keys._loaded = True
+
+    response = _StubResponseWithHeaders(
+        status=429, headers={"Retry-After": "120"}
+    )
+    with _patched_session(response):
+        await ai_engine.chat_with_model(42, "hi")
+
+    deadline = openrouter_keys._cooldowns.get("test-key")
+    assert deadline is not None
+    now = openrouter_keys.time.monotonic()
+    # ~120s from now (within the cooldown clamp ceiling).
+    assert 119.0 <= deadline - now <= 121.0
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys._keys = []
+    openrouter_keys._loaded = False
+
+
+@pytest.mark.asyncio
+async def test_chat_429_falls_back_to_default_on_garbage_retry_after(stub_db):
+    """``Retry-After: not-a-number`` should not crash the 429 branch;
+    cooldown falls back to the default duration.
+    """
+    import openrouter_keys
+
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys._keys = ["test-key"]
+    openrouter_keys._loaded = True
+
+    response = _StubResponseWithHeaders(
+        status=429, headers={"Retry-After": "soon"}
+    )
+    with _patched_session(response):
+        await ai_engine.chat_with_model(42, "hi")
+
+    # Cooldown table must have an entry — the 429 fired the marker.
+    assert "test-key" in openrouter_keys._cooldowns
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys._keys = []
+    openrouter_keys._loaded = False
+
+
+@pytest.mark.asyncio
+async def test_chat_429_no_retry_after_uses_default_cooldown(stub_db):
+    """Missing ``Retry-After`` → default 60s cooldown."""
+    import openrouter_keys
+
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys._keys = ["test-key"]
+    openrouter_keys._loaded = True
+
+    response = _StubResponseWithHeaders(status=429, headers={})
+    with _patched_session(response):
+        await ai_engine.chat_with_model(42, "hi")
+
+    deadline = openrouter_keys._cooldowns.get("test-key")
+    assert deadline is not None
+    now = openrouter_keys.time.monotonic()
+    # ~DEFAULT_COOLDOWN_SECS (60s) from now.
+    expected = openrouter_keys.DEFAULT_COOLDOWN_SECS
+    assert expected - 1.0 <= deadline - now <= expected + 1.0
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys._keys = []
+    openrouter_keys._loaded = False

@@ -234,3 +234,132 @@ def test_calculate_cost_happy_path_pin_with_finite_guards(monkeypatch):
     # 1M input + 1M output at gpt-4o-mini's (0.15, 0.60) per 1M.
     # (0.15 + 0.60) * 1.5 = 1.125.
     assert calculate_cost("openai/gpt-4o-mini", 1_000_000, 1_000_000) == pytest.approx(1.125)
+
+
+# ---- Stage-15-Step-E #4 bundled bug fix: token-side NaN/non-finite guard ----
+
+
+def test_apply_markup_clamps_nan_prompt_tokens_to_zero(monkeypatch):
+    """A NaN prompt_token count (e.g. parsed from a quirky JSON payload
+    that uses the literal ``NaN``) used to propagate through the
+    multiplication, through ``raw * markup``, and through
+    ``max(NaN, 0.0)`` (which returns NaN in CPython because
+    ``NaN < 0.0`` is False) — yielding a NaN cost that
+    ``deduct_balance`` and ``log_usage`` both refuse, leaving the
+    audit trail with a hole and the user with free chat.
+
+    Post-fix: NaN clamps to 0, the call records cleanly, ops sees
+    a logged warning to investigate the upstream source.
+    """
+    monkeypatch.setenv("COST_MARKUP", "1.5")
+    cost = _apply_markup(
+        ModelPrice(input_per_1m_usd=2.0, output_per_1m_usd=8.0),
+        prompt_tokens=float("nan"),
+        completion_tokens=100,
+    )
+    import math as _math
+
+    assert _math.isfinite(cost)
+    assert cost >= 0.0
+    # The completion_tokens half is still charged: 100 * 8.0 / 1M * 1.5
+    # = 0.0012.
+    assert cost == pytest.approx(100 * 8.0 / 1_000_000.0 * 1.5)
+
+
+def test_apply_markup_clamps_inf_completion_tokens_to_zero(monkeypatch):
+    """+Inf completion_tokens used to produce +Inf cost; same downstream
+    poisoning as the NaN case (deduct + log refuse, hole in audit
+    trail). Post-fix: clamps to 0, only prompt half is charged.
+    """
+    monkeypatch.setenv("COST_MARKUP", "1.5")
+    cost = _apply_markup(
+        ModelPrice(input_per_1m_usd=2.0, output_per_1m_usd=8.0),
+        prompt_tokens=200,
+        completion_tokens=float("inf"),
+    )
+    import math as _math
+
+    assert _math.isfinite(cost)
+    # Only the prompt half is charged: 200 * 2.0 / 1M * 1.5 = 0.0006.
+    assert cost == pytest.approx(200 * 2.0 / 1_000_000.0 * 1.5)
+
+
+def test_apply_markup_clamps_negative_tokens_to_zero(monkeypatch):
+    """Negative tokens (a corrupted DB row, a misbehaving stub) used to
+    produce a negative ``raw`` which ``max(raw * markup, 0.0)`` then
+    rounded to 0 — silently dropping the cost. That zero-cost result
+    was correct in this case, but only by accident. Pin the exact
+    behaviour so a future refactor doesn't reintroduce a sign-flip.
+    """
+    monkeypatch.setenv("COST_MARKUP", "1.5")
+    cost = _apply_markup(
+        ModelPrice(input_per_1m_usd=2.0, output_per_1m_usd=8.0),
+        prompt_tokens=-100,
+        completion_tokens=-200,
+    )
+    assert cost == 0.0
+
+
+def test_apply_markup_clamps_string_token_count(monkeypatch):
+    """Defence-in-depth: a non-numeric token count (a stub that
+    forgot to int-cast; an OpenRouter response with a typo'd
+    schema) used to raise TypeError on the multiplication. The
+    raise was caught by an outer except in some call paths but
+    not all — and the user-facing error was confusing. Post-fix:
+    clamps to 0 with a logged warning so the call records cleanly.
+    """
+    monkeypatch.setenv("COST_MARKUP", "1.5")
+    cost = _apply_markup(
+        ModelPrice(input_per_1m_usd=2.0, output_per_1m_usd=8.0),
+        prompt_tokens="bad",  # type: ignore[arg-type]
+        completion_tokens=100,
+    )
+    assert cost == pytest.approx(100 * 8.0 / 1_000_000.0 * 1.5)
+
+
+def test_apply_markup_normal_positive_tokens_unchanged(monkeypatch):
+    """Pin: the new guard must NOT change the happy-path cost. A
+    refactor that accidentally clamped legitimate counts would
+    still pass the NaN test but fail this one.
+    """
+    monkeypatch.setenv("COST_MARKUP", "1.5")
+    cost = _apply_markup(
+        ModelPrice(input_per_1m_usd=2.0, output_per_1m_usd=8.0),
+        prompt_tokens=500,
+        completion_tokens=1500,
+    )
+    expected = (500 * 2.0 + 1500 * 8.0) / 1_000_000.0 * 1.5
+    assert cost == pytest.approx(expected)
+
+
+def test_apply_markup_zero_tokens_returns_zero(monkeypatch):
+    """Edge case: a 200 with empty content + zero tokens. Cost is 0,
+    no warning logged.
+    """
+    monkeypatch.setenv("COST_MARKUP", "1.5")
+    cost = _apply_markup(
+        ModelPrice(input_per_1m_usd=2.0, output_per_1m_usd=8.0),
+        prompt_tokens=0,
+        completion_tokens=0,
+    )
+    assert cost == 0.0
+
+
+def test_apply_markup_nan_tokens_combined_with_nan_price_both_clamp(monkeypatch):
+    """When BOTH the price and the token counts are corrupt, both
+    guards fire and the result is still finite (the price collapses
+    to FALLBACK_PRICE, the tokens collapse to 0, so the cost is 0).
+    """
+    monkeypatch.setenv("COST_MARKUP", "1.5")
+    cost = _apply_markup(
+        ModelPrice(
+            input_per_1m_usd=float("nan"),
+            output_per_1m_usd=float("nan"),
+        ),
+        prompt_tokens=float("nan"),
+        completion_tokens=float("inf"),
+    )
+    import math as _math
+
+    assert _math.isfinite(cost)
+    assert cost == 0.0

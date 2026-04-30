@@ -6,7 +6,7 @@ import aiohttp
 
 from admin_toggles import is_model_disabled
 from database import db
-from openrouter_keys import key_for_user
+from openrouter_keys import key_for_user, mark_key_rate_limited
 from pricing import calculate_cost_async
 from strings import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, t
 
@@ -163,6 +163,37 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
                     # advice ("pick a paid model or wait"). Detect the
                     # ":free" suffix to give a more honest message.
                     if response.status == 429:
+                        # Stage-15-Step-E #4: put this key in
+                        # cooldown so the next user routed to it
+                        # falls through to a different pool member
+                        # rather than retrying the same hot key.
+                        # We honour the upstream Retry-After header
+                        # when present; ``mark_key_rate_limited``
+                        # silently clamps + falls back if the value
+                        # is unusable. Wrapped in a broad except so
+                        # a parsing quirk in the response doesn't
+                        # mask the user-facing 429 reply.
+                        try:
+                            retry_after = response.headers.get(
+                                "Retry-After"
+                            )
+                            mark_key_rate_limited(
+                                api_key,
+                                retry_after_secs=(
+                                    float(retry_after)
+                                    if retry_after
+                                    else None
+                                ),
+                            )
+                        except (ValueError, TypeError):
+                            mark_key_rate_limited(api_key)
+                        except Exception:
+                            log.exception(
+                                "mark_key_rate_limited raised "
+                                "unexpectedly for user %d; "
+                                "continuing to user reply.",
+                                telegram_id,
+                            )
                         if active_model.endswith(":free"):
                             return t(lang, "ai_rate_limited_free")
                         return t(lang, "ai_rate_limited")

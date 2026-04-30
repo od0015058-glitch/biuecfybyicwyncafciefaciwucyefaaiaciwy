@@ -646,6 +646,36 @@ What remains (next AI's TODO):
 * **Rate limiting** — the menu button is fine (Telegram debounces callback queries). If `/history` text command lands, gate it behind the same chat-token bucket as `cmd_chat` so a user can't spam-export their buffer to DoS the DB.
 * **Schema-rotation hook** — if the operator ever needs to comply with a "delete all my data" request, `Database.clear_conversation` already exists. Document that the export button is the user-facing read side and `mem_reset` is the user-facing delete side.
 
+##### Stage-15-Step-E #4 — what's shipped vs. what remains (STARTED, not finished)
+
+**Step-E #4 (Rate limiting per OpenRouter key) — STARTED in PR-after-Step-E-#3.**
+
+Original spec (Step-E table row 4): "extend `openrouter_keys.py` with per-key 429 detection. If a key gets rate-limited, temporarily redistribute its users to other keys. Current sticky assignment doesn't handle key exhaustion."
+
+What's shipped this PR:
+
+* `openrouter_keys.py` — extended with a per-key cooldown table (`_cooldowns: dict[api_key -> deadline_monotonic_seconds]`). New public surface:
+    * `mark_key_rate_limited(api_key, retry_after_secs=None)` — put a key in cooldown. Defaults to 60s; honours an explicit Retry-After; clamps to `MAX_COOLDOWN_SECS=3600` so a misbehaving CDN sending `Retry-After: 86400` can't pin a key out for a day; falls back to the default on NaN / Inf / negative / non-numeric values; ignores stale references (keys not in the current pool) so the cooldown table doesn't grow unbounded; **never shortens** an already-running longer cooldown when a fresh 429 comes in with a smaller Retry-After (OpenRouter sometimes sends back-to-back 429s with different windows).
+    * `is_key_rate_limited(api_key)` — membership check with lazy expiry (cooldowns past their deadline are dropped on read, so the table self-cleans without a background sweeper).
+    * `available_key_count()` — number of pool keys not currently in cooldown. Used by the picker and the diagnostic snapshot.
+    * `key_status_snapshot()` — per-key dict for ops dashboards / metrics with `index`, `rate_limited`, `cooldown_remaining_secs`. Deliberately does **not** leak the api_key string itself into the snapshot rows.
+    * `clear_all_cooldowns()` — tests + ops "force everything back online" recovery.
+* `key_for_user(telegram_id)` — selection policy now: (1) compute sticky idx, (2) if sticky key not in cooldown, return it, (3) otherwise walk forward through the pool returning the first available key, (4) if **every** key is in cooldown, return the sticky pick anyway (with a warning) so the user gets at least an attempt rather than a hard "all keys exhausted" error. The "walk forward" lets a 3-key pool absorb a single key going hot without any user seeing a 429.
+* `ai_engine.chat_with_model` — on a 429 from OpenRouter, call `mark_key_rate_limited(api_key, retry_after_secs=...)` reading the upstream `Retry-After` header. Wrapped in a broad except so a parsing quirk in the response doesn't mask the user-facing 429 reply (the user still gets `ai_rate_limited` / `ai_rate_limited_free`, the cooldown side-effect is best-effort).
+* 22 new tests in `tests/test_openrouter_keys.py` (per-key cooldown lifecycle: mark / is / fall-back / sticky-when-all-cooled / expiry / default vs explicit Retry-After / clamps excessive / falls back on NaN/Inf/non-numeric / keeps-longer / extends-to-longer / unknown-key-noop / empty-string-noop / available_key_count / clear_all_cooldowns / key_status_snapshot / single-key-pool fallback). 4 new tests in `tests/test_ai_engine.py` (429 marks key / Retry-After honoured / garbage Retry-After falls back / no Retry-After uses default).
+
+What remains (next AI's TODO):
+
+* **Cross-replica cooldown coordination** — current state is process-local. Two replicas of the bot will track their own cooldowns independently. For the first slice this is acceptable (60s default cooldown clears within minutes) but a real multi-replica deployment should park the cooldown table in Redis with a short TTL. Pattern: `_redis.setex(f"openrouter:cooldown:{api_key_hash}", retry_after_secs, "1")` and `_redis.exists(...)` for the membership check. Hash the api_key first so the Redis keyspace doesn't leak it.
+* **`/admin/openrouter-keys` ops view** — the snapshot from `key_status_snapshot()` is ready to render but no admin route surfaces it yet. Add a route that lists each key's cooldown remaining and links into the existing admin layout. Pairs nicely with the Stage-15-Step-A `/metrics` exposition: emit `openrouter_key_cooldown_remaining_seconds{index="N"}` so Prometheus catches a stuck key.
+* **Per-key Prometheus counters** — `metrics.py` already has the helper plumbing. Add `openrouter_key_429_total{index="N"}` and `openrouter_key_fallback_total{index="N"}` so dashboards show the distribution.
+* **Retry the request itself with a different key** — current behaviour is "mark the key, return rate-limited message to user". A more user-friendly behaviour is "mark the key, retry the same request once with the next available key". First-slice trade-off: retry adds latency budget pressure (the user already waited the full timeout once), so this is a follow-up that needs a separate latency-aware design — probably a 2-second retry budget gated by `available_key_count() > 0`.
+* **Per-model rate-limit tracking** — OpenRouter sometimes 429s a specific `:free` model rather than the whole key. Currently any 429 puts the entire key in cooldown, which is over-aggressive. The next iteration could key the cooldown table on `(api_key, model)` so a 429 on `google/gemini-flash-1.5:free` doesn't lock out the same key for `anthropic/claude-3.5-sonnet`.
+
+Bundled bug fix in this PR: **`pricing._apply_markup` now NaN-guards the token-count side, not just the price side.** Pre-fix, the function had a defensive fallback for non-finite `ModelPrice.input_per_1m_usd` / `output_per_1m_usd` (the comments correctly explained NaN propagation through `raw * markup` / `max(NaN, 0)`) but no guard on the `prompt_tokens` / `completion_tokens` arguments. Those flow in directly from `data["usage"]["prompt_tokens"]` / `["completion_tokens"]` in `ai_engine.chat_with_model`, where Python's stdlib `json.loads` accepts the literal `NaN` token by default — meaning a quirky OpenRouter 200 response (or, more realistically, a misbehaving stub / custom proxy / future internal billing path) with a non-finite token count would propagate NaN through the multiplication, through `raw * markup`, and through `max(NaN, 0.0)` (which returns NaN in CPython because `NaN < 0.0` is False, so `max` treats NaN as the maximum). The downstream impact mirrors the price-side hole: `database.deduct_balance` refuses the NaN cost (its own NaN guard fires), `database.log_usage` likewise refuses — so the user gets free chat AND the audit trail has a hole. Fix: new `_coerce_token_count(value, label)` helper that clamps non-finite, non-numeric, and negative token counts to `0.0` with a logged warning. Six new test cases in `test_pricing.py` pin the fix (NaN prompt / Inf completion / negative both / non-numeric string / happy-path unchanged / zero-input edge / both-corrupt-collapses-to-zero).
+
+---
+
 ##### Stage-15-Step-E #3 — what's shipped vs. what remains (STARTED, not finished)
 
 **Step-E #3 (Webhook mode instead of long-polling) — STARTED in PR-after-Step-E-#2.**
@@ -1068,22 +1098,35 @@ The user's process for this project — **do not deviate**:
     `conversation_export.format_history_as_text` now returns
     `(text, kept_count)` so the memory-export caption + toast
     report the actually-kept count after a 1 MB trim.
-    **Stage-15-Step-E #3 STARTED (this PR)** — first slice of
+    **Stage-15-Step-E #3 MERGED** (PR #121) — first slice of
     "webhook mode instead of long-polling": new
     `telegram_webhook.py` module gates Telegram updates behind a
-    secret token (header AND path), validates the secret's
-    charset/length per Telegram's documented spec, and shares the
-    aiohttp app + per-IP rate limiter with the IPN webhooks.
-    Opt-in via `TELEGRAM_WEBHOOK_SECRET`; default behaviour
-    (long-polling) is unchanged. Bundled bug fix in #3:
+    secret token (header AND path). Bundled bug fix in #3:
     `webhook_rate_limit_middleware` now protects the TetraPay
-    endpoint (and the new opt-in Telegram webhook) instead of
-    just `/nowpayments-webhook` — pre-fix the TetraPay endpoint
-    bypassed the per-IP token bucket entirely so a flood of
-    forged callbacks could DoS the JSON-parse + signature-verify
-    path. See "Stage-15-Step-E #3 — what's shipped vs. what
-    remains" section above for the precise boundary so the next
-    AI can continue.
+    endpoint instead of just `/nowpayments-webhook`.
+    **Stage-15-Step-E #4 STARTED (this PR)** — first slice of
+    "rate limiting per OpenRouter key": `openrouter_keys.py`
+    extended with a per-key 429 cooldown table and a fall-through
+    selection policy so a single key going hot routes its sticky
+    users to the next available pool member instead of returning
+    a "rate-limited" error every time. `mark_key_rate_limited`
+    honours `Retry-After`, clamps to a 1h ceiling so a misbehaving
+    CDN can't pin a key out for a day, and never shortens an
+    already-running longer cooldown. `ai_engine.chat_with_model`
+    calls the marker on a 429 from OpenRouter, wrapped in a broad
+    except so a parsing quirk in the response doesn't mask the
+    user-facing reply. Bundled bug fix in #4: `pricing._apply_markup`
+    now NaN/Inf/non-numeric/negative-guards the token-count side
+    too, not just the price side — pre-fix, a quirky OpenRouter
+    200 with a non-finite token count would propagate NaN through
+    the multiplication, through `max(NaN, 0.0)` (which returns
+    NaN in CPython), and yield a NaN cost that `deduct_balance`
+    and `log_usage` both refuse — leaving the audit trail with a
+    hole AND the user with free chat. New `_coerce_token_count`
+    helper clamps to 0 with a logged warning so ops can chase
+    the upstream cause. See "Stage-15-Step-E #4 — what's shipped
+    vs. what remains" section above for the precise boundary so
+    the next AI can continue.
 11. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
