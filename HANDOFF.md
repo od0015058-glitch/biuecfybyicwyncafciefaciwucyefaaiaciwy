@@ -646,6 +646,31 @@ What remains (next AI's TODO):
 * **Rate limiting** — the menu button is fine (Telegram debounces callback queries). If `/history` text command lands, gate it behind the same chat-token bucket as `cmd_chat` so a user can't spam-export their buffer to DoS the DB.
 * **Schema-rotation hook** — if the operator ever needs to comply with a "delete all my data" request, `Database.clear_conversation` already exists. Document that the export button is the user-facing read side and `mem_reset` is the user-facing delete side.
 
+##### Stage-15-Step-E #3 — what's shipped vs. what remains (STARTED, not finished)
+
+**Step-E #3 (Webhook mode instead of long-polling) — STARTED in PR-after-Step-E-#2.**
+
+Original spec (Step-E table row 3): "switch from aiogram long-polling to webhook mode. The aiohttp server already runs; register a `/telegram-webhook` route. Reduces latency, uses fewer resources."
+
+What's shipped this PR:
+
+* `telegram_webhook.py` — new module with the webhook plumbing. `is_webhook_mode_enabled()` is the boot-decision predicate; `load_webhook_config()` is the strict parser (validates secret charset/length per Telegram's spec, requires HTTPS base URL except for `localhost`, refuses missing base URL); `install_telegram_webhook_route(app, dp, bot, config)` mounts the POST handler at `/telegram-webhook/<secret>` using `aiogram.webhook.aiohttp_server.SimpleRequestHandler` (which enforces the `X-Telegram-Bot-Api-Secret-Token` header — defence in depth on top of the secret-in-path); `register_webhook_with_telegram(bot, cfg)` calls `Bot.set_webhook` with `drop_pending_updates=False` so a switch from polling to webhook doesn't lose buffered updates; `remove_webhook_from_telegram(bot)` is best-effort on shutdown (logs but doesn't raise so the original shutdown reason isn't masked).
+* `main.py` — opt-in switch. When `TELEGRAM_WEBHOOK_SECRET` is set, `start_webhook_server` mounts the Telegram route on the same aiohttp app + port as the IPN webhooks, registers the path with the rate limiter, then `main()` calls `set_webhook` and blocks on an `asyncio.Event` for the lifetime of the process. When unset, the existing `dp.start_polling(bot)` path runs unchanged — backward-compatible default.
+* `.env.example` — documents `TELEGRAM_WEBHOOK_SECRET`, `TELEGRAM_WEBHOOK_BASE_URL` (optional override), `TELEGRAM_WEBHOOK_PATH_PREFIX` (optional override). Includes a recovery procedure ("unset this var and call delete_webhook") for ops that flip back to polling.
+* 27 new tests in `tests/test_telegram_webhook.py` covering: env-var validation (disabled/whitespace/happy-path/specific-overrides/trailing-slash strip/custom prefix/missing base URL/plain HTTP rejection/localhost allow/secret charset/secret length); `WebhookConfig.__repr__` not leaking the secret; `constant_time_secret_eq` (true/false/empty-string defence); route registration; `Bot.set_webhook` called with the right args; `delete_webhook` swallowing errors. Plus tests for the bundled rate-limit fix (default paths includes TetraPay; `register_rate_limited_webhook_path` extends the set; idempotent; raises before install; rate-limits TetraPay end-to-end; admin traffic still pass-through).
+
+What remains (next AI's TODO):
+
+* **`set_webhook` retry on transient 5xx** — current implementation propagates `set_webhook` errors as fatal. A retry-with-backoff loop would tolerate a Telegram blip on bot startup. Pattern: copy from `pending_alert.py`'s `_retryable_call` helper.
+* **IP-allowlist for Telegram's address ranges** — Telegram publishes its delivery IP ranges (`149.154.160.0/20`, `91.108.4.0/22`). Layer this on top of the secret check — secret guards against URL leak, IP-allowlist guards against header-strip + replay. `aiogram.webhook.security.IPFilter` provides the building block.
+* **Multi-bot `TokenBasedRequestHandler`** — current handler is `SimpleRequestHandler` (one bot per process). If the operator ever wants to run multiple bots on the same aiohttp server, swap to `TokenBasedRequestHandler` (path placeholder `{bot_token}`) — but note aiogram's docstring warning about token-in-URL leakage to reverse-proxy logs.
+* **Health-check route** — `/telegram-webhook/healthz` to monitor the route is live independent of Telegram delivery. Pairs nicely with the `/metrics` endpoint from Stage-15-Step-A.
+* **Migration recipe** — README has a one-liner pointing at `.env.example`; could be expanded into a step-by-step guide ("Set `TELEGRAM_WEBHOOK_SECRET` → restart bot → verify with `Bot.get_webhook_info`").
+
+Bundled bug fix in this PR: **`webhook_rate_limit_middleware` now protects the TetraPay endpoint** (and the new opt-in Telegram webhook) instead of just `/nowpayments-webhook`. Pre-fix, `WEBHOOK_PATH = "/nowpayments-webhook"` was hardcoded as the only filtered path, so the TetraPay endpoint added in Stage-11-Step-C (`main.start_webhook_server` line ~53) bypassed the per-IP token bucket entirely — a flood of forged TetraPay callbacks could DoS the JSON-parse + signature-verify path while NowPayments IPNs and admin-panel traffic stayed untouched. Fix introduces a `WEBHOOK_RATE_LIMITED_PATHS_KEY` AppKey carrying a `set[str]` (defaults: `{WEBHOOK_PATH, "/tetrapay-webhook"}`) and a public `register_rate_limited_webhook_path(app, path)` helper for callers (like the new Telegram webhook) that mount their own routes. The middleware now membership-tests against this set instead of comparing against a single hardcoded constant. Test `test_rate_limit_middleware_now_filters_tetrapay` pins the regression with a single-token bucket — pre-fix the second TetraPay request would have returned 200; post-fix it correctly returns 429.
+
+---
+
 Audit findings (2026-04-30) noted by reading every file — kept here so a future AI / human can pick the highest-leverage one next:
 
 * **`cmd_start` has a redundant `db.create_user` call** (handlers.py ~278) — `UserUpsertMiddleware` already runs first. Inspected during the Stage-13-Step-Aplus audit and decided NOT to remove: the middleware swallows upsert exceptions (logged + handler still runs), so the explicit retry in `cmd_start` is the only safety net for a transient DB issue at the moment of `/start`. Belt-and-braces; leave it.
@@ -1005,18 +1030,34 @@ The user's process for this project — **do not deviate**:
     PR #114 which only made the *post-write resync* fail-soft.
     Remaining: nothing in Stage-15-Step-D. Stage-15-Step-E is
     doc-only and the 12 suggestions are already enumerated above.
-    **Stage-15-Step-E #1 STARTED (this PR)** — first slice of
-    "conversation history persistence & export": new
-    `conversation_export.py` module renders the full buffer as a
-    plain-text export, new `Database.get_full_conversation` reads
-    every row with timestamps, new "📥 Export conversation" button
-    on the memory screen wires it up end-to-end. Bundled bug fix:
-    `metrics._format_help_and_type` now escapes `\` and newline in
-    HELP text per the Prometheus exposition spec — same defensive
-    pattern as the label-value escape closed in PR #116, but for
-    the unquoted HELP line. See "Stage-15-Step-E #1 — what's
-    shipped vs. what remains" section below for the precise
-    boundary so the next AI can continue.
+    **Stage-15-Step-E #1 MERGED** (PR #119) — first slice of
+    "conversation history persistence & export". Bundled bug fix
+    in #1: `metrics._format_help_and_type` now escapes `\` and
+    newline in HELP text per the Prometheus exposition spec.
+    **Stage-15-Step-E #2 STARTED** (PR #120, not yet merged at
+    this PR's branch-off point) — first slice of "spending
+    analytics for users": new `Database.get_user_spending_summary`,
+    new `user_stats` formatter, new "📊 My usage stats" button on
+    the wallet menu. Bundled bug fix in #2:
+    `conversation_export.format_history_as_text` now returns
+    `(text, kept_count)` so the memory-export caption + toast
+    report the actually-kept count after a 1 MB trim.
+    **Stage-15-Step-E #3 STARTED (this PR)** — first slice of
+    "webhook mode instead of long-polling": new
+    `telegram_webhook.py` module gates Telegram updates behind a
+    secret token (header AND path), validates the secret's
+    charset/length per Telegram's documented spec, and shares the
+    aiohttp app + per-IP rate limiter with the IPN webhooks.
+    Opt-in via `TELEGRAM_WEBHOOK_SECRET`; default behaviour
+    (long-polling) is unchanged. Bundled bug fix in #3:
+    `webhook_rate_limit_middleware` now protects the TetraPay
+    endpoint (and the new opt-in Telegram webhook) instead of
+    just `/nowpayments-webhook` — pre-fix the TetraPay endpoint
+    bypassed the per-IP token bucket entirely so a flood of
+    forged callbacks could DoS the JSON-parse + signature-verify
+    path. See "Stage-15-Step-E #3 — what's shipped vs. what
+    remains" section above for the precise boundary so the next
+    AI can continue.
 11. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.

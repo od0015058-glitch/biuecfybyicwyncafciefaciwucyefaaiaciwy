@@ -291,6 +291,56 @@ def chat_inflight_count() -> int:
 # rename of the endpoint only has to change in one place.
 WEBHOOK_PATH = "/nowpayments-webhook"
 
+# Stage-15-Step-E #3 bundled bug fix: every public-facing webhook
+# endpoint should sit behind the same per-IP token bucket — pre-fix,
+# only ``/nowpayments-webhook`` did. The TetraPay endpoint was added in
+# Stage-11-Step-C (``main.start_webhook_server`` line ~53) but the rate
+# limiter was never extended to cover it, so a flood of forged TetraPay
+# callbacks could DoS the JSON-parse + signature-verify path while
+# legitimate NowPayments IPNs and legitimate users were untouched.
+# Telegram updates (when webhook mode is enabled — see
+# ``telegram_webhook.py``) sit at a path that varies per-deploy
+# (``/telegram-webhook/<secret>``) so the route mounter passes the path
+# through ``register_rate_limited_webhook_path`` to add it dynamically.
+TETRAPAY_WEBHOOK_PATH = "/tetrapay-webhook"
+
+_DEFAULT_RATE_LIMITED_PATHS: frozenset[str] = frozenset(
+    {WEBHOOK_PATH, TETRAPAY_WEBHOOK_PATH}
+)
+
+# AppKey carrying the **full** set of paths (defaults + any
+# dynamically-registered ones). The middleware reads this on every
+# request rather than the constant above so a future caller can opt
+# additional endpoints in without forking the middleware.
+WEBHOOK_RATE_LIMITED_PATHS_KEY: web.AppKey = web.AppKey(
+    "_webhook_rate_limited_paths", set
+)
+
+
+def register_rate_limited_webhook_path(
+    app: web.Application, path: str
+) -> None:
+    """Add ``path`` to the set of routes that
+    ``webhook_rate_limit_middleware`` filters.
+
+    Used by callers that mount their own webhook routes on the
+    same aiohttp app and want them protected by the same per-IP
+    bucket as the built-in IPN endpoints. Idempotent — adding the
+    same path twice is a no-op.
+
+    Raises ``RuntimeError`` if called before
+    ``install_webhook_rate_limit`` has seeded the app.
+    """
+    paths = app.get(WEBHOOK_RATE_LIMITED_PATHS_KEY)
+    if paths is None:
+        msg = (
+            "register_rate_limited_webhook_path called before "
+            "install_webhook_rate_limit — install the middleware "
+            "first so the path-set exists."
+        )
+        raise RuntimeError(msg)
+    paths.add(path)
+
 
 # Environment variable that opts the rate-limit keying into trusting
 # the X-Forwarded-For header. See ``client_ip_for_rate_limit`` for
@@ -433,7 +483,13 @@ async def webhook_rate_limit_middleware(
     The bucket cache lives on the application itself so it survives
     request boundaries.
     """
-    if request.path != WEBHOOK_PATH:
+    # Stage-15-Step-E #3 bundled fix: filter on the **set** of
+    # protected paths rather than the single legacy
+    # ``/nowpayments-webhook``. Pre-fix, ``/tetrapay-webhook`` (added
+    # in Stage-11-Step-C) and the new ``/telegram-webhook/<secret>``
+    # (added in this PR, opt-in) bypassed the limiter entirely.
+    paths = request.app.get(WEBHOOK_RATE_LIMITED_PATHS_KEY)
+    if paths is None or request.path not in paths:
         return await handler(request)
 
     # Cache is pre-seeded by ``install_webhook_rate_limit`` before the
@@ -478,6 +534,12 @@ def install_webhook_rate_limit(
     bursts.
     """
     app.middlewares.append(webhook_rate_limit_middleware)
+    # Seed the path-set with the built-in defaults (NowPayments +
+    # TetraPay). Callers that mount additional webhook routes on the
+    # same app (e.g. ``telegram_webhook.install_telegram_webhook_route``
+    # for opt-in webhook mode) extend the set via
+    # ``register_rate_limited_webhook_path``.
+    app[WEBHOOK_RATE_LIMITED_PATHS_KEY] = set(_DEFAULT_RATE_LIMITED_PATHS)
     app[WEBHOOK_RATE_LIMIT_CACHE_KEY] = _LRUBucketCache(
         capacity=capacity, refill_rate=refill_rate
     )
