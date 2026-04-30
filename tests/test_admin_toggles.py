@@ -68,8 +68,17 @@ def test_get_disabled_gateways_snapshot():
 # ---- _active_pay_currencies helper in handlers ----------------------
 
 
-def test_active_pay_currencies_filters_disabled():
-    """handlers._active_pay_currencies filters based on admin_toggles cache."""
+def test_active_pay_currencies_filters_disabled(monkeypatch):
+    """handlers._active_pay_currencies filters based on admin_toggles cache.
+
+    Unrelated Stage-15 gate: also requires ``NOWPAYMENTS_API_KEY`` to
+    be set (otherwise every crypto ticker is dropped — see the new
+    Stage-15-Step-D bug fix). We pin the env var to a dummy value
+    here so this test stays scoped to the toggle-filter behaviour
+    it was originally written to cover; the new env-gate path has
+    its own dedicated test below.
+    """
+    monkeypatch.setenv("NOWPAYMENTS_API_KEY", "dummy-key-for-test")
     _reset()
     from handlers import _active_pay_currencies, SUPPORTED_PAY_CURRENCIES
 
@@ -85,6 +94,33 @@ def test_active_pay_currencies_filters_disabled():
     assert "eth" in tickers
 
     _reset()
+
+
+def test_active_pay_currencies_empty_when_nowpayments_unset(monkeypatch):
+    """Stage-15-Step-D bundled bug fix: the picker must NOT surface
+    crypto tickers when ``NOWPAYMENTS_API_KEY`` is unset.
+
+    Pre-fix the picker still listed BTC / ETH / etc. even though
+    every invoice-creation attempt would fail with a cryptic
+    "Invalid API key" error from NowPayments. Post-fix the list is
+    empty so the dual-currency entry / wallet hub falls back to
+    showing only TetraPay (Rial), which is the correct UX for a
+    deploy that hasn't yet enabled NowPayments.
+    """
+    monkeypatch.delenv("NOWPAYMENTS_API_KEY", raising=False)
+    _reset()
+    from handlers import _active_pay_currencies
+
+    assert _active_pay_currencies() == []
+
+    # Whitespace-only key is treated identically (we ``strip()`` the
+    # value so an operator who left ``NOWPAYMENTS_API_KEY=  `` in
+    # ``.env`` doesn't accidentally re-enable the broken picker).
+    monkeypatch.setenv("NOWPAYMENTS_API_KEY", "   ")
+    assert _active_pay_currencies() == []
+
+    monkeypatch.setenv("NOWPAYMENTS_API_KEY", "real-key")
+    assert len(_active_pay_currencies()) > 0
 
 
 def test_currency_grid_layout():

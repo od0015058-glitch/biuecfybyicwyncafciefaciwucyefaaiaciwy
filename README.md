@@ -123,6 +123,33 @@ NowPayments crypto invoices.
   conversation context stays consistent. If only the bare
   `OPENROUTER_API_KEY` is set, all traffic goes there (backward-
   compatible). See `.env.example` for details.
+- **Prometheus `/metrics` endpoint** — the same aiohttp server that
+  hosts the IPN webhooks publishes `GET /metrics` in Prometheus
+  text-exposition format for internal scraping (Prometheus,
+  Grafana Agent, VictoriaMetrics — no third-party
+  `prometheus_client` dependency in the bot itself). Output covers
+  per-loop heartbeat epochs (FX refresh, model discovery, catalog
+  refresh, NowPayments min-amount refresh, pending alert / reaper
+  loops), IPN drop counters (NowPayments + TetraPay) broken down by
+  reason, the in-flight chat-slot gauge, the count of
+  admin-disabled models / gateways, and the size of the OpenRouter
+  key pool. The endpoint is gated by `METRICS_IP_ALLOWLIST`
+  (comma-separated IPs / CIDRs, default `127.0.0.1,::1`); an empty
+  allowlist locks every request out (fail-closed). Sample scrape
+  config:
+  ```yaml
+  scrape_configs:
+    - job_name: meowassist
+      scrape_interval: 30s
+      static_configs:
+        - targets: ['127.0.0.1:8080']
+  ```
+  Sample alert (a stuck reaper goes silent for >15 minutes):
+  ```yaml
+  - alert: MeowassistReaperStuck
+    expr: time() - meowassist_pending_reaper_last_run_epoch > 900
+    for: 5m
+  ```
 
 For the full project history, file map, and roadmap **read [HANDOFF.md](./HANDOFF.md)**.
 
@@ -274,7 +301,8 @@ pytest tests/
 | `middlewares.py` | `UserUpsertMiddleware` — ensures `users` row exists before any handler runs. |
 | `force_join.py` | `RequiredChannelMiddleware` + the `force_join_check` callback handler. When `REQUIRED_CHANNEL` is set, every non-admin user is gated behind a "join the channel" screen until Telegram confirms membership. Admins bypass; API errors fail open. |
 | `referral.py` | Stage-13-Step-C. Env-var config (`BOT_USERNAME` / `REFERRAL_BONUS_PERCENT` / `REFERRAL_BONUS_MAX_USD`), the `/start <payload>` parser (the bundled bug-fix that finally inspects the deep-link payload `cmd_start` ignored pre-PR-110), the share-URL builder, and the thin wrapper around `Database._grant_referral_in_tx` that the finalize-payment open-TX calls. The DB-layer primitives (`get_or_create_referral_code`, `claim_referral`, `_grant_referral_in_tx`, `get_referral_stats`) live in `database.py`. |
-| `rate_limit.py` | Token-bucket primitives + `consume_chat_token` (per-user throughput throttle) + `try_claim_chat_slot` / `release_chat_slot` (per-user in-flight cap) and `webhook_rate_limit_middleware` (per-IP). Guards the AI chat path against runaway OpenRouter spend on both axes (sustained rate and burst concurrency) and the `/nowpayments-webhook` endpoint against DoS bursts. |
+| `rate_limit.py` | Token-bucket primitives + `consume_chat_token` (per-user throughput throttle) + `try_claim_chat_slot` / `release_chat_slot` (per-user in-flight cap) + `chat_inflight_count` (read-only accessor for the Stage-15-Step-A metrics gauge) and `webhook_rate_limit_middleware` (per-IP). Guards the AI chat path against runaway OpenRouter spend on both axes (sustained rate and burst concurrency) and the `/nowpayments-webhook` endpoint against DoS bursts. |
+| `metrics.py` | Stage-15-Step-A. Prometheus `/metrics` exposition mounted on the existing aiohttp server. Process-local loop heartbeat registry (`record_loop_tick` / `get_loop_last_tick`) instrumented from every forever-loop's success-path. CIDR allowlist parser (`parse_ip_allowlist`) gated by `METRICS_IP_ALLOWLIST` (default `127.0.0.1,::1`, fail-closed on empty). No third-party `prometheus_client` dependency — exposition format rendered by hand in `render_metrics`. |
 | `strings.py` | Two-locale (fa/en) compiled string table + `t(lang, key, **kwargs)` helper. Layered with a runtime override cache populated from the `bot_strings` DB table — admin edits at `/admin/strings` shadow the compiled defaults until reverted. Missing-slug lookups now log a one-shot WARNING per `(lang, key)` instead of silently returning the bare slug. |
 | `wallet_display.py` | Stage-11-Step-D. `format_toman_annotation(lang, balance_usd, snap)` returns the `\n≈ N تومان` (fa) / `\n≈ N TMN` (en) line spliced onto every wallet view's `$X.YZ` figure when an FX snapshot is cached. Stale snapshots get the `(نرخ تقریبی)` / `(approx)` suffix; cold cache returns `""` so the wallet still renders without the line; non-finite balances and arithmetic-overflow products are rejected with `""` rather than rendering `≈ nan تومان`. `format_balance_block(lang, balance_usd, snap)` packages `$X.YZ` + the annotation for callers (post-credit DMs, future wallet sub-screens) that don't go through `strings.t` — and substitutes `$0.00` for the head string on a non-finite balance so a corrupted upstream can't leak `$nan` either (the annotation guard already covered the Toman line). |
 | `wallet_receipts.py` | **Stage-12-Step-C.** Renders the new "🧾 Recent top-ups" wallet sub-screen. `get_receipts_page_size()` reads the `RECEIPTS_PAGE_SIZE` env var (default 5, max 20). `format_receipt_line(row, lang)` renders one row as `<status badge> — $X.YZ — <gateway label> — YYYY-MM-DD`; TetraPay rows append `(≈ N TMN)` using the per-transaction `gateway_locked_rate_toman_per_usd` (NOT the live snapshot — the user verifies against what they actually paid). Same NaN-defense policy as `wallet_display`: a non-finite `amount_usd` renders `$0.00`, a non-finite locked rate omits the Toman annotation. Backed by `Database.list_user_transactions(*, telegram_id, limit, before_id=None)`, which **hard-codes the `WHERE telegram_id = …` clause** and `raise ValueError` on a missing/zero/negative `telegram_id` — separate method from the admin-side `list_transactions` so a future buggy caller can't drop the user-scope filter and leak someone else's transactions. Cursor pagination via `before_id` over `transaction_id` (stable when fresh top-ups land mid-browse). Status whitelist is `{"SUCCESS", "PARTIAL", "REFUNDED"}` — PENDING / EXPIRED / FAILED are operational state, not user-facing receipts. |

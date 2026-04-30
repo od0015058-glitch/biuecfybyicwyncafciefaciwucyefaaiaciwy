@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -100,12 +101,38 @@ SUPPORTED_PAY_CURRENCIES: tuple[tuple[str, str], ...] = (
 _CURRENCY_ROWS_LAYOUT = (3, 3, 3)
 
 
+def _nowpayments_configured() -> bool:
+    """Return True iff ``NOWPAYMENTS_API_KEY`` is set to a non-empty value.
+
+    Read fresh on every call rather than cached at import time so a
+    deploy that fills in the key after the bot starts (e.g. via a
+    ``docker compose restart`` after editing ``.env``) picks it up
+    on the next render — and so the unit tests for this gate can
+    use ``monkeypatch.setenv`` instead of having to reload the
+    ``handlers`` module.
+    """
+    return bool(os.getenv("NOWPAYMENTS_API_KEY", "").strip())
+
+
 def _active_pay_currencies() -> list[tuple[str, str]]:
-    """Return SUPPORTED_PAY_CURRENCIES minus admin-disabled gateways."""
+    """Return ``SUPPORTED_PAY_CURRENCIES`` minus admin-disabled gateways.
+
+    Stage-15-Step-D bug-fix bundled with Stage-15-Step-A: also drop
+    every NowPayments crypto ticker when ``NOWPAYMENTS_API_KEY`` is
+    unset. Pre-fix the picker still listed BTC / ETH / LTC / etc.
+    even though every invoice-creation attempt would fail with
+    a cryptic "Invalid API key" error from NowPayments — confusing
+    the user into retrying a different currency until they exhausted
+    every row. The dual-currency entry / wallet hub fall back to
+    showing only TetraPay (Rial) when this filter empties the crypto
+    list, which is the correct UX for a deploy that hasn't yet
+    enabled NowPayments.
+    """
+    nowpayments_on = _nowpayments_configured()
     return [
         (label, ticker)
         for label, ticker in SUPPORTED_PAY_CURRENCIES
-        if not is_gateway_disabled(ticker)
+        if not is_gateway_disabled(ticker) and nowpayments_on
     ]
 
 

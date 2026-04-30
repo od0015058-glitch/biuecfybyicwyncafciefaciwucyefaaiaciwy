@@ -17,6 +17,7 @@ from handlers import SUPPORTED_PAY_CURRENCIES, router
 from middlewares import UserUpsertMiddleware
 from force_join import RequiredChannelMiddleware, get_required_channel
 from fx_rates import refresh_usd_to_toman_loop
+from metrics import install_metrics_route
 from model_discovery import discover_new_models_loop
 from payments import payment_webhook, refresh_min_amounts_loop
 from tetrapay import tetrapay_webhook
@@ -50,6 +51,13 @@ async def start_webhook_server(bot: Bot) -> web.AppRunner:
     # responsible for parsing, dedupe, the authoritative ``/api/verify``
     # call, and the idempotent ``finalize_payment``.
     app.router.add_post("/tetrapay-webhook", tetrapay_webhook)
+
+    # Stage-15-Step-A: Prometheus ``/metrics`` endpoint for internal
+    # scraping. IP-allowlisted (default ``127.0.0.1,::1``) so a
+    # leaked URL doesn't expose internal counters publicly. No
+    # third-party ``prometheus_client`` dependency — the exposition
+    # format is rendered by hand in ``metrics.render_metrics``.
+    install_metrics_route(app)
 
     # Mount the web admin panel under /admin/. Same aiohttp app, same
     # process — one less thing to deploy. Auth is HMAC-cookie based,

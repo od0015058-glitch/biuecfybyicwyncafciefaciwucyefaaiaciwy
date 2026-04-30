@@ -281,6 +281,14 @@ async def _refresh(*, force: bool) -> Catalog:
                 len(_catalog.models),
                 len(_catalog.by_provider),
             )
+            # Stage-15-Step-A: heartbeat for
+            # ``meowassist_catalog_refresh_last_run_epoch``. Recorded
+            # only on a successful fetch — the warning-path that
+            # keeps the previous live snapshot deliberately leaves
+            # the gauge stale so operators can alert on it.
+            from metrics import record_loop_tick
+
+            record_loop_tick("catalog_refresh")
         except Exception:
             if not _catalog.models:
                 log.exception(

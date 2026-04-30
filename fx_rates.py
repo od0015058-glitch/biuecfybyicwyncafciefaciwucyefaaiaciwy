@@ -409,6 +409,12 @@ async def refresh_usd_to_toman_loop(
             raise
         except Exception:
             log.exception("FX refresher iteration failed; retrying")
+        else:
+            # Stage-15-Step-A: heartbeat for
+            # ``meowassist_fx_refresh_last_run_epoch``.
+            from metrics import record_loop_tick
+
+            record_loop_tick("fx_refresh")
         try:
             await asyncio.sleep(interval)
         except asyncio.CancelledError:

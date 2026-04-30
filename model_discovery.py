@@ -419,6 +419,12 @@ async def run_discovery_pass(bot: Bot) -> DiscoveryResult:
       reported via the new-model path) so a first deploy doesn't
       fire a 200-row delta DM.
     """
+    # ``models_catalog._refresh`` records the
+    # ``catalog_refresh`` heartbeat on a successful OpenRouter fetch
+    # (Stage-15-Step-A). We do NOT tick the ``catalog_refresh`` gauge
+    # here because ``force_refresh`` falls through to the previous
+    # snapshot on a failed fetch — recording the tick from the
+    # caller would silently mask the staleness we want to surface.
     catalog = await force_refresh()
     prior_seen = await db.get_seen_model_ids()
     prior_prices = await db.get_model_prices()
@@ -501,6 +507,15 @@ async def discover_new_models_loop(
             raise
         except Exception:
             log.exception("discovery pass crashed; retrying next tick")
+        else:
+            # Stage-15-Step-A: heartbeat for the Prometheus
+            # ``meowassist_model_discovery_last_run_epoch`` gauge.
+            # ``run_discovery_pass`` itself records the
+            # ``catalog_refresh`` tick after the
+            # ``force_refresh`` call succeeds.
+            from metrics import record_loop_tick
+
+            record_loop_tick("model_discovery")
         try:
             await asyncio.sleep(interval)
         except asyncio.CancelledError:

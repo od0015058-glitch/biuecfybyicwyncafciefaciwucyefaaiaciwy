@@ -358,6 +358,12 @@ async def _alert_loop(
                 log.exception(
                     "run_pending_alert_pass raised; will retry next tick"
                 )
+            else:
+                # Stage-15-Step-A: heartbeat for
+                # ``meowassist_pending_alert_last_run_epoch``.
+                from metrics import record_loop_tick
+
+                record_loop_tick("pending_alert")
             await asyncio.sleep(interval_seconds)
     except asyncio.CancelledError:
         log.info("pending-alert loop cancelled; exiting cleanly")
