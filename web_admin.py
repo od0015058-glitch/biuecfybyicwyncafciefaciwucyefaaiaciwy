@@ -522,6 +522,41 @@ async def logout(request: web.Request) -> web.StreamResponse:
     return response
 
 
+def _collect_ipn_health() -> dict:
+    """Snapshot the per-process IPN drop counters for the dashboard tile.
+
+    Stage-15-Step-D #5. ``payments.get_ipn_drop_counters()`` and
+    ``tetrapay.get_tetrapay_drop_counters()`` are both
+    process-local and reset to zero on every restart, so the tile
+    is labelled "since last restart" in the template. Each gateway
+    is collected behind its own ``try`` so a future regression in
+    one accessor (or a missing-import edge case in tests) cannot
+    blank out the other half of the panel.
+    """
+    nowpayments: dict[str, int]
+    tetrapay: dict[str, int]
+    try:
+        from payments import get_ipn_drop_counters
+
+        nowpayments = dict(get_ipn_drop_counters())
+    except Exception:
+        log.exception("dashboard: get_ipn_drop_counters failed")
+        nowpayments = {}
+    try:
+        from tetrapay import get_tetrapay_drop_counters
+
+        tetrapay = dict(get_tetrapay_drop_counters())
+    except Exception:
+        log.exception("dashboard: get_tetrapay_drop_counters failed")
+        tetrapay = {}
+    return {
+        "nowpayments": nowpayments,
+        "tetrapay": tetrapay,
+        "nowpayments_total": sum(nowpayments.values()),
+        "tetrapay_total": sum(tetrapay.values()),
+    }
+
+
 async def dashboard(request: web.Request) -> web.StreamResponse:
     db = request.app.get(APP_KEY_DB)
     metrics: dict
@@ -564,12 +599,15 @@ async def dashboard(request: web.Request) -> web.StreamResponse:
             metrics = dict(empty_metrics)
             db_error = "Database query failed — see logs."
 
+    ipn_health = _collect_ipn_health()
+
     return aiohttp_jinja2.render_template(
         "dashboard.html",
         request,
         {
             "metrics": metrics,
             "db_error": db_error,
+            "ipn_health": ipn_health,
             "active_page": "dashboard",
         },
     )

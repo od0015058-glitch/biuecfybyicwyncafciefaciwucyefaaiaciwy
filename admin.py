@@ -189,6 +189,23 @@ def format_metrics(rows: dict) -> str:
             )
         else:
             lines.append(f"⏳ Pending payments: *{pending_count:,}*")
+        # Stage-15-Step-D #5 bundled fix: surface the
+        # ``pending_payments_over_threshold_count`` sub-line so the
+        # Telegram-side ``/admin_metrics`` digest matches what the
+        # web dashboard already shows. Stage-12-Step-B added the
+        # over-threshold count to the DB shape and wired it into
+        # ``dashboard.html`` but missed this consumer, so an
+        # operator running ``/admin_metrics`` saw the raw count
+        # (e.g. "5 pending") with no signal that 3 of those 5 were
+        # already past the proactive-DM threshold and should have
+        # caused a separate alert. Showing both keeps the two admin
+        # surfaces in sync.
+        over_threshold = rows.get("pending_payments_over_threshold_count")
+        threshold_h = rows.get("pending_alert_threshold_hours")
+        if over_threshold and threshold_h:
+            lines.append(
+                f"  ↳ {over_threshold:,} over {threshold_h}h"
+            )
     if rows.get("top_models"):
         lines.append("")
         lines.append("🔝 *Top models* (by call count, 30d)")
