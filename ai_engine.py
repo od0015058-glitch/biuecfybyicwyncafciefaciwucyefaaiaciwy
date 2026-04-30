@@ -124,7 +124,11 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
     messages.append({"role": "user", "content": user_prompt})
 
     # 4. Call OpenRouter API
-    api_key = key_for_user(telegram_id)
+    try:
+        api_key = key_for_user(telegram_id)
+    except RuntimeError:
+        log.error("No OpenRouter API keys configured — cannot serve chat.")
+        return t(lang, "ai_provider_unavailable")
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
