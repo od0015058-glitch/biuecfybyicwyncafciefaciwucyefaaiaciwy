@@ -403,6 +403,48 @@ def render_metrics() -> str:
         )
     )
 
+    # Stage-15-Step-F: coarse bot-health score. Operators alert on
+    # ``meowassist_bot_status_score >= 4`` to catch under-attack /
+    # down without parsing the level label. The classifier reads
+    # the same in-process signals the ``/admin/control`` panel
+    # surfaces — single source of truth across the dashboard, the
+    # admin panel, and Prometheus.
+    from bot_health import compute_bot_status, status_score
+
+    status = compute_bot_status(
+        inflight_count=chat_inflight_count(),
+        ipn_drops_total=(
+            sum(get_ipn_drop_counters().values())
+            + sum(get_tetrapay_drop_counters().values())
+            + sum(get_zarinpal_drop_counters().values())
+        ),
+        loop_ticks={
+            name: _LOOP_LAST_TICK.get(name, 0.0)
+            for name in _LOOP_METRIC_NAMES
+        },
+        expected_loops=_LOOP_METRIC_NAMES,
+        # The Prometheus path can't observe a transient DB-read
+        # exception (the dashboard owns that signal). Pass None so
+        # the score is driven by loops + drop counters + load only.
+        # The ``/admin/control`` panel still detects DB-down via its
+        # own dashboard-style read.
+        db_error=None,
+        login_throttle_active_keys=0,
+        # ``now`` defaults to time.time(); leave it unbound so the
+        # gauge always reflects "now" rather than a frozen snapshot.
+    )
+    parts.extend(
+        _format_gauge(
+            "meowassist_bot_status_score",
+            (
+                "Coarse bot-health classification score: 0=idle, "
+                "1=healthy, 2=busy, 3=degraded, 4=under_attack, "
+                "5=down."
+            ),
+            float(status_score(status.level)),
+        )
+    )
+
     # Prometheus requires a trailing newline on the body.
     return "\n".join(parts) + "\n"
 

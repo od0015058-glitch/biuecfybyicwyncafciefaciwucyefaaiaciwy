@@ -275,6 +275,26 @@ NowPayments crypto invoices.
   anyway with a warning, so the user gets at least one attempt
   rather than a hard "no service" error. First slice of
   Stage-15-Step-E #4.
+- **Bot health & emergency control panel** — new `/admin/control`
+  page surfaces a traffic-light status tile (idle / healthy /
+  busy / degraded / under-attack / down) classified by
+  `bot_health.compute_bot_status` from in-flight chat slots, IPN
+  drop totals, login-throttle activity, background loop
+  heartbeats and DB reachability. The same page exposes
+  master kill-switches that disable every AI model or every
+  payment gateway in one click (CSRF-protected, audit-logged),
+  plus a **force-stop** button that sends `SIGTERM` to the bot
+  process so a wedged or under-attack deploy can be cycled in
+  one click — the operator's process supervisor (systemd /
+  docker / pm2) restarts the bot. Tunable thresholds via
+  `BOT_HEALTH_BUSY_INFLIGHT`,
+  `BOT_HEALTH_LOOP_STALE_SECONDS`,
+  `BOT_HEALTH_IPN_DROP_ATTACK_THRESHOLD`,
+  `BOT_HEALTH_LOGIN_THROTTLE_ATTACK_KEYS`. The Prometheus
+  exposition adds a `meowassist_bot_status_score` gauge (0=idle,
+  5=down) so existing alerting rules can target
+  `meowassist_bot_status_score >= 4` to page on under-attack /
+  down. First slice of Stage-15-Step-F.
 
 For the full project history, file map, and roadmap **read [HANDOFF.md](./HANDOFF.md)**.
 
