@@ -388,3 +388,646 @@ async def test_rate_limit_middleware_still_passes_through_admin_traffic():
         req = make_mocked_request("GET", "/admin/", app=app)
         resp = await webhook_rate_limit_middleware(req, fake_handler)
         assert resp.status == 200
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #3 follow-up: bundled bug fix in _resolve_path
+# ---------------------------------------------------------------------
+
+
+def test_resolve_path_falls_back_when_prefix_strips_to_empty(caplog):
+    """Bundled bug fix: an empty / slash-only prefix used to produce
+    ``//<secret>`` (double slash) which aiohttp registers as a route
+    that doesn't match incoming canonical ``/<secret>`` requests.
+    Now we fall back to the documented default and log a warning so
+    the operator can fix the env var."""
+    from telegram_webhook import _resolve_path
+
+    caplog.set_level("WARNING", logger="bot.telegram_webhook")
+    # An empty prefix strips to "" which would build "//secret".
+    assert _resolve_path("", "abc") == f"{DEFAULT_WEBHOOK_PATH_PREFIX}/abc"
+    # Slash-only prefix has the same defect.
+    assert _resolve_path("/", "abc") == f"{DEFAULT_WEBHOOK_PATH_PREFIX}/abc"
+    # Multi-slash prefix likewise.
+    assert _resolve_path("///", "abc") == f"{DEFAULT_WEBHOOK_PATH_PREFIX}/abc"
+    # Warning was logged each time so the operator notices.
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) >= 3
+    for record in warnings:
+        assert WEBHOOK_PATH_PREFIX_ENV in record.getMessage()
+
+
+def test_resolve_path_does_not_warn_for_explicit_prefix(caplog):
+    """The fallback only kicks in for a degenerate empty prefix —
+    a normal explicit prefix must NOT log a warning (otherwise the
+    log spam would defeat the point of having a documented default)."""
+    from telegram_webhook import _resolve_path
+
+    caplog.set_level("WARNING", logger="bot.telegram_webhook")
+    assert _resolve_path("/telegram-webhook", "abc") == "/telegram-webhook/abc"
+    assert _resolve_path("custom-path", "xyz") == "/custom-path/xyz"
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings == []
+
+
+def test_load_webhook_config_normalises_empty_prefix(monkeypatch):
+    """Wired-up regression for the bundled bug fix:
+    ``TELEGRAM_WEBHOOK_PATH_PREFIX="/"`` no longer results in a
+    double-slash path."""
+    monkeypatch.setenv(WEBHOOK_SECRET_ENV, "validsecret")
+    monkeypatch.setenv(WEBHOOK_BASE_URL_ENV, "https://example.com")
+    monkeypatch.setenv(WEBHOOK_PATH_PREFIX_ENV, "/")
+    cfg = load_webhook_config()
+    assert cfg is not None
+    assert cfg.path == f"{DEFAULT_WEBHOOK_PATH_PREFIX}/validsecret"
+    assert "//" not in cfg.url.split("://", 1)[1]
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #3 follow-up: register_webhook_with_retry
+# ---------------------------------------------------------------------
+
+
+@pytest.fixture
+def _retry_cfg():
+    return WebhookConfig(
+        secret="retrysecret",
+        base_url="https://example.com",
+        path="/telegram-webhook/retrysecret",
+    )
+
+
+async def test_register_with_retry_succeeds_on_first_attempt(_retry_cfg):
+    """Happy path: ``set_webhook`` succeeds on the first try, no
+    retries occur, no sleep is invoked."""
+    from telegram_webhook import register_webhook_with_retry
+
+    bot = MagicMock()
+    bot.set_webhook = AsyncMock(return_value=True)
+    sleeps: list[float] = []
+    async def fake_sleep(secs: float) -> None:
+        sleeps.append(secs)
+
+    await register_webhook_with_retry(
+        bot, _retry_cfg, max_attempts=3, base_delay_secs=1.0,
+        sleep=fake_sleep,
+    )
+    assert bot.set_webhook.await_count == 1
+    assert sleeps == []
+
+
+async def test_register_with_retry_recovers_from_transient_5xx(
+    _retry_cfg, caplog,
+):
+    """A ``TelegramServerError`` on the first attempt is retried
+    after the configured backoff; a subsequent success exits the
+    loop."""
+    from aiogram.exceptions import TelegramServerError
+    from telegram_webhook import register_webhook_with_retry
+
+    caplog.set_level("WARNING", logger="bot.telegram_webhook")
+    method = MagicMock(__name__="setWebhook")
+    bot = MagicMock()
+    call_log = []
+    async def flaky_set_webhook(**kwargs):
+        call_log.append(kwargs)
+        if len(call_log) == 1:
+            raise TelegramServerError(method=method, message="503 Service Unavailable")
+        return True
+    bot.set_webhook = flaky_set_webhook
+    sleeps: list[float] = []
+    async def fake_sleep(secs: float) -> None:
+        sleeps.append(secs)
+
+    await register_webhook_with_retry(
+        bot, _retry_cfg, max_attempts=3, base_delay_secs=1.0,
+        sleep=fake_sleep,
+    )
+    assert len(call_log) == 2
+    # First retry: 1s backoff.
+    assert sleeps == [1.0]
+    # Warning about the transient retry was logged.
+    assert any(
+        "transient" in r.getMessage() for r in caplog.records
+    )
+
+
+async def test_register_with_retry_uses_exponential_backoff(_retry_cfg):
+    """Sleep durations follow the documented 1s / 2s / 4s schedule
+    for max_attempts=3, base=1.0."""
+    from aiogram.exceptions import TelegramServerError
+    from telegram_webhook import register_webhook_with_retry
+
+    method = MagicMock(__name__="setWebhook")
+    bot = MagicMock()
+    bot.set_webhook = AsyncMock(
+        side_effect=TelegramServerError(method=method, message="503"),
+    )
+    sleeps: list[float] = []
+    async def fake_sleep(secs: float) -> None:
+        sleeps.append(secs)
+
+    with pytest.raises(TelegramServerError):
+        await register_webhook_with_retry(
+            bot, _retry_cfg, max_attempts=3, base_delay_secs=1.0,
+            sleep=fake_sleep,
+        )
+    # 3 attempts → 2 backoffs (after attempt 1 and 2).
+    assert sleeps == [1.0, 2.0]
+    assert bot.set_webhook.await_count == 3
+
+
+async def test_register_with_retry_does_not_retry_400(_retry_cfg):
+    """``TelegramBadRequest`` is a deploy-side typo (bad URL,
+    invalid secret_token shape). Burning retries on it just delays
+    the loud failure; we must propagate the error immediately."""
+    from aiogram.exceptions import TelegramBadRequest
+    from telegram_webhook import register_webhook_with_retry
+
+    method = MagicMock(__name__="setWebhook")
+    bot = MagicMock()
+    bot.set_webhook = AsyncMock(
+        side_effect=TelegramBadRequest(method=method, message="bad url"),
+    )
+    sleeps: list[float] = []
+    async def fake_sleep(secs: float) -> None:
+        sleeps.append(secs)
+
+    with pytest.raises(TelegramBadRequest):
+        await register_webhook_with_retry(
+            bot, _retry_cfg, max_attempts=5, base_delay_secs=1.0,
+            sleep=fake_sleep,
+        )
+    # No retries — single attempt.
+    assert bot.set_webhook.await_count == 1
+    assert sleeps == []
+
+
+async def test_register_with_retry_recovers_from_network_error(_retry_cfg):
+    """A transport-layer error (DNS hiccup, TCP reset) is also
+    retried — distinct from a 5xx but equally transient."""
+    from aiogram.exceptions import TelegramNetworkError
+    from telegram_webhook import register_webhook_with_retry
+
+    bot = MagicMock()
+    call_log = []
+    async def flaky(**kwargs):
+        call_log.append(kwargs)
+        if len(call_log) == 1:
+            raise TelegramNetworkError(
+                method=MagicMock(__name__="setWebhook"),
+                message="connection reset",
+            )
+        return True
+    bot.set_webhook = flaky
+    sleeps: list[float] = []
+    async def fake_sleep(secs: float) -> None:
+        sleeps.append(secs)
+
+    await register_webhook_with_retry(
+        bot, _retry_cfg, max_attempts=3, base_delay_secs=0.5,
+        sleep=fake_sleep,
+    )
+    assert len(call_log) == 2
+    assert sleeps == [0.5]
+
+
+async def test_register_with_retry_reads_max_attempts_from_env(
+    _retry_cfg, monkeypatch,
+):
+    """Env override is read at call time so a test (or a future
+    operator hot-reload) can change the cap without re-importing."""
+    from aiogram.exceptions import TelegramServerError
+    from telegram_webhook import (
+        WEBHOOK_REGISTER_BASE_DELAY_ENV,
+        WEBHOOK_REGISTER_MAX_ATTEMPTS_ENV,
+        register_webhook_with_retry,
+    )
+
+    monkeypatch.setenv(WEBHOOK_REGISTER_MAX_ATTEMPTS_ENV, "2")
+    monkeypatch.setenv(WEBHOOK_REGISTER_BASE_DELAY_ENV, "0.0")
+    method = MagicMock(__name__="setWebhook")
+    bot = MagicMock()
+    bot.set_webhook = AsyncMock(
+        side_effect=TelegramServerError(method=method, message="503"),
+    )
+    async def fake_sleep(_secs: float) -> None:
+        return None
+
+    with pytest.raises(TelegramServerError):
+        await register_webhook_with_retry(
+            bot, _retry_cfg, sleep=fake_sleep,
+        )
+    # max_attempts=2 from env → exactly 2 attempts.
+    assert bot.set_webhook.await_count == 2
+
+
+def test_int_env_helper_falls_back_on_garbage(monkeypatch):
+    """Defence-in-depth: a malformed env value falls back to the
+    default rather than crashing boot."""
+    from telegram_webhook import _read_int_env
+
+    monkeypatch.setenv("FOO_INT", "not-a-number")
+    assert _read_int_env("FOO_INT", 7) == 7
+    monkeypatch.setenv("FOO_INT", "0")
+    assert _read_int_env("FOO_INT", 7) == 7
+    monkeypatch.setenv("FOO_INT", "-5")
+    assert _read_int_env("FOO_INT", 7) == 7
+    monkeypatch.delenv("FOO_INT", raising=False)
+    assert _read_int_env("FOO_INT", 7) == 7
+    monkeypatch.setenv("FOO_INT", "12")
+    assert _read_int_env("FOO_INT", 7) == 12
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #3 follow-up: IP allowlist
+# ---------------------------------------------------------------------
+
+
+def test_load_webhook_ip_allowlist_returns_none_when_unset(monkeypatch):
+    """Default-off: the IP filter is opt-in."""
+    from telegram_webhook import (
+        WEBHOOK_IP_ALLOWLIST_ENV,
+        load_webhook_ip_allowlist,
+    )
+
+    monkeypatch.delenv(WEBHOOK_IP_ALLOWLIST_ENV, raising=False)
+    assert load_webhook_ip_allowlist() is None
+
+
+def test_load_webhook_ip_allowlist_default_resolves_telegram_ranges(
+    monkeypatch,
+):
+    """The literal ``default`` value expands to Telegram's
+    documented delivery ranges."""
+    import ipaddress
+
+    from telegram_webhook import (
+        DEFAULT_TELEGRAM_IP_RANGES,
+        WEBHOOK_IP_ALLOWLIST_ENV,
+        load_webhook_ip_allowlist,
+    )
+
+    monkeypatch.setenv(WEBHOOK_IP_ALLOWLIST_ENV, "default")
+    parsed = load_webhook_ip_allowlist()
+    assert parsed is not None
+    expected = tuple(ipaddress.ip_network(c) for c in DEFAULT_TELEGRAM_IP_RANGES)
+    assert parsed == expected
+
+
+def test_load_webhook_ip_allowlist_default_case_insensitive(monkeypatch):
+    """Operator copy-pasted ``Default`` from a doc — should still work."""
+    from telegram_webhook import (
+        WEBHOOK_IP_ALLOWLIST_ENV,
+        load_webhook_ip_allowlist,
+    )
+
+    monkeypatch.setenv(WEBHOOK_IP_ALLOWLIST_ENV, "DEFAULT")
+    assert load_webhook_ip_allowlist() is not None
+    monkeypatch.setenv(WEBHOOK_IP_ALLOWLIST_ENV, "Default")
+    assert load_webhook_ip_allowlist() is not None
+
+
+def test_load_webhook_ip_allowlist_explicit_cidrs(monkeypatch):
+    """Operator can supply an explicit CIDR list — useful for a
+    private deploy fronted by a reverse proxy on a known IP."""
+    import ipaddress
+
+    from telegram_webhook import (
+        WEBHOOK_IP_ALLOWLIST_ENV,
+        load_webhook_ip_allowlist,
+    )
+
+    monkeypatch.setenv(
+        WEBHOOK_IP_ALLOWLIST_ENV, "10.0.0.0/8, 192.168.1.5",
+    )
+    parsed = load_webhook_ip_allowlist()
+    assert parsed is not None
+    assert ipaddress.ip_network("10.0.0.0/8") in parsed
+    assert ipaddress.ip_network("192.168.1.5/32") in parsed
+
+
+def test_load_webhook_ip_allowlist_drops_malformed_entries(
+    monkeypatch, caplog,
+):
+    """Fail-soft: a typoed entry is logged and dropped, surviving
+    entries still apply. Better than failing closed (which would
+    block every Telegram delivery for a single typo) since the
+    secret check is the primary gate."""
+    import ipaddress
+
+    from telegram_webhook import (
+        WEBHOOK_IP_ALLOWLIST_ENV,
+        load_webhook_ip_allowlist,
+    )
+
+    caplog.set_level("WARNING", logger="bot.telegram_webhook")
+    monkeypatch.setenv(
+        WEBHOOK_IP_ALLOWLIST_ENV, "10.0.0.0/8, not-an-ip, 192.168.1.0/24",
+    )
+    parsed = load_webhook_ip_allowlist()
+    assert parsed is not None
+    assert ipaddress.ip_network("10.0.0.0/8") in parsed
+    assert ipaddress.ip_network("192.168.1.0/24") in parsed
+    # Three entries in env, one malformed → two survived.
+    assert len(parsed) == 2
+    assert any(
+        "not-an-ip" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_load_webhook_ip_allowlist_all_malformed_returns_none(
+    monkeypatch, caplog,
+):
+    """If every entry was malformed, behave as if unset (None)
+    rather than locking everything out — fail-soft."""
+    from telegram_webhook import (
+        WEBHOOK_IP_ALLOWLIST_ENV,
+        load_webhook_ip_allowlist,
+    )
+
+    caplog.set_level("WARNING", logger="bot.telegram_webhook")
+    monkeypatch.setenv(
+        WEBHOOK_IP_ALLOWLIST_ENV, "garbage, also-garbage",
+    )
+    assert load_webhook_ip_allowlist() is None
+
+
+def _mock_request_with_remote(
+    method: str, path: str, *, app, remote: str | None,
+):
+    """Helper: build a ``make_mocked_request`` whose
+    ``request.remote`` returns the given string. ``request.remote``
+    is derived from ``transport.get_extra_info("peername")``, so we
+    inject a MagicMock transport that returns ``(ip, port)`` (or
+    ``None`` for the missing-remote case)."""
+    transport = MagicMock()
+    if remote is None:
+        transport.get_extra_info = MagicMock(return_value=None)
+    else:
+        transport.get_extra_info = MagicMock(return_value=(remote, 12345))
+    return make_mocked_request(method, path, app=app, transport=transport)
+
+
+async def test_ip_filter_middleware_passes_through_admin_traffic():
+    """Admin / non-webhook requests must pass through untouched
+    even when the filter is active. The filter scopes to the
+    Telegram path only."""
+    import ipaddress
+
+    from telegram_webhook import (
+        APP_KEY_TELEGRAM_WEBHOOK_IP_FILTER,
+        telegram_webhook_ip_filter_middleware,
+    )
+
+    app = web.Application()
+    app[APP_KEY_TELEGRAM_WEBHOOK_IP_FILTER] = (
+        "/telegram-webhook/abc",
+        (ipaddress.ip_network("149.154.160.0/20"),),
+    )
+
+    async def handler(_req):
+        return web.Response(status=200, text="ok")
+
+    # Admin request from a non-allowlisted IP — must pass through.
+    req = make_mocked_request("GET", "/admin/dashboard", app=app)
+    resp = await telegram_webhook_ip_filter_middleware(req, handler)
+    assert resp.status == 200
+
+
+async def test_ip_filter_middleware_allows_telegram_ip():
+    """A request on the Telegram path from inside the allowlist
+    is forwarded to the handler."""
+    import ipaddress
+
+    from telegram_webhook import (
+        APP_KEY_TELEGRAM_WEBHOOK_IP_FILTER,
+        telegram_webhook_ip_filter_middleware,
+    )
+
+    app = web.Application()
+    app[APP_KEY_TELEGRAM_WEBHOOK_IP_FILTER] = (
+        "/telegram-webhook/abc",
+        (ipaddress.ip_network("149.154.160.0/20"),),
+    )
+
+    async def handler(_req):
+        return web.Response(status=200, text="ok")
+
+    req = _mock_request_with_remote(
+        "POST", "/telegram-webhook/abc",
+        app=app, remote="149.154.167.50",
+    )
+    resp = await telegram_webhook_ip_filter_middleware(req, handler)
+    assert resp.status == 200
+
+
+async def test_ip_filter_middleware_rejects_outside_ip(caplog):
+    """A POST from outside the allowlist gets a 403 *before* the
+    handler runs. Cheap rejection (no body parse, no dispatch)."""
+    import ipaddress
+
+    from telegram_webhook import (
+        APP_KEY_TELEGRAM_WEBHOOK_IP_FILTER,
+        telegram_webhook_ip_filter_middleware,
+    )
+
+    caplog.set_level("WARNING", logger="bot.telegram_webhook")
+    app = web.Application()
+    app[APP_KEY_TELEGRAM_WEBHOOK_IP_FILTER] = (
+        "/telegram-webhook/abc",
+        (ipaddress.ip_network("149.154.160.0/20"),),
+    )
+
+    handler_called = []
+    async def handler(_req):
+        handler_called.append(True)
+        return web.Response(status=200)
+
+    req = _mock_request_with_remote(
+        "POST", "/telegram-webhook/abc",
+        app=app, remote="8.8.8.8",
+    )
+    resp = await telegram_webhook_ip_filter_middleware(req, handler)
+    assert resp.status == 403
+    assert handler_called == []
+    assert any(
+        "not in IP allowlist" in r.getMessage() for r in caplog.records
+    )
+
+
+async def test_ip_filter_middleware_rejects_unparseable_remote():
+    """A request without ``request.remote`` (or with garbage) gets
+    a 403 — defence in depth."""
+    import ipaddress
+
+    from telegram_webhook import (
+        APP_KEY_TELEGRAM_WEBHOOK_IP_FILTER,
+        telegram_webhook_ip_filter_middleware,
+    )
+
+    app = web.Application()
+    app[APP_KEY_TELEGRAM_WEBHOOK_IP_FILTER] = (
+        "/telegram-webhook/abc",
+        (ipaddress.ip_network("149.154.160.0/20"),),
+    )
+
+    async def handler(_req):
+        return web.Response(status=200)
+
+    req = _mock_request_with_remote(
+        "POST", "/telegram-webhook/abc",
+        app=app, remote=None,
+    )
+    resp = await telegram_webhook_ip_filter_middleware(req, handler)
+    assert resp.status == 403
+
+
+async def test_ip_filter_middleware_no_op_when_state_missing():
+    """If the filter wasn't installed (state key absent), every
+    request passes through — defensive default-allow because the
+    secret check is the primary gate."""
+    from telegram_webhook import telegram_webhook_ip_filter_middleware
+
+    app = web.Application()
+
+    async def handler(_req):
+        return web.Response(status=200, text="ok")
+
+    req = _mock_request_with_remote(
+        "POST", "/telegram-webhook/abc", app=app, remote="8.8.8.8",
+    )
+    resp = await telegram_webhook_ip_filter_middleware(req, handler)
+    assert resp.status == 200
+
+
+def test_install_telegram_webhook_ip_filter_no_op_when_unset(monkeypatch):
+    """Installing with no env var configured stores an empty
+    allowlist — middleware becomes a no-op without removing it
+    from the chain (so a hot-reload doesn't need re-registration)."""
+    from telegram_webhook import (
+        APP_KEY_TELEGRAM_WEBHOOK_IP_FILTER,
+        WEBHOOK_IP_ALLOWLIST_ENV,
+        install_telegram_webhook_ip_filter,
+        telegram_webhook_ip_filter_middleware,
+    )
+
+    monkeypatch.delenv(WEBHOOK_IP_ALLOWLIST_ENV, raising=False)
+    cfg = WebhookConfig(
+        secret="s", base_url="https://x", path="/telegram-webhook/s",
+    )
+    app = web.Application()
+    install_telegram_webhook_ip_filter(app, config=cfg)
+    state = app[APP_KEY_TELEGRAM_WEBHOOK_IP_FILTER]
+    assert state[0] == cfg.path
+    assert state[1] == ()
+    # Middleware was registered (so a future opt-in via env hot-reload
+    # works without re-registration).
+    assert telegram_webhook_ip_filter_middleware in app.middlewares
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #3 follow-up: /telegram-webhook/healthz
+# ---------------------------------------------------------------------
+
+
+def test_healthz_path_strips_secret():
+    """The healthz path must NOT include the secret. An operator
+    polling the health endpoint shouldn't need the secret material."""
+    from telegram_webhook import healthz_path_for
+
+    cfg = WebhookConfig(
+        secret="topsecret",
+        base_url="https://example.com",
+        path="/telegram-webhook/topsecret",
+    )
+    healthz = healthz_path_for(cfg)
+    assert healthz == "/telegram-webhook/healthz"
+    assert "topsecret" not in healthz
+
+
+def test_healthz_path_respects_custom_prefix():
+    """A custom prefix is preserved on the healthz path."""
+    from telegram_webhook import healthz_path_for
+
+    cfg = WebhookConfig(
+        secret="s",
+        base_url="https://example.com",
+        path="/bot/updates/s",
+    )
+    assert healthz_path_for(cfg) == "/bot/updates/healthz"
+
+
+async def test_healthz_route_returns_200(aiohttp_client):
+    """The route returns 200 with a tiny JSON body. The body
+    includes the prefix (so an operator inspecting the response
+    can confirm they hit the right deploy) but **not** the
+    secret or the URL."""
+    from telegram_webhook import (
+        install_telegram_webhook_healthz_route,
+    )
+
+    cfg = WebhookConfig(
+        secret="topsecret",
+        base_url="https://example.com",
+        path="/telegram-webhook/topsecret",
+    )
+    app = web.Application()
+    install_telegram_webhook_healthz_route(app, cfg)
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/telegram-webhook/healthz")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["status"] == "ok"
+    assert body["webhook_prefix"] == "/telegram-webhook"
+    # No secret leak.
+    payload = await resp.text()
+    assert "topsecret" not in payload
+
+
+async def test_healthz_route_does_not_require_secret_in_query(aiohttp_client):
+    """The probe is intentionally unauthenticated — a load
+    balancer / k8s liveness probe should work without any
+    credentials. Confirm a plain GET succeeds."""
+    from telegram_webhook import (
+        install_telegram_webhook_healthz_route,
+    )
+
+    cfg = WebhookConfig(
+        secret="s",
+        base_url="https://example.com",
+        path="/telegram-webhook/s",
+    )
+    app = web.Application()
+    install_telegram_webhook_healthz_route(app, cfg)
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/telegram-webhook/healthz")
+    assert resp.status == 200
+
+
+async def test_healthz_route_does_not_consume_rate_limit_token(
+    aiohttp_client,
+):
+    """The healthz path must not be in the rate-limited set —
+    a load balancer probing every 5s would otherwise fight the
+    bucket against real Telegram delivery."""
+    from rate_limit import (
+        WEBHOOK_RATE_LIMITED_PATHS_KEY,
+        install_webhook_rate_limit,
+    )
+    from telegram_webhook import (
+        install_telegram_webhook_healthz_route,
+    )
+
+    cfg = WebhookConfig(
+        secret="s",
+        base_url="https://example.com",
+        path="/telegram-webhook/s",
+    )
+    app = web.Application()
+    install_webhook_rate_limit(app)
+    install_telegram_webhook_healthz_route(app, cfg)
+    rate_limited = app[WEBHOOK_RATE_LIMITED_PATHS_KEY]
+    assert "/telegram-webhook/healthz" not in rate_limited

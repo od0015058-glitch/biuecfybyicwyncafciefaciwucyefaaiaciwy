@@ -921,10 +921,10 @@ What's shipped this PR:
 
 What remains (next AI's TODO):
 
-* **`set_webhook` retry on transient 5xx** — current implementation propagates `set_webhook` errors as fatal. A retry-with-backoff loop would tolerate a Telegram blip on bot startup. Pattern: copy from `pending_alert.py`'s `_retryable_call` helper.
-* **IP-allowlist for Telegram's address ranges** — Telegram publishes its delivery IP ranges (`149.154.160.0/20`, `91.108.4.0/22`). Layer this on top of the secret check — secret guards against URL leak, IP-allowlist guards against header-strip + replay. `aiogram.webhook.security.IPFilter` provides the building block.
+* ✅ **`set_webhook` retry on transient 5xx** — shipped in Stage-15-Step-E #3 follow-up #1. New `register_webhook_with_retry` wraps `register_webhook_with_telegram` in a retry loop that tolerates `TelegramServerError` and `TelegramNetworkError` (3 attempts by default, 1s/2s exponential backoff, configurable via `TELEGRAM_WEBHOOK_REGISTER_MAX_ATTEMPTS` and `TELEGRAM_WEBHOOK_REGISTER_BASE_DELAY_SECONDS`). `TelegramBadRequest` is **not** retried — that's a deploy-side typo, not a Telegram blip.
+* ✅ **IP-allowlist for Telegram's address ranges** — shipped in the same follow-up. Opt-in via `TELEGRAM_WEBHOOK_IP_ALLOWLIST` env var. Set to `default` for Telegram's documented delivery ranges (`149.154.160.0/20`, `91.108.4.0/22`); supply a comma-separated CIDR list for custom topologies. Defence-in-depth on top of the secret check; default-off so existing deploys aren't accidentally locked out.
+* ✅ **Health-check route** — shipped in the same follow-up. `GET /telegram-webhook/healthz` returns a tiny `{"status":"ok","webhook_prefix":"/telegram-webhook"}` JSON; 200 OK. Stateless (doesn't talk to Telegram or the DB on every probe), unauthenticated (the body carries no secret), not rate-limited (so a load balancer probing every 5s can't fight the bucket against real updates).
 * **Multi-bot `TokenBasedRequestHandler`** — current handler is `SimpleRequestHandler` (one bot per process). If the operator ever wants to run multiple bots on the same aiohttp server, swap to `TokenBasedRequestHandler` (path placeholder `{bot_token}`) — but note aiogram's docstring warning about token-in-URL leakage to reverse-proxy logs.
-* **Health-check route** — `/telegram-webhook/healthz` to monitor the route is live independent of Telegram delivery. Pairs nicely with the `/metrics` endpoint from Stage-15-Step-A.
 * **Migration recipe** — README has a one-liner pointing at `.env.example`; could be expanded into a step-by-step guide ("Set `TELEGRAM_WEBHOOK_SECRET` → restart bot → verify with `Bot.get_webhook_info`").
 
 Bundled bug fix in this PR: **`webhook_rate_limit_middleware` now protects the TetraPay endpoint** (and the new opt-in Telegram webhook) instead of just `/nowpayments-webhook`. Pre-fix, `WEBHOOK_PATH = "/nowpayments-webhook"` was hardcoded as the only filtered path, so the TetraPay endpoint added in Stage-11-Step-C (`main.start_webhook_server` line ~53) bypassed the per-IP token bucket entirely — a flood of forged TetraPay callbacks could DoS the JSON-parse + signature-verify path while NowPayments IPNs and admin-panel traffic stayed untouched. Fix introduces a `WEBHOOK_RATE_LIMITED_PATHS_KEY` AppKey carrying a `set[str]` (defaults: `{WEBHOOK_PATH, "/tetrapay-webhook"}`) and a public `register_rate_limited_webhook_path(app, path)` helper for callers (like the new Telegram webhook) that mount their own routes. The middleware now membership-tests against this set instead of comparing against a single hardcoded constant. Test `test_rate_limit_middleware_now_filters_tetrapay` pins the regression with a single-token bucket — pre-fix the second TetraPay request would have returned 200; post-fix it correctly returns 429.
@@ -1917,7 +1917,68 @@ The user's process for this project — **do not deviate**:
     invariant, and empty-pool empty-state copy). Sidebar nav
     link `🔑 OpenRouter keys` added to `_layout.html` so the
     page is discoverable from any admin tab.
-12. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+12. **Stage-15-Step-E #3 follow-up #1 MERGED** (PR-after-#137) —
+    closes three of the four remaining Step-E #3 TODOs in one PR:
+    `set_webhook` retry-with-backoff on transient 5xx /
+    `TelegramNetworkError` (3 attempts, 1s/2s/4s exponential
+    backoff by default, configurable via
+    `TELEGRAM_WEBHOOK_REGISTER_MAX_ATTEMPTS` /
+    `TELEGRAM_WEBHOOK_REGISTER_BASE_DELAY_SECONDS`);
+    `TelegramBadRequest` is **not** retried because a 400 is a
+    deploy-side typo (bad URL, malformed secret_token) and
+    burning retries on it just delays the loud failure the
+    operator needs to fix. Opt-in IP-allowlist for the Telegram
+    webhook receiver via `TELEGRAM_WEBHOOK_IP_ALLOWLIST` —
+    special value `default` expands to Telegram's documented
+    delivery ranges (`149.154.160.0/20`, `91.108.4.0/22`); a
+    comma-separated CIDR list is also accepted; default-off so
+    existing deploys aren't accidentally locked out; layered on
+    top of the secret check (defence-in-depth — the secret
+    guards against a leaked URL, the IP allowlist guards against
+    a leaked URL **plus** a leaked secret since a forged request
+    can't easily originate from Telegram's published delivery
+    IPs); request-time check trusts only `request.remote` (NOT
+    `X-Forwarded-For`), mirroring `metrics._client_ip`'s defence
+    against a public-facing reverse proxy that can be tricked
+    into spoofing the header. Stateless `GET
+    /telegram-webhook/healthz` probe — 200 OK with a tiny
+    `{"status":"ok","webhook_prefix":"<prefix>"}` JSON; never
+    leaks the secret, the URL, or the path; doesn't talk to
+    Telegram (no rate-limit budget tax) or the DB (no fan-out
+    on a probe storm); not in the rate-limited path set so a
+    load balancer probing every 5s can't fight the bucket
+    against real updates. Bundled bug fix: `_resolve_path` now
+    falls back to the documented default when
+    `TELEGRAM_WEBHOOK_PATH_PREFIX` strips down to empty (`""`,
+    `"/"`, `"///"`, …). Pre-fix, an empty prefix produced
+    `"//<secret>"` (double leading slash) — aiohttp registers
+    that as a route at `//<secret>` while incoming requests get
+    canonicalised to `/<secret>`, the route silently 404s every
+    Telegram delivery, and Telegram itself accepts the
+    double-slash URL on `set_webhook` so the bot reports the
+    webhook as registered while in fact every update is
+    dropped. Operator-visible signal: log warning + `cfg.path`
+    inspection now matches the route the deployer expected.
+    27 new tests in `tests/test_telegram_webhook.py` covering:
+    the bundled `_resolve_path` fix (3 inputs that strip to
+    empty, the no-warn case for explicit prefixes, end-to-end
+    via `load_webhook_config`); the retry loop (happy path,
+    recover from one transient 5xx, full exponential backoff
+    schedule, no-retry on `TelegramBadRequest`, recover from
+    `TelegramNetworkError`, env override at call time, env
+    helper falls back on garbage); the IP allowlist (returns
+    None when unset, default expands to Telegram ranges,
+    case-insensitive, explicit CIDR list, drops malformed
+    entries fail-soft, all-malformed returns None,
+    middleware passes admin traffic through, allows
+    Telegram-IP request, rejects outside-range request,
+    rejects unparseable remote, no-op when state missing,
+    install-with-no-env stores empty allowlist); and the
+    healthz route (path strips secret, custom prefix
+    preserved, 200 OK, no-secret-leak in body, no auth
+    required, not in rate-limited path set). Total suite:
+    1944 tests passing (was 1917 + 27 new).
+13. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-13. **Read the §11 working agreement before doing anything.**
+14. **Read the §11 working agreement before doing anything.**
