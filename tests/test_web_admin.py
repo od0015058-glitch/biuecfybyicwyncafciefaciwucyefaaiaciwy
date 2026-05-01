@@ -2152,6 +2152,356 @@ async def test_monetization_db_error_path_renders_correct_margin_pct(
 
 
 # ---------------------------------------------------------------------
+# Stage-15-Step-E #9 follow-up #2: monetization CSV export
+# ---------------------------------------------------------------------
+
+
+def _sample_monetization_summary() -> dict:
+    return {
+        "markup": 2.0,
+        "lifetime": {
+            "revenue_usd": 1234.5678,
+            "charged_usd": 600.0,
+            "openrouter_cost_usd": 300.0,
+            "gross_margin_usd": 300.0,
+            "gross_margin_pct": 50.0,
+            "net_profit_usd": 934.5678,
+        },
+        "window": {
+            "days": 30,
+            "revenue_usd": 200.0,
+            "charged_usd": 80.0,
+            "openrouter_cost_usd": 40.0,
+            "gross_margin_usd": 40.0,
+            "gross_margin_pct": 50.0,
+            "net_profit_usd": 160.0,
+        },
+        "by_model": [
+            {
+                "model": "openai/gpt-4o",
+                "requests": 12,
+                "charged_usd": 50.0,
+                "openrouter_cost_usd": 25.0,
+                "gross_margin_usd": 25.0,
+            },
+            {
+                "model": "anthropic/claude-3-opus",
+                "requests": 8,
+                "charged_usd": 30.0,
+                "openrouter_cost_usd": 15.0,
+                "gross_margin_usd": 15.0,
+            },
+        ],
+    }
+
+
+def test_monetization_csv_headers_pinned():
+    """The header row order is part of the CSV's contract — flipping
+    columns silently corrupts every downstream spreadsheet that
+    indexes by position. A future refactor that reorders the dict
+    must explicitly update this list and the tests."""
+    from web_admin import MONETIZATION_CSV_HEADERS
+    assert MONETIZATION_CSV_HEADERS == (
+        "scope",
+        "window_days",
+        "model",
+        "requests",
+        "revenue_usd",
+        "charged_usd",
+        "openrouter_cost_usd",
+        "gross_margin_usd",
+        "gross_margin_pct",
+        "net_profit_usd",
+        "markup",
+    )
+
+
+def test_monetization_csv_rows_shape_for_populated_summary():
+    from web_admin import _format_monetization_csv_rows
+
+    rows = _format_monetization_csv_rows(_sample_monetization_summary())
+
+    # Two scope rows + two by_model rows = 4 total.
+    assert len(rows) == 4
+    # Each row terminates with CRLF.
+    for r in rows:
+        assert r.endswith("\r\n")
+
+    # Row 1: lifetime — model + requests + window_days are blank;
+    # all numeric fields use 4 decimal places.
+    parts = rows[0].rstrip("\r\n").split(",")
+    assert parts[0] == "lifetime"
+    assert parts[1] == ""  # window_days
+    assert parts[2] == ""  # model
+    assert parts[3] == ""  # requests
+    assert parts[4] == "1234.5678"  # revenue
+    assert parts[10] == "2.0000"  # markup
+
+    # Row 2: window — window_days=30, model + requests blank.
+    parts = rows[1].rstrip("\r\n").split(",")
+    assert parts[0] == "window"
+    assert parts[1] == "30"
+    assert parts[2] == ""
+    assert parts[3] == ""
+    assert parts[4] == "200.0000"
+
+    # Row 3: window_by_model — gpt-4o, requests=12, scope-level
+    # fields blank.
+    parts = rows[2].rstrip("\r\n").split(",")
+    assert parts[0] == "window_by_model"
+    assert parts[1] == "30"
+    assert parts[2] == "openai/gpt-4o"
+    assert parts[3] == "12"
+    assert parts[4] == ""  # revenue: scope-level
+    assert parts[5] == "50.0000"
+    assert parts[8] == ""  # gross_margin_pct: scope-level
+    assert parts[9] == ""  # net_profit_usd: scope-level
+
+
+def test_monetization_csv_rows_handle_empty_by_model():
+    from web_admin import _format_monetization_csv_rows
+
+    summary = _sample_monetization_summary()
+    summary["by_model"] = []
+    rows = _format_monetization_csv_rows(summary)
+    # Two scope rows only.
+    assert len(rows) == 2
+    assert rows[0].startswith("lifetime,")
+    assert rows[1].startswith("window,30,")
+
+
+def test_monetization_csv_rows_drop_non_dict_by_model_entries():
+    """A future schema bump that returns a non-dict (e.g. a tuple)
+    in the by_model list must not crash the CSV serializer — drop
+    the offender, log nothing (the request handler is the right
+    place to log), and keep going."""
+    from web_admin import _format_monetization_csv_rows
+
+    summary = _sample_monetization_summary()
+    summary["by_model"] = [
+        ("not", "a", "dict"),  # type: ignore[list-item]
+        {"model": "openai/gpt-4o", "requests": 1, "charged_usd": 0.5,
+         "openrouter_cost_usd": 0.25, "gross_margin_usd": 0.25},
+        None,
+    ]
+    rows = _format_monetization_csv_rows(summary)
+    # 2 scope rows + 1 valid by_model row = 3.
+    assert len(rows) == 3
+    assert rows[2].startswith("window_by_model,30,openai/gpt-4o,1,")
+
+
+def test_monetization_csv_format_usd_scrubs_nan_and_inf():
+    """Defence-in-depth NaN / Inf scrub mirrors the one in
+    ``Database.get_user_spending_summary`` — a transient
+    ``Decimal('NaN')`` from a corrupted aggregate must NOT render
+    as ``nan`` in the CSV (Excel rejects ``nan``)."""
+    from web_admin import _format_usd_csv
+
+    assert _format_usd_csv(float("nan")) == "0.0000"
+    assert _format_usd_csv(float("inf")) == "0.0000"
+    assert _format_usd_csv(float("-inf")) == "0.0000"
+    assert _format_usd_csv(None) == ""
+    assert _format_usd_csv("not-a-number") == ""
+    assert _format_usd_csv(1.2345) == "1.2345"
+    assert _format_usd_csv(0) == "0.0000"
+
+
+async def test_monetization_csv_route_requires_auth(
+    aiohttp_client, make_admin_app
+):
+    client = await aiohttp_client(make_admin_app(password="letmein"))
+    resp = await client.get(
+        "/admin/monetization/export.csv", allow_redirects=False
+    )
+    assert resp.status in (302, 303), resp.status
+    assert resp.headers.get("Location", "").startswith("/admin/login")
+
+
+async def test_monetization_csv_route_returns_csv_with_correct_headers(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db_with_monetization(_sample_monetization_summary())
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization/export.csv?window=30")
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("text/csv")
+    assert "monetization-30d-" in resp.headers.get(
+        "Content-Disposition", ""
+    )
+    assert "no-store" in resp.headers.get("Cache-Control", "")
+    body = await resp.text()
+    # Header row first, then data rows.
+    lines = body.split("\r\n")
+    assert lines[0] == (
+        "scope,window_days,model,requests,revenue_usd,charged_usd,"
+        "openrouter_cost_usd,gross_margin_usd,gross_margin_pct,"
+        "net_profit_usd,markup"
+    )
+    assert lines[1].startswith("lifetime,")
+    assert lines[2].startswith("window,30,")
+    assert lines[3].startswith("window_by_model,30,openai/gpt-4o,12,")
+    assert lines[4].startswith(
+        "window_by_model,30,anthropic/claude-3-opus,8,"
+    )
+
+
+async def test_monetization_csv_route_honours_window_query_param(
+    aiohttp_client, make_admin_app
+):
+    """``?window=7`` must pass ``window_days=7`` through to
+    ``db.get_monetization_summary`` and embed ``7d`` in the
+    Content-Disposition filename."""
+    db = _stub_db_with_monetization(_sample_monetization_summary())
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization/export.csv?window=7")
+    assert resp.status == 200
+    db.get_monetization_summary.assert_awaited()
+    call_kwargs = db.get_monetization_summary.await_args.kwargs
+    assert call_kwargs["window_days"] == 7
+    assert "monetization-7d-" in resp.headers.get(
+        "Content-Disposition", ""
+    )
+
+
+async def test_monetization_csv_route_falls_back_on_invalid_window(
+    aiohttp_client, make_admin_app
+):
+    """Garbage / non-allowlisted ``?window=`` values must coerce to
+    the default 30-day window — same fail-soft policy as the HTML
+    page."""
+    db = _stub_db_with_monetization(_sample_monetization_summary())
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    for bad in ("365", "abc", "0", "-7", "14", "1.5"):
+        resp = await client.get(
+            f"/admin/monetization/export.csv?window={bad}"
+        )
+        assert resp.status == 200
+        assert "monetization-30d-" in resp.headers.get(
+            "Content-Disposition", ""
+        )
+
+
+async def test_monetization_csv_route_uses_top_models_limit(
+    aiohttp_client, make_admin_app
+):
+    """The CSV export pulls ``MONETIZATION_CSV_TOP_MODELS_LIMIT``
+    (1000) — wider than the on-screen table's 10 — because offline
+    analysis wants the full long tail. A future refactor that
+    forgets to thread the higher limit through must regress here."""
+    from web_admin import MONETIZATION_CSV_TOP_MODELS_LIMIT
+    db = _stub_db_with_monetization(_sample_monetization_summary())
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization/export.csv")
+    assert resp.status == 200
+    call_kwargs = db.get_monetization_summary.await_args.kwargs
+    assert call_kwargs["top_models_limit"] == MONETIZATION_CSV_TOP_MODELS_LIMIT
+    assert call_kwargs["top_models_limit"] == 1000
+
+
+async def test_monetization_csv_route_db_error_renders_empty_csv(
+    aiohttp_client, make_admin_app
+):
+    """A DB-error during export must NOT 500 — return an empty-zero
+    CSV with the markup column populated so the operator at least
+    has the pricing config and timestamp recorded. Same fail-soft
+    pattern the HTML page uses."""
+    db = _stub_db_with_monetization(RuntimeError("boom"))
+    with _pytest_for_window.MonkeyPatch.context() as mp:
+        mp.setattr("pricing.get_markup", lambda: 2.0)
+        client = await aiohttp_client(
+            make_admin_app(password="letmein", db=db)
+        )
+        await client.post(
+            "/admin/login",
+            data={"password": "letmein"},
+            allow_redirects=False,
+        )
+        resp = await client.get("/admin/monetization/export.csv")
+        body = await resp.text()
+    assert resp.status == 200
+    lines = body.split("\r\n")
+    # Header + lifetime + window rows (no by_model).
+    assert lines[0].startswith("scope,window_days,")
+    assert lines[1].startswith("lifetime,")
+    # Markup carried through from the fallback.
+    assert lines[1].endswith(",2.0000")
+    assert lines[2].startswith("window,30,")
+
+
+async def test_monetization_csv_route_writes_audit_row(
+    aiohttp_client, make_admin_app
+):
+    """Each successful export records a ``monetization_export_csv``
+    audit row with the window + row count in ``meta``. Mirrors the
+    transactions-CSV-export audit shape."""
+    db = _stub_db_with_monetization(_sample_monetization_summary())
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    db.record_admin_audit.reset_mock()
+    resp = await client.get("/admin/monetization/export.csv?window=7")
+    assert resp.status == 200
+    db.record_admin_audit.assert_awaited()
+    call_kwargs = db.record_admin_audit.await_args.kwargs
+    assert call_kwargs["action"] == "monetization_export_csv"
+    assert call_kwargs["target"] == "monetization"
+    assert call_kwargs["meta"]["window_days"] == 7
+    assert call_kwargs["meta"]["rows"] >= 2  # at minimum lifetime + window
+
+
+async def test_monetization_html_page_has_export_csv_link(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db_with_monetization(_sample_monetization_summary())
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization?window=7")
+    assert resp.status == 200
+    body = await resp.text()
+    # Active window threaded into the export link's query string.
+    assert "/admin/monetization/export.csv?window=7" in body
+    assert "Export CSV" in body
+
+
+def test_audit_action_labels_includes_export_csv_actions():
+    """Bundled bug fix in this PR: ``transactions_export_csv`` was
+    being recorded by ``record_admin_audit`` since Stage-9-Step-7 but
+    was never added to the audit-page filter dropdown
+    (``AUDIT_ACTION_LABELS``). An operator filtering "CSV exports
+    only" while reviewing what an admin pulled offline couldn't
+    pick the slug out of the dropdown — they had to scroll the full
+    unfiltered feed.
+
+    Pin both labels so a future PR can't drop them again. Same shape
+    as the existing role_grant / role_revoke pin from Stage-15-Step-E
+    #5 follow-up #1."""
+    from web_admin import AUDIT_ACTION_LABELS
+    assert "transactions_export_csv" in AUDIT_ACTION_LABELS
+    assert AUDIT_ACTION_LABELS["transactions_export_csv"] == (
+        "Transactions CSV exported"
+    )
+    assert "monetization_export_csv" in AUDIT_ACTION_LABELS
+    assert AUDIT_ACTION_LABELS["monetization_export_csv"] == (
+        "Monetization CSV exported"
+    )
+
+
+# ---------------------------------------------------------------------
 # Stage-8-Part-2: promo codes UI
 # ---------------------------------------------------------------------
 

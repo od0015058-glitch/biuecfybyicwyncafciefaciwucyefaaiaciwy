@@ -833,6 +833,237 @@ async def monetization(request: web.Request) -> web.StreamResponse:
     )
 
 
+# Stage-15-Step-E #9 follow-up #2: CSV export.
+#
+# Header row hoisted to a module constant so the test can pin it
+# without copy-pasting the column list. Order MUST match the values
+# yielded in :func:`_format_monetization_csv_rows`.
+#
+# Schema choice: a single CSV with a ``scope`` column rather than
+# three separate files. An operator pulling the export into a
+# spreadsheet for monthly P&L wants one tab, not three; the ``scope``
+# column lets them filter / pivot from there. Empty cells where a
+# column doesn't apply (model / requests are blank for the
+# lifetime + window scopes; revenue / margin_pct / net are blank for
+# the per-model rows because those figures are scope-level, not
+# per-model).
+MONETIZATION_CSV_HEADERS = (
+    "scope",
+    "window_days",
+    "model",
+    "requests",
+    "revenue_usd",
+    "charged_usd",
+    "openrouter_cost_usd",
+    "gross_margin_usd",
+    "gross_margin_pct",
+    "net_profit_usd",
+    "markup",
+)
+
+# Cap on how many ``by_model`` rows the CSV export pulls. The
+# on-screen table sticks to ``_MONETIZATION_TOP_MODELS_LIMIT`` (10)
+# to keep the page short, but the CSV is for offline analysis — let
+# operators see the long tail. Defence-in-depth cap at 1000 so a
+# pathological user-set OPENROUTER_MODELS list (or a future "model
+# discovery" PR that adds variants) can't blow the response size.
+MONETIZATION_CSV_TOP_MODELS_LIMIT = 1000
+
+
+def _format_usd_csv(value) -> str:
+    """Render a USD figure for the monetization CSV.
+
+    Same shape as ``_format_tx_row_for_csv`` — 4 decimal places, no
+    commas, no dollar sign. Accounting software (Excel,
+    QuickBooks) will reject ``$1,234`` but happily import
+    ``1234.5678``. Defence-in-depth NaN/Inf scrub mirrors the
+    DB-side coercion in :class:`Database.get_user_spending_summary`
+    — the monetization aggregate goes through
+    :class:`pricing.get_markup` so a bogus ``markup=0`` upstream
+    can't propagate; but a transient ``Decimal('NaN')`` from a
+    legacy aggregate row would otherwise render as ``nan`` in the
+    CSV output, breaking the import.
+    """
+    if value is None:
+        return ""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if f != f or f in (float("inf"), float("-inf")):
+        return "0.0000"
+    return f"{f:.4f}"
+
+
+def _format_monetization_csv_rows(summary: dict) -> list[str]:
+    """Serialize a monetization summary into a list of CSV row
+    strings (each with trailing CRLF).
+
+    Yields three groups of rows, in display order:
+
+    1. ``scope=lifetime`` — one row, model + requests blank.
+    2. ``scope=window`` — one row with ``window_days`` set,
+       model + requests blank.
+    3. ``scope=window_by_model`` — one row per top model.
+       ``revenue_usd`` / ``gross_margin_pct`` / ``net_profit_usd``
+       blank because those are scope-level figures, not per-model.
+
+    Parametrised over ``summary``'s shape so a future schema bump
+    surfaces here as a ``KeyError`` rather than silent data loss.
+    """
+    markup_field = _format_usd_csv(summary.get("markup"))
+
+    rows: list[str] = []
+
+    lifetime = summary.get("lifetime", {}) or {}
+    rows.append(",".join(_csv_quote(f) for f in [
+        "lifetime",
+        "",
+        "",
+        "",
+        _format_usd_csv(lifetime.get("revenue_usd")),
+        _format_usd_csv(lifetime.get("charged_usd")),
+        _format_usd_csv(lifetime.get("openrouter_cost_usd")),
+        _format_usd_csv(lifetime.get("gross_margin_usd")),
+        _format_usd_csv(lifetime.get("gross_margin_pct")),
+        _format_usd_csv(lifetime.get("net_profit_usd")),
+        markup_field,
+    ]) + "\r\n")
+
+    window = summary.get("window", {}) or {}
+    window_days_field = (
+        str(int(window["days"])) if window.get("days") is not None else ""
+    )
+    rows.append(",".join(_csv_quote(f) for f in [
+        "window",
+        window_days_field,
+        "",
+        "",
+        _format_usd_csv(window.get("revenue_usd")),
+        _format_usd_csv(window.get("charged_usd")),
+        _format_usd_csv(window.get("openrouter_cost_usd")),
+        _format_usd_csv(window.get("gross_margin_usd")),
+        _format_usd_csv(window.get("gross_margin_pct")),
+        _format_usd_csv(window.get("net_profit_usd")),
+        markup_field,
+    ]) + "\r\n")
+
+    for model_row in summary.get("by_model", []) or []:
+        if not isinstance(model_row, dict):
+            continue
+        rows.append(",".join(_csv_quote(f) for f in [
+            "window_by_model",
+            window_days_field,
+            model_row.get("model") or "",
+            (
+                str(int(model_row["requests"]))
+                if model_row.get("requests") is not None
+                else ""
+            ),
+            "",  # revenue_usd: scope-level, not per-model
+            _format_usd_csv(model_row.get("charged_usd")),
+            _format_usd_csv(model_row.get("openrouter_cost_usd")),
+            _format_usd_csv(model_row.get("gross_margin_usd")),
+            "",  # gross_margin_pct: scope-level
+            "",  # net_profit_usd: scope-level
+            markup_field,
+        ]) + "\r\n")
+
+    return rows
+
+
+async def monetization_csv_get(request: web.Request) -> web.StreamResponse:
+    """``GET /admin/monetization/export.csv`` — CSV export.
+
+    Stage-15-Step-E #9 follow-up #2. Carries the same ``?window=``
+    allowlist semantics as the HTML page (7 / 30 / 90; anything
+    else falls back to 30). The CSV always pulls
+    ``MONETIZATION_CSV_TOP_MODELS_LIMIT`` rows (1000) regardless of
+    the on-screen ``_MONETIZATION_TOP_MODELS_LIMIT`` (10) — the
+    export is for offline analysis, not at-a-glance reading.
+
+    DB unreachable / query failure → render the empty-zero shape
+    so the operator still gets a CSV with the markup column
+    populated, plus we still record the audit row. Same
+    fail-soft pattern the HTML page uses.
+    """
+    db = request.app.get(APP_KEY_DB)
+    window_days = _parse_monetization_window(request.query.get("window"))
+
+    try:
+        from pricing import get_markup
+        markup_for_fallback = float(get_markup())
+    except Exception:
+        log.exception("monetization_csv_get: get_markup failed")
+        markup_for_fallback = 1.0
+
+    summary: dict
+    db_error: str | None = None
+    if db is None:
+        summary = _empty_monetization_summary(
+            window_days=window_days,
+            markup=markup_for_fallback,
+        )
+        db_error = "no-db"
+    else:
+        try:
+            summary = await db.get_monetization_summary(
+                window_days=window_days,
+                top_models_limit=MONETIZATION_CSV_TOP_MODELS_LIMIT,
+            )
+        except Exception:
+            log.exception(
+                "monetization_csv_get: get_monetization_summary failed"
+            )
+            summary = _empty_monetization_summary(
+                window_days=window_days,
+                markup=markup_for_fallback,
+            )
+            db_error = "db-error"
+
+    response = web.StreamResponse(
+        status=200,
+        reason="OK",
+        headers={
+            "Content-Type": "text/csv; charset=utf-8",
+            # Same filename pattern as the transactions export.
+            "Content-Disposition": (
+                "attachment; "
+                f"filename=\"monetization-{window_days}d-"
+                f"{_now_compact()}.csv\""
+            ),
+            "Cache-Control": "no-store, max-age=0",
+        },
+    )
+    await response.prepare(request)
+
+    header = ",".join(_csv_quote(h) for h in MONETIZATION_CSV_HEADERS) + "\r\n"
+    await response.write(header.encode("utf-8"))
+
+    rows = _format_monetization_csv_rows(summary)
+    if rows:
+        await response.write("".join(rows).encode("utf-8"))
+
+    await response.write_eof()
+
+    await _record_audit_safe(
+        request,
+        "monetization_export_csv",
+        target="monetization",
+        outcome="ok" if db_error is None else "degraded",
+        meta={
+            "window_days": window_days,
+            "rows": len(rows),
+            "db_error": db_error,
+        },
+    )
+    log.info(
+        "monetization_csv_get: exported %d rows for window=%dd db_error=%s",
+        len(rows), window_days, db_error,
+    )
+    return response
+
+
 # ---------------------------------------------------------------------
 # Admin audit helper (Stage-9-Step-2)
 # ---------------------------------------------------------------------
@@ -894,6 +1125,20 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     # labels so a future PR can't drop them again.
     "role_grant": "Admin role granted",
     "role_revoke": "Admin role revoked",
+    # Stage-15-Step-E #9 follow-up #2: CSV exports. Two slugs were
+    # being recorded by ``record_admin_audit`` at their respective
+    # call sites (``transactions_csv_get`` since Stage-9-Step-7 and
+    # ``monetization_csv_get`` since this PR), but ``transactions_
+    # export_csv`` was missed when the audit-dropdown sweep landed
+    # in Stage-15-Step-F follow-up #3. The rows were stored
+    # correctly, but an operator filtering the audit feed to "CSV
+    # exports only" while reviewing what an admin pulled offline
+    # couldn't pick the slug out of the dropdown — they had to
+    # scroll the full unfiltered feed. Bundled fix in this PR. A
+    # regression test in ``tests/test_web_admin.py`` pins both
+    # labels so a future PR can't drop them again.
+    "transactions_export_csv": "Transactions CSV exported",
+    "monetization_export_csv": "Monetization CSV exported",
 }
 
 
@@ -6043,6 +6288,12 @@ def setup_admin_routes(
     app.router.add_get(
         "/admin/monetization",
         _require_auth(monetization),
+    )
+    # Stage-15-Step-E #9 follow-up #2: CSV export. Honours the same
+    # ``?window=`` allowlist as the HTML page.
+    app.router.add_get(
+        "/admin/monetization/export.csv",
+        _require_auth(monetization_csv_get),
     )
 
     # Stage-8-Part-2: promo codes.

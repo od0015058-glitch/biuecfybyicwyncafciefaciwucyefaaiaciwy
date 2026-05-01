@@ -27,6 +27,7 @@ from zarinpal import zarinpal_callback
 from bot_health_alert import start_bot_health_alert_task
 from pending_alert import start_pending_alert_task
 from pending_expiration import start_pending_expiration_task
+from zarinpal_backfill import start_zarinpal_backfill_task
 from rate_limit import (
     install_webhook_rate_limit,
     register_rate_limited_webhook_path,
@@ -329,6 +330,15 @@ async def main():
     # pending_expiration.py for the full contract.
     expiration_task = start_pending_expiration_task(bot)
 
+    # Stage-15-Step-E #8 follow-up #2: Zarinpal browser-close backfill
+    # reaper. Wakes every ZARINPAL_BACKFILL_INTERVAL_MIN minutes
+    # (default 5) and verifies any PENDING Zarinpal row in the
+    # window (min_age, max_age) — crediting orders the gateway
+    # settled but whose user-redirect callback never landed
+    # (browser-close race). See zarinpal_backfill.py for the full
+    # contract + jurisdictional split with the expire reaper.
+    zarinpal_backfill_task = start_zarinpal_backfill_task(bot)
+
     # Stage-12-Step-B: proactive admin alert loop for stuck PENDING
     # transactions. Wakes every PENDING_ALERT_INTERVAL_MIN minutes
     # (default 30) and DMs admins about PENDING rows older than
@@ -443,6 +453,13 @@ async def main():
             pass
         except Exception:
             log.exception("pending-expiration reaper exited with error")
+        zarinpal_backfill_task.cancel()
+        try:
+            await zarinpal_backfill_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("zarinpal-backfill reaper exited with error")
         pending_alert_task.cancel()
         try:
             await pending_alert_task

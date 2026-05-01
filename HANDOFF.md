@@ -824,7 +824,7 @@ What remains (next AI's TODO):
 * ~~**Telegram FSM integration.**~~ ✅ **shipped (Stage-15-Step-E #8 follow-up #1 PR).** Added a "💳 پرداخت با زرین‌پال" / "💳 Pay with Zarinpal" button on the Toman-entry currency-picker keyboard next to the existing TetraPay button (rendered conditionally on `not is_gateway_disabled("zarinpal")` — the same admin-toggle hook the TetraPay button already uses, so disabling Zarinpal at runtime hides the button without code changes). The picker layout now packs the card-gateway buttons into a single top row whose width tracks the count of enabled card gateways, so a single-enabled deploy doesn't stretch the lone button across the chat width. Routed `cur_zarinpal` through `process_custom_currency_selection` to a new `_start_zarinpal_invoice` helper that mirrors `_start_tetrapay_invoice` 1:1: clear FSM, validate the locked `toman_rate_at_entry` snapshot, call `zarinpal.create_order` (catches both `ZarinpalError` and transport / timeout exceptions, renders `zarinpal_unreachable` with retry / home buttons), call `Database.create_pending_transaction(gateway="zarinpal", currency_used="IRR", gateway_invoice_id=order.authority, gateway_locked_rate_toman_per_usd=order.locked_rate_toman_per_usd, ...)`, and render `zarinpal_order_text` with the gateway-issued StartPay URL on an `InlineKeyboardBuilder.button(url=...)` "Go to Zarinpal" button. Promo `promo_code` / `promo_bonus_usd` ride through to the PENDING row identically to the TetraPay path so settlement credits the bonus. New strings (5): `zarinpal_button`, `zarinpal_creating_order`, `zarinpal_order_text`, `zarinpal_pay_button`, `zarinpal_unreachable` — both `fa` and `en` defined; `.po` files regenerated via `python -m i18n_po export` to keep the drift gate green. 23 new unit tests in `tests/test_zarinpal_telegram_fsm.py`: keyboard wiring (button presence with all combos of {tetrapay, zarinpal} ∈ enabled / disabled), `process_custom_currency_selection` routing (happy path, gateway-disabled toast, lost-amount toast), `_start_zarinpal_invoice` happy path (asserts `create_pending_transaction` kwargs, asserts the StartPay URL ends up on the keyboard), promo data ride-through, missing-rate path renders `charge_toman_no_rate`, `create_order` exception renders `zarinpal_unreachable`, `create_pending_transaction` returning `False` renders `charge_invoice_error` (and crucially, doesn't hand out a payment URL), bundled-bug-fix gate (parametrized over NaN / Inf / negative / zero / `bool` / accidental-string `toman_rate_at_entry`), and an i18n-coverage check confirming every new slug exists in both languages. Total test suite is now **2017 passing** (was 1994 pre-PR).
 
   Bundled bug fix in this PR (real, found while writing `_start_zarinpal_invoice` and back-checking the existing `_start_tetrapay_invoice` validation gate): **`_start_tetrapay_invoice`'s `toman_rate_at_entry` validation was too permissive.** Pre-fix the gate was `toman_rate_at_entry is None or not isinstance(toman_rate_at_entry, (int, float))`, which accepted `float('nan')`, `float('inf')`, `-1.0`, `0.0`, and `True` (`bool` is a subclass of `int`, so `isinstance(True, (int, float))` is True). A poisoned FSM `toman_rate_at_entry` would slip past the gate, get coerced via `float(toman_rate_at_entry)` and passed into `tetrapay_create_order(rate_toman_per_usd=...)` → `usd_to_irr_amount` which raises `ValueError` on non-finite / non-positive rates. The handler caught that `ValueError` as a generic `Exception` and rendered `tetrapay_unreachable` — misleading the user into thinking the gateway was down when actually our FSM data was corrupted (correct UX is to send them back to the Toman-entry prompt to re-enter a fresh rate). Fix: tightened the gate in BOTH `_start_tetrapay_invoice` AND the new `_start_zarinpal_invoice` to also reject `bool`, non-finite floats, and non-positive values up-front; the user sees `charge_toman_no_rate` with a retry button to `amt_toman` (the Toman-entry prompt). Pinned by a parametrized test that exercises every poisoned-rate shape.
-* **Backfill reaper for browser-close races.** Zarinpal can settle an order whose user closes the browser before the `?Authority=…&Status=OK` redirect lands — without a backfill, we'd never credit them. The current `pending_expiration` reaper would EXPIRE the row after 24h. A small periodic task that calls `verify_payment` for any PENDING Zarinpal row older than ~5 minutes (and finalizes if the gateway says it settled) closes that gap. Probably ~80 LoC + ~10 tests. The TetraPay path doesn't need this because TetraPay POSTs the callback server-to-server and retries on 5xx — only the user-redirect model has the browser-close gap.
+* ~~**Backfill reaper for browser-close races.**~~ ✅ **shipped (Stage-15-Step-E #8 follow-up #2 PR).** New `zarinpal_backfill.py` module spawns an async task at boot that wakes every `ZARINPAL_BACKFILL_INTERVAL_MIN` minutes (default 5) and verifies any PENDING Zarinpal row in the window `(min_age, max_age)` (default 5 min — 23 h). For each row: `zarinpal.verify_payment(authority, locked_irr)` (gateway authoritative settlement check) → `Database.finalize_payment(authority, locked_usd)` (idempotent — FOR UPDATE + status check guards against double-credit if the user reopens their tab while the reaper is mid-tick) → user DM via the same `zarinpal_credit_notification` string the redirect callback would have sent → audit row marked `actor="zarinpal_backfill"` so forensics can distinguish backfill credits from callback credits. Per-process counters (`rows_examined`, `credited`, `verify_failed`, `transport_error`, `finalize_noop`, `audit_failed`) exposed via `get_zarinpal_backfill_counters()` for ops panels. Heartbeat exposed as `meowassist_zarinpal_backfill_last_run_epoch` via the standard `record_loop_tick` plumbing. Jurisdictional split with the existing expire reaper: backfill owns `(min_age_seconds, max_age_hours * 3600)`; expire owns everything older — the README documents the recommended 1-hour buffer between `ZARINPAL_BACKFILL_MAX_AGE_HOURS=23` and `PENDING_EXPIRATION_HOURS=24`. Wired into `main.start_webhook_server` directly after the existing `start_pending_expiration_task`, cancelled cleanly on shutdown. New DB query `Database.list_pending_zarinpal_for_backfill(min_age_seconds, max_age_hours, limit)` filters by `gateway='zarinpal' AND status='PENDING'` with both age bounds, orders oldest-first, and coerces the `amount_crypto_or_rial` to a positive integer (filtering NULL / non-finite / non-positive legacy rows so the reaper doesn't crash on a corrupt row). Bundled real bug fix: `metrics.record_loop_tick(name)` now logs a WARN exactly once per process when *name* is not in `_LOOP_METRIC_NAMES`. Pre-fix, a typo'd loop name (e.g. `record_loop_tick("zarinpal_baackfill")`) would silently store the tick but the gauge would never appear in the `/metrics` exposition — Prometheus' "loop is stuck" alert (`time() - last_run_epoch > N`) would then perpetually fire on the (forever-zero) gauge, masquerading as a real outage. The new warning surfaces the typo at the loop's first tick. Tracking set `_LOOP_TICK_UNKNOWN_NAMES_WARNED` is also cleared by `reset_loop_ticks_for_tests` so each test starts fresh. 19 new tests in `tests/test_zarinpal_backfill.py` covering: SQL shape (`gateway='zarinpal'`, status filter, both age bounds, oldest-first ordering, return-shape coercion) / invalid-bounds rejection (`min_age <= 0`, `max_age <= 0`, `limit <= 0`) / NULL+zero+negative IRR row filtering / happy path (verify→finalize→DM→audit) / verify-rejected (no finalize, no DM) / transport-error (no finalize) / finalize-noop (callback raced ahead) / per-row crash isolation / empty result / DB query error / DM failure (TelegramForbiddenError) doesn't block credit / `_read_int_env` unset+garbage+below-minimum / `record_loop_tick` warn-once / no-warn for known names / one warn per distinct unknown name / `zarinpal_backfill` is in `_LOOP_METRIC_NAMES` / reset clears warned set.
 * **Designed success / failure HTML pages.** The current `_HTML_SUCCESS` / `_HTML_FAILURE` are intentionally minimal — RTL Persian-only, sans-serif, centered text, no styling beyond a single-color heading. The user is expected to flip back to Telegram for the canonical confirmation. A designer pass with brand colors, a logo, and an English fallback would be a nice-to-have polish.
 * **Drop-counter visibility on `/admin/`.** `web_admin._collect_ipn_health` already renders TetraPay + NowPayments tiles. Adding a third tile for Zarinpal is a 5-line `for accessor in (..., zarinpal.get_zarinpal_drop_counters)` extension. Deferred to keep this PR scoped to the gateway integration itself.
 
@@ -869,7 +869,7 @@ What remains for future Step-E #9 PRs:
 
   Bundled bug fix in this PR (real, found while writing the window-selector tests and cross-checking the `_empty_monetization_summary` fallback shape): **the DB-error / dev-mode fallback hardcoded `gross_margin_pct=0.0` for both lifetime and window blocks.** Pre-fix, when `db.get_monetization_summary` raised (transient pool issue, asyncpg disconnect, etc.) OR when the page was hit in dev-mode without a DB, the empty-fallback shape returned `gross_margin_pct=0.0` regardless of the configured markup. The pricing tile then rendered "Current markup multiplier: 2.0000× (gross margin pinned at **0.00%** of every charged dollar)" — wildly misleading, because the gross-margin percentage is purely a function of the markup (`(markup - 1) / markup * 100`) and doesn't need transactional data. An operator hitting the page during a 30-second DB blip would see the right markup figure but the wrong margin percentage. Fix: derive `gross_margin_pct` from the `markup` argument inside `_empty_monetization_summary` so the DB-error path matches the happy-path math. Pinned by a parametrized test exercising `markup ∈ {0.0, 1.0, 1.5, 2.0, 4.0}` and a route-level regression test that monkeypatches `pricing.get_markup` and stubs the DB to raise.
 * **Daily / weekly time-series chart** — the current page is a snapshot. A small Chart.js (or HTML canvas) sparkline showing daily revenue / OR cost / margin would let an operator spot trends without exporting CSVs.
-* **CSV export** — same shape as `/admin/transactions/export.csv`. Operator pipes into a spreadsheet for monthly P&L.
+* ~~**CSV export**~~ ✅ **shipped (Stage-15-Step-E #9 follow-up #2 PR).** New `GET /admin/monetization/export.csv?window=7|30|90` endpoint streams a single CSV with a `scope` column (`lifetime` / `window` / `window_by_model`) so an operator can pivot it for monthly P&L without screen-scraping. Header pinned by the test (`scope, window_days, model, requests, revenue_usd, charged_usd, openrouter_cost_usd, gross_margin_usd, gross_margin_pct, net_profit_usd, markup`); empty cells where a column doesn't apply (model + requests blank for scope-level rows; revenue + margin_pct + net blank for the per-model rows). Honours the same `?window=` allowlist as the HTML page — anything else falls back to 30. Pulls `MONETIZATION_CSV_TOP_MODELS_LIMIT=1000` rows (vs. the on-screen `_MONETIZATION_TOP_MODELS_LIMIT=10`) so the long-tail models are included for offline analysis; `Cache-Control: no-store` and `Content-Disposition: attachment; filename="monetization-{N}d-YYYYMMDDTHHMMSSZ.csv"` so a later admin session on the same machine can't pull a cached copy. Each successful export records a `monetization_export_csv` audit row with the window + row count + db_error flag in `meta`. The HTML page grew an "⬇ Export CSV" link in the page header carrying the active `?window=` into the export. **Bundled bug fix:** `transactions_export_csv` was being recorded by `record_admin_audit` since Stage-9-Step-7 but was missed when the audit-dropdown sweep landed in Stage-15-Step-F follow-up #3 — operators filtering "CSV exports only" couldn't pick the slug out of the audit-page dropdown and had to scroll the full unfiltered feed. Fix: added both `transactions_export_csv` AND `monetization_export_csv` to `AUDIT_ACTION_LABELS`, with a regression test that pins both labels.
 * **Per-user contribution** — "top 10 users by revenue contributed in the last 30 days". Requires a join from `transactions` → `users`, similar to the existing `/admin/users` filtering. Useful for "should we reach out to whales?" segmenting.
 * **Markup history tracking** — record `COST_MARKUP` changes in a small `markup_changes` table so the implied-OR-cost calculation can use the markup that was active when each `usage_logs` row was created, rather than today's markup uniformly. Removes the lifetime-drift caveat.
 * **Break-even analysis** — given current monthly run-rate (revenue, OR cost, fixed overhead from env), how many active users / requests does the bot need to break even? Out-of-scope for the data model right now since "fixed overhead" isn't anywhere in the schema.
@@ -2288,6 +2288,106 @@ The user's process for this project — **do not deviate**:
     row drop / NaN cost row drop / Persian locale rendering /
     window-truncation for stale snapshots / `_empty_stats_snapshot`
     includes `daily` key. Suite: 2106 → 2123 passing (+17 new).
+19. **Stage-15-Step-E #9 follow-up #2 OPENED** (PR-after-#148) —
+    monetization CSV export at `GET
+    /admin/monetization/export.csv?window=7|30|90`. Streams a single
+    CSV with a `scope` column (`lifetime` / `window` /
+    `window_by_model`) so an operator can pivot it for monthly P&L
+    without screen-scraping. Honours the same `?window=` allowlist
+    as the HTML page; pulls `MONETIZATION_CSV_TOP_MODELS_LIMIT=1000`
+    rows (vs. the on-screen `_MONETIZATION_TOP_MODELS_LIMIT=10`)
+    so the long-tail models are included for offline analysis.
+    `Cache-Control: no-store` + timestamped filename
+    (`monetization-{N}d-YYYYMMDDTHHMMSSZ.csv`) follow the same
+    pattern as `transactions_csv_get`. Each successful export
+    writes a `monetization_export_csv` audit row with the window
+    + row count + db_error flag in `meta`. The HTML page grew an
+    "⬇ Export CSV" link in the header carrying the active
+    `?window=` into the export. **Bundled real bug fix:**
+    `transactions_export_csv` was being recorded by
+    `record_admin_audit` since Stage-9-Step-7 but was missed when
+    the audit-dropdown sweep landed in Stage-15-Step-F follow-up
+    #3 — operators filtering "CSV exports only" on the audit page
+    couldn't pick the slug out of the dropdown and had to scroll
+    the full unfiltered feed. Fix: added BOTH
+    `transactions_export_csv` AND `monetization_export_csv` to
+    `AUDIT_ACTION_LABELS`, with a regression test that pins both
+    labels so a future PR can't drop them again — same shape as
+    the existing `role_grant` / `role_revoke` pin from
+    Stage-15-Step-E #5 follow-up #1. New helpers:
+    `_format_usd_csv` (4dp, no comma, scrubs NaN/Inf to
+    `"0.0000"` mirroring `Database._finite_float`),
+    `_format_monetization_csv_rows` (pure-function serializer,
+    drops non-dict by_model entries, parametrised over the
+    summary shape so a future schema bump surfaces here as a
+    `KeyError` rather than silent data loss),
+    `monetization_csv_get` (the route handler with fail-soft
+    DB-error path that still emits an empty-zero CSV with the
+    markup populated). 14 new tests in `tests/test_web_admin.py`
+    covering: header pin / populated-summary row shape /
+    empty-by_model / non-dict by_model entry skip / NaN+Inf
+    scrub for `_format_usd_csv` / auth required / route
+    end-to-end (CSV body + headers + filename + cache-control)
+    / `?window=` allowlist threading / invalid-window fall-back
+    (parametrised over 6 bad inputs) / `top_models_limit=1000`
+    pin / DB-error fail-soft renders empty CSV with markup /
+    audit row written / HTML page exposes the export link /
+    audit-action labels include both export slugs. Suite:
+    2106 → 2120 passing (+14 new).
+19. **Stage-15-Step-E #8 follow-up #2 OPENED** (PR-after-#148) —
+    Zarinpal browser-close backfill reaper. Closes the gap where
+    Zarinpal settles an order whose user closes the browser
+    before the `?Authority=…&Status=OK` redirect lands. New
+    `zarinpal_backfill.py` module spawns a periodic asyncio task
+    at boot (interval `ZARINPAL_BACKFILL_INTERVAL_MIN`, default
+    5 min) that for each PENDING Zarinpal row in the
+    `(min_age, max_age)` window calls
+    `zarinpal.verify_payment` → `Database.finalize_payment` →
+    sends the standard credit DM → writes an audit row marked
+    `actor="zarinpal_backfill"`. New DB query
+    `Database.list_pending_zarinpal_for_backfill(
+    min_age_seconds, max_age_hours, limit)` filters by
+    `gateway='zarinpal' AND status='PENDING'` with both age
+    bounds and coerces legacy NULL / non-finite / non-positive
+    `amount_crypto_or_rial` rows out of the result. Heartbeat
+    via `record_loop_tick("zarinpal_backfill")` exposed as
+    `meowassist_zarinpal_backfill_last_run_epoch`. Per-process
+    counters (`rows_examined` / `credited` / `verify_failed` /
+    `transport_error` / `finalize_noop` / `audit_failed`)
+    available via `get_zarinpal_backfill_counters()` for future
+    ops panel integration. Jurisdictional split with the existing
+    `pending_expiration` reaper enforced by env-var convention:
+    backfill owns up to 23h, expire owns 24h+, with a 1-hour
+    buffer documented in the README. Wired into
+    `main.start_webhook_server` directly after
+    `start_pending_expiration_task`, cancelled cleanly on
+    shutdown. TetraPay and NowPayments don't need this because
+    their callbacks are server-to-server POSTs that retry on
+    5xx — only Zarinpal's user-redirect model has the
+    browser-close gap. Bundled real bug fix:
+    `metrics.record_loop_tick(name)` now logs a WARN exactly
+    once per process when *name* is not in
+    `_LOOP_METRIC_NAMES`. Pre-fix, a typo'd loop name would
+    silently store the tick but the gauge would never appear in
+    the `/metrics` exposition — Prometheus' "loop is stuck"
+    alert (`time() - last_run_epoch > N`) would then perpetually
+    fire on the (forever-zero) gauge, masquerading as a real
+    outage. The new warning surfaces the typo at the loop's
+    first tick. The dedupe set is also cleared by
+    `reset_loop_ticks_for_tests` so each test starts fresh. 19
+    new tests in `tests/test_zarinpal_backfill.py` covering: SQL
+    shape (gateway+status filters, both age bounds, ordering,
+    return-shape coercion) / invalid-bounds rejection / NULL +
+    zero + negative IRR row filtering / happy path
+    (verify→finalize→DM→audit) / verify-rejected (no finalize,
+    no DM) / transport-error (no finalize) / finalize-noop
+    (callback raced ahead) / per-row crash isolation / empty
+    result / DB query error / DM failure (TelegramForbiddenError)
+    doesn't block credit / `_read_int_env` unset+garbage+
+    below-minimum / `record_loop_tick` warn-once / no-warn for
+    known names / one warn per distinct unknown name /
+    `zarinpal_backfill` is in `_LOOP_METRIC_NAMES` / reset
+    clears warned set. Suite: 2106 → 2125 passing (+19 new).
 20. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.

@@ -3,7 +3,20 @@
 {% block title %}Monetization{% endblock %}
 
 {% block main %}
-<h2>Monetization</h2>
+<div style="display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 0.75em;">
+  <h2 style="margin: 0;">Monetization</h2>
+  {# Stage-15-Step-E #9 follow-up #2: CSV export. Honours the
+     active ``?window=`` so a 7d / 30d / 90d view exports the same
+     scope as what the operator is currently looking at. The
+     filename embeds the window so multiple exports don't collide
+     in the Downloads folder. #}
+  <a class="reset"
+     href="/admin/monetization/export.csv?window={{ active_window }}"
+     download
+     title="Export the monetization rollup as a CSV file (lifetime + selected window + per-model breakdown)">
+    ⬇ Export CSV
+  </a>
+</div>
 
 <p style="color: var(--text-muted); margin: 0 0 1em 0; font-size: 0.9em;">
   Revenue (gateway top-ups), wallet charges (per-token spend), implied
