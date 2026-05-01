@@ -207,6 +207,23 @@ NowPayments crypto invoices.
   command gates** — that's the follow-up PR (gate `/admin_credit` to
   `super`, `/admin_broadcast` to `operator`, `/admin_metrics` to
   `viewer`). First slice of Stage-15-Step-E #5.
+- **Telethon-driven live-bot integration test scaffold (first
+  slice)** — `tests/integration/` ships a Telethon-based scaffold
+  that drives a *live* test bot via a real Telegram user account
+  (MTProto, not the Bot API — bots can't DM other bots). The
+  suite skips itself cleanly when any of `TG_API_ID` /
+  `TG_API_HASH` / `TG_TEST_SESSION_STRING` /
+  `TG_TEST_BOT_USERNAME` is unset, so CI's
+  `pytest -v` just emits `SKIPPED [reason]` lines and stays
+  green. To run locally, set the four secrets (the throwaway
+  session-string generation script lives in
+  `tests/integration/conftest.py`) and point
+  `TG_TEST_BOT_USERNAME` at a *dedicated test bot, not the
+  production bot* — a flaky test must not be able to credit /
+  refund / broadcast to real users. Four smoke tests cover the
+  `/start` greeting + hub keyboard, `/balance` rendering the
+  wallet line, and the bot's resilience to unknown commands.
+  First slice of Stage-15-Step-E #6.
 - **Per-key 429 cooldown for OpenRouter** — when OpenRouter
   returns 429 for one of the configured pool keys (the upstream
   provider rate-limited it, or the key hit its OpenRouter plan

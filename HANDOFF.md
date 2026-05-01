@@ -58,7 +58,8 @@ entrypoint.sh       runs `alembic upgrade head` then exec's main.py
 Dockerfile          python:3.12-slim + requirements
 docker-compose.yml  postgres + redis + bot
 .env.example        every required env var
-tests/              pytest, ~534 cases
+tests/              pytest, 1565 cases (1561 unit + 4 opt-in integration)
+tests/integration/  Telethon-driven live-bot suite (skips without TG_API_*)
 .github/workflows/ci.yml   3.11/3.12 matrix + alembic roundtrip + docker build
 ```
 
@@ -615,7 +616,7 @@ Systematic sweep of the codebase for latent bugs. Candidates identified during a
 | 3 | **Webhook mode instead of long-polling** — switch from aiogram long-polling to webhook mode. The aiohttp server already runs; register a `/telegram-webhook` route. Reduces latency, uses fewer resources. | P3 ops | Low | Only worthwhile if the bot gets >100 concurrent users |
 | 4 | **Rate limiting per OpenRouter key** — extend `openrouter_keys.py` with per-key 429 detection. If a key gets rate-limited, temporarily redistribute its users to other keys. Current sticky assignment doesn't handle key exhaustion. | P3 ops | Medium | Only matters with 10+ keys and heavy traffic |
 | 5 | **Admin role system** — currently all admins have full access. Add roles: `viewer` (read-only dashboard), `operator` (can broadcast, manage promos), `super` (can edit users, refund). Store in DB, not env. **STARTED — see "Stage-15-Step-E #5" section below for first-slice scope, what remains, and the bundled JSONB-decode bug fix.** | P2 product | High | Only needed if the team grows beyond 1 admin |
-| 6 | **Automated testing with real Telegram** — use `telethon` or `pyrogram` to write integration tests that actually send messages to the bot and verify responses. Currently all tests are unit tests with mocked Telegram. | P3 ops | High | Big investment but catches integration bugs CI can't |
+| 6 | **Automated testing with real Telegram** — use `telethon` or `pyrogram` to write integration tests that actually send messages to the bot and verify responses. Currently all tests are unit tests with mocked Telegram. **STARTED — see "Stage-15-Step-E #6" section below for the scaffold + skip-by-default gate + bundled `_parse_float_env` non-finite guard.** | P3 ops | High | Big investment but catches integration bugs CI can't |
 | 7 | **i18n framework upgrade** — move from the current `strings.py` dict to proper `.po` / `.mo` gettext files. Enables community translations, pluralization rules, and tooling like Crowdin. | P2 product | Medium | Only worthwhile if adding a third language (Arabic, Turkish) |
 | 8 | **Stripe / Zarinpal payment gateway** — add conventional card payment options alongside crypto. Stripe for international, Zarinpal for Iranian cards (alternative to TetraPay). | P2 product | High | Significant gateway integration work |
 | 9 | **Bot monetization dashboard** — admin page showing revenue vs. OpenRouter cost, profit margin per model, break-even analysis. All data already exists in `usage_logs` + `transactions`. | P2 product | Medium | High value for the operator to understand business health |
@@ -711,6 +712,42 @@ What remains (next AI's TODO):
 * **First-login auto-promote of `ADMIN_USER_IDS` admins to a real `admin_roles` row.** Currently env-list admins only get a `super` role *implicitly* via `effective_role`. A startup task that ensures every env-list id has a matching `admin_roles` row would make the DB the source of truth and let the operator drop env-list management entirely.
 
 Bundled bug fix in this PR (real, found during code review of the audit-page wiring): **`Database.list_admin_audit_log` and `Database.list_payment_status_transitions` now decode JSONB `meta` columns through a new `_decode_jsonb_meta(...)` helper instead of `dict(r["meta"])`.** Pre-fix, both readers ran `dict(r["meta"]) if r["meta"] is not None else None`. asyncpg returns JSONB columns as raw `str` by default (no codec is registered on the pool — see the audit + payment-status writers, which all hand-cast `$N::jsonb` from a `json.dumps`-rendered string), so `dict("...JSON string...")` raised `ValueError: dictionary update sequence element #0 has length 1; 2 is required` for every non-empty meta. The audit-page handler (`web_admin.audit_get`) wraps the read in `try/except` and renders "Database query failed" on any exception, so the regression was *silent* in production — the operator looking at `${WEBHOOK_BASE_URL}/admin/audit` would see an empty error tile instead of the per-action audit trail the moment the table grew its first non-NULL `meta` row (which is most rows: every login attempt records `{"reason": "..."}`, every wallet adjustment records `{"delta_usd": ...}`, etc.). The new helper accepts `None` / `dict` / `str` / `bytes` cleanly and demotes any unparseable row's `meta` to `None` (with a logged WARNING) so a single poisoned row can't blank the entire feed. Confirmed locally with a real asyncpg connection against a Postgres 16 container. 5 new tests in `tests/test_database_queries.py` pin both the JSONB-`str` decode path (regression pin), the dict pass-through (forward-compat for a future `set_type_codec` registration), the corrupted-row-doesn't-blank-feed semantics, and the matching `list_payment_status_transitions` site (same shape, same regression — one helper call site, one fix).
+
+---
+
+##### Stage-15-Step-E #6 — what's shipped vs. what remains (STARTED, not finished)
+
+**Step-E #6 (Automated testing with real Telegram) — STARTED in PR-after-Step-E-#5.**
+
+Original spec (Step-E table row 6): "use telethon or pyrogram to write integration tests that actually send messages to the bot and verify responses. Currently all tests are unit tests with mocked Telegram."
+
+What's shipped this PR:
+
+* `requirements-dev.txt` adds `telethon>=1.36,<2`. Pinned upper bound because telethon ships breaking changes on the regular and we don't want a surprise major-version bump to break the unit-test path.
+* `tests/integration/__init__.py` — marks the directory as a package so pytest's discovery picks it up under `testpaths = tests`.
+* `tests/integration/conftest.py` — the **scaffold**:
+    * `_SECRET_VARS` tuple lists the four required env vars: `TG_API_ID`, `TG_API_HASH`, `TG_TEST_SESSION_STRING`, `TG_TEST_BOT_USERNAME`.
+    * `integration_secrets` (session-scoped fixture) calls `pytest.skip(...)` listing the missing vars, so a CI run with no secrets emits clean `SKIPPED [reason]` lines and stays green. The skip happens at *fixture-resolution* time, not import time, so the test files still get *collected* (and lint / static analysis still see them) when secrets are missing — only the actual run is short-circuited.
+    * `telegram_client` (session-scoped, async) — connected, logged-in Telethon `TelegramClient`. Imports telethon *inside* the fixture so a production-only `pip install -r requirements.txt` (no dev deps) cleanly skips the suite rather than raising `ImportError` at collection time.
+    * `send_and_wait` — the polling helper. Sends a message, sleeps `TG_TEST_SETTLE_SECONDS` (default 0.5s, configurable) to let the bot's long-poller catch up, then `iter_messages(min_id=sent.id)` until the next reply arrives. Bounded by `TG_TEST_TIMEOUT_SECONDS` (default 15s). Raises `asyncio.TimeoutError` (NOT `pytest.fail`) on timeout so individual tests can opt to catch the timeout — used by the "unknown command doesn't crash the bot" test, which actively *expects* the bot to be silent and just verifies the next legitimate command still works.
+* `tests/integration/test_smoke.py` — four smoke tests:
+    * `/start` returns *some* reply (alive + reachable + long-poller running).
+    * `/start` posts a hub message with `reply_markup` (the inline keyboard renders).
+    * `/balance` reply contains `$` (wallet template renders the balance line).
+    * Unknown command doesn't wedge the bot — followup `/start` still responds.
+* `.env.example` documents the four secrets + the two optional timeout knobs with a step-by-step setup walkthrough (the throwaway script that generates the session string lives in `conftest.py` so the operator can copy-paste).
+* README.md and HANDOFF.md updated.
+* CI is unaffected: `pytest -v` collects 4 integration tests and skips all of them with a clear "missing env var(s) ..." reason. The existing 1549 unit tests still run normally.
+
+What remains (next AI's TODO):
+
+* **Add coverage for the FSM flows** — the three FSM machines (`promo_input`, `custom_amount_input`, the broadcast preview flow) are the biggest gap mocks miss. A real Telegram client lets us exercise the "send /promo, then send a code on the next message" two-step that fixture-based tests can't fully simulate. Use `send_and_wait` twice in a row.
+* **Add coverage for the inline keyboard / callback-query path** — `send_and_wait` currently only watches for *messages*. Extend it (or add a sibling helper) to watch for the next callback-query the bot edits-message-back from. Telethon exposes inline button presses via `client.send_message(..., buttons=...)` and the bot's edit shows up in `iter_messages` with an updated `edit_date`; pin one round of "tap 'My usage stats' on the wallet menu, expect the spending breakdown" to lock the wallet flow end-to-end.
+* **Wire the suite into a separate optional CI job** — the current implementation skips by default. A follow-up should add a *manually-triggered* GH Actions workflow that injects the secrets and runs `pytest tests/integration -v`. Operator decides cadence; weekly nightly is a reasonable default. Don't gate every PR on it because Telegram MTProto can be flaky and we don't want to block merges on transient network blips.
+* **Spin up a dedicated test bot and seed an opinionated test account** — the current docs say "use a separate bot, not production". A follow-up should script `BOT_TOKEN_TEST` provisioning + a fixture user with `$10` of seed credits so refund / debit smoke tests don't need a real top-up.
+* **Document the operator's manual test recipe in README.md** — the smoke tests cover the bot's *external* boundary (Telegram → bot). The operator's manual smoke (top up via NowPayments, refund, broadcast) covers the *backoffice* boundary; a checklist in the README would make it reproducible.
+
+Bundled bug fix in this PR (real, found during the env-parsing audit while drafting the integration test setup): **`model_discovery._parse_float_env` and `fx_rates._parse_float_env` now reject `nan` / `inf` / `-inf` env values explicitly, falling back to the supplied default with a logged WARNING.** Pre-fix, the two near-identical helpers caught only `ValueError` from `float(raw)` — but `float("nan")` / `float("inf")` parse *successfully* and return non-finite floats. Both helpers feed into a percent-threshold comparison: `model_discovery._compute_price_deltas` does `if abs(input_delta_pct) >= threshold_pct` and `fx_rates.refresh_usd_to_toman_once` does `if abs(delta_pct) >= threshold`. Every comparison against NaN is `False` in Python, and nothing finite ever exceeds `+Inf`, so a misconfigured `PRICE_ALERT_THRESHOLD_PERCENT=nan` (or `FX_RATE_ALERT_THRESHOLD_PERCENT=inf`) would *silently disable* the alert system on that side: admins would stop being DM'd about price moves and FX swings without any error surfacing in logs. The fallback path was supposed to catch operator typos and warn — instead it accepted the malformed value and pretended everything was fine. Fix: `math.isfinite(value)` guard added to both helpers; non-finite values now log a WARNING and fall back to the supplied default, so the alerts keep working at the documented threshold instead of going dark. 16 new tests across `test_model_discovery.py` (7 unit cases) and `test_fx_rates.py` (8 unit cases + 1 end-to-end pin proving a `nan` env value still fires the rate-move DM via the default-fallback path).
 
 ---
 
@@ -1152,36 +1189,46 @@ The user's process for this project — **do not deviate**:
     selection policy. Bundled bug fix in #4:
     `pricing._apply_markup` now NaN/Inf/non-numeric/negative-guards
     the token-count side too, not just the price side.
-    **Stage-15-Step-E #5 STARTED (this PR)** — first slice of
-    "admin role system": new `admin_roles` table + `admin_roles.py`
+    **Stage-15-Step-E #5 MERGED** (PR #123) — first slice of
+    "admin role system": `admin_roles` table + `admin_roles.py`
     module owning the `viewer`/`operator`/`super` hierarchy +
-    `Database.get/set/delete/list_admin_roles` CRUD primitives +
-    three new Telegram commands (`/admin_role_grant <user_id>
-    <role> [notes]`, `/admin_role_revoke <user_id>`,
+    `Database.get/set/delete/list_admin_roles` + three new
+    Telegram commands (`/admin_role_grant`, `/admin_role_revoke`,
     `/admin_role_list`). Backward compatible: env-list admins
-    keep `super` access via `effective_role`'s fallback so this
-    PR doesn't lock the legacy operator out. The role hierarchy
-    is documented but **not yet wired into the existing command
-    gates** — that's the next PR (gate `/admin_credit` to `super`,
-    `/admin_broadcast` to `operator`, `/admin_metrics` to `viewer`).
-    Bundled bug fix in #5:
-    `Database.list_admin_audit_log` and
-    `Database.list_payment_status_transitions` now decode JSONB
-    `meta` columns through a new `_decode_jsonb_meta` helper
-    instead of `dict(r["meta"])`. Pre-fix, asyncpg returned JSONB
-    columns as raw `str` (no codec registered on the pool — see
-    the writer side, which all hand-cast `$N::jsonb` from
-    `json.dumps`-rendered strings) and `dict("...JSON string...")`
-    raised `ValueError` for every non-empty meta. The audit-page
-    handler swallowed the exception and rendered "Database query
-    failed", so the regression was *silent* in production: the
-    operator looking at `${WEBHOOK_BASE_URL}/admin/audit` would see
-    an empty error tile instead of the per-action audit trail the
-    moment the table grew its first non-NULL `meta` row (which is
-    most rows). Confirmed locally with a real asyncpg connection
-    against Postgres 16. See "Stage-15-Step-E #5 — what's shipped
-    vs. what remains" section above for the precise boundary so
-    the next AI can continue.
+    keep `super` access via `effective_role`'s fallback. Bundled
+    bug fix in #5: JSONB `meta` decode now goes through
+    `_decode_jsonb_meta` instead of `dict(r["meta"])` — pre-fix,
+    `${WEBHOOK_BASE_URL}/admin/audit` was silently broken any
+    time the table had a non-NULL meta row.
+    **Stage-15-Step-E #6 STARTED (this PR)** — first slice of
+    "automated testing with real Telegram": new
+    `tests/integration/` directory with a Telethon-driven scaffold
+    (`integration_secrets` skip-gate session-scoped fixture,
+    session-scoped `telegram_client`, polling `send_and_wait`
+    helper) plus four smoke tests (`/start` reply, hub keyboard
+    arrives, `/balance` shows `$`, unknown command doesn't wedge
+    the bot). The whole suite skips itself when any of
+    `TG_API_ID` / `TG_API_HASH` / `TG_TEST_SESSION_STRING` /
+    `TG_TEST_BOT_USERNAME` is unset, so CI just sees `SKIPPED`
+    lines and stays green. `.env.example` documents the four
+    secrets + the two optional timeout knobs and points at
+    `conftest.py` for the throwaway script that generates the
+    session string. Bundled bug fix in #6:
+    `model_discovery._parse_float_env` and
+    `fx_rates._parse_float_env` now reject non-finite (`nan` /
+    `inf` / `-inf`) values explicitly. Pre-fix, both helpers
+    caught only `ValueError` from `float()` — but `float("nan")`
+    parses successfully and a downstream
+    `if abs(delta) >= threshold` against NaN is *always* False,
+    silently disabling the price-move alerts (model_discovery)
+    and the FX rate-move alerts (fx_rates). A misconfigured
+    `PRICE_ALERT_THRESHOLD_PERCENT=nan` would have stopped DMs
+    to admins without any error surfacing in logs. Fix: a
+    `math.isfinite(value)` guard added to both helpers; non-finite
+    values now log a WARNING and fall back to the supplied
+    default. See "Stage-15-Step-E #6 — what's shipped vs. what
+    remains" section above for the precise boundary so the next
+    AI can continue.
 11. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.

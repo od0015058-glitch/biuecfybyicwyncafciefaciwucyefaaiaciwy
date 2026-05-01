@@ -12,3 +12,10 @@ pytest-asyncio>=0.23.0
 # pytest-aiohttp ships the `aiohttp_client` fixture used to spin up
 # a real aiohttp test server for the webhook rate-limit middleware.
 pytest-aiohttp>=1.0.5
+# Telethon drives the opt-in integration suite under
+# ``tests/integration/`` (Stage-15-Step-E #6). The suite skips itself
+# when ``TG_API_ID`` / ``TG_API_HASH`` / ``TG_TEST_SESSION_STRING`` /
+# ``TG_TEST_BOT_USERNAME`` are unset, so CI just collects + skips.
+# A pinned upper bound keeps a future major-version break out of the
+# unit-test path: telethon ships breaking changes on the regular.
+telethon>=1.36,<2
