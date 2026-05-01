@@ -445,6 +445,210 @@ def test_latest_observed_recent_drops_returns_zero_until_loop_ticks():
     assert bha.latest_observed_recent_drops() == 0
 
 
+# ---------------------------------------------------------------------
+# audit-log hook (Stage-15-Step-F follow-up #3)
+# ---------------------------------------------------------------------
+
+
+def _patch_audit(monkeypatch) -> AsyncMock:
+    """Patch ``database.db.record_admin_audit`` and return the spy.
+
+    The audit write is best-effort with try/except — these tests
+    pin that the spy *was* called with the expected arguments, not
+    that the alert loop succeeds or fails based on the audit
+    return value.
+    """
+    spy = AsyncMock(return_value=42)
+    import database
+
+    monkeypatch.setattr(database.db, "record_admin_audit", spy)
+    return spy
+
+
+@pytest.mark.asyncio
+async def test_alert_dm_records_audit_row(monkeypatch):
+    """A successful UNDER_ATTACK alert DM must produce one audit row
+    with action=bot_health_alert, outcome=ok, and meta capturing
+    the level / signals / delivery counts."""
+    bot = _make_bot()
+    _patch_admins(monkeypatch, (111, 222))
+    _patch_signals(monkeypatch, drops_total=200)
+    spy = _patch_audit(monkeypatch)
+    state = bha.AlertLoopState()
+
+    sent = await bha.run_bot_health_alert_pass(bot, state=state)
+    assert sent == 2  # both admins received the DM
+
+    spy.assert_awaited_once()
+    kwargs = spy.await_args.kwargs
+    assert kwargs["actor"] == "bot_health_alert"
+    assert kwargs["action"] == "bot_health_alert"
+    assert kwargs["target"] == "under_attack"
+    assert kwargs["ip"] is None
+    assert kwargs["outcome"] == "ok"
+    meta = kwargs["meta"]
+    assert meta["level"] == "under_attack"
+    assert meta["score"] == 4
+    assert meta["sent_count"] == 2
+    assert meta["admin_count"] == 2
+    assert isinstance(meta["signals"], list)
+    assert any("IPN" in s for s in meta["signals"])
+
+
+@pytest.mark.asyncio
+async def test_recovery_dm_records_audit_row(monkeypatch):
+    """The recovery DM uses action=bot_health_recovery and meta
+    captures the prior bad level."""
+    bot = _make_bot()
+    _patch_admins(monkeypatch, (111,))
+    spy = _patch_audit(monkeypatch)
+    state = bha.AlertLoopState(
+        last_dispatched_level=BotStatusLevel.UNDER_ATTACK,
+    )
+    _patch_signals(monkeypatch, drops_total=0)
+
+    sent = await bha.run_bot_health_alert_pass(bot, state=state)
+    assert sent == 1
+
+    spy.assert_awaited_once()
+    kwargs = spy.await_args.kwargs
+    assert kwargs["action"] == "bot_health_recovery"
+    assert kwargs["target"] in {"healthy", "idle"}
+    assert kwargs["outcome"] == "ok"
+    meta = kwargs["meta"]
+    assert meta["recovered_from"] == "under_attack"
+    assert meta["sent_count"] == 1
+    assert meta["admin_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_partial_delivery_records_partial_outcome(monkeypatch):
+    """If one admin blocked the bot, the audit row should still
+    fire and ``meta.sent_count < admin_count`` makes the partial
+    fan-out visible to the operator reviewing the timeline."""
+    bot = _make_bot()
+    bot.send_message = AsyncMock(
+        side_effect=[None, TelegramForbiddenError(method=None, message="x")]
+    )
+    _patch_admins(monkeypatch, (111, 222))
+    _patch_signals(monkeypatch, drops_total=200)
+    spy = _patch_audit(monkeypatch)
+    state = bha.AlertLoopState()
+
+    sent = await bha.run_bot_health_alert_pass(bot, state=state)
+    assert sent == 1
+
+    kwargs = spy.await_args.kwargs
+    meta = kwargs["meta"]
+    assert kwargs["outcome"] == "ok"  # at least one admin reached
+    assert meta["sent_count"] == 1
+    assert meta["admin_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_zero_admins_reachable_records_no_admins_reachable(monkeypatch):
+    """All admins blocked the bot → outcome marks the silent
+    incident so the audit log is the *only* surface that captured
+    it. Without this the operator has no way to know the alert
+    fired but didn't reach anyone."""
+    bot = _make_bot()
+    bot.send_message = AsyncMock(
+        side_effect=TelegramForbiddenError(method=None, message="blocked")
+    )
+    _patch_admins(monkeypatch, (111, 222))
+    _patch_signals(monkeypatch, drops_total=200)
+    spy = _patch_audit(monkeypatch)
+    state = bha.AlertLoopState()
+
+    sent = await bha.run_bot_health_alert_pass(bot, state=state)
+    assert sent == 0
+
+    kwargs = spy.await_args.kwargs
+    assert kwargs["outcome"] == "no_admins_reachable"
+    meta = kwargs["meta"]
+    assert meta["sent_count"] == 0
+    assert meta["admin_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_no_admins_configured_still_records_audit(monkeypatch):
+    """An unconfigured deploy with empty ADMIN_USER_IDS but a real
+    UNDER_ATTACK condition must still leave an audit-log row so
+    the timeline isn't silently empty during an actual incident."""
+    bot = _make_bot()
+    _patch_admins(monkeypatch, ())  # empty
+    _patch_signals(monkeypatch, drops_total=200)
+    spy = _patch_audit(monkeypatch)
+    state = bha.AlertLoopState()
+
+    sent = await bha.run_bot_health_alert_pass(bot, state=state)
+    assert sent == 0
+
+    spy.assert_awaited_once()
+    kwargs = spy.await_args.kwargs
+    assert kwargs["outcome"] == "no_admins_configured"
+    meta = kwargs["meta"]
+    assert meta["sent_count"] == 0
+    assert meta["admin_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_audit_failure_does_not_break_dm(monkeypatch):
+    """A DB outage that crashes the audit insert must NOT stop the
+    DM from being sent — the alert loop's job is to page the
+    operator first, record-keeping second."""
+    bot = _make_bot()
+    _patch_admins(monkeypatch, (111,))
+    _patch_signals(monkeypatch, drops_total=200)
+
+    import database
+
+    crashing = AsyncMock(side_effect=RuntimeError("DB pool died"))
+    monkeypatch.setattr(database.db, "record_admin_audit", crashing)
+
+    state = bha.AlertLoopState()
+    # Should not raise.
+    sent = await bha.run_bot_health_alert_pass(bot, state=state)
+    assert sent == 1
+    bot.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_busy_does_not_record_audit(monkeypatch):
+    """BUSY isn't a paging condition — so the audit log shouldn't
+    fill up with BUSY rows on every alert tick during heavy
+    traffic."""
+    bot = _make_bot()
+    _patch_admins(monkeypatch, (111,))
+    spy = _patch_audit(monkeypatch)
+    _patch_signals(monkeypatch, inflight=10_000)
+    state = bha.AlertLoopState()
+
+    await bha.run_bot_health_alert_pass(bot, state=state)
+    spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dedup_does_not_double_record_audit(monkeypatch):
+    """Same level + same hour anchor on consecutive ticks → no
+    second DM, no second audit row. The audit log should match the
+    DM cadence one-to-one. We simulate a sustained UNDER_ATTACK by
+    stepping ``drops_total`` up each tick so each pass sees a fresh
+    delta."""
+    bot = _make_bot()
+    _patch_admins(monkeypatch, (111,))
+    spy = _patch_audit(monkeypatch)
+    state = bha.AlertLoopState()
+
+    _patch_signals(monkeypatch, drops_total=200)
+    await bha.run_bot_health_alert_pass(bot, state=state)
+    # Second tick with another wave — still UNDER_ATTACK, same hour
+    # anchor, so dedup must suppress the DM and the audit row.
+    _patch_signals(monkeypatch, drops_total=400)
+    await bha.run_bot_health_alert_pass(bot, state=state)
+    assert spy.await_count == 1
+
+
 @pytest.mark.asyncio
 async def test_latest_observed_recent_drops_returns_loop_value(monkeypatch):
     bot = _make_bot()

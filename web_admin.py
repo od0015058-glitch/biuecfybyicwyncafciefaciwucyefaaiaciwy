@@ -805,6 +805,24 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     "model_enable": "AI model enabled",
     "gateway_disable": "Gateway disabled",
     "gateway_enable": "Gateway enabled",
+    # Stage-15-Step-F first slice: emergency control panel.
+    # These slugs were already being recorded by ``record_admin_audit``
+    # at the kill-switch / force-stop call sites in this module, but
+    # they were not exposed in the filter dropdown — meaning an
+    # operator reviewing what fired during an incident couldn't
+    # narrow the feed to "force-stop only" without scrolling through
+    # the full audit log. Bundled fix in this PR.
+    "control_force_stop": "Bot force-stopped",
+    "control_disable_all_models": "All AI models disabled (kill-switch)",
+    "control_enable_all_models": "All AI models re-enabled",
+    "control_disable_all_gateways": "All gateways disabled (kill-switch)",
+    "control_enable_all_gateways": "All gateways re-enabled",
+    # Stage-15-Step-F follow-up #3: alert-loop audit rows. ``actor``
+    # is fixed to ``"bot_health_alert"`` (the loop, not a human),
+    # so an operator can filter actor=bot_health_alert to pull just
+    # the alert-loop incidents.
+    "bot_health_alert": "Bot-health alert DM sent",
+    "bot_health_recovery": "Bot-health recovery DM sent",
 }
 
 

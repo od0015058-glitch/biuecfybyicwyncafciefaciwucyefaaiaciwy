@@ -1169,10 +1169,10 @@ What remains for a follow-up PR:
   incidents 1-N tick-intervals later. The current behaviour favours
   early signal over noise reduction; whether that's the right
   trade-off depends on the deploy's loop cadences.
-* **Alert audit log** — DMs aren't currently recorded in the
-  `audit_log` table, so an operator reviewing what fired during
-  an incident has to scrape Telegram. Adding a row per DM would
-  close that gap.
+* **Alert audit log** —
+  *shipped in Stage-15-Step-F follow-up #3
+  (`bot_health_alert._record_alert_audit`)*. See that section
+  below.
 
 Files in this PR (Stage-15-Step-F follow-up #1):
 
@@ -1305,6 +1305,102 @@ Files in this PR (Stage-15-Step-F follow-up #2):
   unknown-loop legacy fallback, the bug-fix grace window, and the
   module-level boot-epoch accessor.
 * `.env.example` — documented the per-loop override convention.
+
+---
+
+#### Stage-15-Step-F follow-up #3: alert-loop audit trail (queued 2026-05-01)
+
+The first slice (PR #131) added the `/admin/control` panel and
+`/admin/audit` already records every human admin action there.
+Follow-up #1 (PR #132) added the proactive Telegram-DM alert loop.
+Until this PR, those DMs went *only* to Telegram — they did not
+leave a row in `admin_audit_log`. An operator reviewing what
+happened during an incident had to scrape Telegram (and hope
+nobody had cleared their chat).
+
+This follow-up wires the alert loop into the existing
+`admin_audit_log` table, alongside the human-admin actions, so
+`/admin/audit` becomes a single timeline of everything that
+happened during an incident:
+
+* **`bot_health_alert._record_alert_audit`** — best-effort hook
+  called once per fired DM event (not per recipient: one fan-out
+  → one audit row, with delivery counts in `meta`). Best-effort
+  in the same sense as `web_admin._record_audit_safe`: every
+  exception is logged and swallowed so a DB outage that breaks
+  the audit insert never stops the actual DM from going out.
+* **Action slugs** — `bot_health_alert` (bad-level transition,
+  e.g. healthy → under_attack) and `bot_health_recovery`
+  (bad → healthy/idle). The `target` column is the entered
+  level (e.g. `under_attack`) so an operator can group rows by
+  "what level fired".
+* **`actor = "bot_health_alert"`** — distinguishes loop-driven
+  rows from human-admin rows (`actor = "web"`). Filter
+  `?actor=bot_health_alert` on `/admin/audit` for the
+  alert-only feed.
+* **`outcome` semantics**:
+    * `ok` — at least one admin received the DM.
+    * `no_admins_reachable` — every admin blocked the bot or
+      raised a TelegramAPIError. The fact that the alert *fired
+      but reached nobody* is the kind of silent failure the audit
+      log exists to surface.
+    * `no_admins_configured` — `ADMIN_USER_IDS` is empty. An
+      unconfigured deploy that's actually under attack now leaves
+      a trail rather than going completely silent on every channel.
+* **`meta` jsonb** — captures level, score, full signals tuple,
+  recovered-from level (recovery only), and the per-DM delivery
+  counts. Self-contained — the operator doesn't need to
+  cross-reference Prometheus to know *why* the alert fired.
+
+Bundled bug fix in this PR (real, found while wiring the new
+slugs into the audit-log filter dropdown): **the five
+control-panel slugs from PR #131
+(`control_force_stop`, `control_disable_all_models`,
+`control_enable_all_models`, `control_disable_all_gateways`,
+`control_enable_all_gateways`) were being recorded by
+`record_admin_audit` at every kill-switch / force-stop call site,
+but they were never added to the `AUDIT_ACTION_LABELS` dropdown
+on `/admin/audit`**. The rows themselves were stored correctly,
+but an operator filtering the audit feed to "kill-switches only"
+during an incident review couldn't pick those slugs out of the
+dropdown — they had to scroll the full unfiltered feed. A new
+test `test_audit_filter_dropdown_includes_control_panel_actions`
+pins all five labels (plus the two new alert-loop labels) so a
+future PR can't drop them again.
+
+What remains for a follow-up PR:
+
+* **Audit retention policy** — `admin_audit_log` grows forever
+  today. A future slice could add a `cron`-style trim of rows
+  older than N days, with a config knob for the retention
+  window.
+* **Alert-row timeline view** — `/admin/audit` is a flat table.
+  An incident-focused view that groups consecutive `bot_health_alert`
+  rows by level, with the recovery row collapsed into the same
+  group, would make 3am triage faster.
+* **Per-recipient delivery row** — current contract is one audit
+  row per *event*, with delivery counts in `meta`. If a deploy
+  ever needs to know exactly *which* admin received the DM, a
+  per-recipient row would be needed. Trade-off is audit-log
+  noise on a multi-admin deploy. Current contract is intentional.
+
+Files in this PR (Stage-15-Step-F follow-up #3):
+
+* `bot_health_alert.py` — new `_record_alert_audit` helper, hooked
+  into `notify_admins_of_health_change` after the DM fan-out
+  (and into the no-admins-configured early return). The audit
+  insert is best-effort: a DB outage cannot prevent the DM.
+* `web_admin.py` — added five PR #131 control-panel slugs and the
+  two new alert-loop slugs to `AUDIT_ACTION_LABELS`. Bundled
+  bug fix.
+* `tests/test_bot_health_alert.py` — 8 new tests covering the
+  alert audit row, the recovery audit row, partial delivery,
+  zero admins reachable, no admins configured (audit still
+  fires), DB-outage doesn't break the DM, BUSY doesn't audit,
+  and dedup also suppresses the audit row.
+* `tests/test_web_admin.py` — 1 new test pinning the new labels
+  appear in the `/admin/audit` dropdown so a future PR can't
+  silently drop them.
 
 ---
 
