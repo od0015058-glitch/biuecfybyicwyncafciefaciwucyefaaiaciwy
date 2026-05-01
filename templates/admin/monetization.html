@@ -28,7 +28,18 @@
 </div>
 
 <div class="panel">
-  <h3>Last {{ summary["window"].days }} days</h3>
+  <div style="display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 0.75em; margin-bottom: 0.75em;">
+    <h3 style="margin: 0;">Last {{ summary["window"].days }} days</h3>
+    <div class="window-selector" role="group" aria-label="Select rolling window">
+      {% for option in window_options %}
+        {% if option == active_window %}
+          <span class="window-selector-active" aria-current="page">{{ option }}d</span>
+        {% else %}
+          <a href="?window={{ option }}" rel="nofollow">{{ option }}d</a>
+        {% endif %}
+      {% endfor %}
+    </div>
+  </div>
   <div class="stat-grid">
     <div class="stat">
       <div class="label">Gateway revenue</div>

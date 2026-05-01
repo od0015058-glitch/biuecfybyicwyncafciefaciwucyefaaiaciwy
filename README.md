@@ -22,12 +22,15 @@ NowPayments crypto invoices.
   *implied* OpenRouter cost (charges divided by the current
   `COST_MARKUP`), gross margin (charges − OpenRouter cost), and net
   profit (revenue − OpenRouter cost) — both lifetime and over a
-  trailing 30-day window. Includes a per-model breakdown over the
-  same window sorted by charged USD descending so the biggest
-  margin contributors are at the top. Footnotes on the page spell
-  out the assumptions (implied OR cost drifts when `COST_MARKUP`
-  changes; net profit is forward-looking — assumes every credited
-  dollar will eventually burn).
+  trailing window selectable via a `?window=7|30|90` query param
+  (defaults to 30 days; the segmented pill control at the top-right
+  of the "Last N days" panel switches between week / month /
+  quarter views). Includes a per-model breakdown over the same
+  window sorted by charged USD descending so the biggest margin
+  contributors are at the top. Footnotes on the page spell out the
+  assumptions (implied OR cost drifts when `COST_MARKUP` changes;
+  net profit is forward-looking — assumes every credited dollar
+  will eventually burn).
 - Telegram-side admin commands (`/admin`, `/admin_metrics`,
   `/admin_credit`, `/admin_broadcast`, …) for ops via DMs.
 - **Canonical slash-command menu** — on every startup the bot

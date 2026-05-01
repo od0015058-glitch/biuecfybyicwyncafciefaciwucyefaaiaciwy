@@ -688,6 +688,39 @@ async def dashboard(request: web.Request) -> web.StreamResponse:
 _MONETIZATION_DEFAULT_WINDOW_DAYS: int = 30
 _MONETIZATION_TOP_MODELS_LIMIT: int = 10
 
+# Stage-15-Step-E #9 follow-up #1: the page accepts ``?window=N`` on
+# the GET, but only against this allowlist. Arbitrary ``window_days``
+# would let an admin browse "the last 365 days" / "the last 1 day"
+# / "the last 0 days" — the first is a database load problem on the
+# ``charged_total`` lookup at scale, the second is mostly noise, and
+# the last is rejected by ``Database.get_monetization_summary`` with
+# ``ValueError`` (which we'd then have to render). 7 / 30 / 90 are
+# the conventional ops-dashboard windows (week / month / quarter)
+# and match what the rest of the admin surface offers — see
+# ``/stats?window=7|30|90`` from Stage-15-Step-E #2 follow-up.
+_MONETIZATION_WINDOW_OPTIONS: tuple[int, ...] = (7, 30, 90)
+
+
+def _parse_monetization_window(raw: str | None) -> int:
+    """Parse the ``?window=`` query param against the fixed allowlist.
+
+    Returns the integer window-days. Falls back to
+    ``_MONETIZATION_DEFAULT_WINDOW_DAYS`` for any value that isn't in
+    the allowlist (missing / non-numeric / out-of-range / negative
+    / zero / leading-plus / trailing-whitespace), so a malformed
+    user-edited URL never 500s the page — it just renders the
+    default window.
+    """
+    if raw is None:
+        return _MONETIZATION_DEFAULT_WINDOW_DAYS
+    try:
+        parsed = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return _MONETIZATION_DEFAULT_WINDOW_DAYS
+    if parsed not in _MONETIZATION_WINDOW_OPTIONS:
+        return _MONETIZATION_DEFAULT_WINDOW_DAYS
+    return parsed
+
 
 def _empty_monetization_summary(
     *, window_days: int, markup: float = 0.0,
@@ -700,13 +733,28 @@ def _empty_monetization_summary(
     — Devin Review caught a similar mismatch on PR #54 where the
     template wanted ``user_count`` but the real DB returned
     ``users_total``, which 500'd every dashboard load.
+
+    Stage-15-Step-E #9 follow-up #1 bundled bug fix: the
+    ``gross_margin_pct`` field is now derived from ``markup`` rather
+    than hardcoded to 0.0. Pre-fix, when a DB query failed (or the
+    page was hit in dev-mode without a DB), the template's pricing
+    tile rendered "Current markup multiplier: 2.0000× (gross margin
+    pinned at 0.00% of every charged dollar)" — wildly misleading,
+    because the gross margin percentage is purely a function of the
+    markup (`(markup - 1) / markup * 100`) and doesn't need any
+    transactional data. The DB-error path now matches the
+    happy-path math.
     """
+    if markup > 1.0:
+        derived_pct = (markup - 1.0) / markup * 100.0
+    else:
+        derived_pct = 0.0
     zero_block = {
         "revenue_usd": 0.0,
         "charged_usd": 0.0,
         "openrouter_cost_usd": 0.0,
         "gross_margin_usd": 0.0,
-        "gross_margin_pct": 0.0,
+        "gross_margin_pct": derived_pct,
         "net_profit_usd": 0.0,
     }
     return {
@@ -734,6 +782,13 @@ async def monetization(request: web.Request) -> web.StreamResponse:
     summary: dict
     db_error: str | None = None
 
+    # Stage-15-Step-E #9 follow-up #1: window selector. Parse the
+    # ``?window=`` query param against the fixed allowlist (7 / 30 /
+    # 90); anything else falls back to 30. The selected value is also
+    # threaded into the template so the segmented control can render
+    # the active state.
+    window_days = _parse_monetization_window(request.query.get("window"))
+
     # Read the markup once for the empty-fallback path so the page
     # still shows the operator their current pricing config even
     # when the DB is out. Cheap and stable.
@@ -746,20 +801,20 @@ async def monetization(request: web.Request) -> web.StreamResponse:
 
     if db is None:
         summary = _empty_monetization_summary(
-            window_days=_MONETIZATION_DEFAULT_WINDOW_DAYS,
+            window_days=window_days,
             markup=markup_for_fallback,
         )
         db_error = "No database wired up (development mode)."
     else:
         try:
             summary = await db.get_monetization_summary(
-                window_days=_MONETIZATION_DEFAULT_WINDOW_DAYS,
+                window_days=window_days,
                 top_models_limit=_MONETIZATION_TOP_MODELS_LIMIT,
             )
         except Exception:
             log.exception("monetization: get_monetization_summary failed")
             summary = _empty_monetization_summary(
-                window_days=_MONETIZATION_DEFAULT_WINDOW_DAYS,
+                window_days=window_days,
                 markup=markup_for_fallback,
             )
             db_error = "Database query failed — see logs."
@@ -771,6 +826,8 @@ async def monetization(request: web.Request) -> web.StreamResponse:
             "summary": summary,
             "db_error": db_error,
             "active_page": "monetization",
+            "window_options": _MONETIZATION_WINDOW_OPTIONS,
+            "active_window": window_days,
         },
     )
 

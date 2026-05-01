@@ -1898,6 +1898,252 @@ async def test_monetization_empty_by_model_table_renders_placeholder(
 
 
 # ---------------------------------------------------------------------
+# Stage-15-Step-E #9 follow-up #1: window selector
+# ---------------------------------------------------------------------
+
+
+import pytest as _pytest_for_window  # noqa: E402  (test-suite local alias)
+from web_admin import (  # noqa: E402
+    _MONETIZATION_DEFAULT_WINDOW_DAYS,
+    _MONETIZATION_WINDOW_OPTIONS,
+    _empty_monetization_summary,
+    _parse_monetization_window,
+)
+
+
+@_pytest_for_window.mark.parametrize(
+    "raw,expected",
+    [
+        # Allowlist hits.
+        ("7", 7),
+        ("30", 30),
+        ("90", 90),
+        # Padding / leading-plus tolerated by ``int()`` after .strip().
+        (" 30 ", 30),
+        ("+30", 30),
+        # Allowlist misses → fall back to default.
+        ("14", _MONETIZATION_DEFAULT_WINDOW_DAYS),
+        ("365", _MONETIZATION_DEFAULT_WINDOW_DAYS),
+        ("0", _MONETIZATION_DEFAULT_WINDOW_DAYS),
+        ("-7", _MONETIZATION_DEFAULT_WINDOW_DAYS),
+        # Non-numeric / malformed → fall back to default.
+        ("abc", _MONETIZATION_DEFAULT_WINDOW_DAYS),
+        ("", _MONETIZATION_DEFAULT_WINDOW_DAYS),
+        ("7d", _MONETIZATION_DEFAULT_WINDOW_DAYS),
+        ("7.0", _MONETIZATION_DEFAULT_WINDOW_DAYS),
+        # Missing entirely → default.
+        (None, _MONETIZATION_DEFAULT_WINDOW_DAYS),
+    ],
+)
+def test_parse_monetization_window_allowlist(raw, expected):
+    """The query-param parser accepts only the fixed allowlist
+    (7 / 30 / 90); anything else falls back to the default."""
+    assert _parse_monetization_window(raw) == expected
+
+
+def test_parse_monetization_window_options_constant():
+    """Pin the allowlist tuple so a future regression that drops one
+    of the conventional windows is caught at test time. The template
+    iterates this tuple directly to render the segmented control."""
+    assert _MONETIZATION_WINDOW_OPTIONS == (7, 30, 90)
+    assert _MONETIZATION_DEFAULT_WINDOW_DAYS in _MONETIZATION_WINDOW_OPTIONS
+
+
+@_pytest_for_window.mark.parametrize("markup,expected_pct", [
+    (1.0, 0.0),
+    (0.0, 0.0),
+    (2.0, 50.0),
+    (1.5, (1.5 - 1.0) / 1.5 * 100.0),
+    (4.0, 75.0),
+])
+def test_empty_monetization_summary_derives_gross_margin_pct(
+    markup, expected_pct
+):
+    """Bundled bug fix: the empty-fallback shape now derives
+    ``gross_margin_pct`` from the markup rather than hardcoding 0.0,
+    so the dev-mode / DB-error paths no longer mis-render the
+    pricing tile (e.g. "markup 2× / margin 0%")."""
+    summary = _empty_monetization_summary(window_days=30, markup=markup)
+    assert summary["lifetime"]["gross_margin_pct"] == _pytest_for_window.approx(
+        expected_pct
+    )
+    assert summary["window"]["gross_margin_pct"] == _pytest_for_window.approx(
+        expected_pct
+    )
+
+
+async def test_monetization_route_default_window_when_no_query_param(
+    aiohttp_client, make_admin_app
+):
+    """No ``?window=`` query → 30-day window passed to the DB call."""
+    summary = {
+        "markup": 2.0,
+        "lifetime": {
+            "revenue_usd": 0.0, "charged_usd": 0.0,
+            "openrouter_cost_usd": 0.0, "gross_margin_usd": 0.0,
+            "gross_margin_pct": 50.0, "net_profit_usd": 0.0,
+        },
+        "window": {
+            "days": 30,
+            "revenue_usd": 0.0, "charged_usd": 0.0,
+            "openrouter_cost_usd": 0.0, "gross_margin_usd": 0.0,
+            "gross_margin_pct": 50.0, "net_profit_usd": 0.0,
+        },
+        "by_model": [],
+    }
+    db = _stub_db_with_monetization(summary)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization")
+    assert resp.status == 200, await resp.text()
+    db.get_monetization_summary.assert_awaited_once()
+    kwargs = db.get_monetization_summary.await_args.kwargs
+    assert kwargs["window_days"] == 30
+
+
+@_pytest_for_window.mark.parametrize("requested", [7, 30, 90])
+async def test_monetization_route_honors_allowlisted_window_query(
+    aiohttp_client, make_admin_app, requested
+):
+    """A valid ``?window=N`` (where N ∈ {7, 30, 90}) flows into the
+    DB call and the rendered page heading."""
+    summary = {
+        "markup": 2.0,
+        "lifetime": {
+            "revenue_usd": 0.0, "charged_usd": 0.0,
+            "openrouter_cost_usd": 0.0, "gross_margin_usd": 0.0,
+            "gross_margin_pct": 50.0, "net_profit_usd": 0.0,
+        },
+        "window": {
+            "days": requested,
+            "revenue_usd": 0.0, "charged_usd": 0.0,
+            "openrouter_cost_usd": 0.0, "gross_margin_usd": 0.0,
+            "gross_margin_pct": 50.0, "net_profit_usd": 0.0,
+        },
+        "by_model": [],
+    }
+    db = _stub_db_with_monetization(summary)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get(f"/admin/monetization?window={requested}")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    db.get_monetization_summary.assert_awaited_once()
+    kwargs = db.get_monetization_summary.await_args.kwargs
+    assert kwargs["window_days"] == requested
+    # Heading reflects the active window.
+    assert f"Last {requested} days" in body
+
+
+async def test_monetization_route_falls_back_on_invalid_window_query(
+    aiohttp_client, make_admin_app
+):
+    """An out-of-allowlist or malformed ``?window=`` value silently
+    falls back to the 30-day default — never 500s."""
+    summary = {
+        "markup": 2.0,
+        "lifetime": {
+            "revenue_usd": 0.0, "charged_usd": 0.0,
+            "openrouter_cost_usd": 0.0, "gross_margin_usd": 0.0,
+            "gross_margin_pct": 50.0, "net_profit_usd": 0.0,
+        },
+        "window": {
+            "days": 30,
+            "revenue_usd": 0.0, "charged_usd": 0.0,
+            "openrouter_cost_usd": 0.0, "gross_margin_usd": 0.0,
+            "gross_margin_pct": 50.0, "net_profit_usd": 0.0,
+        },
+        "by_model": [],
+    }
+    db = _stub_db_with_monetization(summary)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    for bogus in ("365", "abc", "0", "-7", "14"):
+        db.get_monetization_summary.reset_mock()
+        resp = await client.get(f"/admin/monetization?window={bogus}")
+        assert resp.status == 200, await resp.text()
+        kwargs = db.get_monetization_summary.await_args.kwargs
+        assert kwargs["window_days"] == 30, (
+            f"window={bogus!r} should fall back to 30; got {kwargs}"
+        )
+
+
+async def test_monetization_route_renders_window_selector(
+    aiohttp_client, make_admin_app
+):
+    """The page renders a segmented selector with all three options;
+    the active one is a non-link span (so the operator can't click
+    the current view) and the inactive ones are anchors with the
+    correct ``?window=`` href."""
+    summary = {
+        "markup": 2.0,
+        "lifetime": {
+            "revenue_usd": 0.0, "charged_usd": 0.0,
+            "openrouter_cost_usd": 0.0, "gross_margin_usd": 0.0,
+            "gross_margin_pct": 50.0, "net_profit_usd": 0.0,
+        },
+        "window": {
+            "days": 7,
+            "revenue_usd": 0.0, "charged_usd": 0.0,
+            "openrouter_cost_usd": 0.0, "gross_margin_usd": 0.0,
+            "gross_margin_pct": 50.0, "net_profit_usd": 0.0,
+        },
+        "by_model": [],
+    }
+    db = _stub_db_with_monetization(summary)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization?window=7")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    # All three pills appear.
+    assert ">7d<" in body
+    assert ">30d<" in body
+    assert ">90d<" in body
+    # Active pill (7d) is a span, NOT an anchor.
+    assert 'class="window-selector-active"' in body
+    # Inactive pills are anchors with the correct target.
+    assert 'href="?window=30"' in body
+    assert 'href="?window=90"' in body
+
+
+async def test_monetization_db_error_path_renders_correct_margin_pct(
+    aiohttp_client, make_admin_app
+):
+    """Bundled bug fix regression test: when the DB query fails and
+    we fall back to ``_empty_monetization_summary``, the pricing tile
+    must still render the markup-derived gross-margin percentage.
+    Pre-fix it rendered "0.00% of every charged dollar" regardless
+    of markup."""
+    db = _stub_db_with_monetization(RuntimeError("boom"))
+    # Pin the markup so the test is independent of env config.
+    with _pytest_for_window.MonkeyPatch.context() as mp:
+        mp.setattr("pricing.get_markup", lambda: 2.0)
+        client = await aiohttp_client(
+            make_admin_app(password="letmein", db=db)
+        )
+        await client.post(
+            "/admin/login",
+            data={"password": "letmein"},
+            allow_redirects=False,
+        )
+        resp = await client.get("/admin/monetization")
+        assert resp.status == 200, await resp.text()
+        body = await resp.text()
+    assert "Database query failed" in body
+    # markup=2.0 → gross_margin_pct=50%.
+    assert "50.00%" in body
+
+
+# ---------------------------------------------------------------------
 # Stage-8-Part-2: promo codes UI
 # ---------------------------------------------------------------------
 
