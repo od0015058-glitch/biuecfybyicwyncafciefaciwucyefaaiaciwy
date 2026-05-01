@@ -118,7 +118,7 @@ def format_history_as_text(
     original_count = len(rendered)
     handle_line = f" for @{user_handle}" if user_handle else ""
 
-    def _build(dropped: int) -> str:
+    def _build(rendered_list: list[str], dropped: int) -> str:
         kept = original_count - dropped
         header = [
             f"Conversation history{handle_line}",
@@ -129,9 +129,9 @@ def format_history_as_text(
             "—" * 40,
             "",
         ]
-        return "\n".join(header) + "\n" + "\n".join(rendered)
+        return "\n".join(header) + "\n" + "\n".join(rendered_list)
 
-    text = _build(0)
+    text = _build(rendered, 0)
     if len(text.encode("utf-8")) <= EXPORT_MAX_BYTES:
         return text, original_count
 
@@ -139,11 +139,46 @@ def format_history_as_text(
     # body fits. The header always reflects the *kept* count plus
     # the explicit "(trimmed N oldest)" suffix so the user can
     # see exactly how much was dropped.
+    #
+    # Stage-15-Step-E #1 follow-up bundled bug fix: pre-fix this
+    # loop re-rendered + re-encoded the *entire* buffer on every
+    # iteration, which is O(n²) on the kept-rows count. A user
+    # with a 5 MB buffer triggering trim would burn ~12 MB of
+    # repeated UTF-8 encoding work per dropped message — for the
+    # ~4 MB they had to drop, that's ~50 MB of useless encoding.
+    # Post-fix we pre-compute each message's encoded byte size
+    # *once* and run a single forward pass dropping from the
+    # front while the running sum + the (worst-case) header is
+    # still over budget. O(n) bytes processed instead of O(n²).
+    # Header size grows imperceptibly with ``dropped`` (digits),
+    # so we approximate the header overhead with the largest
+    # plausible header (1 MB / 9-digit drop count is fine) and
+    # subtract that from the body budget.
+    encoded_sizes = [
+        len(piece.encode("utf-8")) + 1  # +1 for the joining "\n"
+        for piece in rendered
+    ]
+    # Maximum header size for any (dropped, kept) pair we'll
+    # produce — re-rendering with the largest plausible drop
+    # count (== ``original_count``) gives us a safe upper bound.
+    # The ``+1`` accounts for the trailing "\n" between header
+    # and body.
+    max_header_bytes = (
+        len(_build([], original_count).encode("utf-8")) + 1
+    )
+    body_budget = EXPORT_MAX_BYTES - max_header_bytes
+    if body_budget < 0:
+        body_budget = 0
+
     dropped = 0
-    while rendered and len(text.encode("utf-8")) > EXPORT_MAX_BYTES:
+    body_total = sum(encoded_sizes)
+    while encoded_sizes and body_total > body_budget:
+        body_total -= encoded_sizes[0]
+        encoded_sizes.pop(0)
         rendered.pop(0)
         dropped += 1
-        text = _build(dropped)
+
+    text = _build(rendered, dropped)
     return text, original_count - dropped
 
 

@@ -768,6 +768,42 @@ async def memory_reset_handler(callback: CallbackQuery, state: FSMContext):
     await _render_memory_screen(callback, lang)
 
 
+async def _build_history_export_document(
+    user_id: int, username: str | None
+) -> tuple[BufferedInputFile, int] | None:
+    """Pull + render the user's full conversation buffer.
+
+    Returns ``(document, kept_count)`` ready for ``answer_document``,
+    or ``None`` when the buffer is empty (caller decides how to
+    communicate the empty case — toast for the callback path,
+    chat bubble for the slash-command path).
+
+    ``kept_count`` is the count that actually landed in the file —
+    ``format_history_as_text`` may have trimmed the oldest
+    messages to stay under ``EXPORT_MAX_BYTES`` (1 MB). The
+    caller surfaces this count in the caption + toast so a heavy
+    user whose buffer just got rewritten doesn't see
+    "Conversation history (1500 messages)" while the .txt
+    actually only contains the most recent ~500.
+
+    Shared between :func:`memory_export_handler` (the wallet-menu
+    callback) and :func:`cmd_history` (the slash-command alias)
+    so the two surfaces can never drift on filename / encoding /
+    trim semantics. Stage-15-Step-E #1 follow-up.
+    """
+    rows = await db.get_full_conversation(user_id)
+    if not rows:
+        return None
+    rendered, kept = format_history_as_text(
+        rows, user_handle=username
+    )
+    document = BufferedInputFile(
+        rendered.encode("utf-8"),
+        filename=export_filename_for(user_id),
+    )
+    return document, kept
+
+
 @router.callback_query(F.data == "mem_export")
 async def memory_export_handler(callback: CallbackQuery, state: FSMContext):
     """Stage-15-Step-E #1 (started, not finished): export the
@@ -783,41 +819,83 @@ async def memory_export_handler(callback: CallbackQuery, state: FSMContext):
     message rather than an empty file.
 
     Future work tracked in ``conversation_export.py``'s module
-    docstring: ``.pdf`` export, ``/history`` command alias, paginated
-    multi-file export for very long buffers, rate limiting.
+    docstring: ``.pdf`` export, paginated multi-file export for
+    very long buffers (the ``/history`` command alias is shipped
+    in :func:`cmd_history`).
     """
     await state.clear()
     lang = await _get_user_language(callback.from_user.id)
-    rows = await db.get_full_conversation(callback.from_user.id)
-    if not rows:
+    result = await _build_history_export_document(
+        callback.from_user.id, callback.from_user.username
+    )
+    if result is None:
         await callback.answer(
             t(lang, "memory_export_empty"), show_alert=True
         )
         return
-    rendered, kept = format_history_as_text(
-        rows, user_handle=callback.from_user.username
-    )
-    document = BufferedInputFile(
-        rendered.encode("utf-8"),
-        filename=export_filename_for(callback.from_user.id),
-    )
+    document, kept = result
     # ``answer_document`` lives on Message, not on CallbackQuery —
     # send it via the bot itself so we can target the chat
     # without disturbing the memory-screen message above it.
-    #
-    # ``kept`` is the count that actually landed in the file —
-    # ``format_history_as_text`` may have trimmed the oldest
-    # messages to stay under ``EXPORT_MAX_BYTES`` (1 MB). Pre-fix
-    # the caption + toast both said ``len(rows)`` (the untrimmed
-    # input count), so a heavy user whose buffer was just trimmed
-    # would see "Conversation history (1500 messages)" while the
-    # .txt itself only contained the most recent ~500. Use
-    # ``kept`` so the user-facing count matches reality.
     await callback.message.answer_document(
         document,
         caption=t(lang, "memory_export_caption", count=kept),
     )
     await callback.answer(t(lang, "memory_export_done", count=kept))
+
+
+@router.message(Command("history"))
+async def cmd_history(message: Message, state: FSMContext):
+    """Slash-command alias for the wallet-menu's "Export history"
+    button.
+
+    Re-uses :func:`_build_history_export_document` so the slash
+    surface and the menu-button surface ship identical files —
+    same filename pattern, same trim semantics, same caption
+    count.
+
+    Rate-limited via :func:`consume_chat_token`. The wallet-menu
+    callback path is fine without rate-limiting (Telegram itself
+    debounces callback queries), but a typed slash command can be
+    fired repeatedly to thrash :meth:`Database.get_full_conversation`,
+    which does a full unbounded table scan against the
+    ``conversation_messages`` index. Sharing the chat-token
+    bucket means a user who's already exhausted their AI-prompt
+    budget can't pivot to spamming exports — same throttle, same
+    forgiveness window.
+
+    Same defensive ``from_user is None`` / FSM-clear shape as
+    :func:`cmd_start` / :func:`cmd_redeem` / :func:`cmd_stats`.
+    Empty-buffer case lands as a fresh chat bubble (the toast
+    alert pattern from the callback path needs a callback query
+    to attach to, which we don't have here).
+    """
+    await state.clear()
+    if message.from_user is None:
+        # Anonymous group admin / channel-bot edge case — same
+        # guard as cmd_start / cmd_redeem / cmd_stats.
+        return
+    user_id = message.from_user.id
+    lang = await _get_user_language(user_id)
+    if not await consume_chat_token(user_id):
+        # Same flash key the AI-chat path uses on throttle so the
+        # user gets a consistent "slow down" UX across surfaces.
+        log.info(
+            "history rate-limited telegram_id=%s", user_id,
+        )
+        await message.answer(t(lang, "ai_local_rate_limited"))
+        return
+    result = await _build_history_export_document(
+        user_id, message.from_user.username
+    )
+    if result is None:
+        await message.answer(t(lang, "memory_export_empty"))
+        return
+    document, kept = result
+    await message.answer_document(
+        document,
+        caption=t(lang, "memory_export_caption", count=kept),
+    )
 
 
 @router.callback_query(F.data.startswith("set_lang_"))
