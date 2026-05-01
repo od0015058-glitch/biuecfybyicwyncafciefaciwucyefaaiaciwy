@@ -62,6 +62,7 @@ import io
 import logging
 import os
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -132,6 +133,13 @@ APP_KEY_BROADCAST_JOBS: web.AppKey = web.AppKey(
 # cancel in-flight jobs during a clean app shutdown.
 APP_KEY_BROADCAST_TASKS: web.AppKey = web.AppKey(
     "admin_broadcast_tasks", dict
+)
+# Stage-15-Step-F: tests inject a no-op kill function here so
+# ``control_force_stop_post`` doesn't actually murder the test
+# process. Production never sets this — ``bot_health.request_force_stop``
+# defaults to ``os.kill`` against the current PID.
+APP_KEY_FORCE_STOP_FN: web.AppKey = web.AppKey(
+    "admin_force_stop_fn", object
 )
 
 # Per-request flag set by the auth middleware. ``request[]`` doesn't
@@ -241,6 +249,17 @@ def verify_cookie(
 TOTP_VALID_WINDOW = 1
 
 
+# Persian (U+06F0..U+06F9) and Arabic-Indic (U+0660..U+0669) digit
+# ranges, mapped to ASCII ``0``-``9``. Used by ``verify_totp_code``
+# to transparently accept TOTP codes pasted from a Persian / Arabic
+# locale clipboard. Built once at import time so each verify call
+# is a single ``str.translate`` walk.
+_FARSI_ARABIC_DIGIT_TRANSLATION = str.maketrans(
+    "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+    "01234567890123456789",
+)
+
+
 def _normalize_totp_secret(secret: str) -> str:
     """Return *secret* uppercased + de-spaced (authenticator-app friendly).
 
@@ -293,11 +312,32 @@ def verify_totp_code(secret: str, submitted: str) -> bool:
     (whitespace stripped, but case preserved — TOTP codes are
     digits only) before dispatch so a stray space copied with the
     code still verifies.
+
+    Stage-15-Step-F bundled bug fix: non-ASCII digit characters
+    (Persian ``۰۱۲۳۴۵۶۷۸۹`` U+06F0–U+06F9, Arabic-Indic ``٠١٢٣٤٥٦٧٨٩``
+    U+0660–U+0669, full-width digits, etc.) used to be accepted by
+    ``str.isdigit()`` but rejected by ``pyotp.TOTP.verify`` — so a
+    Persian admin pasting their authenticator code from a Persian-
+    locale clipboard saw a confusing "Invalid 2FA code" error
+    rather than logging in. This is the bot's primary user base.
+    The fix is two-step: (1) translate Persian / Arabic-Indic
+    digits to ASCII before validation so the verify path
+    transparently accepts what the operator typed, and (2) tighten
+    the format check to ``isascii() and isdigit()`` so any
+    *remaining* non-ASCII digit class (full-width, mathematical,
+    Bengali, …) fails with a fast ``False`` rather than reaching
+    pyotp and raising into the broad-except.
     """
     if not secret or not submitted:
         return False
     cleaned = "".join(submitted.split())
-    if not cleaned.isdigit() or len(cleaned) != 6:
+
+    # Persian (U+06F0..U+06F9) and Arabic-Indic (U+0660..U+0669)
+    # digit ranges. ``str.translate`` is a one-shot O(n) walk; the
+    # table is built once at module import and reused every call.
+    cleaned = cleaned.translate(_FARSI_ARABIC_DIGIT_TRANSLATION)
+
+    if not (cleaned.isascii() and cleaned.isdigit() and len(cleaned) == 6):
         return False
     try:
         return bool(
@@ -4788,6 +4828,572 @@ async def gateways_enable_post(request: web.Request) -> web.StreamResponse:
 
 
 # ---------------------------------------------------------------------
+# Bot health & emergency control (Stage-15-Step-F)
+# ---------------------------------------------------------------------
+#
+# Renders a single-page operator panel at ``/admin/control``:
+#   * traffic-light status tile (idle / healthy / busy / degraded /
+#     under-attack / down) computed by ``bot_health.compute_bot_status``
+#   * live signals: in-flight chat slots, IPN drop totals,
+#     login-throttle bucket count, disabled-models / disabled-gateways
+#     counts, background loop heartbeats, process uptime + PID
+#   * master kill-switches for every AI model and every payment
+#     gateway (one click → write every key into the disabled tables)
+#   * force-stop button: sends ``SIGTERM`` to the running PID via
+#     ``bot_health.request_force_stop``. The operator's process
+#     supervisor (systemd / docker / pm2) is expected to restart the
+#     bot — this is the "kill it before it bleeds out" button, not a
+#     graceful pause. For pause-only, use the kill-switches instead.
+#
+# Every POST handler is CSRF-protected via ``verify_csrf_token`` and
+# audit-logged via ``_record_audit_safe`` so the operator can review
+# emergency actions after the fact.
+
+# Process boot timestamp — read once at module import so the
+# uptime gauge in the control panel is monotonic. Using ``time.time()``
+# (wall clock) rather than ``time.monotonic()`` because we render the
+# value as "since process start" in the operator's local time, not
+# as a stopwatch.
+_BOT_PROCESS_START_EPOCH: float = time.time()
+
+
+# Every gateway key the bot recognises. The crypto tickers come from
+# ``handlers.SUPPORTED_PAY_CURRENCIES``; the card gateways are the
+# Rial-side ones the bot ships. Imported lazily inside the helper so
+# this module's import surface stays small (and so a future
+# ``handlers.py`` edit doesn't fight an import cycle).
+_KNOWN_CARD_GATEWAY_KEYS: tuple[str, ...] = ("tetrapay", "zarinpal")
+
+
+def _all_gateway_keys() -> list[str]:
+    """Return every gateway key the bot recognises (card + crypto).
+
+    Order is stable across calls so the audit-log meta payload is
+    diff-friendly when the operator hits "disable all" twice.
+    """
+    keys: list[str] = list(_KNOWN_CARD_GATEWAY_KEYS)
+    try:
+        from handlers import SUPPORTED_PAY_CURRENCIES
+
+        keys.extend(ticker for _, ticker in SUPPORTED_PAY_CURRENCIES)
+    except Exception:
+        # Degrade rather than crash the panel if ``handlers.py`` is
+        # half-imported under tests — the card gateway list is still
+        # actionable on its own.
+        log.exception("control: failed to import SUPPORTED_PAY_CURRENCIES")
+    return keys
+
+
+def _all_model_ids() -> list[str]:
+    """Return every model id the in-memory OpenRouter catalog exposes.
+
+    Reads ``models_catalog._catalog`` directly — the same warm cache
+    the picker, pricing, and discovery loops use. Falls back to the
+    empty list if the catalog hasn't loaded yet (cold-start window
+    or test wiring without a refresh) — disabling zero models is a
+    no-op so that's fine.
+    """
+    try:
+        import models_catalog
+
+        catalog = models_catalog._catalog
+    except Exception:
+        log.exception("control: failed to read models catalog")
+        return []
+    if catalog is None or not catalog.models:
+        return []
+    return sorted({m.id for m in catalog.models})
+
+
+def _collect_control_signals(
+    *, app: web.Application, db_error: str | None,
+) -> dict:
+    """Snapshot every numeric signal the control panel renders.
+
+    Pure-ish — reads in-process counters and the OpenRouter catalog;
+    no DB calls. Each accessor is wrapped in its own ``try`` so a
+    regression in one source doesn't blank the rest of the panel.
+    """
+    # In-flight chat slots.
+    try:
+        from rate_limit import chat_inflight_count, login_throttle_active_count
+
+        inflight_count = chat_inflight_count()
+        login_keys = login_throttle_active_count(app)
+    except Exception:
+        log.exception("control: rate_limit accessor failed")
+        inflight_count = 0
+        login_keys = 0
+
+    # IPN drop totals (NowPayments + TetraPay + Zarinpal). Reuses
+    # the dashboard's collector so the totals match the dashboard
+    # "IPN health" tile.
+    ipn_health = _collect_ipn_health()
+    ipn_drops_total = (
+        int(ipn_health.get("nowpayments_total", 0))
+        + int(ipn_health.get("tetrapay_total", 0))
+        + int(ipn_health.get("zarinpal_total", 0))
+    )
+
+    # Disabled-{models,gateways} counts.
+    try:
+        from admin_toggles import (
+            get_disabled_gateways,
+            get_disabled_models,
+        )
+
+        disabled_models_count = len(get_disabled_models())
+        disabled_gateways_count = len(get_disabled_gateways())
+    except Exception:
+        log.exception("control: admin_toggles accessor failed")
+        disabled_models_count = 0
+        disabled_gateways_count = 0
+
+    # Background-loop heartbeats.
+    try:
+        from metrics import _LOOP_METRIC_NAMES, get_loop_last_tick
+    except Exception:
+        log.exception("control: metrics accessor failed")
+        loop_names: tuple[str, ...] = ()
+        get_last = lambda _name: None  # noqa: E731
+    else:
+        loop_names = _LOOP_METRIC_NAMES
+        get_last = get_loop_last_tick
+
+    now = time.time()
+    loops: list[dict] = []
+    loop_ticks_for_classifier: dict[str, float] = {}
+    for name in loop_names:
+        last = get_last(name)
+        if last is None or last == 0.0:
+            loops.append({"name": name, "last_tick_age_s": None})
+            continue
+        age = max(0, int(now - float(last)))
+        loops.append({"name": name, "last_tick_age_s": age})
+        loop_ticks_for_classifier[name] = float(last)
+
+    # Total catalog sizes for the kill-switch summary.
+    total_models = len(_all_model_ids())
+    total_gateways = len(_all_gateway_keys())
+
+    return {
+        "inflight_count": int(inflight_count),
+        "ipn_drops_total": int(ipn_drops_total),
+        "login_throttle_active_keys": int(login_keys),
+        "disabled_models_count": int(disabled_models_count),
+        "disabled_gateways_count": int(disabled_gateways_count),
+        "total_models_count": int(total_models),
+        "total_gateways_count": int(total_gateways),
+        "loops": loops,
+        "loop_ticks_for_classifier": loop_ticks_for_classifier,
+        "loop_names_for_classifier": tuple(loop_names),
+        "uptime_seconds": max(0, int(now - _BOT_PROCESS_START_EPOCH)),
+        "pid": os.getpid(),
+    }
+
+
+async def control_get(request: web.Request) -> web.StreamResponse:
+    """``GET /admin/control`` — render the bot-health + emergency panel."""
+    db = request.app.get(APP_KEY_DB)
+    db_error: str | None = None
+    if db is None:
+        db_error = "No database wired up (development mode)."
+    else:
+        # Cheap probe — same shape as the dashboard's read so the
+        # panel surfaces the *same* DB-error condition the operator
+        # sees on the home tile. ``get_system_metrics`` is the
+        # cheapest representative call; we only care about whether
+        # the pool is alive.
+        try:
+            from pending_alert import get_pending_alert_threshold_hours
+            await db.get_system_metrics(
+                pending_alert_threshold_hours=(
+                    get_pending_alert_threshold_hours()
+                ),
+            )
+        except Exception:
+            log.exception("control: db probe failed")
+            db_error = "Database query failed — see logs."
+
+    signals = _collect_control_signals(app=request.app, db_error=db_error)
+
+    from bot_health import compute_bot_status
+
+    status = compute_bot_status(
+        inflight_count=signals["inflight_count"],
+        ipn_drops_total=signals["ipn_drops_total"],
+        loop_ticks=signals["loop_ticks_for_classifier"],
+        expected_loops=signals["loop_names_for_classifier"],
+        db_error=db_error,
+        login_throttle_active_keys=signals["login_throttle_active_keys"],
+    )
+
+    ctx = {
+        "active_page": "control",
+        "csrf_token": csrf_token_for(request),
+        "flash": None,
+        "status": status,
+        "signals": signals,
+    }
+    response = aiohttp_jinja2.render_template("control.html", request, ctx)
+    flash = pop_flash(request, response)
+    if flash is not None:
+        ctx["flash"] = flash
+        response = aiohttp_jinja2.render_template("control.html", request, ctx)
+    return response
+
+
+def _control_csrf_guard(
+    request: web.Request, form, *, redirect_to: str = "/admin/control",
+) -> web.StreamResponse | None:
+    """Verify the CSRF token; return a redirect-with-flash on failure.
+
+    Returns ``None`` on success so the caller can ``if guard:`` test.
+    """
+    if verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        return None
+    log.warning(
+        "control: CSRF token mismatch from %s (path=%s)",
+        request.remote, request.path,
+    )
+    response = web.HTTPFound(location=redirect_to)
+    set_flash(
+        response, kind="error",
+        message="Form submission was rejected (CSRF). Refresh and try again.",
+        secret=request.app.get(APP_KEY_SESSION_SECRET, ""),
+        cookie_secure=request.app.get(APP_KEY_COOKIE_SECURE, True),
+    )
+    return response
+
+
+async def control_disable_all_models_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/control/disable-all-models`` — master kill-switch."""
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app[APP_KEY_DB]
+    form = await request.post()
+
+    guard = _control_csrf_guard(request, form)
+    if guard is not None:
+        return guard
+
+    from admin_toggles import refresh_disabled_models
+
+    model_ids = _all_model_ids()
+    newly_disabled = 0
+    failed = 0
+    for model_id in model_ids:
+        try:
+            if await db.disable_model(model_id, actor="web:control"):
+                newly_disabled += 1
+        except Exception:
+            log.exception(
+                "control: disable_all_models — disable_model(%r) failed",
+                model_id,
+            )
+            failed += 1
+    await refresh_disabled_models(db)
+    await _record_audit_safe(
+        request, "control_disable_all_models",
+        meta={
+            "total_models": len(model_ids),
+            "newly_disabled": newly_disabled,
+            "failed": failed,
+        },
+    )
+    response = web.HTTPFound(location="/admin/control")
+    if failed:
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Disabled {newly_disabled} of {len(model_ids)} models — "
+                f"{failed} write(s) failed (see logs)."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    else:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Disabled all {len(model_ids)} model(s). "
+                f"{newly_disabled} newly disabled."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    return response
+
+
+async def control_enable_all_models_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/control/enable-all-models`` — clear the disabled-models table."""
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app[APP_KEY_DB]
+    form = await request.post()
+
+    guard = _control_csrf_guard(request, form)
+    if guard is not None:
+        return guard
+
+    from admin_toggles import refresh_disabled_models
+
+    # Snapshot from the DB (not the in-memory cache) so a freshly-
+    # restarted process that hasn't warmed the cache yet still
+    # re-enables every row. ``get_disabled_models`` returns a set of
+    # model_id strings.
+    try:
+        before = list(await db.get_disabled_models())
+    except Exception:
+        log.exception(
+            "control: enable_all_models — get_disabled_models read failed"
+        )
+        before = []
+    cleared = 0
+    failed = 0
+    for model_id in before:
+        try:
+            if await db.enable_model(model_id):
+                cleared += 1
+        except Exception:
+            log.exception(
+                "control: enable_all_models — enable_model(%r) failed",
+                model_id,
+            )
+            failed += 1
+    await refresh_disabled_models(db)
+    await _record_audit_safe(
+        request, "control_enable_all_models",
+        meta={"cleared": cleared, "failed": failed},
+    )
+    response = web.HTTPFound(location="/admin/control")
+    if failed:
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Re-enabled {cleared} model(s) — {failed} write(s) failed "
+                "(see logs)."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    else:
+        set_flash(
+            response, kind="success",
+            message=f"Re-enabled all {cleared} previously-disabled model(s).",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    return response
+
+
+async def control_disable_all_gateways_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/control/disable-all-gateways`` — master kill-switch."""
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app[APP_KEY_DB]
+    form = await request.post()
+
+    guard = _control_csrf_guard(request, form)
+    if guard is not None:
+        return guard
+
+    from admin_toggles import refresh_disabled_gateways
+
+    gateway_keys = _all_gateway_keys()
+    newly_disabled = 0
+    failed = 0
+    for key in gateway_keys:
+        try:
+            if await db.disable_gateway(key, actor="web:control"):
+                newly_disabled += 1
+        except Exception:
+            log.exception(
+                "control: disable_all_gateways — disable_gateway(%r) failed",
+                key,
+            )
+            failed += 1
+    await refresh_disabled_gateways(db)
+    await _record_audit_safe(
+        request, "control_disable_all_gateways",
+        meta={
+            "total_gateways": len(gateway_keys),
+            "newly_disabled": newly_disabled,
+            "failed": failed,
+        },
+    )
+    response = web.HTTPFound(location="/admin/control")
+    if failed:
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Disabled {newly_disabled} of {len(gateway_keys)} gateways "
+                f"— {failed} write(s) failed (see logs)."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    else:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Disabled all {len(gateway_keys)} payment gateway "
+                f"key(s). {newly_disabled} newly disabled."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    return response
+
+
+async def control_enable_all_gateways_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/control/enable-all-gateways`` — clear the disabled-gateways table."""
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app[APP_KEY_DB]
+    form = await request.post()
+
+    guard = _control_csrf_guard(request, form)
+    if guard is not None:
+        return guard
+
+    from admin_toggles import refresh_disabled_gateways
+
+    # Read from the DB (not the in-memory cache) — see
+    # ``control_enable_all_models_post`` for the rationale.
+    try:
+        before = list(await db.get_disabled_gateways())
+    except Exception:
+        log.exception(
+            "control: enable_all_gateways — get_disabled_gateways read failed"
+        )
+        before = []
+    cleared = 0
+    failed = 0
+    for key in before:
+        try:
+            if await db.enable_gateway(key):
+                cleared += 1
+        except Exception:
+            log.exception(
+                "control: enable_all_gateways — enable_gateway(%r) failed",
+                key,
+            )
+            failed += 1
+    await refresh_disabled_gateways(db)
+    await _record_audit_safe(
+        request, "control_enable_all_gateways",
+        meta={"cleared": cleared, "failed": failed},
+    )
+    response = web.HTTPFound(location="/admin/control")
+    if failed:
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Re-enabled {cleared} gateway(s) — {failed} write(s) "
+                "failed (see logs)."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    else:
+        set_flash(
+            response, kind="success",
+            message=f"Re-enabled all {cleared} previously-disabled gateway(s).",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    return response
+
+
+async def control_force_stop_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/control/force-stop`` — SIGTERM the running bot.
+
+    The handler:
+
+    1. Verifies the CSRF token (else 302 + flash).
+    2. Verifies the ``confirm`` field equals ``FORCE-STOP`` (the
+       template injects this so a stray click on the button without
+       the JS confirm dialog firing still hits a second guard).
+    3. Audit-logs the action *before* signalling — once SIGTERM
+       lands, the asyncio loop unwinds and the audit-write would
+       race the DB pool teardown.
+    4. Sets the flash banner so the next page render (after the
+       supervisor restarts the bot) tells the operator the request
+       was received.
+    5. Calls ``bot_health.request_force_stop`` *after* returning
+       the response, so the browser actually sees a 302 instead of
+       a connection-reset.
+
+    The ``request.app`` may store a test-injected kill function at
+    ``APP_KEY_FORCE_STOP_FN`` — production never sets it, so the
+    primitive defaults to ``os.kill`` against the current PID.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    form = await request.post()
+
+    guard = _control_csrf_guard(request, form)
+    if guard is not None:
+        return guard
+
+    confirm = str(form.get("confirm", "")).strip()
+    if confirm != "FORCE-STOP":
+        log.warning(
+            "control: force-stop POST missing confirm sentinel from %s",
+            request.remote,
+        )
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Force-stop request missing confirmation. The button "
+                "must be submitted from the panel form."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    log.warning(
+        "control: force-stop confirmed from %s — signalling pid=%d",
+        request.remote, os.getpid(),
+    )
+    await _record_audit_safe(
+        request, "control_force_stop",
+        outcome="ok",
+        meta={"pid": os.getpid()},
+    )
+
+    response = web.HTTPFound(location="/admin/control")
+    set_flash(
+        response, kind="success",
+        message=(
+            "Force-stop signal sent. The bot process will exit and "
+            "restart via your supervisor."
+        ),
+        secret=secret, cookie_secure=cookie_secure,
+    )
+
+    # Schedule the kill *after* this handler returns the response so
+    # the browser actually receives the 302. ``call_later(0, …)``
+    # runs on the next event-loop tick; aiohttp is mid-tick right
+    # now finishing the response. Tests inject a no-op kill_fn via
+    # APP_KEY_FORCE_STOP_FN so the test process isn't actually
+    # signalled.
+    from bot_health import request_force_stop
+
+    kill_fn = request.app.get(APP_KEY_FORCE_STOP_FN)
+    loop = asyncio.get_event_loop()
+    loop.call_later(
+        0.05,
+        lambda: request_force_stop(kill_fn=kill_fn),
+    )
+    return response
+
+
+# ---------------------------------------------------------------------
 # App wiring
 # ---------------------------------------------------------------------
 
@@ -5054,6 +5660,29 @@ def setup_admin_routes(
     app.router.add_get("/admin/gateways", _require_auth(gateways_get))
     app.router.add_post("/admin/gateways/disable", _require_auth(gateways_disable_post))
     app.router.add_post("/admin/gateways/enable", _require_auth(gateways_enable_post))
+
+    # Stage-15-Step-F: bot health & emergency control panel.
+    app.router.add_get("/admin/control", _require_auth(control_get))
+    app.router.add_post(
+        "/admin/control/disable-all-models",
+        _require_auth(control_disable_all_models_post),
+    )
+    app.router.add_post(
+        "/admin/control/enable-all-models",
+        _require_auth(control_enable_all_models_post),
+    )
+    app.router.add_post(
+        "/admin/control/disable-all-gateways",
+        _require_auth(control_disable_all_gateways_post),
+    )
+    app.router.add_post(
+        "/admin/control/enable-all-gateways",
+        _require_auth(control_enable_all_gateways_post),
+    )
+    app.router.add_post(
+        "/admin/control/force-stop",
+        _require_auth(control_force_stop_post),
+    )
 
     # Stage-9-Step-10: durable broadcast registry orphan sweep.
     # Any row left in ``queued`` / ``running`` from before the

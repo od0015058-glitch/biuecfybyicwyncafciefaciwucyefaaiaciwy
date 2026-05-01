@@ -972,6 +972,127 @@ Audit findings (2026-04-30) noted by reading every file — kept here so a futur
 
 ---
 
+#### Stage-15-Step-F: Bot health & emergency control panel (queued 2026-05-01)
+
+The user asked for a single page in the web admin showing the bot's
+*current* health classification (idle / under pressure / under attack
+/ down / etc.) plus a force-stop button and master kill-switches —
+"every thing i need to have in my hands for times that is bot is
+crashing or not responding or under attack". Stage-15-Step-F is that
+panel.
+
+What this PR ships (first slice — operator-actionable end-to-end):
+
+* **`bot_health.py`** — pure-function module exposing
+  `BotStatusLevel` (idle / healthy / busy / degraded / under_attack /
+  down), `BotStatus` dataclass, `compute_bot_status(...)` classifier
+  (severity ordering DOWN > UNDER_ATTACK > DEGRADED > BUSY >
+  HEALTHY > IDLE — the highest-severity signal wins so the operator's
+  attention goes to the active threat), `request_force_stop(...)`
+  primitive (defaults to SIGTERM + `os.kill(getpid())`, accepts a
+  `kill_fn` injection for tests). Tunable thresholds via env vars
+  (`BOT_HEALTH_BUSY_INFLIGHT=50`, `BOT_HEALTH_LOOP_STALE_SECONDS=1800`,
+  `BOT_HEALTH_IPN_DROP_ATTACK_THRESHOLD=100`,
+  `BOT_HEALTH_LOGIN_THROTTLE_ATTACK_KEYS=25`) so the operator can tune
+  per-deploy without a code change.
+* **`/admin/control`** — new admin page with the traffic-light
+  status tile, a live-signals table (in-flight chat slots, IPN drops
+  since boot across all gateways, login-throttle active IP count,
+  disabled-models / disabled-gateways counts, background loop
+  heartbeat ages, process uptime + PID), master kill-switches for
+  *all* AI models and *all* payment gateways (one click → one row
+  per id in the disabled tables), and a **force-stop** button that
+  sends SIGTERM to the bot process. Force-stop requires both CSRF
+  + a hidden `confirm=FORCE-STOP` sentinel in the form so a stray
+  click on a forwarded URL can't kill the bot. Every POST is
+  CSRF-protected and audit-logged via `_record_audit_safe`.
+* **`templates/admin/control.html`** + nav-link entry in
+  `_layout.html`. Dark-themed status tile colour-coded by severity
+  (green→amber→red), sectioned panels for the kill-switches and
+  the danger-zone force-stop button (red border + double JS confirm).
+* **`meowassist_bot_status_score` Prometheus gauge** — rendered in
+  `metrics.render_metrics` so existing alerting rules can target
+  `meowassist_bot_status_score >= 4` to page on under-attack / down
+  without parsing the level label. Single source of truth across the
+  dashboard, the admin panel, and Prometheus.
+* **`rate_limit.login_throttle_active_count(app)`** — read-only
+  accessor exposing the number of distinct IPs currently in the
+  per-IP login-throttle bucket cache. A spike here is one of the
+  strongest "under attack" signals because a brute-force login
+  spray rotates through fresh keys (the per-key bucket drains
+  slowly), so the cache size grows linearly with the number of
+  distinct attackers seen this process. Used by both the classifier
+  and the panel's signals table.
+
+Bundled bug fix in this PR (real, found while reading
+`web_admin.verify_totp_code` to understand how the panel's
+auth-aware POSTs would interact with 2FA): **non-ASCII digit
+characters were silently rejected by TOTP verification** even
+though `str.isdigit()` accepted them. The bot's primary user base
+is Persian; an admin pasting their authenticator code from a
+Persian-locale clipboard would type the code in Persian digits
+(`۱۲۳۴۵۶` U+06F0..U+06F9) and see a confusing "Invalid 2FA code"
+error rather than logging in — the format-check accepted Persian
+digits as "isdigit", but `pyotp.TOTP.verify` then rejected the
+non-ASCII string and raised into the broad-except, so the
+operator just saw the generic error path. Fix is two-step:
+(1) translate Persian (U+06F0..U+06F9) and Arabic-Indic
+(U+0660..U+0669) digits to ASCII before validation via a
+module-level `str.maketrans` table — built once at import time so
+each verify call is a single O(n) `str.translate` walk; (2)
+tighten the format check to `isascii() and isdigit() and len == 6`
+so any *remaining* non-ASCII digit class (Bengali, full-width,
+mathematical, …) fails fast with `False` rather than reaching
+pyotp and raising into the broad-except. Four new regression tests
+pin: ASCII-Persian round-trip, Arabic-Indic, mixed-script (a
+half-typed half-pasted code), and the rejection path for Bengali
++ full-width.
+
+What remains for a follow-up PR:
+
+* **Tunable severity thresholds via the admin panel** — currently
+  `BOT_HEALTH_*` are read from env at `compute_bot_status` call-site
+  (so operators must restart to change them). A future slice could
+  surface them as editable fields on `/admin/control` and persist to
+  the DB (`Database.set_setting(key, value)` already exists for
+  similar use-cases in Stage-12).
+* **Attack-pattern analytics** — `/admin/control` shows the *current*
+  classification but not the *history*. A follow-up could add a
+  rolling-window timeline (last 1h / 6h / 24h) of the level changes
+  driven by the existing audit-log table.
+* **Proactive Telegram-DM alerts on degraded/under-attack** — the
+  proactive-DM loop (`pending_alert.py`) already has the plumbing
+  to DM admins on threshold crosses; a tiny extension that DMs
+  on `bot_status_score >= 3` for >5 minutes would close the loop
+  for off-hours operators who don't sit on the panel.
+* **Per-loop "freshness" thresholds** — currently every loop shares
+  the same `BOT_HEALTH_LOOP_STALE_SECONDS=1800` (30 min) threshold,
+  but `model_discovery` ticks every 6h by design while `fx_rates`
+  ticks every 30 min. The single threshold under-flags a stale
+  `fx_rates` and over-flags `model_discovery`. A real fix is a
+  per-loop config dict.
+
+Files in this PR (Stage-15-Step-F):
+
+* `bot_health.py` (new)
+* `web_admin.py` — `_FARSI_ARABIC_DIGIT_TRANSLATION` table +
+  digit-normalisation in `verify_totp_code`; new `APP_KEY_FORCE_STOP_FN`;
+  6 new route handlers + helpers (`_all_gateway_keys`, `_all_model_ids`,
+  `_collect_control_signals`, `_control_csrf_guard`, `control_get`,
+  `control_disable_all_models_post`, `control_enable_all_models_post`,
+  `control_disable_all_gateways_post`, `control_enable_all_gateways_post`,
+  `control_force_stop_post`); 6 new `app.router.add_*` registrations.
+* `metrics.py` — `meowassist_bot_status_score` gauge in `render_metrics`.
+* `rate_limit.py` — `login_throttle_active_count(app)`.
+* `templates/admin/control.html` (new) + nav entry in
+  `templates/admin/_layout.html`.
+* `tests/test_bot_health.py` (new) — 22 tests for the classifier +
+  force-stop primitive + dataclass.
+* `tests/test_web_admin.py` — 4 new TOTP-Persian-digits tests + 11
+  new `/admin/control` route tests.
+
+---
+
 ## 6. The IPN signature bug we were stuck on (kept for context)
 
 ### Symptom (from prod log 2026-04-27 16:12:01 UTC)

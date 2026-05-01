@@ -1,0 +1,280 @@
+{% extends "_layout.html" %}
+
+{% block title %}Bot health & emergency control{% endblock %}
+
+{% block extra_head %}
+<style>
+  .status-tile {
+    border-radius: 8px;
+    padding: 18px;
+    margin-bottom: 18px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+  .status-tile .level {
+    font-size: 24px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+  }
+  .status-tile .summary {
+    font-size: 14px;
+    opacity: 0.9;
+  }
+  .status-tile.idle      { background: #1f2933; color: #b6c2cf; }
+  .status-tile.healthy   { background: #163d24; color: #a6e3a1; }
+  .status-tile.busy      { background: #4a3a16; color: #f9e2af; }
+  .status-tile.degraded  { background: #5a3617; color: #fab387; }
+  .status-tile.under_attack { background: #5d1a1a; color: #f38ba8; }
+  .status-tile.down      { background: #1a1a1a; color: #f38ba8; border: 2px solid #f38ba8; }
+  .status-dot {
+    width: 18px; height: 18px; border-radius: 50%;
+    display: inline-block;
+  }
+  .status-dot.idle      { background: #b6c2cf; }
+  .status-dot.healthy   { background: #a6e3a1; }
+  .status-dot.busy      { background: #f9e2af; }
+  .status-dot.degraded  { background: #fab387; }
+  .status-dot.under_attack { background: #f38ba8; }
+  .status-dot.down      { background: #f38ba8; box-shadow: 0 0 0 2px #f38ba8; }
+  .signals { margin: 12px 0 0; padding-left: 18px; font-size: 13px; }
+  .signal-row { margin: 4px 0; }
+
+  .control-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 18px;
+    margin-bottom: 18px;
+  }
+  .control-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .control-card h3 { margin-top: 0; font-size: 15px; }
+  .control-card p { color: var(--text-muted); font-size: 13px; margin: 8px 0; }
+
+  .danger-zone {
+    border: 2px solid var(--danger);
+    background: rgba(255, 107, 107, 0.05);
+  }
+  .danger-zone h3 { color: var(--danger); }
+
+  .btn-danger {
+    background: var(--danger);
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    padding: 8px 18px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .btn-danger:hover { filter: brightness(1.1); }
+  .btn-warn {
+    background: transparent;
+    color: var(--warn, #f9e2af);
+    border: 1px solid var(--warn, #f9e2af);
+    border-radius: 4px;
+    padding: 6px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .btn-warn:hover { background: rgba(249, 226, 175, 0.1); }
+  .btn-confirm {
+    background: var(--success);
+    color: #111;
+    border: none;
+    border-radius: 4px;
+    padding: 6px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+
+  .signals-table {
+    width: 100%;
+    margin-top: 8px;
+    font-size: 13px;
+  }
+  .signals-table td { padding: 4px 8px; }
+  .signals-table td.label {
+    color: var(--text-muted);
+    width: 220px;
+  }
+  .signals-table td.value {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+</style>
+{% endblock %}
+
+{% block main %}
+<h2>Bot health &amp; emergency control</h2>
+
+{% if flash %}
+<div class="alert alert-{{ flash.kind }}">{{ flash.message }}</div>
+{% endif %}
+
+<div class="status-tile {{ status.level.value }}">
+  <span class="status-dot {{ status.level.value }}"></span>
+  <div>
+    <div class="level">{{ status.level.value.replace('_', ' ') }}</div>
+    <div class="summary">{{ status.summary }}</div>
+    {% if status.signals %}
+    <ul class="signals">
+      {% for s in status.signals %}
+      <li class="signal-row">{{ s }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </div>
+</div>
+
+<div class="panel">
+  <h3>Live signals</h3>
+  <p style="color: var(--text-muted); font-size: 13px; margin: 0 0 8px 0;">
+    Counters are per-process and reset on every restart. For long-term
+    history, scrape <code>/metrics</code> into Prometheus —
+    <code>meowassist_bot_status_score</code> tracks this same
+    classification.
+  </p>
+  <table class="signals-table">
+    <tbody>
+      <tr>
+        <td class="label">In-flight chat slots</td>
+        <td class="value">{{ "{:,}".format(signals.inflight_count) }}</td>
+      </tr>
+      <tr>
+        <td class="label">IPN drops since boot (all gateways)</td>
+        <td class="value">{{ "{:,}".format(signals.ipn_drops_total) }}</td>
+      </tr>
+      <tr>
+        <td class="label">Login-throttle active IPs</td>
+        <td class="value">{{ "{:,}".format(signals.login_throttle_active_keys) }}</td>
+      </tr>
+      <tr>
+        <td class="label">Disabled AI models</td>
+        <td class="value">{{ "{:,}".format(signals.disabled_models_count) }}</td>
+      </tr>
+      <tr>
+        <td class="label">Disabled gateways</td>
+        <td class="value">{{ "{:,}".format(signals.disabled_gateways_count) }}</td>
+      </tr>
+      <tr>
+        <td class="label">Process uptime (seconds)</td>
+        <td class="value">{{ "{:,}".format(signals.uptime_seconds) }}</td>
+      </tr>
+      <tr>
+        <td class="label">Process PID</td>
+        <td class="value">{{ signals.pid }}</td>
+      </tr>
+    </tbody>
+  </table>
+
+  {% if signals.loops %}
+  <h4 style="margin: 18px 0 8px 0; font-size: 13px;">Background loop heartbeats</h4>
+  <table class="signals-table">
+    <thead>
+      <tr>
+        <td class="label">Loop</td>
+        <td class="label">Last tick</td>
+      </tr>
+    </thead>
+    <tbody>
+      {% for loop_row in signals.loops %}
+      <tr>
+        <td class="label">{{ loop_row.name }}</td>
+        <td class="value">
+          {% if loop_row.last_tick_age_s is none %}
+            <span style="color: var(--danger);">never ticked</span>
+          {% else %}
+            {{ loop_row.last_tick_age_s }}s ago
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+
+<div class="control-grid">
+  <div class="control-card">
+    <h3>🤖 AI models — master kill-switch</h3>
+    <p>
+      Disable every model the picker can offer in one click. Users
+      already mid-conversation finish their current turn; new
+      ``/start`` flows that try to pick a model fall through to the
+      "no models available" path. Re-enable wipes the entire
+      <code>disabled_models</code> table.
+    </p>
+    <p style="margin-top: 4px; color: var(--text-muted); font-size: 12px;">
+      Currently disabled: <strong>{{ signals.disabled_models_count }}</strong>
+      of <strong>{{ signals.total_models_count }}</strong> known model(s).
+    </p>
+    <form method="post" action="/admin/control/disable-all-models" style="margin-top: 8px;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="btn-warn"
+              onclick="return confirm('Disable EVERY known AI model? Users will be unable to start new chats until you re-enable.');">
+        Disable all models
+      </button>
+    </form>
+    <form method="post" action="/admin/control/enable-all-models" style="margin-top: 6px;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="btn-confirm">Enable all models</button>
+    </form>
+  </div>
+
+  <div class="control-card">
+    <h3>💳 Payment gateways — master kill-switch</h3>
+    <p>
+      Disable every payment gateway and crypto ticker. Existing
+      pending invoices are unaffected (they finalize via IPN as
+      normal); new top-up attempts hit a "no gateway available" path.
+      Useful when Zarinpal / TetraPay are down or NowPayments IPNs are
+      being forged.
+    </p>
+    <p style="margin-top: 4px; color: var(--text-muted); font-size: 12px;">
+      Currently disabled: <strong>{{ signals.disabled_gateways_count }}</strong>
+      of <strong>{{ signals.total_gateways_count }}</strong> gateway key(s).
+    </p>
+    <form method="post" action="/admin/control/disable-all-gateways" style="margin-top: 8px;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="btn-warn"
+              onclick="return confirm('Disable EVERY payment gateway? New top-ups will fall through to a no-gateway error.');">
+        Disable all gateways
+      </button>
+    </form>
+    <form method="post" action="/admin/control/enable-all-gateways" style="margin-top: 6px;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="btn-confirm">Enable all gateways</button>
+    </form>
+  </div>
+</div>
+
+<div class="control-card danger-zone">
+  <h3>🛑 Force-stop bot</h3>
+  <p>
+    Send <code>SIGTERM</code> to PID <code>{{ signals.pid }}</code>. The
+    bot's asyncio loop will unwind cleanly: cancel background tasks,
+    close the DB pool, close the Telegram session, exit. Your process
+    supervisor (systemd / docker / pm2) will restart the bot
+    automatically — this is your one-click "kill it before it bleeds
+    out" button. Do <strong>not</strong> use this if you only want to
+    pause traffic; use the kill-switches above instead.
+  </p>
+  <p style="margin-top: 4px; color: var(--text-muted); font-size: 12px;">
+    The web admin will become unreachable for ~5–15 seconds while the
+    bot restarts. Refresh the page after that to confirm the new PID.
+  </p>
+  <form method="post" action="/admin/control/force-stop" style="margin-top: 8px;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="confirm" value="FORCE-STOP">
+    <button type="submit" class="btn-danger"
+            onclick="return confirm('FORCE-STOP THE BOT?\n\nThe process will exit. Your supervisor (systemd / docker / pm2) must restart it. Continue?');">
+      🛑 Force-stop bot now
+    </button>
+  </form>
+</div>
+{% endblock %}

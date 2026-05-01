@@ -458,6 +458,26 @@ async def consume_login_token(app: web.Application, client_key: str) -> bool:
     return await cache.consume(client_key)
 
 
+def login_throttle_active_count(app: web.Application) -> int:
+    """Return the number of distinct client keys currently in the throttle cache.
+
+    Read-only accessor exposed to the Stage-15-Step-F bot-health
+    classifier and the ``/admin/control`` panel. A spike in this
+    count is one of the strongest "under attack" signals — a brute-
+    force login spray rotates through fresh keys (since the per-key
+    bucket drains slowly), so the cache size grows linearly with
+    the number of distinct attackers seen this process.
+
+    Returns 0 if the cache hasn't been installed (e.g. tests that
+    mount routes manually) — same fail-open posture as
+    ``consume_login_token``.
+    """
+    cache = app.get(LOGIN_RATE_LIMIT_CACHE_KEY)
+    if cache is None:
+        return 0
+    return len(cache._buckets)
+
+
 @web.middleware
 async def webhook_rate_limit_middleware(
     request: web.Request,

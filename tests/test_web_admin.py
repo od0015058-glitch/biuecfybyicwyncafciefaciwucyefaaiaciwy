@@ -794,6 +794,67 @@ def test_verify_totp_code_swallows_pyotp_errors_returns_false(monkeypatch):
     assert verify_totp_code("ABCDEFGHIJKLMNOP", "123456") is False
 
 
+def test_verify_totp_code_accepts_persian_digits():
+    """Stage-15-Step-F bundled bug fix.
+
+    The bot's primary user base is Persian. An admin pasting the
+    current TOTP from a Persian-locale clipboard would type the
+    code in Persian digits (``۱۲۳۴۵۶`` U+06F0..U+06F9) and see a
+    confusing "Invalid 2FA code" error — ``str.isdigit()`` accepted
+    them but ``pyotp.TOTP.verify`` rejected them. The fix normalises
+    Persian + Arabic-Indic digits to ASCII before validation.
+    """
+    import pyotp
+    from web_admin import verify_totp_code
+
+    _PERSIAN = "۰۱۲۳۴۵۶۷۸۹"
+    secret = pyotp.random_base32()
+    ascii_code = pyotp.TOTP(secret).now()
+    persian_code = "".join(_PERSIAN[int(d)] for d in ascii_code)
+    assert verify_totp_code(secret, persian_code) is True
+
+
+def test_verify_totp_code_accepts_arabic_indic_digits():
+    """Stage-15-Step-F bundled bug fix — Arabic-Indic digits
+    (``٠١٢٣٤٥٦٧٨٩`` U+0660..U+0669) also normalise to ASCII."""
+    import pyotp
+    from web_admin import verify_totp_code
+
+    _ARABIC_INDIC = "٠١٢٣٤٥٦٧٨٩"
+    secret = pyotp.random_base32()
+    ascii_code = pyotp.TOTP(secret).now()
+    arabic_code = "".join(_ARABIC_INDIC[int(d)] for d in ascii_code)
+    assert verify_totp_code(secret, arabic_code) is True
+
+
+def test_verify_totp_code_accepts_mixed_persian_and_ascii():
+    """Stage-15-Step-F bundled bug fix — mixed scripts within the
+    same code (a Persian admin who half-typed and half-pasted)
+    still normalise cleanly."""
+    import pyotp
+    from web_admin import verify_totp_code
+
+    _PERSIAN = "۰۱۲۳۴۵۶۷۸۹"
+    secret = pyotp.random_base32()
+    ascii_code = pyotp.TOTP(secret).now()
+    # Replace just the first 3 digits with their Persian equivalents.
+    mixed = "".join(_PERSIAN[int(d)] for d in ascii_code[:3]) + ascii_code[3:]
+    assert verify_totp_code(secret, mixed) is True
+
+
+def test_verify_totp_code_rejects_non_arabic_persian_unicode_digits():
+    """Stage-15-Step-F bundled bug fix — only Persian + Arabic-Indic
+    digits are normalised. Other Unicode digit classes (Bengali,
+    full-width, mathematical) still fail-fast with ``False`` rather
+    than reaching pyotp."""
+    from web_admin import verify_totp_code
+
+    # Bengali ``০১২৩৪৫`` (U+09E6..U+09EB).
+    assert verify_totp_code("ABCDEFGHIJKLMNOP", "০১২৩৪৫") is False
+    # Full-width Latin digits ``１２３４５６``.
+    assert verify_totp_code("ABCDEFGHIJKLMNOP", "１２３４５６") is False
+
+
 def test_setup_admin_routes_rejects_invalid_totp_secret(make_admin_app):
     """Invalid base32 in ADMIN_2FA_SECRET fails at boot — the app must
     not start with a half-broken 2FA config.
@@ -8474,3 +8535,315 @@ async def test_models_disable_post_handles_model_id_with_slash(
         assert await_args.args == (mid,), (
             f"db.disable_model received {await_args.args} but expected {(mid,)}"
         )
+
+
+# =====================================================================
+# Stage-15-Step-F: bot health & emergency control panel
+# =====================================================================
+
+
+async def _login_and_get_control_csrf(client, password: str = "pw") -> str:
+    """Log in, fetch /admin/control, scrape its CSRF token."""
+    await client.post(
+        "/admin/login", data={"password": password}, allow_redirects=False
+    )
+    resp = await client.get("/admin/control")
+    body = await resp.text()
+    import re
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+    assert m, "Expected CSRF token in /admin/control form"
+    return m.group(1)
+
+
+async def test_control_get_requires_auth(aiohttp_client, make_admin_app):
+    client = await aiohttp_client(make_admin_app())
+    resp = await client.get("/admin/control", allow_redirects=False)
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/login"
+
+
+async def test_control_get_renders_status_tile_and_signals(
+    aiohttp_client, make_admin_app
+):
+    """Happy path: the panel renders the BotStatus level + signals
+    inline plus the disable/enable forms with valid CSRF tokens."""
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.get("/admin/control")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Bot health" in body
+    # Status tile renders one of the six classification levels.
+    assert any(
+        f'status-tile {lvl}' in body
+        for lvl in ("idle", "healthy", "busy", "degraded",
+                    "under_attack", "down")
+    )
+    # All four kill-switch forms + the force-stop form are rendered.
+    assert "/admin/control/disable-all-models" in body
+    assert "/admin/control/enable-all-models" in body
+    assert "/admin/control/disable-all-gateways" in body
+    assert "/admin/control/enable-all-gateways" in body
+    assert "/admin/control/force-stop" in body
+    # Force-stop button has the confirm sentinel hidden field.
+    assert 'name="confirm" value="FORCE-STOP"' in body
+    # CSRF tokens render on every form.
+    assert 'name="csrf_token"' in body
+
+
+async def test_control_force_stop_post_requires_csrf(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    # Missing CSRF → 302 + flash, no kill.
+    resp = await client.post(
+        "/admin/control/force-stop",
+        data={"confirm": "FORCE-STOP"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/control"
+    follow = await client.get("/admin/control")
+    assert "CSRF" in (await follow.text())
+
+
+async def test_control_force_stop_post_requires_confirm_sentinel(
+    aiohttp_client, make_admin_app
+):
+    """A POST without ``confirm=FORCE-STOP`` (e.g. a stray form
+    submission) is refused with a flash, no kill."""
+    from web_admin import APP_KEY_FORCE_STOP_FN
+
+    db = _stub_toggle_db()
+    app = make_admin_app(password="pw", db=db)
+    captured: list[tuple[int, int]] = []
+    app[APP_KEY_FORCE_STOP_FN] = lambda pid, sig: captured.append((pid, sig))
+    client = await aiohttp_client(app)
+    csrf = await _login_and_get_control_csrf(client, "pw")
+
+    resp = await client.post(
+        "/admin/control/force-stop",
+        data={"csrf_token": csrf, "confirm": "nope"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    follow = await client.get("/admin/control")
+    body = await follow.text()
+    assert "missing confirmation" in body.lower()
+    # Wait a tick for any deferred kill — there must not be one.
+    import asyncio
+    await asyncio.sleep(0.1)
+    assert captured == []
+
+
+async def test_control_force_stop_post_signals_kill_fn(
+    aiohttp_client, make_admin_app
+):
+    """Happy path: with CSRF + confirm, the kill function is invoked
+    on the next event-loop tick. The handler must return 302 *before*
+    the kill so the browser sees the redirect."""
+    import asyncio
+    from web_admin import APP_KEY_FORCE_STOP_FN
+
+    db = _stub_toggle_db()
+    app = make_admin_app(password="pw", db=db)
+    captured: list[tuple[int, int]] = []
+    app[APP_KEY_FORCE_STOP_FN] = lambda pid, sig: captured.append((pid, sig))
+    client = await aiohttp_client(app)
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.record_admin_audit.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/force-stop",
+        data={"csrf_token": csrf, "confirm": "FORCE-STOP"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/control"
+    # Wait a generous tick for the deferred kill to fire.
+    await asyncio.sleep(0.2)
+    assert len(captured) == 1, (
+        "force-stop kill_fn was not invoked"
+    )
+    pid, sig = captured[0]
+    import os
+    import signal as _signal
+    assert pid == os.getpid()
+    assert sig == _signal.SIGTERM
+
+    # Audit row written *before* the kill.
+    db.record_admin_audit.assert_awaited()
+    audit_call = db.record_admin_audit.await_args
+    assert audit_call.kwargs.get("action") == "control_force_stop"
+
+
+async def test_control_disable_all_models_writes_audit_and_disables(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """Disable-all walks every model id and calls db.disable_model."""
+    db = _stub_toggle_db()
+    # Inject a deterministic catalog so the test isn't tied to live
+    # OpenRouter data.
+    fake_ids = ["openai/gpt-4o", "anthropic/claude-3-5-sonnet", "x-ai/grok-2"]
+    monkeypatch.setattr(
+        "web_admin._all_model_ids", lambda: list(fake_ids)
+    )
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.record_admin_audit.reset_mock()
+    db.disable_model.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/disable-all-models",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/control"
+    # Every catalog id was disabled.
+    assert db.disable_model.await_count == len(fake_ids)
+    seen = {call.args[0] for call in db.disable_model.await_args_list}
+    assert seen == set(fake_ids)
+    # Audit row written.
+    db.record_admin_audit.assert_awaited()
+    assert (
+        db.record_admin_audit.await_args.kwargs.get("action")
+        == "control_disable_all_models"
+    )
+
+
+async def test_control_enable_all_models_clears_disabled_set(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_toggle_db()
+    db.get_disabled_models = AsyncMock(
+        return_value={"openai/gpt-4o", "anthropic/claude"}
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.record_admin_audit.reset_mock()
+    db.enable_model.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/enable-all-models",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert db.enable_model.await_count == 2
+    db.record_admin_audit.assert_awaited()
+    assert (
+        db.record_admin_audit.await_args.kwargs.get("action")
+        == "control_enable_all_models"
+    )
+
+
+async def test_control_disable_all_gateways_writes_audit_and_disables(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.record_admin_audit.reset_mock()
+    db.disable_gateway.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/disable-all-gateways",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/control"
+    # The card gateway keys ("tetrapay", "zarinpal") at minimum.
+    seen = {call.args[0] for call in db.disable_gateway.await_args_list}
+    assert "tetrapay" in seen
+    assert "zarinpal" in seen
+    # Audit row written.
+    db.record_admin_audit.assert_awaited()
+    assert (
+        db.record_admin_audit.await_args.kwargs.get("action")
+        == "control_disable_all_gateways"
+    )
+
+
+async def test_control_enable_all_gateways_clears_disabled_set(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_toggle_db()
+    db.get_disabled_gateways = AsyncMock(return_value={"tetrapay", "btc"})
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.record_admin_audit.reset_mock()
+    db.enable_gateway.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/enable-all-gateways",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert db.enable_gateway.await_count == 2
+    db.record_admin_audit.assert_awaited()
+    assert (
+        db.record_admin_audit.await_args.kwargs.get("action")
+        == "control_enable_all_gateways"
+    )
+
+
+async def test_control_disable_all_models_db_failure_flashes_error(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """A DB blip on one row must NOT propagate as a 500 — the handler
+    catches per-row exceptions and surfaces a flash error so the
+    operator can retry."""
+    db = _stub_toggle_db(
+        disable_model_result=RuntimeError("simulated DB blip")
+    )
+    monkeypatch.setattr(
+        "web_admin._all_model_ids", lambda: ["openai/gpt-4o"]
+    )
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+
+    resp = await client.post(
+        "/admin/control/disable-all-models",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    follow = await client.get("/admin/control")
+    body = await follow.text()
+    assert "failed" in body.lower()
+
+
+async def test_control_force_stop_post_requires_auth(
+    aiohttp_client, make_admin_app
+):
+    """Force-stop must require auth — an unauthenticated POST must
+    redirect to login, never reach the kill function."""
+    from web_admin import APP_KEY_FORCE_STOP_FN
+
+    app = make_admin_app(password="pw")
+    captured: list[tuple[int, int]] = []
+    app[APP_KEY_FORCE_STOP_FN] = lambda pid, sig: captured.append((pid, sig))
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/admin/control/force-stop",
+        data={"csrf_token": "anything", "confirm": "FORCE-STOP"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+    import asyncio
+    await asyncio.sleep(0.1)
+    assert captured == []
