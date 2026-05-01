@@ -47,18 +47,34 @@ file under ``locale/<lang>/LC_MESSAGES/messages.po``.
 
 ``python -m i18n_po check`` — exit non-zero if any on-disk .po
 file differs from the dict export. Used by CI.
+
+``python -m i18n_po import <lang> <path>`` — bulk-load a
+translator's ``.po`` file into the ``bot_strings`` runtime
+override table (Stage-15-Step-E #7 follow-up #2). Every
+``msgstr`` is validated against
+:func:`strings.validate_override` before being written; entries
+that fail (unknown slug, bad placeholder, malformed syntax) are
+reported and skipped — the rest are upserted. ``--dry-run``
+validates without writing. Use ``--updated-by`` to tag the
+``bot_strings.updated_by`` audit column with a translator name
+or PR number; defaults to ``"i18n_po-import"``.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import datetime as dt
 import logging
 import os
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import strings
+
+if TYPE_CHECKING:  # pragma: no cover
+    from database import Database
 
 log = logging.getLogger("bot.i18n_po")
 
@@ -406,6 +422,279 @@ def _check_locale_files() -> int:
     return 1 if drift else 0
 
 
+# --------------------------------------------------------------------- #
+# Import (Stage-15-Step-E #7 follow-up #2)                              #
+# --------------------------------------------------------------------- #
+
+
+# Public so callers (tests, future operator tooling) can introspect
+# what the import actually changed without re-parsing the report
+# strings.
+class ImportReport:
+    """Tally of what an :func:`import_po_into_db` run did.
+
+    Counters are tracked in five buckets so the operator can tell
+    at a glance whether the import was clean (only ``upserted`` or
+    ``unchanged``), partially clean (some ``invalid``), or had a
+    DB-side problem (``errors``).
+
+    ``invalid`` collects ``(key, reason)`` so the operator can fix
+    the offending msgstrs in the source .po and re-run; ``errors``
+    collects ``(key, reason)`` for I/O / DB problems that aren't
+    the translator's fault. The two are kept separate so a
+    network blip doesn't masquerade as a translation problem.
+    """
+
+    __slots__ = (
+        "upserted",
+        "unchanged",
+        "skipped_empty",
+        "skipped_unknown_slug",
+        "invalid",
+        "errors",
+    )
+
+    def __init__(self) -> None:
+        self.upserted: list[str] = []
+        self.unchanged: list[str] = []
+        self.skipped_empty: list[str] = []
+        self.skipped_unknown_slug: list[str] = []
+        self.invalid: list[tuple[str, str]] = []
+        self.errors: list[tuple[str, str]] = []
+
+    @property
+    def total_seen(self) -> int:
+        return (
+            len(self.upserted)
+            + len(self.unchanged)
+            + len(self.skipped_empty)
+            + len(self.skipped_unknown_slug)
+            + len(self.invalid)
+            + len(self.errors)
+        )
+
+    @property
+    def has_failures(self) -> bool:
+        return bool(self.invalid or self.errors)
+
+    def render(self) -> str:
+        """Operator-facing summary block."""
+        lines = [
+            f"  total entries seen      : {self.total_seen}",
+            f"  upserted                : {len(self.upserted)}",
+            f"  unchanged (already set) : {len(self.unchanged)}",
+            f"  skipped (empty msgstr)  : {len(self.skipped_empty)}",
+            f"  skipped (unknown slug)  : {len(self.skipped_unknown_slug)}",
+            f"  invalid (bad msgstr)    : {len(self.invalid)}",
+            f"  errors (db / io)        : {len(self.errors)}",
+        ]
+        if self.skipped_unknown_slug:
+            lines.append("")
+            lines.append("Skipped — slug not in strings.py:")
+            for key in self.skipped_unknown_slug:
+                lines.append(f"  - {key}")
+        if self.invalid:
+            lines.append("")
+            lines.append("Invalid — msgstr failed validation:")
+            for key, reason in self.invalid:
+                lines.append(f"  - {key}: {reason}")
+        if self.errors:
+            lines.append("")
+            lines.append("Errors — DB / I/O problems:")
+            for key, reason in self.errors:
+                lines.append(f"  - {key}: {reason}")
+        return "\n".join(lines)
+
+
+async def import_po_into_db(
+    db: "Database",
+    lang: str,
+    po_text: str,
+    *,
+    dry_run: bool = False,
+    updated_by: str = "i18n_po-import",
+    existing_overrides: dict[tuple[str, str], str] | None = None,
+) -> ImportReport:
+    """Validate every ``(msgid, msgstr)`` and UPSERT the survivors
+    into ``bot_strings``.
+
+    *db* is an opened :class:`database.Database` (its ``pool`` is
+    the only attribute we touch — the test harness passes a
+    duck-typed stub).
+
+    *lang* must be one of :data:`strings.SUPPORTED_LANGUAGES`. We
+    don't auto-detect from the .po metadata because gettext lets
+    translators write whatever they want into the ``Language:``
+    header; explicit is safer.
+
+    *po_text* is the raw .po body. ``load_po`` parses it.
+
+    *dry_run* — when ``True`` we run all the same validation but
+    skip the actual UPSERT call. Caller still gets the same
+    report counters so they can preview the change.
+
+    *updated_by* — string that lands in
+    ``bot_strings.updated_by``. Defaults to ``"i18n_po-import"``;
+    the CLI accepts a ``--updated-by`` flag so an operator can
+    write something like ``"crowdin-pr-241"`` for traceability.
+
+    *existing_overrides* — optional pre-loaded snapshot of the
+    ``bot_strings`` table. If supplied we use it to bucket
+    "unchanged" rows (msgstr matches what's already in the DB)
+    so the report's ``upserted`` count reflects only *real*
+    changes. If omitted we fetch it from the DB once.
+
+    Returns the :class:`ImportReport` regardless of failures —
+    callers decide whether ``has_failures`` should escalate to a
+    non-zero exit code.
+    """
+    if lang not in strings.SUPPORTED_LANGUAGES:
+        raise ValueError(
+            f"unsupported lang {lang!r}; "
+            f"known: {list(strings.SUPPORTED_LANGUAGES)}"
+        )
+
+    report = ImportReport()
+
+    try:
+        catalog = load_po(po_text)
+    except ValueError as exc:
+        # The whole file is unparseable — surface as a single
+        # error so the operator knows nothing landed.
+        report.errors.append(("<file>", f"failed to parse .po: {exc}"))
+        return report
+
+    # Snapshot existing overrides once so we can bucket
+    # "unchanged" entries without re-querying per-key. On a typical
+    # 160-slug .po this is a single query of <100 rows.
+    if existing_overrides is None:
+        try:
+            existing_overrides = await db.load_all_string_overrides()
+        except Exception as exc:  # noqa: BLE001  — surface as report
+            log.exception(
+                "i18n_po import: failed to snapshot bot_strings"
+            )
+            report.errors.append(
+                ("<bot_strings snapshot>", f"{type(exc).__name__}: {exc}")
+            )
+            return report
+
+    for key in sorted(catalog):
+        msgstr = catalog[key]
+        if not msgstr:
+            # Empty msgstr is the gettext "untranslated" marker;
+            # bot_strings is for *non*-empty overrides only. Empty
+            # entries are not stored — the runtime falls through to
+            # the .po-runtime layer or the compiled default.
+            report.skipped_empty.append(key)
+            continue
+        if strings.get_compiled_default(lang, key) is None:
+            # Unknown slug — translator is on a stale strings.py
+            # snapshot, or there's a typo. Don't poison the table
+            # with it; tell the operator so they can update the .po.
+            report.skipped_unknown_slug.append(key)
+            continue
+        validation_error = strings.validate_override(lang, key, msgstr)
+        if validation_error is not None:
+            report.invalid.append((key, validation_error))
+            continue
+        if existing_overrides.get((lang, key)) == msgstr:
+            # Idempotent re-runs are common (translator pushes
+            # again after a tiny edit) — don't count rows that
+            # didn't actually change.
+            report.unchanged.append(key)
+            continue
+        if dry_run:
+            # In dry-run we still bucket as "would upsert" so the
+            # operator gets accurate counts.
+            report.upserted.append(key)
+            continue
+        try:
+            await db.upsert_string_override(
+                lang, key, msgstr, updated_by=updated_by
+            )
+        except Exception as exc:  # noqa: BLE001 — surface as report
+            log.exception(
+                "i18n_po import: failed upsert for %s:%s", lang, key
+            )
+            report.errors.append(
+                (key, f"upsert failed: {type(exc).__name__}: {exc}")
+            )
+            continue
+        report.upserted.append(key)
+
+    return report
+
+
+async def _import_cli_async(
+    lang: str,
+    po_path_arg: Path,
+    *,
+    dry_run: bool,
+    updated_by: str,
+) -> int:
+    """CLI entry point body. Connects to the DB, runs the import,
+    prints the report, returns the exit code.
+
+    The caller is expected to have already validated that
+    ``po_path_arg`` exists — :func:`main` does that pre-flight
+    before kicking off ``asyncio.run`` so a missing-file exit
+    doesn't spin up (and tear down) a fresh event loop. Tearing
+    down the default loop has been observed to contaminate
+    downstream tests that use :func:`asyncio.get_event_loop`
+    afterward.
+    """
+    po_text = po_path_arg.read_text(encoding="utf-8")
+
+    # Late import — keeps the export / check codepaths free of any
+    # asyncpg dependency. The DB module is a heavy import (it pulls
+    # in dozens of asyncpg helpers) so we only pay the cost on the
+    # `import` subcommand.
+    from database import Database
+
+    db = Database()
+    try:
+        await db.connect()
+    except Exception as exc:  # noqa: BLE001
+        # Make the DB connection error obvious — most likely cause
+        # is missing DB_USER / DB_PASSWORD / DB_NAME / DB_HOST /
+        # DB_PORT env vars when running locally.
+        print(
+            f"ERROR: failed to connect to the database: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        print(
+            "Set DB_USER / DB_PASSWORD / DB_NAME / DB_HOST / "
+            "DB_PORT in the environment, or use --dry-run to "
+            "skip the DB connection (validates only).",
+            file=sys.stderr,
+        )
+        return 3
+
+    try:
+        report = await import_po_into_db(
+            db,
+            lang,
+            po_text,
+            dry_run=dry_run,
+            updated_by=updated_by,
+        )
+    finally:
+        try:
+            await db.close()
+        except Exception:  # noqa: BLE001  — never mask the report
+            log.exception("i18n_po import: db.close() failed")
+
+    print(
+        f"i18n_po import (lang={lang}, file={po_path_arg}, "
+        f"dry_run={dry_run}, updated_by={updated_by!r}):"
+    )
+    print(report.render())
+
+    return 1 if report.has_failures else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m i18n_po",
@@ -417,6 +706,44 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("export", help="Write the .po files.")
     sub.add_parser("check", help="Compare on-disk .po files against strings.py.")
+
+    import_p = sub.add_parser(
+        "import",
+        help=(
+            "Bulk-load a translator's .po file into the bot_strings "
+            "DB table. Validates every msgstr first."
+        ),
+    )
+    import_p.add_argument(
+        "lang",
+        help=(
+            "Locale code — must be in strings.SUPPORTED_LANGUAGES "
+            "(today: fa, en)."
+        ),
+    )
+    import_p.add_argument(
+        "po_path",
+        type=Path,
+        help="Path to the translator's messages.po file.",
+    )
+    import_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Validate every entry but skip the DB UPSERT. Use this "
+            "to preview a translator's PR before applying."
+        ),
+    )
+    import_p.add_argument(
+        "--updated-by",
+        default="i18n_po-import",
+        help=(
+            "Tag the bot_strings.updated_by audit column. Use a "
+            "translator name or PR number for traceability. "
+            "Defaults to 'i18n_po-import'."
+        ),
+    )
+
     args = parser.parse_args(argv)
 
     if args.cmd == "export":
@@ -426,6 +753,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "check":
         return _check_locale_files()
+    if args.cmd == "import":
+        # File-existence pre-flight before spinning up an event
+        # loop. Avoids tearing down the default loop just to bail
+        # out on a missing file (which contaminates downstream
+        # ``asyncio.get_event_loop`` calls in some test runners).
+        if not args.po_path.is_file():
+            print(
+                f"ERROR: .po file not found: {args.po_path}",
+                file=sys.stderr,
+            )
+            return 2
+        return asyncio.run(
+            _import_cli_async(
+                args.lang,
+                args.po_path,
+                dry_run=args.dry_run,
+                updated_by=args.updated_by,
+            )
+        )
     parser.error(f"unknown command {args.cmd!r}")
     return 2  # unreachable, parser.error exits
 
