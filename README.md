@@ -374,6 +374,24 @@ NowPayments crypto invoices.
   (Persian-as-msgid is awkward and length-explodes); the
   source-locale text appears as a `#.` translator comment for
   context. Stage-15-Step-E #7 first slice + follow-up #1.
+  **Importer (Stage-15-Step-E #7 follow-up #2)** —
+  `python -m i18n_po import <lang> <path>` bulk-loads a
+  translator's `.po` into the runtime `bot_strings` table. Every
+  `msgstr` is validated against `strings.validate_override`
+  before being written; rows that fail (unknown slug, bad
+  placeholder, malformed format syntax) are reported and skipped
+  while the rest are upserted. `--dry-run` validates without
+  writing — use it to preview a translator's PR before applying.
+  `--updated-by NAME` tags `bot_strings.updated_by` with a
+  translator name or PR number for traceability (defaults to
+  `i18n_po-import`). The CLI prints a five-bucket summary
+  (`upserted` / `unchanged` / `skipped_empty` /
+  `skipped_unknown_slug` / `invalid` / `errors`) and exits
+  non-zero if any entry hit the `invalid` or `errors` buckets,
+  so CI / cron-driven imports can fail fast on bad input.
+  Closes the .po round-trip: a community translator submits
+  `messages.po`, the operator runs the import, and overrides go
+  live without a code deploy.
 - **Per-key 429 cooldown for OpenRouter** — when OpenRouter
   returns 429 for one of the configured pool keys (the upstream
   provider rate-limited it, or the key hit its OpenRouter plan
