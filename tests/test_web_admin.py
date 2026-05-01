@@ -6135,6 +6135,33 @@ async def test_audit_get_requires_auth(aiohttp_client, make_admin_app):
     assert resp.headers["Location"] == "/admin/login"
 
 
+async def test_audit_filter_dropdown_includes_control_panel_actions(
+    aiohttp_client, make_admin_app,
+):
+    """Bug-fix regression (Stage-15-Step-F follow-up #3): the
+    control-panel slugs (force-stop, kill-switches) shipped in
+    PR #131 were being recorded by ``record_admin_audit`` but
+    were never added to the filter dropdown — so an operator
+    couldn't narrow the audit feed to "kill-switches only" without
+    scrolling through the full log. The dropdown must now list all
+    five control-panel actions plus the alert-loop slugs."""
+    db = _stub_db(audit_log_result=[])
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/audit")
+    assert resp.status == 200
+    body = await resp.text()
+    # Control panel slugs (PR #131).
+    assert "Bot force-stopped" in body
+    assert "All AI models disabled (kill-switch)" in body
+    assert "All AI models re-enabled" in body
+    assert "All gateways disabled (kill-switch)" in body
+    assert "All gateways re-enabled" in body
+    # Alert-loop slugs (this PR).
+    assert "Bot-health alert DM sent" in body
+    assert "Bot-health recovery DM sent" in body
+
+
 async def test_user_edit_route_requires_auth(
     aiohttp_client, make_admin_app
 ):
