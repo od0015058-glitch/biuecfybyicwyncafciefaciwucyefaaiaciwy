@@ -1023,6 +1023,234 @@ async def test_get_user_usage_aggregates_handles_none_row():
 
 
 # ---------------------------------------------------------------------
+# Stage-15-Step-E #2 follow-up: bundled bug fix + new
+# ``export_user_usage_logs`` query.
+#
+# Both queries share ``_coerce_usage_log_row`` so a poisoned
+# ``Decimal('NaN')`` row (legacy ``log_usage`` calls pre-PR-#75
+# could write NaN into ``cost_deducted_usd``) lands as ``0.0``
+# rather than ``"nan"`` / a ``ValueError`` crash. Pre-fix the
+# admin-side ``GET /admin/users/{id}/usage`` either rendered
+# ``$nan`` or 500'd; the parallel ``get_user_spending_summary``
+# already scrubbed but the per-row mapper did not.
+# ---------------------------------------------------------------------
+
+
+async def test_list_user_usage_logs_scrubs_nan_cost_to_zero():
+    """Bundled bug fix: a poisoned ``cost_deducted_usd`` row must
+    not leak ``nan`` into the admin-side rendered table."""
+    from decimal import Decimal
+
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=1)
+    conn.fetch = AsyncMock(
+        return_value=[
+            {
+                "log_id": 99,
+                "model_used": "openai/gpt-4o",
+                "prompt_tokens": 10,
+                "completion_tokens": 20,
+                "cost_deducted_usd": Decimal("NaN"),
+                "created_at": None,
+            }
+        ]
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    out = await db.list_user_usage_logs(telegram_id=7)
+    row = out["rows"][0]
+    assert row["cost_usd"] == 0.0
+    assert row["total_tokens"] == 30
+
+
+async def test_list_user_usage_logs_scrubs_infinity_cost_to_zero():
+    """Same scrub policy for ``Inf`` / ``-Inf``."""
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=1)
+    conn.fetch = AsyncMock(
+        return_value=[
+            {
+                "log_id": 99,
+                "model_used": "openai/gpt-4o",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "cost_deducted_usd": float("inf"),
+                "created_at": None,
+            }
+        ]
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    out = await db.list_user_usage_logs(telegram_id=7)
+    assert out["rows"][0]["cost_usd"] == 0.0
+
+
+async def test_list_user_usage_logs_scrubs_negative_tokens_to_zero():
+    """``prompt_tokens`` / ``completion_tokens`` are ``INT NOT NULL``
+    in the schema — but the DB scrub clamps any sneaked-in
+    negative value (a future migration could change the type;
+    a buggy stub could feed -1) to 0 so neither column nor
+    ``total_tokens`` go negative."""
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=1)
+    conn.fetch = AsyncMock(
+        return_value=[
+            {
+                "log_id": 99,
+                "model_used": "openai/gpt-4o",
+                "prompt_tokens": -5,
+                "completion_tokens": 20,
+                "cost_deducted_usd": 0.0,
+                "created_at": None,
+            }
+        ]
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    out = await db.list_user_usage_logs(telegram_id=7)
+    row = out["rows"][0]
+    assert row["prompt_tokens"] == 0
+    assert row["completion_tokens"] == 20
+    assert row["total_tokens"] == 20
+
+
+# ----------------------------------------------------------------------
+# export_user_usage_logs (the new user-facing CSV-export query)
+# ----------------------------------------------------------------------
+
+
+async def test_export_user_usage_logs_filters_by_telegram_id():
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.export_user_usage_logs(telegram_id=42)
+
+    sql, *binds = conn.fetch.await_args.args
+    assert "WHERE telegram_id = $1" in sql
+    # Sorted oldest first so a CSV opened in Excel reads
+    # top-to-bottom in chronological order.
+    assert "ORDER BY log_id ASC" in sql
+    assert binds[0] == 42
+
+
+async def test_export_user_usage_logs_clamps_limit_to_max():
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.export_user_usage_logs(telegram_id=1, limit=10**9)
+    binds = conn.fetch.await_args.args[1:]
+    assert binds[1] == db.USAGE_LOGS_EXPORT_MAX_ROWS
+
+
+async def test_export_user_usage_logs_clamps_limit_floor_to_one():
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.export_user_usage_logs(telegram_id=1, limit=0)
+    binds = conn.fetch.await_args.args[1:]
+    assert binds[1] == 1
+
+
+async def test_export_user_usage_logs_default_limit_is_max():
+    """``limit=None`` falls back to the cap, not to a smaller
+    sensible default — the cap *is* the default for an unbounded
+    "give me everything" export."""
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.export_user_usage_logs(telegram_id=1)
+    binds = conn.fetch.await_args.args[1:]
+    assert binds[1] == db.USAGE_LOGS_EXPORT_MAX_ROWS
+
+
+async def test_export_user_usage_logs_rejects_non_positive_telegram_id():
+    db = database_module.Database()
+    db.pool = _PoolStub(_make_conn())
+    with pytest.raises(ValueError):
+        await db.export_user_usage_logs(telegram_id=0)
+    with pytest.raises(ValueError):
+        await db.export_user_usage_logs(telegram_id=-5)
+
+
+async def test_export_user_usage_logs_rejects_non_int_telegram_id():
+    db = database_module.Database()
+    db.pool = _PoolStub(_make_conn())
+    with pytest.raises(ValueError):
+        await db.export_user_usage_logs(telegram_id="42")  # type: ignore[arg-type]
+
+
+async def test_export_user_usage_logs_returns_empty_list_when_no_rows():
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    out = await db.export_user_usage_logs(telegram_id=7)
+    assert out == []
+
+
+async def test_export_user_usage_logs_maps_rows_with_total_tokens():
+    """Same per-row shape as ``list_user_usage_logs`` — both use
+    ``_coerce_usage_log_row`` so they cannot drift."""
+    conn = _make_conn()
+    conn.fetch = AsyncMock(
+        return_value=[
+            {
+                "log_id": 1,
+                "model_used": "openai/gpt-4o",
+                "prompt_tokens": 10,
+                "completion_tokens": 20,
+                "cost_deducted_usd": 0.0042,
+                "created_at": None,
+            }
+        ]
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    out = await db.export_user_usage_logs(telegram_id=7)
+    assert len(out) == 1
+    assert out[0]["id"] == 1
+    assert out[0]["model"] == "openai/gpt-4o"
+    assert out[0]["prompt_tokens"] == 10
+    assert out[0]["completion_tokens"] == 20
+    assert out[0]["total_tokens"] == 30
+    assert out[0]["cost_usd"] == pytest.approx(0.0042)
+    assert out[0]["created_at"] is None
+
+
+async def test_export_user_usage_logs_scrubs_nan_cost_at_boundary():
+    """Same NaN scrub the admin-side path benefits from in the
+    bundled bug fix above — a poisoned cost row must not leak
+    ``nan`` into the user-facing CSV either."""
+    from decimal import Decimal
+
+    conn = _make_conn()
+    conn.fetch = AsyncMock(
+        return_value=[
+            {
+                "log_id": 1,
+                "model_used": "openai/gpt-4o",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "cost_deducted_usd": Decimal("NaN"),
+                "created_at": None,
+            }
+        ]
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    out = await db.export_user_usage_logs(telegram_id=7)
+    assert out[0]["cost_usd"] == 0.0
+
+
+# ---------------------------------------------------------------------
 # Bug-fix sweep: defense-in-depth NaN / Infinity guards on the four
 # money-handling DB methods.
 #

@@ -100,6 +100,11 @@ _STRINGS: dict[str, dict[str, str]] = {
         "memory_export_done": "✅ {count} پیام به صورت فایل ارسال شد",
         # ---- User spending analytics (Stage-15-Step-E #2 — first slice) ----
         "btn_my_stats": "📊 آمار مصرف من",
+        # Stage-15-Step-E #2 follow-up — usage-log CSV export.
+        "btn_export_usage_csv": "📤 دریافت CSV مصرف",
+        "usage_csv_export_empty": "📭 هنوز هیچ گزارش مصرفی برای خروجی‌گرفتن ثبت نشده است.",
+        "usage_csv_export_caption": "📤 گزارش مصرف ({count} ردیف) در قالب CSV",
+        "usage_csv_export_done": "✅ {count} ردیف از گزارش مصرف به‌صورت فایل ارسال شد",
         "stats_title": "📊 **آمار مصرف شما**",
         "stats_balance_line": "💰 موجودی فعلی: *${balance:.2f}*",
         "stats_empty": (
@@ -589,6 +594,11 @@ _STRINGS: dict[str, dict[str, str]] = {
         "memory_export_done": "✅ Sent {count} messages as a file",
         # ---- User spending analytics (Stage-15-Step-E #2 — first slice) ----
         "btn_my_stats": "📊 My usage stats",
+        # Stage-15-Step-E #2 follow-up — usage-log CSV export.
+        "btn_export_usage_csv": "📤 Download usage CSV",
+        "usage_csv_export_empty": "📭 No usage logs to export yet.",
+        "usage_csv_export_caption": "📤 Usage report ({count} rows) as CSV",
+        "usage_csv_export_done": "✅ Sent {count} usage rows as a CSV file",
         "stats_title": "📊 **Your usage stats**",
         "stats_balance_line": "💰 Current balance: *${balance:.2f}*",
         "stats_empty": (

@@ -150,6 +150,11 @@ msgstr "❌ Cancel"
 msgid "btn_close_menu"
 msgstr "❌ Close"
 
+#. 📤 دریافت CSV مصرف
+#: strings.py:btn_export_usage_csv
+msgid "btn_export_usage_csv"
+msgstr "📤 Download usage CSV"
+
 #. ✅ عضو شدم
 #: strings.py:btn_force_join_check
 msgid "btn_force_join_check"
@@ -1164,6 +1169,21 @@ msgstr "💳 Go to payment gateway"
 msgid "tetrapay_unreachable"
 msgstr ""
 "❌ The Iranian card gateway is not responding. Please try again in a few minutes, or pay with crypto."
+
+#. 📤 گزارش مصرف ({count} ردیف) در قالب CSV
+#: strings.py:usage_csv_export_caption
+msgid "usage_csv_export_caption"
+msgstr "📤 Usage report ({count} rows) as CSV"
+
+#. ✅ {count} ردیف از گزارش مصرف به‌صورت فایل ارسال شد
+#: strings.py:usage_csv_export_done
+msgid "usage_csv_export_done"
+msgstr "✅ Sent {count} usage rows as a CSV file"
+
+#. 📭 هنوز هیچ گزارش مصرفی برای خروجی‌گرفتن ثبت نشده است.
+#: strings.py:usage_csv_export_empty
+msgid "usage_csv_export_empty"
+msgstr "📭 No usage logs to export yet."
 
 #. 👛 **کیف پول شما**
 #. 

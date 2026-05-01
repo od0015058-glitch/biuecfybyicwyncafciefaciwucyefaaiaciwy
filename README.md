@@ -236,6 +236,25 @@ NowPayments crypto invoices.
   the snapshot dict only contains finite floats — pre-fix
   `float(Decimal('NaN') or 0)` propagated NaN through to other
   callers because `Decimal('NaN')` is truthy in Python.
+  Stage-15-Step-E #2 follow-up #4: a "📤 Download usage CSV"
+  button on the same stats screen (or `/usage_csv` slash) ships
+  the user's full `usage_logs` history back as an RFC-4180 CSV
+  document with a UTF-8 BOM (so Excel auto-detects the encoding
+  instead of mojibaking Persian model names) and `\n` line
+  terminators. Header row pinned to
+  `id,created_at,model,prompt_tokens,completion_tokens,total_tokens,cost_usd`
+  matching the admin-side `/admin/users/<id>/usage` table column
+  order so a user comparing the CSV → admin screenshot doesn't
+  have to mentally re-sort. Six-fractional-digit cost precision
+  matches the `cost_deducted_usd DECIMAL(10,6)` column. Hard
+  5 MB cap; oldest rows are trimmed first when a heavy buffer
+  overflows, and the kept count is surfaced in the upload
+  caption so a heavy user whose buffer was trimmed sees the
+  truth (matches the conversation-export caption fix from
+  Step-E #2). The DB query is clamped at 50 000 rows so a buggy
+  caller can't tar-pit the connection. Both surfaces share
+  `_build_usage_csv_export_document` — same shape as the
+  conversation-history export pair from Step-E #1.
 - **Opt-in Telegram webhook mode** — set `TELEGRAM_WEBHOOK_SECRET`
   to switch from long-polling to webhook delivery. The bot mounts
   a `POST /telegram-webhook/<secret>` route on the same aiohttp

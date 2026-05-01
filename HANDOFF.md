@@ -964,7 +964,7 @@ What remains (next AI's TODO):
 * ✅ **Per-day breakdown (ASCII bars)** — shipped in the Stage-15-Step-E #2 follow-up #3. New `Database.get_user_daily_spending(telegram_id, days)` groups `usage_logs` by `date_trunc('day', created_at)::date` over the requested rolling window, returning `{"date": "YYYY-MM-DD", "calls": int, "cost_usd": float}` rows oldest-first; the user-facing renderer (`user_stats._format_daily_bars`) emits one row per day in a fenced code block (`█` filled / `░` empty), with bar widths proportional to `cost / max(cost)` over the visible window. Missing days inside the window are padded as zero-height bars so the date axis stays continuous from oldest → newest. Image-based graphs are still out of scope — the bar chart is rendered as monospaced text inside Telegram's existing message envelope, no new dependency surface needed.
 * **Per-week / longer-period graphs** — `get_user_daily_spending` returns daily granularity only; a weekly bucket would need either a new query (`date_trunc('week', created_at)`) or formatter-side aggregation. Punting until product confirms the granularity is needed — the 30 / 90 / 365-day windows already let the user see month-over-month patterns at a glance.
 * **Image-based graphs** — would need a separate dependency surface (`matplotlib` / `Pillow`) which is **explicitly out of scope** until the operator approves the new dep.
-* **CSV export of full `usage_logs`** — pairs nicely with the conversation export from Step-E #1. The admin panel already has a JSON view at `/admin/users/<id>/usage`; a user-facing CSV button on the stats screen would close the loop.
+* ✅ **CSV export of full `usage_logs`** — shipped in the Stage-15-Step-E #2 follow-up #4 (PR-after-#153). New `Database.export_user_usage_logs(telegram_id, *, limit=None)` query (oldest-first sort so the CSV reads top-to-bottom in chronological order; clamped at the DB layer to `USAGE_LOGS_EXPORT_MAX_ROWS` = 50 000), new pure-function module `usage_csv_export.py` (mirrors `conversation_export.py`'s shape — RFC-4180 with UTF-8 BOM for Excel auto-detection, `\n` line terminator, six-fractional-digit cost precision matching `cost_deducted_usd DECIMAL(10,6)`, front-trim oldest rows when over `EXPORT_MAX_BYTES` = 5 MB, returns `(csv_bytes, kept_count)` so the caller can surface the real count post-trim). New `usage_export` callback handler mounted on the existing `/stats` keyboard ("📤 Download usage CSV" button on its own row above back+home), plus a `/usage_csv` slash-command alias re-using the shared private builder so the two surfaces cannot drift on filename / encoding / trim semantics. Slash path is rate-limited via `consume_chat_token` (same chat-token bucket as AI prompts); callback path is not (Telegram's own callback debounce is the soft cap). Filename pattern `meowassist-usage-<telegram_id>-<UTC date>.csv` matches the conversation-history export's pattern.
 * **Schema-rotation hook** — if the operator ever needs to "reset" a user's stats without deleting their wallet history, document that this is `DELETE FROM usage_logs WHERE telegram_id = $1`. Currently the only data-deletion surfaces are `mem_reset` (conversation buffer) and the admin panel's user-deletion flow.
 
 Bundled bug fix in this PR (real, found during code review of the Step-E #1 export module): **`conversation_export.format_history_as_text` now returns `(text, kept_count)` instead of just `text`.** Pre-fix, the handler called `t(lang, "memory_export_caption", count=len(rows))` and `t(lang, "memory_export_done", count=len(rows))` — but `format_history_as_text` may have trimmed older messages to stay under the 1 MB `EXPORT_MAX_BYTES` cap. The in-file header reflected the truth (`Messages: 10 (trimmed 10 oldest)`) but the caption + toast both lied (`Conversation history (20 messages)`) for any user heavy enough to trigger the trim. Fix returns the actually-kept count alongside the rendered text and the handler now uses that. Test `test_memory_export_handler_caption_uses_kept_count_after_trim` pins the regression with a 2 MB simulated buffer.
@@ -2388,7 +2388,7 @@ The user's process for this project — **do not deviate**:
     known names / one warn per distinct unknown name /
     `zarinpal_backfill` is in `_LOOP_METRIC_NAMES` / reset
     clears warned set. Suite: 2106 → 2125 passing (+19 new).
-22. **Stage-15-Step-E #10 follow-up #1 OPENED** (PR-after-#152) —
+22. **Stage-15-Step-E #10 follow-up #1 MERGED** (PR #153) —
     image-as-document rejection handler. iPhone's default photo
     format (HEIC) and Telegram's "Send as File" attach mode both
     arrive as `message.document` (not `message.photo`), so
@@ -2445,7 +2445,80 @@ The user's process for this project — **do not deviate**:
     `aiohttp.ClientPayloadError` / `ConnectionResetError` /
     generic `RuntimeError` on both `get_file` and `download_file`
     sites). Suite: 2204 → 2240 passing (+36 new).
-23. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+23. **Stage-15-Step-E #2 follow-up #4 OPENED** (PR-after-#153) —
+    user-facing usage-log CSV export. New
+    `Database.export_user_usage_logs(telegram_id, *, limit=None)`
+    fetches up to `USAGE_LOGS_EXPORT_MAX_ROWS` (50 000) rows
+    from `usage_logs` for the requesting user, oldest-first so a
+    CSV opened in Excel reads top-to-bottom in chronological
+    order. New pure-function module `usage_csv_export.py`
+    (mirrors `conversation_export.py`'s text-export shape from
+    Stage-15-Step-E #1) renders to RFC-4180 CSV with a UTF-8 BOM
+    (Excel auto-detects UTF-8 only with the BOM, otherwise a
+    Persian model display name mojibakes), ``\n`` line
+    terminator, six-fractional-digit cost precision (matches the
+    `cost_deducted_usd DECIMAL(10,6)` column), front-trims the
+    OLDEST rows when over `EXPORT_MAX_BYTES` (5 MB), and returns
+    `(csv_bytes, kept_count)` so the caller can surface the
+    real count to the user (a heavy user whose buffer was
+    trimmed sees "Usage report (30 000 rows)" matching the
+    actual file, not "(50 000)" lying about it). New
+    `@router.callback_query(F.data == "usage_export")` handler
+    mounted on the existing `/stats` keyboard (button text
+    "📤 Download usage CSV" / FA "📤 دریافت CSV مصرف" on its
+    own row above back+home). New `/usage_csv` slash-command
+    alias re-uses the same private builder so the two surfaces
+    can never drift on filename / encoding / trim semantics —
+    same shape as `/history` from Stage-15-Step-E #1. Slash path
+    is rate-limited via `consume_chat_token` (same chat-token
+    bucket as AI prompts so a user already exhausted on prompts
+    can't pivot to spamming exports); callback path is not
+    (Telegram's own callback-debounce is the soft cap, mirroring
+    `memory_export_handler`). Empty-buffer case is a toast on
+    the callback path (button stays visible so a re-tap after a
+    chat works) and a fresh chat bubble on the slash path
+    (toast needs a callback query). Filename pattern
+    `meowassist-usage-<telegram_id>-<UTC date>.csv` matches the
+    conversation-history export's pattern so a user with both
+    files saved sees a consistent naming scheme in their
+    downloads folder. Bundled real bug fix:
+    `Database.list_user_usage_logs` (admin-side
+    `GET /admin/users/{id}/usage` view) used bare `int(...)` /
+    `float(...)` row-mapper coercions. The parallel
+    `get_user_spending_summary` already scrubs but the per-row
+    mapper did not — a poisoned `cost_deducted_usd =
+    Decimal('NaN')` row (legacy bug pre-PR-#75 wrote NaN into
+    that column for a small set of users; PostgreSQL accepts
+    `'NaN'::numeric`) would either render `$nan` in the cost
+    column or 500 the admin page on `int(Decimal('NaN'))`. New
+    module-level `_coerce_usage_log_row` helper scrubs every
+    numeric column to a finite, non-negative value at the
+    boundary, shared between `list_user_usage_logs` and the
+    new `export_user_usage_logs` so the two surfaces cannot
+    drift. 56 new test instances:
+    `tests/test_usage_csv_export.py` (35 — header order pin,
+    one-row-per-input, six-digit cost precision, UTC ISO
+    timestamp formatting for str / datetime / naive / non-UTC
+    /  None / unparseable inputs, NaN/Inf/None/non-numeric
+    /True scrub on cost + tokens, RFC-4180 quoting on
+    `,` / `"` / `\n` in model id, UTF-8 BOM, ``\n`` line
+    terminator, kept-count semantics + front-trim under tiny
+    budget, EXPORT_MAX_BYTES pin, header-only-when-empty,
+    user_handle ignored, filename pattern), 8 new
+    `tests/test_handlers_usage_csv.py` (callback sends doc,
+    callback empty alert, callback caption uses kept count
+    after trim, callback filename embeds telegram_id, slash
+    sends doc, slash empty chat bubble, slash rate-limit
+    short-circuits before DB, slash anonymous user silent
+    drop, stats keyboard registers the button), 13 new
+    `tests/test_database_queries.py` (NaN scrub on
+    `list_user_usage_logs` cost + Inf cost + negative tokens,
+    `export_user_usage_logs` filter / limit clamp / floor /
+    default-is-max / ValueError on non-positive id +
+    non-int id / empty list / row mapping with total_tokens
+    sum / NaN cost scrub at boundary). Suite: 2240 → 2296
+    passing (+56 new).
+24. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-24. **Read the §11 working agreement before doing anything.**
+25. **Read the §11 working agreement before doing anything.**

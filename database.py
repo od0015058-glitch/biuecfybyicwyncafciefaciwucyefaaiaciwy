@@ -89,6 +89,90 @@ def _is_finite_amount(value) -> bool:
     except (TypeError, ValueError):
         return False
 
+
+def _finite_int_or_zero(value) -> int:
+    """Coerce ``value`` to a non-negative finite int, fallback ``0``.
+
+    Mirror of the local helper inside ``get_user_spending_summary``.
+    Lifted to module scope so the per-row coercion in
+    :func:`_coerce_usage_log_row` doesn't have to redefine it on
+    every call (the spending-summary helper is fine because it
+    closes over a single fetch — the per-row mapper runs N times
+    per page / export).
+    """
+    if value is None:
+        return 0
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if not _is_finite_amount(f):
+        return 0
+    try:
+        return max(int(f), 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _finite_float_or_zero(value) -> float:
+    """Coerce ``value`` to a finite float, fallback ``0.0``.
+
+    Same scrub policy as
+    :meth:`Database.get_user_spending_summary`'s local
+    ``_finite_float`` — a poisoned ``Decimal('NaN')`` row in
+    ``cost_deducted_usd`` (legacy data from a pre-PR-#75
+    ``log_usage`` call) lands as ``0.0`` rather than ``nan``.
+    """
+    if value is None:
+        return 0.0
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not _is_finite_amount(f):
+        return 0.0
+    return f
+
+
+def _coerce_usage_log_row(r) -> dict:
+    """Per-row mapper for ``usage_logs`` query results.
+
+    Stage-15-Step-E #2 follow-up. Shared between
+    :meth:`Database.list_user_usage_logs` (the admin-side
+    paginated read backing ``GET /admin/users/{id}/usage``) and
+    :meth:`Database.export_user_usage_logs` (the new user-facing
+    CSV export) so the two surfaces can never drift on token /
+    cost coercion.
+
+    Bundled bug fix: the original ``list_user_usage_logs`` mapper
+    used bare ``int(...)`` / ``float(...)`` casts. ``int(x)``
+    raises ``ValueError`` for ``Decimal('NaN')``, ``float(x)``
+    silently produces ``nan``. A poisoned row (legacy bug
+    pre-PR-#75 wrote NaN into ``cost_deducted_usd`` for a small
+    set of users; the parallel
+    :meth:`Database.get_user_spending_summary` already scrubs
+    these but the admin-side per-user usage-log view did not)
+    would either crash the admin page or render ``$nan`` in the
+    cost column. Post-fix every numeric column is scrubbed to a
+    finite, non-negative value at the boundary so neither the
+    admin HTML view nor the new CSV export can leak NaN.
+    """
+    prompt_tokens = _finite_int_or_zero(r["prompt_tokens"])
+    completion_tokens = _finite_int_or_zero(r["completion_tokens"])
+    return {
+        "id": int(r["log_id"]),
+        "model": r["model_used"],
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "cost_usd": _finite_float_or_zero(r["cost_deducted_usd"]),
+        "created_at": (
+            r["created_at"].isoformat()
+            if r["created_at"] is not None else None
+        ),
+    }
+
+
 class Database:
     def __init__(self):
         self.pool = None
@@ -3136,6 +3220,12 @@ class Database:
         }
 
     USAGE_LOGS_MAX_PER_PAGE: int = 200
+    # Stage-15-Step-E #2 follow-up: export hard cap. 50 000 rows
+    # at ~150 bytes / row = ~7.5 MB CSV; the formatter front-trims
+    # to ``EXPORT_MAX_BYTES`` (5 MB) so the actual delivered file
+    # is smaller, but the DB cap protects the connection from a
+    # buggy caller passing ``limit=10**9``.
+    USAGE_LOGS_EXPORT_MAX_ROWS: int = 50_000
 
     async def list_user_usage_logs(
         self,
@@ -3199,28 +3289,67 @@ class Database:
         total = int(total or 0)
         total_pages = (total + per_page - 1) // per_page
         return {
-            "rows": [
-                {
-                    "id": int(r["log_id"]),
-                    "model": r["model_used"],
-                    "prompt_tokens": int(r["prompt_tokens"]),
-                    "completion_tokens": int(r["completion_tokens"]),
-                    "total_tokens": (
-                        int(r["prompt_tokens"]) + int(r["completion_tokens"])
-                    ),
-                    "cost_usd": float(r["cost_deducted_usd"]),
-                    "created_at": (
-                        r["created_at"].isoformat()
-                        if r["created_at"] is not None else None
-                    ),
-                }
-                for r in rows
-            ],
+            "rows": [_coerce_usage_log_row(r) for r in rows],
             "total": total,
             "page": page,
             "per_page": per_page,
             "total_pages": total_pages,
         }
+
+    async def export_user_usage_logs(
+        self,
+        telegram_id: int,
+        *,
+        limit: int | None = None,
+    ) -> list[dict]:
+        """Stage-15-Step-E #2 follow-up: full ``usage_logs`` export
+        for the user-facing CSV download.
+
+        Returns the same per-row shape as
+        :meth:`list_user_usage_logs` but unpaginated, sorted oldest
+        first so a CSV dropped into Excel reads top-to-bottom in
+        chronological order. ``limit`` is clamped to
+        ``[1, USAGE_LOGS_EXPORT_MAX_ROWS]`` (default
+        :attr:`USAGE_LOGS_EXPORT_MAX_ROWS`); a malformed-large
+        request can't tar-pit the DB or blow past Telegram's 50 MB
+        document cap. ``None`` falls back to the default cap.
+
+        ``cost_usd`` / ``prompt_tokens`` / ``completion_tokens`` /
+        ``total_tokens`` are scrubbed via :func:`_coerce_usage_log_row`
+        so a poisoned row (legacy ``Decimal('NaN')`` written by a
+        pre-PR-#75 ``log_usage`` call into ``cost_deducted_usd``)
+        emits ``0.0`` / ``0`` rather than ``"nan"`` / a crash.
+
+        Defensive against a non-positive ``telegram_id`` — raises
+        ``ValueError`` for symmetry with the rest of the per-user
+        analytics queries.
+        """
+        if not isinstance(telegram_id, int) or telegram_id <= 0:
+            raise ValueError(
+                "telegram_id is required and must be a positive integer; "
+                f"got {telegram_id!r}"
+            )
+        max_rows = self.USAGE_LOGS_EXPORT_MAX_ROWS
+        if limit is None:
+            effective_limit = max_rows
+        else:
+            effective_limit = max(1, min(int(limit), max_rows))
+        tid = int(telegram_id)
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT log_id, model_used,
+                       prompt_tokens, completion_tokens,
+                       cost_deducted_usd, created_at
+                FROM usage_logs
+                WHERE telegram_id = $1
+                ORDER BY log_id ASC
+                LIMIT $2
+                """,
+                tid,
+                effective_limit,
+            )
+        return [_coerce_usage_log_row(r) for r in rows]
 
     async def get_user_usage_aggregates(self, telegram_id: int) -> dict:
         """Stage-9-Step-8: lightweight aggregates rendered above the
