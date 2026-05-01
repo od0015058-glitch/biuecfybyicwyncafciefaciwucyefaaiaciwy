@@ -323,6 +323,10 @@ _STRINGS: dict[str, dict[str, str]] = {
             "✅ پرداخت شما با موفقیت تأیید شد.\n"
             "**${amount:.2f}** به کیف پول شما اضافه گردید."
         ),
+        "zarinpal_credit_notification": (
+            "✅ پرداخت زرین‌پال شما با موفقیت تأیید شد.\n"
+            "**${amount:.2f}** به کیف پول شما اضافه گردید."
+        ),
         "charge_invoice_text": (
             "🧾 **فاکتور شارژ حساب**\n\n"
             "مبلغ شارژ خالص: `${amount}`\n"
@@ -746,6 +750,10 @@ _STRINGS: dict[str, dict[str, str]] = {
         ),
         "tetrapay_credit_notification": (
             "✅ Your payment has been confirmed.\n"
+            "**${amount:.2f}** has been added to your wallet."
+        ),
+        "zarinpal_credit_notification": (
+            "✅ Your Zarinpal payment has been confirmed.\n"
             "**${amount:.2f}** has been added to your wallet."
         ),
         "charge_invoice_text": (
