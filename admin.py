@@ -87,9 +87,18 @@ def _escape_md(s: str | None) -> str:
 def parse_admin_user_ids(raw: str | None) -> frozenset[int]:
     """Parse the ``ADMIN_USER_IDS`` env value into a frozenset of ints.
 
-    Tolerant: empty / None → empty set. Whitespace-only entries and
-    non-integer entries are silently dropped (with a WARNING log) so
-    a typo in the env doesn't crash the bot at startup.
+    Tolerant: empty / None → empty set. Whitespace-only entries,
+    non-integer entries, and **non-positive integer entries** are
+    silently dropped (with a WARNING log) so a typo in the env
+    doesn't crash the bot at startup.
+
+    Why reject non-positive ids: Telegram never issues a 0 or
+    negative user id. A typo (`123,-456`) or accidentally pasting a
+    chat id into the env value would silently put a never-matchable
+    row in the admin set; with Stage-15-Step-E #5 follow-up #3's
+    auto-promote on top, a non-positive entry would also seed a
+    bogus ``admin_roles`` row in the DB. Drop them at parse time so
+    every downstream consumer sees a clean set.
     """
     if not raw:
         return frozenset()
@@ -99,11 +108,20 @@ def parse_admin_user_ids(raw: str | None) -> frozenset[int]:
         if not part:
             continue
         try:
-            out.add(int(part))
+            value = int(part)
         except ValueError:
             log.warning(
                 "ADMIN_USER_IDS: ignoring non-integer entry %r", part
             )
+            continue
+        if value <= 0:
+            log.warning(
+                "ADMIN_USER_IDS: ignoring non-positive entry %r "
+                "(Telegram user ids are always >= 1)",
+                part,
+            )
+            continue
+        out.add(value)
     return frozenset(out)
 
 

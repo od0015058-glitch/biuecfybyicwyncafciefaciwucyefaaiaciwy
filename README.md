@@ -286,6 +286,20 @@ NowPayments crypto invoices.
   "DB write failed" error. Web-side per-handler role gating
   remains the open follow-up; today the page lives behind the
   same single-password gate as every other admin tab.
+  **First-login auto-promote (Stage-15-Step-E #5 follow-up #3)** —
+  `admin_roles.ensure_env_admins_have_roles(db, admin_ids)` runs
+  from the boot path and seeds a `super` row in `admin_roles` for
+  every id in `ADMIN_USER_IDS` that doesn't already have one.
+  Idempotent (a re-boot bumps `skipped_existing` instead of
+  rewriting), defensive (never **downgrades** an existing role,
+  never **escalates non-env users**, never blocks boot on a
+  transient DB error). With this, the DB is the source of truth
+  for the admin surface — operators reading `/admin/roles` see
+  every legacy env-list admin too, and the audit trail can
+  attribute role state changes that started outside the panel.
+  Non-positive entries (a typo like `ADMIN_USER_IDS=123,-456` or
+  a chat-id paste) are dropped at parse time so the auto-promote
+  never seeds an unmatchable row.
 - **Telethon-driven live-bot integration test suite** —
   `tests/integration/` ships a Telethon-based suite that drives a
   *live* test bot via a real Telegram user account (MTProto, not
