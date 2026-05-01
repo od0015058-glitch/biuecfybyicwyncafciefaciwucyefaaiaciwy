@@ -4849,12 +4849,15 @@ async def gateways_enable_post(request: web.Request) -> web.StreamResponse:
 # audit-logged via ``_record_audit_safe`` so the operator can review
 # emergency actions after the fact.
 
-# Process boot timestamp — read once at module import so the
-# uptime gauge in the control panel is monotonic. Using ``time.time()``
-# (wall clock) rather than ``time.monotonic()`` because we render the
-# value as "since process start" in the operator's local time, not
-# as a stopwatch.
-_BOT_PROCESS_START_EPOCH: float = time.time()
+# Process boot timestamp — defer to the ``bot_health`` module so the
+# uptime gauge in the control panel and the classifier's
+# never-ticked-loop grace window agree on the same reference epoch.
+# Using ``time.time()`` (wall clock) rather than ``time.monotonic()``
+# because we render the value as "since process start" in the
+# operator's local time, not as a stopwatch.
+from bot_health import get_process_start_epoch as _bot_health_start_epoch
+
+_BOT_PROCESS_START_EPOCH: float = _bot_health_start_epoch()
 
 
 # Every gateway key the bot recognises. The crypto tickers come from

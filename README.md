@@ -295,6 +295,22 @@ NowPayments crypto invoices.
   5=down) so existing alerting rules can target
   `meowassist_bot_status_score >= 4` to page on under-attack /
   down. First slice of Stage-15-Step-F.
+- **Per-loop freshness thresholds for bot-health** — the
+  `bot_health.compute_bot_status` classifier now derives each
+  background loop's stale threshold from a per-loop cadence map
+  (`bot_health.LOOP_CADENCES`) rather than a single shared
+  `BOT_HEALTH_LOOP_STALE_SECONDS=1800` knob. Long-cadence loops
+  like `model_discovery` (6h) and `catalog_refresh` (24h) no
+  longer trip DEGRADED on a healthy bot; short-cadence loops like
+  `bot_health_alert` (60s) now correctly trip stale at 3 min
+  rather than after a 30 min outage. Operators can pin a per-loop
+  override via `BOT_HEALTH_LOOP_STALE_<UPPER_NAME>_SECONDS`.
+  Bundled bug fix: a freshly-booted bot used to show DEGRADED for
+  any loop that hadn't ticked yet — including `catalog_refresh`
+  which only fires once per 24h, so a fresh deploy was DEGRADED
+  for its first 24h. The classifier now grace-periods a never-
+  ticked loop until `uptime > stale_threshold`. Stage-15-Step-F
+  follow-up #2.
 - **Proactive bot-health Telegram DMs** — new `bot_health_alert.py`
   background loop wakes every `BOT_HEALTH_ALERT_INTERVAL_SECONDS`
   (default 60), runs the same `bot_health.compute_bot_status`

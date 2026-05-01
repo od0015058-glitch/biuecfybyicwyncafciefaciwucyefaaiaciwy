@@ -145,6 +145,127 @@ DEFAULT_IPN_DROP_ATTACK_THRESHOLD = 100
 DEFAULT_LOGIN_THROTTLE_ATTACK_KEYS = 25
 
 
+# ── Per-loop expected cadences ──────────────────────────────────────
+#
+# Each background loop has a published interval (see HANDOFF.md).
+# The single ``BOT_HEALTH_LOOP_STALE_SECONDS`` knob from the first
+# slice over-flags long-cadence loops (``model_discovery`` ticks
+# every 6h by design — 30 min stale threshold means it'd be DEGRADED
+# 100% of the time) and under-flags short-cadence loops
+# (``bot_health_alert`` ticks every 60 s — a missing 5-tick window
+# is a real outage but the single 30-min knob would hide it). The
+# fix is per-loop thresholds derived from each loop's cadence.
+#
+# The convention: a loop is "stale" if its last tick is older than
+# ``2 × cadence + 60 s`` — one missed tick plus a one-minute safety
+# margin to absorb scheduler jitter. The +60 s prevents
+# ``min_amount_refresh`` (cadence 900 s) from oscillating between
+# fresh / stale every minute when a tick happens slightly after its
+# nominal window.
+#
+# Operators can override per-loop via the
+# ``BOT_HEALTH_LOOP_STALE_<UPPER_NAME>_SECONDS`` env var (e.g.
+# ``BOT_HEALTH_LOOP_STALE_FX_REFRESH_SECONDS=900``). The legacy
+# single-knob ``BOT_HEALTH_LOOP_STALE_SECONDS`` is still honoured for
+# *unknown* loop names (forward-compat: a future loop opt-in by
+# adding to ``_LOOP_METRIC_NAMES`` doesn't need to also touch this
+# module — it'll fall back to the legacy knob until a cadence entry
+# is added here).
+LOOP_CADENCES: dict[str, int] = {
+    # NowPayments per-currency min-amount refresher — 15 min by
+    # default, see ``payments._MIN_AMOUNT_REFRESH_INTERVAL_SECONDS``.
+    "min_amount_refresh": 900,
+    # USD→Toman FX refresher — 10 min by default, see
+    # ``fx_rates._DEFAULT_INTERVAL_SECONDS``.
+    "fx_refresh": 600,
+    # OpenRouter model-discovery loop — 6h by default, see
+    # ``model_discovery._DEFAULT_DISCOVERY_INTERVAL_SECONDS``.
+    "model_discovery": 21_600,
+    # OpenRouter catalog refresh — TTL-gated at 24h, see
+    # ``models_catalog.CATALOG_TTL_SECONDS``. NB this is *not* a
+    # timer-driven loop — the gauge ticks only on a successful
+    # ``_refresh()`` call. A 48h threshold lets one TTL-cycle slip
+    # without flagging stale.
+    "catalog_refresh": 86_400,
+    # Stuck-PENDING alert loop — 30 min by default, see
+    # ``pending_alert._PENDING_ALERT_INTERVAL_MIN_DEFAULT``.
+    "pending_alert": 1_800,
+    # PENDING reaper — 15 min by default, see
+    # ``pending_expiration._DEFAULT_EXPIRATION_INTERVAL_MIN``.
+    "pending_reaper": 900,
+    # Bot-health proactive alert loop — 60 s by default, see
+    # ``bot_health_alert._BOT_HEALTH_ALERT_INTERVAL_SECONDS_DEFAULT``.
+    "bot_health_alert": 60,
+}
+
+# Safety margin added on top of (2 × cadence) so a tick that lands
+# just past its nominal window doesn't oscillate the panel between
+# fresh and stale.
+_STALE_THRESHOLD_MARGIN_SECONDS = 60
+
+
+def _stale_threshold_seconds(loop_name: str, *, fallback: int) -> int:
+    """Per-loop stale threshold in seconds.
+
+    Resolution order:
+
+    1. Explicit env override
+       ``BOT_HEALTH_LOOP_STALE_<UPPER_NAME>_SECONDS`` if set to a
+       positive integer. Bad values fall through silently to the
+       next layer (mirrors ``_env_int``'s fail-safe).
+    2. Cadence-derived: ``2 × LOOP_CADENCES[name] +
+       _STALE_THRESHOLD_MARGIN_SECONDS``.
+    3. *fallback* (the caller's legacy single-knob value) for
+       unknown loop names.
+    """
+    explicit_key = (
+        f"BOT_HEALTH_LOOP_STALE_{loop_name.upper()}_SECONDS"
+    )
+    raw = os.getenv(explicit_key, "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            log.warning(
+                "bot_health: invalid %s=%r (not an int) — "
+                "falling back to cadence-derived threshold",
+                explicit_key, raw,
+            )
+        else:
+            if value > 0:
+                return value
+            log.warning(
+                "bot_health: invalid %s=%d (non-positive) — "
+                "falling back to cadence-derived threshold",
+                explicit_key, value,
+            )
+    cadence = LOOP_CADENCES.get(loop_name)
+    if cadence is not None:
+        return cadence * 2 + _STALE_THRESHOLD_MARGIN_SECONDS
+    return fallback
+
+
+# Process-boot epoch — used to grace-period a never-ticked loop on
+# a fresh deploy. Captured at module-load time so re-importing this
+# module in tests doesn't shift the perceived boot time. Tests that
+# need a frozen value pass ``process_start_epoch=`` explicitly to
+# :func:`compute_bot_status`.
+_PROCESS_START_EPOCH: float = time.time()
+
+
+def get_process_start_epoch() -> float:
+    """Read-only accessor for the process-boot epoch.
+
+    Exposed so ``web_admin`` and ``metrics`` can use the same epoch
+    the classifier uses (single source of truth — the panel's
+    "uptime" tile and the classifier's never-ticked grace check
+    must agree, otherwise a fresh bot can show a 47-second uptime
+    on the panel while DEGRADED-because-loop-hasn't-ticked alarms
+    fire below).
+    """
+    return _PROCESS_START_EPOCH
+
+
 def _env_int(key: str, default: int) -> int:
     """Read a non-negative int from env, falling back to *default*.
 
@@ -186,6 +307,7 @@ def compute_bot_status(
     db_error: str | None,
     login_throttle_active_keys: int,
     now: float | None = None,
+    process_start_epoch: float | None = None,
 ) -> BotStatus:
     """Compute the bot's coarse health classification.
 
@@ -216,7 +338,24 @@ def compute_bot_status(
     * ``expected_loops`` — the names of loops that *should* be
       ticking. The classifier only complains about these — a
       future loop opt-in arrives by name without changing this
-      module.
+      module. Per-loop staleness thresholds derive from
+      :data:`LOOP_CADENCES` (a 6h-cadence loop ticks every 6h, so
+      its threshold is 12h — a single missed tick), with explicit
+      env overrides via
+      ``BOT_HEALTH_LOOP_STALE_<UPPER_NAME>_SECONDS``. Loops absent
+      from :data:`LOOP_CADENCES` fall back to the legacy single
+      knob ``BOT_HEALTH_LOOP_STALE_SECONDS`` (default 1800 s) so a
+      future loop opt-in works without a code change.
+    * ``process_start_epoch`` — epoch when the bot process
+      started, used to grace-period a loop that hasn't ticked yet
+      on a fresh deploy. A 24h-cadence loop like
+      ``catalog_refresh`` legitimately won't have ticked in the
+      first hour after boot — flagging it stale immediately would
+      have a freshly-restarted bot show DEGRADED until the first
+      catalog fetch, which is wrong. Defaults to
+      :func:`get_process_start_epoch` (the bot_health module's
+      load-time epoch, exposed for callers that want the same
+      reference).
     * ``db_error`` — the dashboard's last DB-read exception
       message, or ``None``. Any non-empty value escalates to
       ``DOWN`` regardless of the other signals (the dashboard
@@ -239,10 +378,15 @@ def compute_bot_status(
     6. ``IDLE`` otherwise.
     """
     now = now if now is not None else time.time()
+    boot_epoch = (
+        process_start_epoch
+        if process_start_epoch is not None
+        else _PROCESS_START_EPOCH
+    )
     busy_inflight = _env_int(
         "BOT_HEALTH_BUSY_INFLIGHT", DEFAULT_BUSY_INFLIGHT
     )
-    loop_stale_s = _env_int(
+    legacy_loop_stale_s = _env_int(
         "BOT_HEALTH_LOOP_STALE_SECONDS", DEFAULT_LOOP_STALE_SECONDS
     )
     ipn_attack_t = _env_int(
@@ -287,19 +431,38 @@ def compute_bot_status(
         )
 
     # 3. DEGRADED — at least one expected background loop is stale.
+    #
+    # Per-loop thresholds (see ``_stale_threshold_seconds``) so a
+    # 6h-cadence loop isn't flagged DEGRADED 30 min after boot.
+    # Never-ticked loops get a grace period equal to their stale
+    # threshold (one full "missed tick" window from boot) — without
+    # that, ``catalog_refresh`` (24h cadence, no timer driver, only
+    # ticks on a successful fetch) would always show DEGRADED on a
+    # freshly-deployed bot for the first 24h.
     stale: list[str] = []
+    uptime = max(0.0, now - boot_epoch)
     for loop_name in expected_loops:
+        threshold = _stale_threshold_seconds(
+            loop_name, fallback=legacy_loop_stale_s
+        )
         last_tick = loop_ticks.get(loop_name, 0.0) or 0.0
         if last_tick == 0.0:
-            stale.append(
-                f"{loop_name} loop has not ticked since process start"
-            )
+            # Loop hasn't ticked yet. Grace it until uptime exceeds
+            # one stale-window from boot — beyond that, it's a real
+            # alarm because by definition every loop should have
+            # ticked at least once within ``threshold`` seconds.
+            if uptime > threshold:
+                stale.append(
+                    f"{loop_name} loop has not ticked in "
+                    f"{int(uptime)}s since process start "
+                    f"(threshold {threshold}s)"
+                )
             continue
         delta = now - last_tick
-        if delta > loop_stale_s:
+        if delta > threshold:
             stale.append(
                 f"{loop_name} loop last ticked {int(delta)}s ago "
-                f"(threshold {loop_stale_s}s)"
+                f"(threshold {threshold}s)"
             )
     if stale:
         # Trim long lists for the inline summary; the full list

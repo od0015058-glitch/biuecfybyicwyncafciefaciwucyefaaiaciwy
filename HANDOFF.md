@@ -1063,12 +1063,9 @@ What remains for a follow-up PR:
 * **Proactive Telegram-DM alerts on degraded/under-attack** —
   *shipped in Stage-15-Step-F follow-up #1 (`bot_health_alert.py`)*.
   See that section below.
-* **Per-loop "freshness" thresholds** — currently every loop shares
-  the same `BOT_HEALTH_LOOP_STALE_SECONDS=1800` (30 min) threshold,
-  but `model_discovery` ticks every 6h by design while `fx_rates`
-  ticks every 30 min. The single threshold under-flags a stale
-  `fx_rates` and over-flags `model_discovery`. A real fix is a
-  per-loop config dict.
+* **Per-loop "freshness" thresholds** —
+  *shipped in Stage-15-Step-F follow-up #2 (`bot_health.LOOP_CADENCES`)*.
+  See that section below.
 
 Files in this PR (Stage-15-Step-F):
 
@@ -1197,6 +1194,117 @@ Files in this PR (Stage-15-Step-F follow-up #1):
   pass (idle, first-incident, hour-anchor dedupe, level
   escalation, recovery, BUSY doesn't page, the panel-cache
   contract, negative-delta clamp, error propagation).
+
+---
+
+#### Stage-15-Step-F follow-up #2: per-loop freshness thresholds (queued 2026-05-01)
+
+The Stage-15-Step-F first slice and follow-up #1 both used a single
+`BOT_HEALTH_LOOP_STALE_SECONDS=1800` (30 min) threshold for *every*
+expected background loop. That shared knob was wrong on both ends
+of the cadence spectrum:
+
+* `model_discovery` ticks every 6h by design — the 30 min threshold
+  meant the panel showed DEGRADED 100% of the time (the loop is
+  always >30 min past its last tick except for the few seconds
+  surrounding each fire).
+* `catalog_refresh` ticks at most once per 24h — *worse*, even
+  after one tick it would re-flag DEGRADED every time the panel
+  refreshed.
+* `bot_health_alert` ticks every 60 s — a 5-minute outage of the
+  alert loop (the very thing meant to page the operator on real
+  incidents) would have been silent on the panel because the 30
+  min threshold absorbed it.
+
+Worst of all, on a freshly-booted bot with 0 uptime, *every* loop
+that hadn't ticked yet was flagged DEGRADED — so the panel and the
+proactive-alert DMs from follow-up #1 would fire DEGRADED on every
+restart for the full 30 min until each loop hit its first tick.
+For a 24h-cadence loop like `catalog_refresh` this would be
+permanent.
+
+This follow-up replaces the single knob with per-loop thresholds:
+
+* **`bot_health.LOOP_CADENCES`** — a small dict mapping each
+  registered loop name to its expected interval in seconds. Each
+  loop's stale threshold is `2 × cadence + 60 s` (one missed tick
+  plus a one-minute safety margin to absorb scheduler jitter).
+  Long-cadence loops get long thresholds; short-cadence loops get
+  short thresholds. The panel + the alert loop classify
+  consistently with each loop's actual cadence.
+* **`BOT_HEALTH_LOOP_STALE_<UPPER_NAME>_SECONDS` env overrides** —
+  an operator can pin a per-loop threshold via env if the
+  cadence-derived default isn't right for their deploy (e.g.
+  `BOT_HEALTH_LOOP_STALE_FX_REFRESH_SECONDS=900` to tighten the
+  fx-refresh tolerance). Bad values (non-int / non-positive)
+  silently fall through to the cadence-derived default — same
+  fail-safe convention as the rest of the bot's `_env_int`.
+* **Forward-compat**: a future loop opt-in by adding a name to
+  `metrics._LOOP_METRIC_NAMES` works *without* touching this
+  module — names absent from `LOOP_CADENCES` use the legacy
+  single-knob `BOT_HEALTH_LOOP_STALE_SECONDS` (default 1800 s).
+* **Per-loop grace window from boot** — a loop that hasn't ticked
+  yet on a freshly-booted bot is graced for one stale-threshold
+  window from `process_start_epoch`. Beyond that, it's a real
+  alarm because by definition every loop should have ticked at
+  least once within its threshold. `bot_health.get_process_start_epoch()`
+  is the single source of truth — `web_admin._BOT_PROCESS_START_EPOCH`
+  now defers to it so the panel's "uptime" tile and the
+  classifier's grace check agree.
+
+Bundled bug fix in this PR (real, found while measuring the
+classifier's behaviour on a freshly-booted bot): **a freshly-booted
+bot with `catalog_refresh` in `expected_loops` showed DEGRADED for
+the first 24h** because `compute_bot_status` flagged any loop whose
+`last_tick == 0.0` as stale immediately, with no grace window. The
+previous behaviour:
+
+* `last_tick = 0.0` (never ticked) → DEGRADED unconditionally.
+* `last_tick > 0` and `delta > 1800 s` → DEGRADED.
+
+The fix splits the never-ticked path: a 0.0 last-tick is treated
+as "the loop hasn't fired yet but we don't yet have enough uptime
+to expect a fire", and only escalates to DEGRADED once
+`now - process_start_epoch > stale_threshold`. A new regression
+test `test_fresh_boot_does_not_flag_long_cadence_loop_as_stale`
+pins the contract: a bot that booted 30 min ago with no
+catalog-refresh tick must classify IDLE (not DEGRADED).
+
+What remains for a follow-up PR:
+
+* **Cadence registration via decorator** — the `LOOP_CADENCES`
+  dict is currently maintained by hand. A `@register_loop("name",
+  cadence_seconds=N)` decorator on the loop function would
+  populate the dict at import time, eliminating the
+  manual-sync hazard between a loop's actual cadence and the
+  classifier's expected cadence.
+* **Cadence introspection on the panel** — `/admin/control` could
+  show each loop's published cadence + stale threshold next to
+  the current "last ticked Ns ago" so the operator can see at a
+  glance which loops are overdue.
+* **`pending_alert` cadence isn't quite 30 min** — the loop wakes
+  every `PENDING_ALERT_INTERVAL_MIN` (default 30 min) but only
+  ticks the gauge if it actually finds stuck rows. A correctly
+  silent alert loop on a healthy deploy means the gauge can lag
+  arbitrarily. A follow-up could split into a "loop alive" tick
+  (every wake) vs a "found something" tick (current behaviour).
+
+Files in this PR (Stage-15-Step-F follow-up #2):
+
+* `bot_health.py` — `LOOP_CADENCES` dict, `_stale_threshold_seconds`
+  helper, `get_process_start_epoch()` accessor, new
+  `process_start_epoch` parameter on `compute_bot_status`, grace
+  window for never-ticked loops.
+* `web_admin.py` — `_BOT_PROCESS_START_EPOCH` now defers to
+  `bot_health.get_process_start_epoch()` so the panel + classifier
+  agree on the boot reference.
+* `tests/test_bot_health.py` — 2 existing tests updated to mock
+  the boot epoch (the new grace-period default would otherwise
+  hide their DEGRADED assertion); 9 new tests covering the
+  cadence-derived threshold contract, env override + fallback,
+  unknown-loop legacy fallback, the bug-fix grace window, and the
+  module-level boot-epoch accessor.
+* `.env.example` — documented the per-loop override convention.
 
 ---
 
