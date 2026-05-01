@@ -1,9 +1,10 @@
+import io
 import logging
 import math
 import os
 
 from aiogram import F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -53,6 +54,12 @@ from rate_limit import (
 from referral import build_share_url, parse_referral_payload
 from strings import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, all_button_labels, t
 from tetrapay import create_order as tetrapay_create_order
+from vision import (
+    MAX_IMAGES_PER_MESSAGE,
+    VisionError,
+    encode_image_data_uri,
+    is_vision_capable_model,
+)
 
 log = logging.getLogger("bot.handlers")
 
@@ -2798,5 +2805,198 @@ async def process_chat(message: Message):
     # ``TelegramBadRequest: message is too long``. Chunk on a
     # paragraph / line / hard boundary, in that order, so the split
     # falls on a natural break when possible.
+    for chunk in _split_for_telegram(reply, _TELEGRAM_MAX_MSG_CHARS):
+        await message.answer(chunk)
+
+
+# ==========================================
+# Stage-15-Step-E #10: photo / vision chat
+# ==========================================
+async def _download_photo_to_bytes(message: Message) -> bytes | None:
+    """Download the largest ``PhotoSize`` of a photo message.
+
+    Returns ``None`` if the file is unreachable (Telegram returned
+    no ``file_path``, the buffer is empty, or the download itself
+    raised :class:`aiogram.exceptions.TelegramAPIError`). The
+    caller is responsible for surfacing a localised error to the
+    user — this helper deliberately stays loud-but-recoverable so
+    the photo handler can keep running for *other* photo messages.
+
+    aiogram's ``Bot.download_file`` writes into the destination
+    ``BinaryIO`` (here an :class:`io.BytesIO`) and seeks back to
+    the start; ``buf.getvalue()`` then returns the raw bytes that
+    :func:`vision.encode_image_data_uri` will turn into a data
+    URI for the OpenRouter multimodal payload.
+    """
+    if not message.photo:
+        return None
+    # PhotoSize objects come ordered smallest→largest; the last
+    # one is the best quality variant Telegram offers for this
+    # photo. Cheaper resolutions exist but are noticeably worse
+    # for vision tasks.
+    photo = message.photo[-1]
+    try:
+        file = await message.bot.get_file(photo.file_id)
+    except TelegramAPIError:
+        log.exception(
+            "vision: get_file failed for file_id=%r (chat_id=%s)",
+            photo.file_id, message.chat.id,
+        )
+        return None
+    file_path = getattr(file, "file_path", None)
+    if not file_path:
+        log.warning(
+            "vision: get_file returned no file_path for file_id=%r",
+            photo.file_id,
+        )
+        return None
+    try:
+        buf: io.BytesIO = io.BytesIO()
+        await message.bot.download_file(file_path, destination=buf)
+    except TelegramAPIError:
+        log.exception(
+            "vision: download_file failed for file_path=%r (chat_id=%s)",
+            file_path, message.chat.id,
+        )
+        return None
+    buf.seek(0)
+    data = buf.getvalue()
+    if not data:
+        log.warning(
+            "vision: download_file produced 0 bytes for file_path=%r",
+            file_path,
+        )
+        return None
+    return data
+
+
+def _vision_error_localised(lang: str, err: VisionError) -> str:
+    """Map a :class:`VisionError` reason slug to a localised key.
+
+    Anything we don't recognise falls back to the catch-all
+    ``ai_provider_unavailable`` rather than leaking a raw English
+    error string. Keeps the handler's surface stable even if the
+    helper grows new reason slugs.
+    """
+    return {
+        "oversize_image": t(lang, "ai_image_oversize"),
+        "unsupported_mime": t(lang, "ai_image_unsupported_format"),
+        "empty_image": t(lang, "ai_image_download_failed"),
+        "invalid_input": t(lang, "ai_image_download_failed"),
+        "too_many_images": t(
+            lang, "ai_image_too_many"
+        ).format(max_images=MAX_IMAGES_PER_MESSAGE),
+    }.get(err.reason, t(lang, "ai_provider_unavailable"))
+
+
+@router.message(F.photo)
+async def process_photo(message: Message):
+    """Photo (with optional caption) → multimodal AI turn.
+
+    Stage-15-Step-E #10 first integration slice for the vision
+    feature. Mirrors :func:`process_chat`'s structure (rate-limit
+    gate, in-flight slot, typing action, response chunking) so
+    text and photo paths stay in lockstep — a future change to
+    one needs to be applied to the other.
+
+    Validates client-side as much as possible *before* paying
+    for an OpenRouter call: oversize photo, model-not-vision,
+    download failure all surface as localised messages with no
+    wallet impact. Only when everything passes do we hit
+    :func:`chat_with_model` with ``image_data_uris=[uri]``.
+    """
+    # Photo without ``from_user`` (anonymous-admin / channel
+    # forward edge cases) — drop silently the same way
+    # process_chat does.
+    if message.from_user is None:
+        log.info(
+            "process_photo: dropping photo with no from_user "
+            "(chat_id=%s)",
+            message.chat.id,
+        )
+        return
+    user_id = message.from_user.id
+
+    # Per-user chat rate limit, same bucket as process_chat —
+    # photo turns and text turns share the throughput budget.
+    if not await consume_chat_token(user_id):
+        lang = await _get_user_language(user_id)
+        log.info("vision rate-limited telegram_id=%s", user_id)
+        await message.answer(t(lang, "ai_local_rate_limited"))
+        return
+
+    if not await try_claim_chat_slot(user_id):
+        lang = await _get_user_language(user_id)
+        log.info("vision in-flight rejected telegram_id=%s", user_id)
+        await message.answer(t(lang, "ai_chat_busy"))
+        return
+
+    try:
+        # Pre-flight vision-capability check. ``chat_with_model``
+        # also gates this, but doing the check here saves the
+        # Telegram CDN download + base64 encode for users on a
+        # text-only model — they get the actionable error
+        # immediately. Worst case, the user's row is mid-update
+        # (active_model just changed) and the two checks
+        # disagree, but ``chat_with_model``'s gate is the
+        # authoritative one.
+        lang = await _get_user_language(user_id)
+        user_row = await db.get_user(user_id)
+        if user_row is None:
+            await message.answer(t(DEFAULT_LANGUAGE, "ai_no_account"))
+            return
+        active_model = (user_row.get("active_model") or "").strip()
+        if active_model and not is_vision_capable_model(active_model):
+            log.info(
+                "vision pre-flight: user %d active_model=%r not "
+                "vision-capable; sending ai_model_no_vision",
+                user_id, active_model,
+            )
+            await message.answer(t(lang, "ai_model_no_vision"))
+            return
+
+        await message.bot.send_chat_action(
+            chat_id=message.chat.id, action="typing"
+        )
+
+        image_bytes = await _download_photo_to_bytes(message)
+        if image_bytes is None:
+            await message.answer(t(lang, "ai_image_download_failed"))
+            return
+
+        # Telegram always serves ``photo`` objects as JPEG. PNG /
+        # WEBP / GIF arrive as ``document`` and don't reach this
+        # handler — those would need their own ``F.document``
+        # branch with the document's ``mime_type`` field plumbed
+        # through.
+        try:
+            data_uri = encode_image_data_uri(image_bytes, "image/jpeg")
+        except VisionError as err:
+            log.info(
+                "vision encode rejected for user %d (reason=%s): %s",
+                user_id, err.reason, err.message,
+            )
+            await message.answer(_vision_error_localised(lang, err))
+            return
+
+        # ``message.caption`` is optional — text-only photo turn
+        # is allowed by ``build_multimodal_user_message``.
+        prompt = (message.caption or "").strip()
+        reply = await chat_with_model(
+            user_id, prompt, image_data_uris=[data_uri],
+        )
+    finally:
+        await release_chat_slot(user_id)
+
+    if not reply:
+        log.warning(
+            "chat_with_model returned empty/None reply for "
+            "photo turn user_id=%s; falling back to "
+            "provider-unavailable text",
+            user_id,
+        )
+        await message.answer(t(lang, "ai_provider_unavailable"))
+        return
+
     for chunk in _split_for_telegram(reply, _TELEGRAM_MAX_MSG_CHARS):
         await message.answer(chunk)

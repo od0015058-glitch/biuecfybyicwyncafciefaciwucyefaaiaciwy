@@ -193,9 +193,41 @@ class Database:
         Caller is responsible for only invoking this when memory is
         enabled — we don't re-check the flag here so the FK violation
         (no users row) is the only thing the DB will reject.
+
+        Stage-15-Step-E #10 root-cause fix: strip the U+0000 NUL byte
+        before INSERT. Postgres TEXT rejects ``\\x00`` outright with
+        ``invalid byte sequence for encoding "UTF8": 0x00`` — every
+        other Unicode code point (including the rest of the C0 /
+        C1 control range) is accepted, so a targeted strip preserves
+        the user's content with maximum fidelity. The previous PR
+        (#129 / Stage-15-Step-E #10 first slice) wrapped the call
+        site in ``ai_engine.chat_with_model`` in a defensive try/
+        except so a NUL-bearing prompt wouldn't *lose the AI reply*
+        and silently double-bill on retry — that fix handles the
+        symptom (the broad exception path) but the underlying memory
+        turn is still discarded, so the user's conversation buffer
+        develops gaps every time a NUL slips through. Telegram
+        clients DO let users send U+0000 (paste from a binary file,
+        certain emoji-keyboard bugs on Android), so this isn't
+        theoretical. Stripping at the DB layer means the buffer
+        stays intact and the retrying defensive wrap upstream
+        becomes a backstop for the *other* failure modes
+        (transient disconnect, deadlock, FK violation on
+        concurrent user-row delete) it was originally designed to
+        cover. We log loud-and-once when the strip actually fires,
+        so ops can investigate the source of the NUL.
         """
         if role not in ("user", "assistant"):
             raise ValueError(f"invalid role: {role}")
+        if "\x00" in content:
+            stripped = content.replace("\x00", "")
+            log.warning(
+                "append_conversation_message: stripping %d NUL byte(s) "
+                "from %s message for user %d (Postgres TEXT rejects "
+                "\\x00); preserving the rest of the content",
+                content.count("\x00"), role, telegram_id,
+            )
+            content = stripped
         if len(content) > self.MEMORY_CONTENT_MAX_CHARS:
             content = content[: self.MEMORY_CONTENT_MAX_CHARS]
         query = """

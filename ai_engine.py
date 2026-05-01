@@ -9,6 +9,11 @@ from database import db
 from openrouter_keys import key_for_user, mark_key_rate_limited
 from pricing import calculate_cost_async
 from strings import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, t
+from vision import (
+    VisionError,
+    build_multimodal_user_message,
+    is_vision_capable_model,
+)
 
 log = logging.getLogger("bot.ai_engine")
 
@@ -49,7 +54,35 @@ def _resolve_active_model(raw: object) -> str:
         return _ACTIVE_MODEL_FALLBACK
     return coerced
 
-async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
+async def chat_with_model(
+    telegram_id: int,
+    user_prompt: str,
+    *,
+    image_data_uris: list[str] | None = None,
+) -> str:
+    """Run one chat turn for ``telegram_id``.
+
+    ``image_data_uris`` is the Stage-15-Step-E #10 vision integration
+    surface. When non-empty the active model must be vision-capable
+    (per :func:`vision.is_vision_capable_model`) — a non-vision model
+    short-circuits with the ``ai_model_no_vision`` localised string
+    *before* any wallet debit or OpenRouter spend, so the user can
+    pick a vision-capable model and re-send rather than paying for
+    a 400. The keyword is keyword-only on purpose: callers
+    (``handlers.process_chat`` text path, ``handlers.process_photo``
+    photo path) must opt in by name and the existing 19+ test
+    callsites that pass positional args (``chat_with_model(42, "hi")``)
+    keep working unchanged.
+
+    Memory persistence stays text-only: the prompt text is
+    persisted via ``db.append_conversation_message``, the image
+    bytes are NOT (the schema is ``content TEXT NOT NULL``). A
+    follow-up PR can extend ``conversation_messages`` to JSONB if
+    we want full-fidelity replay; for now the trade-off is that
+    a memory-enabled user's vision turn replays as text-only on
+    the next turn (the model loses the visual context but keeps
+    the conversational thread). HANDOFF.md documents this limit.
+    """
     # 1. Fetch user data and check limits
     user = await db.get_user(telegram_id)
     if not user:
@@ -109,6 +142,22 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
     if is_model_disabled(active_model):
         return t(lang, "ai_model_disabled")
 
+    # Stage-15-Step-E #10: vision-capability gate. Fires *before* the
+    # insufficient-balance gate so a user with empty wallet trying to
+    # send an image to a non-vision model gets the actionable error
+    # (pick a vision model) rather than the generic "top up" — the
+    # latter would have them top up uselessly because the next
+    # attempt would still fail. Also fires *before* the OpenRouter
+    # spend so a non-vision model never sees the image and never
+    # 400s back at us with us holding the bag for a $0 reply.
+    has_images = bool(image_data_uris)
+    if has_images and not is_vision_capable_model(active_model):
+        log.info(
+            "vision rejected for user %d: model %r does not support images",
+            telegram_id, active_model,
+        )
+        return t(lang, "ai_model_no_vision")
+
     # 2. Hard block if they are out of free messages and out of money
     if free_msgs <= 0 and balance < 0.05:
         return t(lang, "ai_insufficient_balance")
@@ -121,7 +170,31 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
     messages: list[dict] = []
     if memory_enabled:
         messages.extend(await db.get_recent_messages(telegram_id))
-    messages.append({"role": "user", "content": user_prompt})
+    if has_images:
+        # Stage-15-Step-E #10: assemble the OpenAI/OpenRouter
+        # multimodal user-message dict via the pure helper. A
+        # ``VisionError`` here means the caller (handler) handed us
+        # malformed inputs that survived its own validation — drop
+        # the image cleanly and surface the same provider-unavailable
+        # text we already use for unrecoverable input issues, so the
+        # user sees a localised message rather than a poller-level
+        # crash. Never charge or call OpenRouter in this branch.
+        try:
+            messages.append(
+                build_multimodal_user_message(user_prompt, image_data_uris)
+            )
+        except VisionError:
+            log.exception(
+                "vision payload assembly failed for user %d "
+                "(model=%r, image_count=%d, prompt_len=%d); "
+                "investigate handler-side validation.",
+                telegram_id, active_model,
+                len(image_data_uris) if image_data_uris else 0,
+                len(user_prompt or ""),
+            )
+            return t(lang, "ai_provider_unavailable")
+    else:
+        messages.append({"role": "user", "content": user_prompt})
 
     # 4. Call OpenRouter API
     try:

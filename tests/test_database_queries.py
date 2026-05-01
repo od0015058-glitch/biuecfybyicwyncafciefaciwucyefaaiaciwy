@@ -2747,3 +2747,158 @@ async def test_list_payment_status_transitions_decodes_jsonb_string_meta():
 
     rows = await db.list_payment_status_transitions()
     assert rows[0]["meta"] == {"received_usd": 4.95}
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10 (this PR) bundled bug fix:
+# ``append_conversation_message`` strips U+0000 NUL bytes before INSERT
+# so a NUL-bearing prompt or reply doesn't poison the conversation
+# buffer with the Postgres "invalid byte sequence for encoding UTF8:
+# 0x00" rejection.
+# ---------------------------------------------------------------------
+# Pre-fix: PR #129 (Stage-15-Step-E #10 first slice) wrapped the
+# upstream call site in ``ai_engine.chat_with_model`` in a defensive
+# try/except so the AI reply isn't lost (and the user isn't double-
+# billed on retry). But the underlying memory turn was still
+# discarded. This test pins the root-cause fix: NUL bytes are
+# silently stripped at the DB layer so the buffer stays intact.
+# Telegram clients DO let users send U+0000 (paste-from-binary,
+# Android emoji-keyboard bugs), so this isn't theoretical.
+# ---------------------------------------------------------------------
+
+
+async def test_append_conversation_message_strips_nul_bytes(caplog):
+    """A prompt with embedded ``\\x00`` must reach the INSERT with
+    the NUL stripped — every other character preserved verbatim
+    so the conversation buffer keeps maximum fidelity."""
+    conn = _make_conn()
+    conn.execute = AsyncMock()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    with caplog.at_level("WARNING"):
+        await db.append_conversation_message(
+            42, "user", "hello\x00world\x00!",
+        )
+
+    # The INSERT was issued with the NUL bytes removed.
+    assert conn.execute.await_count == 1
+    args = conn.execute.await_args.args
+    # ``execute(query, telegram_id, role, content)``
+    assert args[1] == 42
+    assert args[2] == "user"
+    assert args[3] == "helloworld!"
+    # Loud-and-once warning so ops can investigate the source.
+    assert any(
+        "stripping" in record.message and "NUL" in record.message
+        for record in caplog.records
+    ), "expected NUL-strip warning log entry"
+
+
+async def test_append_conversation_message_no_nul_no_log():
+    """A plain prompt without any NUL bytes must NOT emit the
+    strip warning — the log is reserved for the actually-fired
+    case so ops can spot row-corruption sources."""
+    conn = _make_conn()
+    conn.execute = AsyncMock()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    import logging as _logging
+    handler_records: list[_logging.LogRecord] = []
+
+    class _Capture(_logging.Handler):
+        def emit(self, record):
+            handler_records.append(record)
+
+    cap = _Capture(level=_logging.WARNING)
+    database_module.log.addHandler(cap)
+    try:
+        await db.append_conversation_message(42, "user", "plain text only")
+    finally:
+        database_module.log.removeHandler(cap)
+
+    assert conn.execute.await_count == 1
+    args = conn.execute.await_args.args
+    assert args[3] == "plain text only"
+    assert not any(
+        "stripping" in r.getMessage() for r in handler_records
+    )
+
+
+async def test_append_conversation_message_strip_then_truncate():
+    """The strip step runs *before* the length-cap step so a
+    prompt that's NUL-padded to be over the limit gets the NULs
+    removed first; only the genuine content is then capped at
+    ``MEMORY_CONTENT_MAX_CHARS``. Without this ordering a
+    NUL-heavy prompt could be truncated mid-Unicode-codepoint
+    or have its real content prematurely cut off."""
+    conn = _make_conn()
+    conn.execute = AsyncMock()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    cap = db.MEMORY_CONTENT_MAX_CHARS
+    nul_padding = "\x00" * 100
+    real_content = "x" * (cap - 50)
+    prompt = nul_padding + real_content
+
+    await db.append_conversation_message(42, "user", prompt)
+
+    args = conn.execute.await_args.args
+    persisted = args[3]
+    # NULs gone, real content fully preserved (still under cap).
+    assert "\x00" not in persisted
+    assert persisted == real_content
+
+
+async def test_append_conversation_message_only_nul_persists_empty():
+    """A prompt that's *entirely* NUL bytes ends up as the empty
+    string. Postgres TEXT NOT NULL accepts ``''`` so the INSERT
+    succeeds — better than blowing up the whole buffer write
+    with a Postgres-level rejection. The upstream caller has its
+    own defensive catch (PR #129 wrap) so we don't even need to
+    flag this as exceptional from here; the warning log alone
+    is enough for ops to investigate."""
+    conn = _make_conn()
+    conn.execute = AsyncMock()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.append_conversation_message(42, "assistant", "\x00\x00\x00")
+
+    args = conn.execute.await_args.args
+    assert args[3] == ""
+
+
+async def test_append_conversation_message_unicode_preserved_around_nul():
+    """Non-NUL Unicode (RTL Persian text, emoji, control chars
+    other than NUL) must round-trip unchanged. We strip ONLY
+    U+0000 — every other code point is fine in Postgres TEXT."""
+    conn = _make_conn()
+    conn.execute = AsyncMock()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    payload = "سلام\x00دنیا 🌍\x01\x02\nfoo"
+    await db.append_conversation_message(42, "user", payload)
+
+    args = conn.execute.await_args.args
+    # Persian, emoji, \x01, \x02, \n all preserved; only \x00 stripped.
+    assert args[3] == "سلامدنیا 🌍\x01\x02\nfoo"
+
+
+def test_append_conversation_message_invalid_role_still_rejected():
+    """The pre-existing role validation must still fire — the
+    new strip step must run *after* the role check, not
+    short-circuit it. Belt-and-braces: a future refactor that
+    inadvertently moves the role check below the strip would
+    let an invalid role reach the INSERT."""
+    import asyncio
+    conn = _make_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    with pytest.raises(ValueError, match="invalid role"):
+        asyncio.get_event_loop().run_until_complete(
+            db.append_conversation_message(42, "system", "hi"),
+        )
