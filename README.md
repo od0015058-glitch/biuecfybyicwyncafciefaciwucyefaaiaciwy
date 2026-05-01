@@ -295,6 +295,22 @@ NowPayments crypto invoices.
   5=down) so existing alerting rules can target
   `meowassist_bot_status_score >= 4` to page on under-attack /
   down. First slice of Stage-15-Step-F.
+- **Alert-loop audit trail** — every bot-health alert DM
+  (`bot_health_alert.py`) and recovery DM now appends one row to
+  `admin_audit_log`, alongside the human-admin actions on
+  `/admin/control`. Filter `/admin/audit?actor=bot_health_alert`
+  for the loop-driven feed. The `meta` jsonb column captures the
+  entered level, the underlying classifier signals (so the audit
+  row is self-contained), the recovered-from level (recovery
+  only), and the per-DM delivery counts so a partial-fan-out
+  incident ("0 of 2 admins reached") is visible. The
+  `no_admins_reachable` and `no_admins_configured` outcomes
+  surface alerts that fired but didn't reach anyone — silent
+  failures the audit log was designed to catch. Bundled bug
+  fix: the five control-panel action slugs shipped in
+  Stage-15-Step-F first slice (force-stop, kill-switches) were
+  being recorded but were missing from the `/admin/audit` filter
+  dropdown — fixed in this PR. Stage-15-Step-F follow-up #3.
 - **Per-loop freshness thresholds for bot-health** — the
   `bot_health.compute_bot_status` classifier now derives each
   background loop's stale threshold from a per-loop cadence map

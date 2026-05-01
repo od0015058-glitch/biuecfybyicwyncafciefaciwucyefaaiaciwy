@@ -246,6 +246,79 @@ def _format_alert_body(
 # ---------------------------------------------------------------------
 
 
+async def _record_alert_audit(
+    status: BotStatus,
+    *,
+    sent_count: int,
+    admin_count: int,
+    recovered_from: BotStatusLevel | None = None,
+) -> None:
+    """Append one row to ``admin_audit_log`` describing an alert DM.
+
+    Best-effort: every exception is swallowed and logged. The alert
+    loop's responsibility is to DM the operator about incidents —
+    if the audit-log write fails we still want the DM to count.
+
+    Action slug:
+
+    * ``bot_health_alert`` — bad-level transition (DEGRADED /
+      UNDER_ATTACK / DOWN entry).
+    * ``bot_health_recovery`` — recovery transition back to
+      HEALTHY/IDLE.
+
+    The ``meta`` jsonb column captures everything an operator
+    reviewing the incident timeline would want: the level / score,
+    the recovered-from level (recovery only), the underlying
+    ``signals`` tuple from the classifier (so the audit row is
+    self-contained — the operator doesn't need to cross-reference
+    Prometheus to know *why* the alert fired), and the per-DM
+    delivery counts (so a partially-failed fan-out is visible —
+    "0 of 2 admins received this DM" is a much louder signal than
+    just "DM sent" when an admin blocked the bot during an
+    incident).
+
+    ``actor`` is fixed to ``"bot_health_alert"`` (the loop itself,
+    not a human admin) and ``ip`` is ``None`` because no inbound
+    request triggered this — it's a polled background event. The
+    audit-log filter UI on ``/admin/audit`` already supports
+    filtering by ``actor`` so an operator can pull just the
+    alert-loop rows.
+    """
+    is_recovery = recovered_from is not None
+    action = "bot_health_recovery" if is_recovery else "bot_health_alert"
+    outcome = "ok" if sent_count > 0 else "no_admins_reachable"
+    if admin_count == 0:
+        outcome = "no_admins_configured"
+    meta = {
+        "level": status.level.value,
+        "score": status.score,
+        "summary": status.summary,
+        "signals": list(status.signals),
+        "sent_count": sent_count,
+        "admin_count": admin_count,
+    }
+    if recovered_from is not None:
+        meta["recovered_from"] = recovered_from.value
+    try:
+        # Lazy import so this module imports cleanly in tests that
+        # don't have asyncpg / a configured DSN.
+        from database import db
+        await db.record_admin_audit(
+            actor="bot_health_alert",
+            action=action,
+            target=status.level.value,
+            ip=None,
+            outcome=outcome,
+            meta=meta,
+        )
+    except Exception:
+        log.exception(
+            "bot_health_alert: audit log write failed for %s "
+            "(action=%s, outcome=%s)",
+            status.level.value, action, outcome,
+        )
+
+
 async def notify_admins_of_health_change(
     bot: Bot,
     status: BotStatus,
@@ -271,6 +344,18 @@ async def notify_admins_of_health_change(
             "these alerts.",
             status.level.value,
         )
+        # Still record the no-admins-configured event in the audit
+        # log so the operator reviewing the timeline can see *that*
+        # the alert would have fired even though no DM went out.
+        # Otherwise an unconfigured deploy that's actually under
+        # attack would be silent both via DM and via audit-log,
+        # which defeats the whole point of having an audit trail.
+        await _record_alert_audit(
+            status,
+            sent_count=0,
+            admin_count=0,
+            recovered_from=recovered_from,
+        )
         return 0
     text = _format_alert_body(status, recovered_from=recovered_from)
     sent = 0
@@ -290,6 +375,18 @@ async def notify_admins_of_health_change(
                 "Failed to send bot-health alert to admin %d",
                 admin_id,
             )
+    # One audit row per *event* (not per admin) — the audit table
+    # answers "what fired and when", and the meta blob captures the
+    # delivery fan-out so a partial failure is visible. Recording
+    # one row per admin would make the audit log noisy without
+    # adding signal: the per-admin DM result is captured in
+    # ``meta.sent_count`` vs ``meta.admin_count``.
+    await _record_alert_audit(
+        status,
+        sent_count=sent,
+        admin_count=len(admin_ids),
+        recovered_from=recovered_from,
+    )
     return sent
 
 
