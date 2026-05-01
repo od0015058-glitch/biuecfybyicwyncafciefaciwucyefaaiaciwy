@@ -80,6 +80,7 @@ from aiohttp import web
 # referenced — not the module-level ``db`` singleton — so the admin
 # still works against the injected DB in tests.
 import strings as bot_strings_module
+from admin_roles import VALID_ROLES, normalize_role
 from database import Database
 from formatting import format_usd
 from rate_limit import (
@@ -4827,6 +4828,325 @@ async def openrouter_keys_get(request: web.Request) -> web.StreamResponse:
     return response
 
 
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #5 follow-up #2: /admin/roles web page.
+# ---------------------------------------------------------------------
+#
+# Browser counterpart to the Telegram-side ``/admin_role_*`` triplet.
+# Same authoritative DB primitives (``Database.get_admin_role`` /
+# ``set_admin_role`` / ``delete_admin_role`` / ``list_admin_roles``);
+# same audit-log slugs (``role_grant`` / ``role_revoke``); same auth
+# (the existing ``ADMIN_PASSWORD``-gated cookie). Per-admin web auth
+# (a real telegram-id-keyed credential) is the larger redesign Step-E
+# #5's open follow-up backlog calls out — not in scope here. The
+# panel still surfaces every role-table change so an operator who
+# manages roles via the browser keeps the same audit visibility as
+# the Telegram CLI.
+#
+# Routes:
+#   GET  /admin/roles                          — list + grant form
+#   POST /admin/roles                          — grant
+#   POST /admin/roles/{telegram_id}/revoke     — drop the DB row
+#
+# Note: ``ADMIN_USER_IDS`` (env-list legacy admins) are NOT shown
+# here; they keep ``super`` access via the env-list backward-compat
+# fallback regardless. The page is the source of truth for
+# *DB-tracked* roles only — same surface boundary the Telegram
+# ``/admin_role_list`` command pins.
+
+# Free-form notes shown alongside the role row. Maxed at 500 chars to
+# keep the table cell rendering reasonable. The DB column itself is
+# unbounded TEXT, so a future re-design can lift the cap without a
+# migration.
+ADMIN_ROLE_NOTES_MAX_LEN = 500
+
+
+def _parse_role_form(form) -> dict | str:
+    """Parse the ``/admin/roles`` grant form.
+
+    Returns a dict with normalised values on success, or a string error
+    key on failure (one of: ``missing_telegram_id``, ``bad_telegram_id``,
+    ``missing_role``, ``bad_role``, ``notes_too_long``).
+    """
+    raw_id = (form.get("telegram_id") or "").strip()
+    if not raw_id:
+        return "missing_telegram_id"
+    try:
+        telegram_id = int(raw_id)
+    except ValueError:
+        return "bad_telegram_id"
+    if telegram_id <= 0:
+        return "bad_telegram_id"
+
+    raw_role = (form.get("role") or "").strip()
+    if not raw_role:
+        return "missing_role"
+    role = normalize_role(raw_role)
+    if role is None:
+        return "bad_role"
+
+    raw_notes = (form.get("notes") or "")
+    # Strip leading / trailing whitespace but keep any internal newlines
+    # the operator typed — same posture as the gift-code "notes" field.
+    notes = raw_notes.strip() if isinstance(raw_notes, str) else ""
+    if len(notes) > ADMIN_ROLE_NOTES_MAX_LEN:
+        return "notes_too_long"
+
+    return {
+        "telegram_id": telegram_id,
+        "role": role,
+        "notes": notes or None,
+    }
+
+
+_ROLE_FORM_ERR_TEXT = {
+    "missing_telegram_id": "Enter a Telegram user id.",
+    "bad_telegram_id": (
+        "Telegram id must be a positive integer."
+    ),
+    "missing_role": "Pick a role.",
+    "bad_role": (
+        f"Role must be one of: {', '.join(sorted(VALID_ROLES))}."
+    ),
+    "notes_too_long": (
+        f"Notes must be at most {ADMIN_ROLE_NOTES_MAX_LEN} characters."
+    ),
+}
+
+
+async def roles_get(request: web.Request) -> web.StreamResponse:
+    """GET /admin/roles — list DB-tracked admin roles + grant form."""
+    db = request.app.get(APP_KEY_DB)
+    rows: list = []
+    db_error: str | None = None
+    if db is None:
+        db_error = "No database wired up (development mode)."
+    else:
+        try:
+            rows = await db.list_admin_roles(limit=200)
+        except Exception:
+            log.exception("roles_get: list_admin_roles failed")
+            db_error = "Database query failed — see logs."
+
+    context = {
+        "rows": rows,
+        "db_error": db_error,
+        "active_page": "roles",
+        "csrf_token": csrf_token_for(request),
+        "flash": None,
+    }
+    response = aiohttp_jinja2.render_template(
+        "roles.html", request, context,
+    )
+    flash = pop_flash(request, response)
+    if flash is not None:
+        context["flash"] = flash
+        response = aiohttp_jinja2.render_template(
+            "roles.html", request, context,
+        )
+        response.del_cookie(FLASH_COOKIE, path="/admin/")
+    return response
+
+
+async def roles_create(request: web.Request) -> web.StreamResponse:
+    """POST /admin/roles — grant a DB-tracked admin role."""
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+
+    form = await request.post()
+
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning("roles_create: CSRF token mismatch from %s", request.remote)
+        response = web.HTTPFound(location="/admin/roles")
+        set_flash(
+            response,
+            kind="error",
+            message="Form submission was rejected (CSRF). Refresh and try again.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    parsed = _parse_role_form(form)
+    response = web.HTTPFound(location="/admin/roles")
+    if isinstance(parsed, str):
+        set_flash(
+            response,
+            kind="error",
+            message=_ROLE_FORM_ERR_TEXT.get(
+                parsed, f"Invalid input ({parsed})."
+            ),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    db = request.app.get(APP_KEY_DB)
+    if db is None:
+        set_flash(
+            response,
+            kind="error",
+            message="No database wired up — cannot grant.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        stored = await db.set_admin_role(
+            parsed["telegram_id"],
+            parsed["role"],
+            granted_by=None,  # web side has no per-admin identity yet.
+            notes=parsed["notes"],
+        )
+    except ValueError as exc:
+        # ``Database.set_admin_role`` validates again (defense in depth).
+        # Surface the validator's message so the admin sees the
+        # offending value rather than a generic "DB write failed".
+        set_flash(
+            response,
+            kind="error",
+            message=str(exc),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+    except Exception:
+        log.exception("roles_create: set_admin_role failed")
+        set_flash(
+            response,
+            kind="error",
+            message="Database write failed — see logs.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    log.info(
+        "web_admin roles_create: telegram_id=%s role=%s",
+        parsed["telegram_id"], stored,
+    )
+    await _record_audit_safe(
+        request,
+        "role_grant",
+        target=f"user:{parsed['telegram_id']}",
+        meta={"role": stored, "notes": parsed["notes"]},
+    )
+    set_flash(
+        response,
+        kind="success",
+        message=(
+            f"Granted role '{stored}' to {parsed['telegram_id']}."
+        ),
+        secret=secret,
+        cookie_secure=cookie_secure,
+    )
+    return response
+
+
+async def roles_revoke(request: web.Request) -> web.StreamResponse:
+    """POST /admin/roles/{telegram_id}/revoke — drop the DB row."""
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+
+    form = await request.post()
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning("roles_revoke: CSRF token mismatch from %s", request.remote)
+        response = web.HTTPFound(location="/admin/roles")
+        set_flash(
+            response,
+            kind="error",
+            message="Form submission was rejected (CSRF). Refresh and try again.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    raw_id = request.match_info.get("telegram_id", "").strip()
+    response = web.HTTPFound(location="/admin/roles")
+    try:
+        telegram_id = int(raw_id)
+    except ValueError:
+        set_flash(
+            response,
+            kind="error",
+            message="Invalid telegram id in URL.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+    if telegram_id <= 0:
+        set_flash(
+            response,
+            kind="error",
+            message="Invalid telegram id in URL.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    db = request.app.get(APP_KEY_DB)
+    if db is None:
+        set_flash(
+            response,
+            kind="error",
+            message="No database wired up — cannot revoke.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        deleted = await db.delete_admin_role(telegram_id)
+    except Exception:
+        log.exception("roles_revoke: delete_admin_role failed")
+        set_flash(
+            response,
+            kind="error",
+            message="Database write failed — see logs.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    # Audit BOTH outcomes — the Telegram-side ``admin_role_revoke`` does
+    # the same thing (``outcome="ok" if deleted else "noop"``) so a
+    # forensic operator can see "someone tried to revoke X but no row
+    # existed" without diffing the role list against the audit log.
+    await _record_audit_safe(
+        request,
+        "role_revoke",
+        target=f"user:{telegram_id}",
+        outcome="ok" if deleted else "noop",
+        meta={"deleted": bool(deleted)},
+    )
+    if deleted:
+        log.info("web_admin roles_revoke: telegram_id=%s", telegram_id)
+        set_flash(
+            response,
+            kind="success",
+            message=(
+                f"Revoked DB-tracked role for {telegram_id}. "
+                "(If they remain in ADMIN_USER_IDS, they keep super "
+                "access via the env list.)"
+            ),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+    else:
+        set_flash(
+            response,
+            kind="info",
+            message=(
+                f"No DB-tracked role row for {telegram_id} — "
+                "nothing to revoke."
+            ),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+    return response
+
+
 async def gateways_get(request: web.Request) -> web.StreamResponse:
     """GET /admin/gateways — list all payment gateways with toggles."""
     from admin_toggles import get_disabled_gateways
@@ -5779,6 +6099,14 @@ def setup_admin_routes(
     # Stage-15-Step-E #4 follow-up: per-key OpenRouter ops view.
     app.router.add_get(
         "/admin/openrouter-keys", _require_auth(openrouter_keys_get),
+    )
+
+    # Stage-15-Step-E #5 follow-up #2: admin-roles web page.
+    app.router.add_get("/admin/roles", _require_auth(roles_get))
+    app.router.add_post("/admin/roles", _require_auth(roles_create))
+    app.router.add_post(
+        "/admin/roles/{telegram_id}/revoke",
+        _require_auth(roles_revoke),
     )
 
     # Stage-15-Step-F: bot health & emergency control panel.

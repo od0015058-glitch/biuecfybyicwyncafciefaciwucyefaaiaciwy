@@ -708,7 +708,7 @@ What's shipped this PR:
 What remains (next AI's TODO):
 
 * ~~**Wire `role_at_least` into the existing admin command gates.**~~ ✅ **shipped in Stage-15-Step-E #5 follow-up #1 (role-gates wiring PR).** `admin._resolve_actor_role` (DB lookup → env-list fallback) + `admin._require_role(message, required)` now gate every Telegram-side admin handler. Per-handler floors: `/admin_metrics` and `/admin_balance` at `viewer`; `/admin_broadcast` at `operator`; `/admin_credit`, `/admin_debit`, and the entire `/admin_promo_*` family at `super`. The `/admin_role_*` handlers stay env-list-only (a DB-tracked super must NOT be able to self-promote out of the role table). The `/admin` hub message is rendered by `_render_admin_hub(role, is_env_admin=...)` and only lists rows the actor can actually drive — so a viewer typing `/admin` sees `/admin_metrics` and `/admin_balance` only, not `/admin_credit`. 17 new regression tests in `tests/test_admin.py`: the parametrised `test_admin_handlers_respect_role_floor` walks every (role × handler) cell of the matrix and pins both directions (the floor-and-above runs, every strictly-lower role silent-no-ops). Plus dedicated tests for the env-list backward-compat fallback when the DB pool fails (a transient pool error must NOT downgrade a legacy admin from super → None mid-incident), DB-role-wins-over-env-list, no-from-user defence in depth, and the role-CRUD-stays-env-list invariant.
-* **Add `/admin/roles` web page** mirroring the Telegram CLI. List + create + revoke form, audit-logged via the existing `_record_audit_safe` helper. Same auth as the rest of the panel (`ADMIN_PASSWORD`-gated cookie) — per-user web auth is a separate, larger redesign not in scope for the role system.
+* ~~**Add `/admin/roles` web page** mirroring the Telegram CLI.~~ ✅ **shipped in Stage-15-Step-E #5 follow-up #2 (this PR).** Browser counterpart to the `/admin_role_*` triplet: `GET /admin/roles` lists every DB-tracked grant (telegram id, role badge, granted-at, granted-by, notes, revoke button); `POST /admin/roles` writes a grant via `Database.set_admin_role`; `POST /admin/roles/{telegram_id}/revoke` drops the row via `Database.delete_admin_role`. Same auth as the rest of the panel (`ADMIN_PASSWORD`-gated cookie). Both write paths CSRF-protected via `verify_csrf_token` and audit-logged via `_record_audit_safe` with the existing `role_grant` / `role_revoke` slugs (already in `AUDIT_ACTION_LABELS`, so they show up in the `/admin/audit` filter dropdown without a follow-up patch). Form validation rejects empty / non-positive telegram ids, invalid role names (via `admin_roles.normalize_role`), and notes longer than 500 characters; failures surface a flash banner instead of silently no-op-ing. Per-user web auth (telegram-id-keyed credentials) remains the larger redesign called out in `bullet below — not in scope. **Bundled bug fix:** `Database.set_admin_role` now strips U+0000 NUL bytes from the `notes` argument before INSERT, mirroring the Stage-15-Step-E #10 fix on `append_conversation_message` (PR #128). Postgres TEXT rejects `\x00` outright with `invalid byte sequence for encoding "UTF8": 0x00`; the new web textarea is the surface most likely to hit this (an admin pasting from a binary file), but `/admin_role_grant`'s Telegram path also benefits — a NUL-bearing note used to demote the whole grant to a misleading "DB write failed — see logs" error. Strip-and-warn at the DB layer keeps the rest of the note text and logs the strip count loud-and-once for ops triage. **24 new tests** (21 in `tests/test_web_admin.py` covering auth gate / empty state / row rendering / DB error / sidebar nav / happy-path grant + revoke / CSRF protection / every validation branch / DB-error surfacing / noop revoke audit; 3 in `tests/test_database_queries.py` covering NUL strip + log warn / non-NUL passthrough / None notes early-out).
 * **Wire role gates into the web admin panel.** The web side currently has a single `ADMIN_PASSWORD`; per-admin web auth is a larger redesign. As an interim, the web panel could read `effective_role` for the configured `ADMIN_PASSWORD` operator (today it's `super` by default) and surface a "view as <role>" toggle for testing the gates without provisioning a second password.
 * **Per-user web auth** — replace the single `ADMIN_PASSWORD` with per-admin Telegram-id-keyed credentials so the role system actually applies to the browser surface. This is the multi-week piece the original Step-E table row 5 calls out as "high effort"; it needs OAuth/SSO discussion with the operator first.
 * **First-login auto-promote of `ADMIN_USER_IDS` admins to a real `admin_roles` row.** Currently env-list admins only get a `super` role *implicitly* via `effective_role`. A startup task that ensures every env-list id has a matching `admin_roles` row would make the DB the source of truth and let the operator drop env-list management entirely.
@@ -2070,7 +2070,46 @@ The user's process for this project — **do not deviate**:
     most recent always survives, single-second timing budget
     catches an O(n²) regression). Total suite: 1970 tests
     passing (1961 from `main` after #139 + 9 new).
-15. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+15. **Stage-15-Step-E #5 follow-up #2 OPENED** (PR-after-#140) —
+    `/admin/roles` web page mirroring the Telegram `/admin_role_*`
+    triplet. New routes: `GET /admin/roles` lists every DB-tracked
+    grant with telegram id, role badge, granted-at, granted-by, and
+    notes columns plus a per-row revoke button; `POST /admin/roles`
+    writes a grant via the existing `Database.set_admin_role`;
+    `POST /admin/roles/{telegram_id}/revoke` drops the row via
+    `Database.delete_admin_role`. Same auth as the rest of the
+    admin panel (the existing `ADMIN_PASSWORD`-gated cookie — per-
+    admin web identity is a separate, larger redesign called out
+    in the §"what remains" backlog). Both write paths CSRF-
+    protected with `verify_csrf_token` and audit-logged via
+    `_record_audit_safe` using the existing `role_grant` /
+    `role_revoke` slugs (already in `AUDIT_ACTION_LABELS`, so the
+    new entries auto-surface in the `/admin/audit` filter
+    dropdown). Form validation rejects empty / non-positive
+    telegram ids, invalid role names (via
+    `admin_roles.normalize_role`), and notes longer than 500
+    chars — failures surface a flash banner so the admin sees the
+    offending value rather than a generic "DB write failed".
+    Sidebar link added to `templates/admin/_layout.html`. Bundled
+    real bug fix: `Database.set_admin_role` now strips U+0000 NUL
+    bytes from the `notes` argument before INSERT, mirroring the
+    Stage-15-Step-E #10 fix on `append_conversation_message` (PR
+    #128). Postgres TEXT rejects `\x00` outright with `invalid
+    byte sequence for encoding "UTF8": 0x00`; the new web textarea
+    is the surface most likely to hit this (an admin pasting from
+    a binary file), but `/admin_role_grant`'s Telegram path also
+    benefits — a NUL-bearing note used to demote the whole grant
+    to a misleading "DB write failed — see logs" error. Strip-
+    and-warn at the DB layer keeps the rest of the note text and
+    logs the strip count loud-and-once for ops triage. New tests:
+    21 in `tests/test_web_admin.py` (auth gate / empty state / row
+    rendering / DB error / sidebar nav / happy-path grant +
+    revoke / CSRF protection on both write paths / every
+    validation branch / DB-error surfacing / noop-revoke audit
+    pin) + 3 in `tests/test_database_queries.py` (NUL strip + log
+    warn / non-NUL passthrough / `notes=None` early-out). Total
+    suite: 1994 tests passing (1970 + 24 new).
+16. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-16. **Read the §11 working agreement before doing anything.**
+17. **Read the §11 working agreement before doing anything.**

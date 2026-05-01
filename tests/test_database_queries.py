@@ -2520,6 +2520,65 @@ async def test_set_admin_role_uses_upsert():
     assert "granted_at = NOW()" in sql
 
 
+async def test_set_admin_role_strips_nul_bytes_from_notes(caplog):
+    """Postgres TEXT rejects ``\\x00`` outright. The new ``/admin/roles``
+    web form exposes ``notes`` as a free-form textarea — same regression
+    class ``append_conversation_message`` documented in
+    Stage-15-Step-E #10. Strip-and-warn at the DB layer so a NUL-bearing
+    paste from a binary file doesn't demote the whole grant to a generic
+    "DB write failed" error.
+    """
+    import logging
+    conn = _make_conn()
+    conn.execute = AsyncMock(return_value="INSERT 0 1")
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    with caplog.at_level(logging.WARNING):
+        await db.set_admin_role(
+            777, "viewer", notes="hello\x00world\x00\x00",
+        )
+
+    # NUL bytes stripped, the rest of the text preserved.
+    args = conn.execute.await_args.args[1:]
+    assert args[3] == "helloworld"
+    # The strip is logged loud-and-once with the count so ops can
+    # investigate where the NUL came from.
+    assert any(
+        "set_admin_role: stripping" in rec.message
+        and "NUL byte(s) from notes" in rec.message
+        for rec in caplog.records
+    )
+
+
+async def test_set_admin_role_preserves_non_nul_text():
+    """No NUL bytes → notes are forwarded verbatim. Defence against a
+    future "fix" that over-eagerly mangles a perfectly valid string.
+    """
+    conn = _make_conn()
+    conn.execute = AsyncMock(return_value="INSERT 0 1")
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.set_admin_role(
+        777, "viewer", notes="多 byte unicode → still fine\nwith newline",
+    )
+    args = conn.execute.await_args.args[1:]
+    assert args[3] == "多 byte unicode → still fine\nwith newline"
+
+
+async def test_set_admin_role_passes_through_none_notes():
+    """Avoid the strip path when notes is ``None`` (the common case)."""
+    conn = _make_conn()
+    conn.execute = AsyncMock(return_value="INSERT 0 1")
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.set_admin_role(777, "viewer", notes=None)
+    args = conn.execute.await_args.args[1:]
+    assert args[3] is None
+
+
 async def test_delete_admin_role_returns_true_on_delete_one():
     conn = _make_conn()
     conn.execute = AsyncMock(return_value="DELETE 1")
