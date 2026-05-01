@@ -14,6 +14,12 @@ msgstr ""
 "⏳ Your previous message is still being processed.\n"
 "Please wait for it to finish before sending another one."
 
+#. 🖼️ این تصویر به‌صورت «فایل» ارسال شده است و من نمی‌توانم آن را تحلیل کنم. لطفاً همان تصویر را به‌صورت «عکس» (در تلگرام هنگام ارسال، گزینهٔ «Photo» نه «File») دوباره بفرستید تا یک مدل بینایی بتواند آن را ببیند. فرمت‌های HEIC / HEIF (پیش‌فرض آیفون) پشتیبانی نمی‌شوند؛ تلگرام هنگام ارسال به‌صورت «Photo» تصویر را به JPEG تبدیل می‌کند.
+#: strings.py:ai_image_document_instruction
+msgid "ai_image_document_instruction"
+msgstr ""
+"🖼️ You sent this image as a file attachment, which I can't analyze. Please re-send the same image as a photo (in Telegram's attach menu pick \"Photo\", not \"File\") so a vision-capable model can see it. HEIC / HEIF (the iPhone default) isn't supported either; sending as a Photo automatically converts the image to JPEG, which is."
+
 #. 🖼️ دریافت تصویر از تلگرام ممکن نشد. لطفاً دوباره تلاش کنید.
 #: strings.py:ai_image_download_failed
 msgid "ai_image_download_failed"
