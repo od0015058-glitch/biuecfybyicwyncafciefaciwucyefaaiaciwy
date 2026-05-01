@@ -320,6 +320,15 @@ def render_metrics() -> str:
     from payments import get_ipn_drop_counters
     from rate_limit import chat_inflight_count
     from tetrapay import get_tetrapay_drop_counters
+    # Stage-15-Step-E #9 bundled fix: Zarinpal shipped its own
+    # ``_ZARINPAL_DROP_COUNTERS`` registry in Stage-15-Step-E #8 but
+    # the Prometheus exposition was never extended. An operator
+    # alerting on ``meowassist_*_drops_total{reason="bad_signature"}``
+    # would have caught NowPayments forgeries and TetraPay drops but
+    # been blind to Zarinpal verify failures. The exposition now
+    # includes a third labelled counter so the existing alert rules
+    # extend naturally.
+    from zarinpal import get_zarinpal_drop_counters
 
     parts: list[str] = []
 
@@ -338,6 +347,15 @@ def render_metrics() -> str:
             "TetraPay IPN POSTs dropped, broken down by reason.",
             "reason",
             get_tetrapay_drop_counters(),
+        )
+    )
+
+    parts.extend(
+        _format_labelled_counter(
+            "meowassist_zarinpal_drops_total",
+            "Zarinpal callback redirects dropped, broken down by reason.",
+            "reason",
+            get_zarinpal_drop_counters(),
         )
     )
 

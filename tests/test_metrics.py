@@ -143,6 +143,7 @@ def test_reset_loop_ticks_clears_all():
 
 
 def _patch_collectors(monkeypatch, *, ipn_drops=None, tetrapay_drops=None,
+                     zarinpal_drops=None,
                      inflight=0, disabled_models=(), disabled_gateways=(),
                      key_count=0):
     """Patch every collector ``render_metrics`` reads so the test
@@ -153,6 +154,7 @@ def _patch_collectors(monkeypatch, *, ipn_drops=None, tetrapay_drops=None,
     import payments
     import rate_limit
     import tetrapay
+    import zarinpal
 
     monkeypatch.setattr(
         payments, "get_ipn_drop_counters", lambda: dict(ipn_drops or {})
@@ -161,6 +163,11 @@ def _patch_collectors(monkeypatch, *, ipn_drops=None, tetrapay_drops=None,
         tetrapay,
         "get_tetrapay_drop_counters",
         lambda: dict(tetrapay_drops or {}),
+    )
+    monkeypatch.setattr(
+        zarinpal,
+        "get_zarinpal_drop_counters",
+        lambda: dict(zarinpal_drops or {}),
     )
     monkeypatch.setattr(
         rate_limit, "chat_inflight_count", lambda: int(inflight)
@@ -190,6 +197,12 @@ def test_render_metrics_smoke(monkeypatch):
     expected_names = [
         "meowassist_ipn_drops_total",
         "meowassist_tetrapay_drops_total",
+        # Stage-15-Step-E #9 bundled fix: Zarinpal shipped its own
+        # drop registry in Stage-15-Step-E #8 but the Prometheus
+        # exposition was never extended. The smoke test now pins
+        # the third labelled counter so a future regression that
+        # silently drops the import is caught at test time.
+        "meowassist_zarinpal_drops_total",
         "meowassist_min_amount_refresh_last_run_epoch",
         "meowassist_fx_refresh_last_run_epoch",
         "meowassist_model_discovery_last_run_epoch",
@@ -220,6 +233,34 @@ def test_render_metrics_labelled_counter_format(monkeypatch):
     # Sorted-by-label rendering means "bad_json" precedes
     # "bad_signature" in the body.
     assert body.index('"bad_json"') < body.index('"bad_signature"')
+
+
+def test_render_metrics_zarinpal_drops_renders_with_reason_label(monkeypatch):
+    """Stage-15-Step-E #9 bundled fix: an operator alerting on
+    ``meowassist_*_drops_total{reason="bad_signature"}`` was blind to
+    Zarinpal verify failures because the exposition silently ignored
+    the third gateway's drop registry. Pin the per-reason rows so a
+    future regression that drops the import is caught at test time.
+    """
+    metrics.reset_loop_ticks_for_tests()
+    _patch_collectors(
+        monkeypatch,
+        zarinpal_drops={
+            "verify_failed": 4,
+            "missing_authority": 1,
+            "replay": 9,
+        },
+    )
+
+    body = metrics.render_metrics()
+    assert 'meowassist_zarinpal_drops_total{reason="verify_failed"} 4' in body
+    assert 'meowassist_zarinpal_drops_total{reason="missing_authority"} 1' in body
+    assert 'meowassist_zarinpal_drops_total{reason="replay"} 9' in body
+    # Counter type declared once for the family.
+    assert "# TYPE meowassist_zarinpal_drops_total counter" in body
+    # Sort-by-label means missing_authority < replay < verify_failed.
+    assert body.index('"missing_authority"') < body.index('"replay"')
+    assert body.index('"replay"') < body.index('"verify_failed"')
 
 
 def test_format_labelled_counter_escapes_quotes_backslash_newlines(monkeypatch):

@@ -3424,6 +3424,221 @@ class Database:
             ),
         }
 
+    async def get_monetization_summary(
+        self,
+        *,
+        window_days: int = 30,
+        top_models_limit: int = 10,
+    ) -> dict:
+        """Stage-15-Step-E #9 — bot monetization rollup.
+
+        ``get_system_metrics`` already exposes raw revenue (gateway
+        top-ups) and raw spend (sum of ``cost_deducted_usd`` from
+        ``usage_logs``), but a single number doesn't tell the operator
+        whether the markup is paying for OpenRouter calls. This method
+        is the dedicated "is the bot profitable?" rollup the
+        ``/admin/monetization`` page renders.
+
+        Two scopes computed in a single round trip:
+
+        * **Lifetime** — ``revenue_usd_total`` (gateway-only, mirrors
+          ``get_system_metrics`` filter: NowPayments / TetraPay /
+          Zarinpal etc., NOT ``admin`` / ``gift``), and
+          ``charged_usd_total`` (sum of ``cost_deducted_usd`` across
+          ALL of ``usage_logs``).
+        * **Window** — same two figures over the trailing
+          ``window_days`` (default 30 — the same horizon
+          ``get_system_metrics`` uses for the top-models tile, so the
+          "Top models" panel and this one stay aligned).
+
+        For each scope we derive the OpenRouter cost via the current
+        markup (``charged / markup``). The markup is global — the same
+        multiplier applies to every model — so the gross margin
+        *percentage* is just ``(markup - 1) / markup`` regardless of
+        which model. The interesting figure is the *absolute* margin,
+        which scales with usage. The per-model breakdown surfaces
+        which models are pulling that margin (a model with 10 calls
+        × $0.05 charge each is more profitable than one with 1 call
+        × $0.40 even though the percentage is identical).
+
+        Caveats — surfaced in the ``meta`` block of the return value
+        so the template can footnote them:
+
+        * The OpenRouter cost is *implied* — derived from the current
+          markup, not from the per-call OpenRouter spend. If the
+          operator changes ``COST_MARKUP`` mid-deploy the historical
+          rows in ``usage_logs`` were charged at a different markup,
+          but we apply the *current* markup uniformly. The
+          alternative (storing per-row markup or per-row implied
+          OpenRouter cost) is a schema change and out of scope for
+          this slice; the dashboard footnotes the assumption.
+        * Net profit (``revenue - implied_openrouter_cost``) is a
+          *forward-looking* figure that assumes every dollar credited
+          will eventually be consumed. A user who tops up $20 and
+          never sends a prompt has contributed $20 to revenue and
+          $0 to spend — net looks great until the credits start
+          burning. Operators reading this dashboard should treat net
+          as "how much we'd have left if the wallet were drained
+          tomorrow at the current markup", not as realised profit.
+
+        Returns a dict shaped like::
+
+            {
+              "markup": float,              # current pricing.get_markup()
+              "lifetime": {
+                "revenue_usd": float,       # gateway-only
+                "charged_usd": float,       # SUM cost_deducted_usd
+                "openrouter_cost_usd": float,   # charged / markup
+                "gross_margin_usd": float,  # charged - openrouter_cost
+                "gross_margin_pct": float,  # (markup - 1) / markup * 100; 0 when markup<=1
+                "net_profit_usd": float,    # revenue - openrouter_cost
+              },
+              "window": {
+                "days": int,                # echoes window_days
+                ...same five figures over the trailing window
+              },
+              "by_model": [
+                {"model": str, "requests": int,
+                 "charged_usd": float, "openrouter_cost_usd": float,
+                 "gross_margin_usd": float},
+                ...  # up to top_models_limit, sorted by charged DESC
+              ],
+            }
+
+        ``by_model`` rows are sorted by ``charged_usd`` descending —
+        we want the biggest-revenue contributors at the top, not the
+        most-frequently-called (which ``get_system_metrics.top_models``
+        already shows). A model with 1 expensive call beats 1000
+        cheap ones for "where is the margin coming from".
+        """
+        if not isinstance(window_days, int) or window_days <= 0:
+            raise ValueError(
+                f"window_days must be a positive integer; got {window_days!r}"
+            )
+        if not isinstance(top_models_limit, int) or top_models_limit <= 0:
+            raise ValueError(
+                "top_models_limit must be a positive integer; "
+                f"got {top_models_limit!r}"
+            )
+
+        # Imported lazily to avoid a circular import at module-load
+        # time (``pricing`` doesn't import ``database`` today, but
+        # the lazy form keeps it that way under future refactors).
+        from pricing import get_markup
+        markup = float(get_markup())
+
+        # Format the window as a Postgres interval literal. We use
+        # ``$N::interval`` rather than string-substitution so a
+        # bogus ``window_days`` can't reach the SQL — but the
+        # ValueError above already refuses non-positive integers,
+        # so this is purely defense-in-depth.
+        window_interval = f"{int(window_days)} days"
+
+        async with self.pool.acquire() as connection:
+            revenue_total = await connection.fetchval(
+                """
+                SELECT COALESCE(SUM(amount_usd_credited), 0)
+                FROM transactions
+                WHERE status IN ('SUCCESS', 'PARTIAL')
+                  AND gateway NOT IN ('admin', 'gift')
+                """
+            )
+            charged_total = await connection.fetchval(
+                "SELECT COALESCE(SUM(cost_deducted_usd), 0) FROM usage_logs"
+            )
+            revenue_window = await connection.fetchval(
+                """
+                SELECT COALESCE(SUM(amount_usd_credited), 0)
+                FROM transactions
+                WHERE status IN ('SUCCESS', 'PARTIAL')
+                  AND gateway NOT IN ('admin', 'gift')
+                  AND COALESCE(completed_at, created_at)
+                      >= NOW() - $1::interval
+                """,
+                window_interval,
+            )
+            charged_window = await connection.fetchval(
+                """
+                SELECT COALESCE(SUM(cost_deducted_usd), 0)
+                FROM usage_logs
+                WHERE created_at >= NOW() - $1::interval
+                """,
+                window_interval,
+            )
+            by_model_rows = await connection.fetch(
+                """
+                SELECT model_used AS model,
+                       COUNT(*)::int AS requests,
+                       COALESCE(SUM(cost_deducted_usd), 0) AS charged_usd
+                FROM usage_logs
+                WHERE created_at >= NOW() - $1::interval
+                GROUP BY model_used
+                ORDER BY charged_usd DESC
+                LIMIT $2
+                """,
+                window_interval,
+                int(top_models_limit),
+            )
+
+        revenue_total_f = float(revenue_total or 0)
+        charged_total_f = float(charged_total or 0)
+        revenue_window_f = float(revenue_window or 0)
+        charged_window_f = float(charged_window or 0)
+
+        # ``markup <= 1`` means "no profit assumed" — we still want
+        # a numeric answer rather than NaN / div-by-zero. Per
+        # ``pricing.get_markup`` the value is clamped to >= 1.0
+        # before it reaches us, but markup == 1.0 (== "no markup")
+        # is a legitimate config (the operator could be running at
+        # cost). In that case OpenRouter cost == charged, margin is
+        # zero, and the percentage is zero. ``markup_for_div`` keeps
+        # the math defined under both branches.
+        markup_for_div = markup if markup >= 1.0 else 1.0
+        openrouter_cost_total = charged_total_f / markup_for_div
+        openrouter_cost_window = charged_window_f / markup_for_div
+        gross_margin_total = charged_total_f - openrouter_cost_total
+        gross_margin_window = charged_window_f - openrouter_cost_window
+        if markup_for_div > 1.0:
+            gross_margin_pct = (markup_for_div - 1.0) / markup_for_div * 100.0
+        else:
+            gross_margin_pct = 0.0
+
+        by_model: list[dict] = []
+        for row in by_model_rows:
+            charged = float(row["charged_usd"] or 0)
+            or_cost = charged / markup_for_div
+            by_model.append(
+                {
+                    "model": row["model"],
+                    "requests": int(row["requests"] or 0),
+                    "charged_usd": charged,
+                    "openrouter_cost_usd": or_cost,
+                    "gross_margin_usd": charged - or_cost,
+                }
+            )
+
+        return {
+            "markup": markup,
+            "lifetime": {
+                "revenue_usd": revenue_total_f,
+                "charged_usd": charged_total_f,
+                "openrouter_cost_usd": openrouter_cost_total,
+                "gross_margin_usd": gross_margin_total,
+                "gross_margin_pct": gross_margin_pct,
+                "net_profit_usd": revenue_total_f - openrouter_cost_total,
+            },
+            "window": {
+                "days": int(window_days),
+                "revenue_usd": revenue_window_f,
+                "charged_usd": charged_window_f,
+                "openrouter_cost_usd": openrouter_cost_window,
+                "gross_margin_usd": gross_margin_window,
+                "gross_margin_pct": gross_margin_pct,
+                "net_profit_usd": revenue_window_f - openrouter_cost_window,
+            },
+            "by_model": by_model,
+        }
+
     # ---- bot_strings (Stage-9-Step-1.6) ---------------------------
     # Per-(lang, key) overrides for the compiled string table in
     # ``strings.py``. Surface area is intentionally small: full-table

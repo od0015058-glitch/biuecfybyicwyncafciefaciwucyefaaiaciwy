@@ -127,6 +127,230 @@ async def test_get_system_metrics_returns_shape():
 
 
 # ---------------------------------------------------------------------
+# get_monetization_summary (Stage-15-Step-E #9)
+# ---------------------------------------------------------------------
+
+
+async def test_get_monetization_summary_returns_shape(monkeypatch):
+    """Sanity: the returned dict has every key the
+    ``/admin/monetization`` template consumes, and the markup
+    arithmetic flows through correctly. We pin a 2.0× markup so the
+    "OpenRouter cost = charged / markup" relation has a tidy answer
+    independent of the env default.
+    """
+    import pricing
+    monkeypatch.setattr(pricing, "get_markup", lambda: 2.0)
+
+    conn = _make_conn()
+    # fetchval order in the implementation:
+    # revenue_total, charged_total, revenue_window, charged_window.
+    fetchval_vals = iter([100.0, 60.0, 40.0, 24.0])
+    conn.fetchval = AsyncMock(
+        side_effect=lambda *a, **k: next(fetchval_vals)
+    )
+    conn.fetch = AsyncMock(return_value=[])
+
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.get_monetization_summary()
+
+    assert set(result.keys()) == {"markup", "lifetime", "window", "by_model"}
+    assert result["markup"] == 2.0
+
+    expected_block_keys = {
+        "revenue_usd", "charged_usd", "openrouter_cost_usd",
+        "gross_margin_usd", "gross_margin_pct", "net_profit_usd",
+    }
+    assert set(result["lifetime"].keys()) == expected_block_keys
+    # Window block has the same five money keys plus ``days``.
+    assert set(result["window"].keys()) == expected_block_keys | {"days"}
+    assert result["window"]["days"] == 30  # default
+
+    # Lifetime: revenue=$100, charged=$60, markup=2.0 →
+    # OpenRouter cost = $30, gross margin = $30, pct = 50%,
+    # net = revenue − OR cost = $70.
+    lifetime = result["lifetime"]
+    assert lifetime["revenue_usd"] == 100.0
+    assert lifetime["charged_usd"] == 60.0
+    assert lifetime["openrouter_cost_usd"] == pytest.approx(30.0)
+    assert lifetime["gross_margin_usd"] == pytest.approx(30.0)
+    assert lifetime["gross_margin_pct"] == pytest.approx(50.0)
+    assert lifetime["net_profit_usd"] == pytest.approx(70.0)
+
+    # Window: revenue=$40, charged=$24, markup=2.0 →
+    # OR cost = $12, margin = $12, pct = 50%, net = $28.
+    window = result["window"]
+    assert window["revenue_usd"] == 40.0
+    assert window["charged_usd"] == 24.0
+    assert window["openrouter_cost_usd"] == pytest.approx(12.0)
+    assert window["gross_margin_usd"] == pytest.approx(12.0)
+    assert window["gross_margin_pct"] == pytest.approx(50.0)
+    assert window["net_profit_usd"] == pytest.approx(28.0)
+
+
+async def test_get_monetization_summary_revenue_excludes_admin_and_gift(
+    monkeypatch,
+):
+    """The revenue rollup must use the same gateway filter as
+    ``get_system_metrics`` — ``admin`` (manual credit) and ``gift``
+    (gift-code redemption) are free credit issued from nothing, NOT
+    real earnings, and have been excluded from the dashboard's
+    "Total revenue" tile since Stage-8-Part-4. The monetization page
+    has to inherit that filter or the operator looking at the new
+    page will see *higher* revenue than the dashboard, which is
+    exactly the kind of cross-surface drift we want to avoid.
+    """
+    import pricing
+    monkeypatch.setattr(pricing, "get_markup", lambda: 1.5)
+    conn = _make_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_monetization_summary()
+
+    sqls = [call.args[0] for call in conn.fetchval.await_args_list]
+    revenue_sqls = [
+        s for s in sqls if "amount_usd_credited" in s and "SUCCESS" in s
+    ]
+    # Two revenue queries (lifetime + window); both must carry the
+    # same gateway-exclusion clause.
+    assert len(revenue_sqls) == 2, (
+        f"expected 2 revenue queries, got {len(revenue_sqls)}: {revenue_sqls}"
+    )
+    for sql in revenue_sqls:
+        normalized = " ".join(sql.split())
+        assert "gateway NOT IN ('admin', 'gift')" in normalized, (
+            "revenue query missing the admin/gift exclusion: "
+            f"{normalized!r}"
+        )
+
+
+async def test_get_monetization_summary_window_query_uses_interval(
+    monkeypatch,
+):
+    """The trailing-window queries must filter by
+    ``created_at >= NOW() - $::interval`` (transactions falls back to
+    ``COALESCE(completed_at, created_at)`` since a row created right
+    at the window boundary but completed inside it should still
+    count).
+    """
+    import pricing
+    monkeypatch.setattr(pricing, "get_markup", lambda: 1.5)
+    conn = _make_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_monetization_summary(window_days=7)
+
+    sqls = [call.args[0] for call in conn.fetchval.await_args_list]
+    bind_args = [tuple(call.args[1:]) for call in conn.fetchval.await_args_list]
+    # Two window queries; both must bind ``"7 days"`` as the
+    # interval text.
+    window_sqls = [s for s in sqls if "$1::interval" in s]
+    assert len(window_sqls) == 2, (
+        f"expected 2 window queries, got {len(window_sqls)}: {window_sqls}"
+    )
+    for binds in bind_args:
+        if not binds:
+            continue
+        # The window queries' first positional bind is the interval.
+        if binds[0] == "7 days":
+            break
+    else:
+        raise AssertionError(
+            f"no fetchval call bound '7 days' as the interval: "
+            f"{bind_args!r}"
+        )
+
+
+async def test_get_monetization_summary_by_model_sorted_by_charged_desc(
+    monkeypatch,
+):
+    """The per-model breakdown must rank by *charged USD desc*, not
+    by request count (the dashboard's existing ``top_models`` tile
+    already does request-count). Picking the same sort criterion
+    on both pages would just duplicate the dashboard tile — the
+    monetization page is a different question ("which models are
+    earning money?") and needs a different ranking.
+    """
+    import pricing
+    monkeypatch.setattr(pricing, "get_markup", lambda: 2.0)
+    conn = _make_conn()
+    conn.fetch = AsyncMock(
+        return_value=[
+            {"model": "openai/gpt-4o", "requests": 10, "charged_usd": 4.0},
+            {"model": "anthropic/sonnet", "requests": 100, "charged_usd": 1.0},
+        ]
+    )
+    conn.fetchval = AsyncMock(return_value=0)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.get_monetization_summary()
+
+    by_model_sql = conn.fetch.await_args.args[0]
+    normalized = " ".join(by_model_sql.split())
+    assert "ORDER BY charged_usd DESC" in normalized, (
+        "per-model query must rank by charged USD descending; "
+        f"got: {normalized!r}"
+    )
+    # Returned rows preserve the DB sort and carry the derived
+    # OpenRouter-cost / margin columns.
+    assert [r["model"] for r in result["by_model"]] == [
+        "openai/gpt-4o", "anthropic/sonnet",
+    ]
+    first = result["by_model"][0]
+    assert first["charged_usd"] == 4.0
+    assert first["openrouter_cost_usd"] == pytest.approx(2.0)
+    assert first["gross_margin_usd"] == pytest.approx(2.0)
+
+
+async def test_get_monetization_summary_handles_unity_markup(monkeypatch):
+    """``markup = 1.0`` is a legitimate "operating at-cost" config
+    (every charged dollar pays exactly for OpenRouter, no profit).
+    The percentage must be exactly 0% — not NaN, not divide-by-zero —
+    and the gross-margin USD must be exactly zero too. Mirrors the
+    ``pricing.get_markup`` clamp to ``>= 1.0``.
+    """
+    import pricing
+    monkeypatch.setattr(pricing, "get_markup", lambda: 1.0)
+    conn = _make_conn()
+    fetchval_vals = iter([100.0, 50.0, 30.0, 20.0])
+    conn.fetchval = AsyncMock(
+        side_effect=lambda *a, **k: next(fetchval_vals)
+    )
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.get_monetization_summary()
+
+    assert result["markup"] == 1.0
+    assert result["lifetime"]["openrouter_cost_usd"] == pytest.approx(50.0)
+    assert result["lifetime"]["gross_margin_usd"] == pytest.approx(0.0)
+    assert result["lifetime"]["gross_margin_pct"] == 0.0
+    # Net = revenue - OR cost = 100 - 50 = 50 (we still credited
+    # users $50 of headroom that hasn't been burned yet).
+    assert result["lifetime"]["net_profit_usd"] == pytest.approx(50.0)
+
+
+async def test_get_monetization_summary_rejects_non_positive_window():
+    """A buggy caller passing ``window_days=0`` would silently turn
+    every "last N days" query into "the empty interval". Fail loudly.
+    """
+    db = database_module.Database()
+    db.pool = _PoolStub(_make_conn())
+
+    with pytest.raises(ValueError):
+        await db.get_monetization_summary(window_days=0)
+    with pytest.raises(ValueError):
+        await db.get_monetization_summary(window_days=-7)
+    with pytest.raises(ValueError):
+        await db.get_monetization_summary(top_models_limit=0)
+
+
+# ---------------------------------------------------------------------
 # search_users
 # ---------------------------------------------------------------------
 

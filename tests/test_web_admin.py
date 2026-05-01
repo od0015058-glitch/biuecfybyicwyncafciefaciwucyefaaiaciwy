@@ -1521,6 +1521,321 @@ async def test_dashboard_fallback_dicts_match_template_keys(
     assert "Active (7d)" in body
 
 
+async def test_dashboard_renders_zarinpal_drop_counts(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """Stage-15-Step-E #9 bundled fix: Zarinpal shipped its own
+    drop-counter registry in Stage-15-Step-E #8 but the dashboard
+    tile was never extended. The IPN-health panel now surfaces a
+    third Zarinpal section alongside NowPayments and TetraPay so an
+    operator debugging a verify-failure spike can see counts here
+    instead of grepping the bot logs.
+    """
+    import zarinpal
+    monkeypatch.setattr(
+        zarinpal,
+        "get_zarinpal_drop_counters",
+        lambda: {
+            "missing_authority": 1,
+            "non_success_callback": 0,
+            "unknown_invoice": 0,
+            "verify_failed": 7,
+            "replay": 2,
+        },
+    )
+
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+
+    # Zarinpal sub-heading in the IPN health panel.
+    assert "Zarinpal" in body
+    # Per-reason rows render. ``verify_failed`` is the most signal-
+    # rich one (means Zarinpal's verify endpoint rejected our
+    # finalize call) so pin both the row text and the count.
+    assert "verify_failed" in body
+    assert "7" in body
+    assert "replay" in body
+
+
+async def test_dashboard_renders_zarinpal_all_zero_message(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """When every Zarinpal counter is zero (fresh restart, no Iranian
+    card traffic yet) the panel must still render the explanatory
+    "all zero" line — same shape as the NowPayments / TetraPay
+    panels, otherwise the operator sees a bare table and wonders
+    whether the section is broken.
+    """
+    import zarinpal
+    monkeypatch.setattr(
+        zarinpal,
+        "get_zarinpal_drop_counters",
+        lambda: {
+            "missing_authority": 0, "non_success_callback": 0,
+            "unknown_invoice": 0, "verify_failed": 0, "replay": 0,
+        },
+    )
+
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "no Zarinpal callback drops recorded since startup" in body
+
+
+async def test_collect_ipn_health_includes_zarinpal(monkeypatch):
+    """Direct test of the helper: the returned dict must carry a
+    ``zarinpal`` key and a ``zarinpal_total`` summary alongside the
+    NowPayments / TetraPay equivalents. Test pins the shape so a
+    template typo (``ipn_health.zarinpal_drops`` vs
+    ``ipn_health.zarinpal``) is caught at PR time.
+    """
+    import payments
+    import tetrapay
+    import zarinpal
+
+    monkeypatch.setattr(
+        payments,
+        "get_ipn_drop_counters",
+        lambda: {"bad_signature": 0},
+    )
+    monkeypatch.setattr(
+        tetrapay,
+        "get_tetrapay_drop_counters",
+        lambda: {"bad_json": 0},
+    )
+    monkeypatch.setattr(
+        zarinpal,
+        "get_zarinpal_drop_counters",
+        lambda: {"verify_failed": 5, "replay": 1},
+    )
+
+    from web_admin import _collect_ipn_health
+    health = _collect_ipn_health()
+
+    # Three gateway sub-dicts present.
+    assert set(health.keys()) == {
+        "nowpayments", "tetrapay", "zarinpal",
+        "nowpayments_total", "tetrapay_total", "zarinpal_total",
+    }
+    assert health["zarinpal"] == {"verify_failed": 5, "replay": 1}
+    assert health["zarinpal_total"] == 6
+
+
+async def test_collect_ipn_health_resilient_to_zarinpal_accessor_failure(
+    monkeypatch,
+):
+    """Same defense the NowPayments / TetraPay halves already get:
+    a future regression in ``zarinpal.get_zarinpal_drop_counters``
+    must not blank the other two panels. The Zarinpal sub-dict is
+    just empty (template renders the "counters unavailable" line).
+    """
+    import payments
+    import tetrapay
+    import zarinpal
+
+    monkeypatch.setattr(
+        payments, "get_ipn_drop_counters", lambda: {"bad_signature": 1}
+    )
+    monkeypatch.setattr(
+        tetrapay, "get_tetrapay_drop_counters", lambda: {"bad_json": 2}
+    )
+
+    def boom():
+        raise RuntimeError("zarinpal regression")
+    monkeypatch.setattr(zarinpal, "get_zarinpal_drop_counters", boom)
+
+    from web_admin import _collect_ipn_health
+    health = _collect_ipn_health()
+
+    # NowPayments / TetraPay still populated.
+    assert health["nowpayments"] == {"bad_signature": 1}
+    assert health["tetrapay"] == {"bad_json": 2}
+    # Zarinpal half is empty rather than the whole dict imploding.
+    assert health["zarinpal"] == {}
+    assert health["zarinpal_total"] == 0
+
+
+# ---------------------------------------------------------------------
+# /admin/monetization (Stage-15-Step-E #9)
+# ---------------------------------------------------------------------
+
+
+def _stub_db_with_monetization(summary: dict | Exception):
+    """Build a stub DB that has the standard system-metrics surface
+    plus a ``get_monetization_summary`` mock returning *summary* (or
+    raising it).
+    """
+    db = _stub_db()
+    if isinstance(summary, Exception):
+        db.get_monetization_summary = AsyncMock(side_effect=summary)
+    else:
+        db.get_monetization_summary = AsyncMock(return_value=summary)
+    return db
+
+
+async def test_monetization_route_requires_auth(
+    aiohttp_client, make_admin_app
+):
+    """Sanity: the monetization page is gated by ``_require_auth``
+    just like the dashboard, transactions, etc. An unauthenticated
+    GET must redirect to /admin/login.
+    """
+    client = await aiohttp_client(make_admin_app(password="letmein"))
+    resp = await client.get("/admin/monetization", allow_redirects=False)
+    assert resp.status in (302, 303), resp.status
+    assert resp.headers.get("Location", "").startswith("/admin/login")
+
+
+async def test_monetization_renders_lifetime_and_window_blocks(
+    aiohttp_client, make_admin_app
+):
+    """Happy path: the page renders the markup, both money blocks
+    (lifetime + last-30-days), and the per-model table.
+    """
+    summary = {
+        "markup": 2.0,
+        "lifetime": {
+            "revenue_usd": 1234.56,
+            "charged_usd": 600.0,
+            "openrouter_cost_usd": 300.0,
+            "gross_margin_usd": 300.0,
+            "gross_margin_pct": 50.0,
+            "net_profit_usd": 934.56,
+        },
+        "window": {
+            "days": 30,
+            "revenue_usd": 200.0,
+            "charged_usd": 80.0,
+            "openrouter_cost_usd": 40.0,
+            "gross_margin_usd": 40.0,
+            "gross_margin_pct": 50.0,
+            "net_profit_usd": 160.0,
+        },
+        "by_model": [
+            {
+                "model": "openai/gpt-4o",
+                "requests": 12,
+                "charged_usd": 50.0,
+                "openrouter_cost_usd": 25.0,
+                "gross_margin_usd": 25.0,
+            }
+        ],
+    }
+    db = _stub_db_with_monetization(summary)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    # Page heading + section labels.
+    assert "Monetization" in body
+    assert "Last 30 days" in body
+    assert "Lifetime" in body
+    # Markup with 4-decimal precision.
+    assert "2.0000" in body
+    # Lifetime revenue rendered with thousands sep + 2 decimals.
+    assert "$1,234.56" in body
+    # Per-model table.
+    assert "openai/gpt-4o" in body
+
+
+async def test_monetization_renders_db_error_banner_on_query_failure(
+    aiohttp_client, make_admin_app
+):
+    """The DB-error path must render the empty-zero shape plus an
+    inline banner — same fail-soft shape the ``dashboard`` handler
+    uses, so a flaky DB doesn't 500 the page.
+    """
+    db = _stub_db_with_monetization(RuntimeError("kaboom"))
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert "Database query failed" in body
+    assert "Last 30 days" in body  # window block still renders
+
+
+async def test_monetization_renders_dev_mode_without_db(
+    aiohttp_client,
+):
+    """When no DB is wired (local dev), the monetization page
+    renders the dev-mode banner with zero values. Same fail-soft
+    shape the ``dashboard`` handler uses. We bypass ``make_admin_app``
+    here because that fixture substitutes a stub DB when ``db=None``;
+    the dev-mode branch we're pinning specifically wants ``app[DB]``
+    to be ``None``.
+    """
+    app = web.Application()
+    setup_admin_routes(
+        app,
+        db=None,
+        password="letmein",
+        session_secret="x" * 32,
+        ttl_hours=24,
+        cookie_secure=False,
+    )
+    client = await aiohttp_client(app)
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert "No database wired up" in body
+    # Lifetime + window blocks render with zero values.
+    assert "Lifetime" in body
+    assert "Last 30 days" in body
+
+
+async def test_monetization_empty_by_model_table_renders_placeholder(
+    aiohttp_client, make_admin_app
+):
+    """When the per-model table is empty (fresh deploy, no usage
+    logged yet) the panel renders an explanatory placeholder rather
+    than an empty ``<table>`` that looks broken.
+    """
+    summary = {
+        "markup": 1.5,
+        "lifetime": {
+            "revenue_usd": 0.0, "charged_usd": 0.0,
+            "openrouter_cost_usd": 0.0, "gross_margin_usd": 0.0,
+            "gross_margin_pct": 0.0, "net_profit_usd": 0.0,
+        },
+        "window": {
+            "days": 30,
+            "revenue_usd": 0.0, "charged_usd": 0.0,
+            "openrouter_cost_usd": 0.0, "gross_margin_usd": 0.0,
+            "gross_margin_pct": 0.0, "net_profit_usd": 0.0,
+        },
+        "by_model": [],
+    }
+    db = _stub_db_with_monetization(summary)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert "No model usage logged in the last 30 days" in body
+
+
 # ---------------------------------------------------------------------
 # Stage-8-Part-2: promo codes UI
 # ---------------------------------------------------------------------
