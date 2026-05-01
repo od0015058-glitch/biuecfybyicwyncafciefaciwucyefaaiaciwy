@@ -57,6 +57,17 @@ ADMIN_ONLY_COMMANDS: tuple[tuple[str, str], ...] = (
     ("admin_promo_list", "🎟️ List active promo codes"),
     ("admin_promo_revoke", "🚫 Revoke a promo code"),
     ("admin_broadcast", "📣 Broadcast to all users"),
+    # Stage-15-Step-E #5 admin-role CRUD. The handlers shipped with
+    # the role system PR but the slash-menu wasn't updated, so until
+    # this entry was added admins typing ``/`` in the bot chat saw
+    # every other admin command except these three. The handlers
+    # still work (gating is in ``admin.is_admin``, not in the menu),
+    # but the discoverability hole meant operators had to remember
+    # the exact command name to use them. The menu now matches the
+    # set of registered ``Command(...)`` handlers in ``admin.py``.
+    ("admin_role_grant", "👤 Grant an admin role"),
+    ("admin_role_revoke", "🚫 Revoke an admin role"),
+    ("admin_role_list", "👥 List admin roles"),
 )
 
 # Admins see public + admin commands.

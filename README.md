@@ -22,7 +22,12 @@ NowPayments crypto invoices.
   `Bot.set_my_commands` so Telegram's `/` popup never shows stale
   entries left over from BotFather's "Edit Commands" panel. Admin
   commands are scoped per-admin via `BotCommandScopeChat` so
-  non-admins don't see them.
+  non-admins don't see them. The admin scope advertises every
+  `/admin*` handler the bot ships, including the role-system
+  commands (`/admin_role_grant`, `/admin_role_revoke`,
+  `/admin_role_list`); a regression test scans `admin.py` and pins
+  both directions (every `Command("admin_*")` handler must appear in
+  the menu, and every menu entry must have a matching handler).
 - **Wallet-menu redemption** — alongside the existing `/redeem CODE`
   command, the wallet inline menu now exposes a "🎁 Redeem gift code"
   button that prompts for the code and reuses the same eligibility
