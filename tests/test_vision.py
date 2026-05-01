@@ -302,6 +302,42 @@ def test_build_multimodal_user_message_rejects_non_list_image_data_uris():
     assert exc_info.value.reason == "invalid_input"
 
 
+@pytest.mark.parametrize(
+    "bad_prompt",
+    [
+        {"role": "user"},
+        ["fragment", "fragment"],
+        42,
+        3.14,
+        b"bytes-prompt",
+        object(),
+    ],
+)
+def test_build_multimodal_user_message_rejects_non_string_prompt(bad_prompt):
+    """Bug fix bundle (Stage-15-Step-E #6 follow-up #2): a non-string
+    truthy ``prompt`` used to slip past ``(prompt or "").strip()`` and
+    crash with ``AttributeError`` instead of the documented
+    ``VisionError`` contract. With the type guard at the top of the
+    function, every bad shape now produces a clean
+    ``VisionError(reason="invalid_input")``.
+    """
+    with pytest.raises(vision.VisionError) as exc_info:
+        vision.build_multimodal_user_message(bad_prompt, [_stub_uri()])  # type: ignore[arg-type]
+    assert exc_info.value.reason == "invalid_input"
+    assert "prompt" in str(exc_info.value).lower()
+
+
+def test_build_multimodal_user_message_accepts_none_prompt_with_image():
+    """``None`` prompt is the documented "image-only" calling
+    convention; it must keep working after the type-guard tightening.
+    """
+    msg = vision.build_multimodal_user_message(None, [_stub_uri()])  # type: ignore[arg-type]
+    assert msg["role"] == "user"
+    # No text part should be emitted for an empty / None prompt.
+    assert all(part.get("type") != "text" for part in msg["content"])
+    assert sum(1 for p in msg["content"] if p.get("type") == "image_url") == 1
+
+
 # ─── Env-driven module-level constants ─────────────────────────
 
 
