@@ -327,6 +327,25 @@ _STRINGS: dict[str, dict[str, str]] = {
             "✅ پرداخت شما با موفقیت تأیید شد.\n"
             "**${amount:.2f}** به کیف پول شما اضافه گردید."
         ),
+        # Stage-15-Step-E #8 follow-up #1: Zarinpal Telegram FSM
+        # mirrors the TetraPay strings 1:1 so the two card-gateway
+        # surfaces have identical UX vocabulary; only the gateway
+        # name in the user-visible copy changes.
+        "zarinpal_button": "💳 پرداخت با زرین‌پال",
+        "zarinpal_creating_order": "⏳ در حال ارتباط با درگاه زرین‌پال. لطفا صبر کنید...",
+        "zarinpal_order_text": (
+            "🧾 **پرداخت با زرین‌پال**\n\n"
+            "مبلغ: `{amount_irr:,} ریال` (≈ ${amount_usd:.2f})\n"
+            "نرخ تبدیل قفل‌شده: هر دلار ≈ {rate_toman:,.0f} تومان\n\n"
+            "روی دکمه زیر بزنید تا به درگاه زرین‌پال هدایت شوید.\n"
+            "پس از پرداخت، حساب شما به طور خودکار شارژ می‌شود.\n\n"
+            "⚠️ این لینک حدود ۲۰ دقیقه اعتبار دارد."
+        ),
+        "zarinpal_pay_button": "💳 رفتن به درگاه زرین‌پال",
+        "zarinpal_unreachable": (
+            "❌ درگاه زرین‌پال پاسخگو نیست. "
+            "لطفاً چند دقیقه بعد دوباره تلاش کنید یا از روش پرداخت دیگری استفاده کنید."
+        ),
         "zarinpal_credit_notification": (
             "✅ پرداخت زرین‌پال شما با موفقیت تأیید شد.\n"
             "**${amount:.2f}** به کیف پول شما اضافه گردید."
@@ -779,6 +798,22 @@ _STRINGS: dict[str, dict[str, str]] = {
         "tetrapay_credit_notification": (
             "✅ Your payment has been confirmed.\n"
             "**${amount:.2f}** has been added to your wallet."
+        ),
+        # Stage-15-Step-E #8 follow-up #1: Zarinpal Telegram FSM.
+        "zarinpal_button": "💳 Pay with Zarinpal",
+        "zarinpal_creating_order": "⏳ Contacting the Zarinpal gateway. Please wait...",
+        "zarinpal_order_text": (
+            "🧾 **Pay with Zarinpal**\n\n"
+            "Amount: `{amount_irr:,} IRR` (≈ ${amount_usd:.2f})\n"
+            "Locked rate: 1 USD ≈ {rate_toman:,.0f} TMN\n\n"
+            "Tap the button below to be redirected to Zarinpal.\n"
+            "Your wallet will be credited automatically after payment.\n\n"
+            "⚠️ This link is valid for about 20 minutes."
+        ),
+        "zarinpal_pay_button": "💳 Go to Zarinpal",
+        "zarinpal_unreachable": (
+            "❌ The Zarinpal gateway is not responding. "
+            "Please try again in a few minutes, or use another payment method."
         ),
         "zarinpal_credit_notification": (
             "✅ Your Zarinpal payment has been confirmed.\n"
