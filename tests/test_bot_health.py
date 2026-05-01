@@ -98,6 +98,15 @@ def test_degraded_when_loop_stale():
 
 
 def test_degraded_when_loop_never_ticked():
+    """A loop that has not ticked is DEGRADED *once the grace
+    window from boot expires*.
+
+    Per-loop grace = the loop's stale threshold. ``fx_refresh``
+    cadence 600 s → threshold ~1260 s. ``model_discovery`` cadence
+    21600 s → threshold ~43260 s. We mock a boot 50 000 s ago so
+    both grace windows have elapsed.
+    """
+    now = 1_000_000.0
     status = bh.compute_bot_status(
         inflight_count=0,
         ipn_drops_total=0,
@@ -105,6 +114,8 @@ def test_degraded_when_loop_never_ticked():
         expected_loops=("fx_refresh", "model_discovery"),
         db_error=None,
         login_throttle_active_keys=0,
+        now=now,
+        process_start_epoch=now - 50_000.0,
     )
     assert status.level is bh.BotStatusLevel.DEGRADED
     # Both loops show up as stale.
@@ -114,6 +125,7 @@ def test_degraded_when_loop_never_ticked():
 def test_degraded_summary_truncates_long_signal_list():
     """Signals list should be complete but the inline summary is trimmed."""
     expected = tuple(f"loop_{i}" for i in range(10))
+    now = 1_000_000.0
     status = bh.compute_bot_status(
         inflight_count=0,
         ipn_drops_total=0,
@@ -121,6 +133,10 @@ def test_degraded_summary_truncates_long_signal_list():
         expected_loops=expected,
         db_error=None,
         login_throttle_active_keys=0,
+        now=now,
+        # Far past boot so even unknown loops (using the legacy
+        # 1800 s default threshold) are out of grace.
+        process_start_epoch=now - 100_000.0,
     )
     assert status.level is bh.BotStatusLevel.DEGRADED
     assert len(status.signals) == 10
@@ -139,6 +155,201 @@ def test_under_attack_on_ipn_drop_spike():
     )
     assert status.level is bh.BotStatusLevel.UNDER_ATTACK
     assert status.score == 4
+
+
+# ── Per-loop staleness thresholds + grace period ──────────────────
+
+
+def test_fresh_boot_does_not_flag_long_cadence_loop_as_stale():
+    """Bug-fix regression: the legacy single
+    ``BOT_HEALTH_LOOP_STALE_SECONDS=1800`` threshold over-flagged
+    long-cadence loops on a freshly-booted bot. ``catalog_refresh``
+    has a 24h cadence by design — a bot that's been up for 30 min
+    and hasn't yet hit its first catalog-refresh tick is *not*
+    DEGRADED, the loop simply hasn't reached its first scheduled
+    fire."""
+    now = 1_000_000.0
+    status = bh.compute_bot_status(
+        inflight_count=0,
+        ipn_drops_total=0,
+        loop_ticks={},
+        expected_loops=("catalog_refresh",),
+        db_error=None,
+        login_throttle_active_keys=0,
+        now=now,
+        # Boot 30 min ago — well within the 24h grace window.
+        process_start_epoch=now - 1_800.0,
+    )
+    assert status.level is bh.BotStatusLevel.IDLE
+    assert status.signals == ()
+
+
+def test_long_cadence_loop_stale_only_after_two_cadences():
+    """``model_discovery`` has a 6h cadence (21600 s). The per-loop
+    threshold is 2 × cadence + 60 s = 43260 s. Below that, a missed
+    tick is *not* an alarm — the loop is just on its scheduled
+    interval."""
+    now = 1_000_000.0
+    threshold = bh.LOOP_CADENCES["model_discovery"] * 2 + 60
+    # Last tick was just under the threshold ago — fresh.
+    fresh = bh.compute_bot_status(
+        inflight_count=0,
+        ipn_drops_total=0,
+        loop_ticks={"model_discovery": now - (threshold - 1)},
+        expected_loops=("model_discovery",),
+        db_error=None,
+        login_throttle_active_keys=0,
+        now=now,
+        process_start_epoch=now - 100_000.0,  # past grace
+    )
+    assert fresh.level is not bh.BotStatusLevel.DEGRADED
+    # One second past threshold — stale.
+    stale = bh.compute_bot_status(
+        inflight_count=0,
+        ipn_drops_total=0,
+        loop_ticks={"model_discovery": now - (threshold + 1)},
+        expected_loops=("model_discovery",),
+        db_error=None,
+        login_throttle_active_keys=0,
+        now=now,
+        process_start_epoch=now - 100_000.0,
+    )
+    assert stale.level is bh.BotStatusLevel.DEGRADED
+    assert any("model_discovery" in s for s in stale.signals)
+
+
+def test_short_cadence_loop_stale_at_short_threshold():
+    """``bot_health_alert`` has a 60 s cadence. The per-loop
+    threshold is 2 × 60 + 60 = 180 s. The pre-fix legacy threshold
+    was 1800 s — meaning a 5-minute outage of the alert loop would
+    have been silent on the panel."""
+    now = 1_000_000.0
+    # 200 s ago — past the 180 s threshold but well within the
+    # legacy 1800 s threshold.
+    status = bh.compute_bot_status(
+        inflight_count=0,
+        ipn_drops_total=0,
+        loop_ticks={"bot_health_alert": now - 200.0},
+        expected_loops=("bot_health_alert",),
+        db_error=None,
+        login_throttle_active_keys=0,
+        now=now,
+        process_start_epoch=now - 100_000.0,
+    )
+    assert status.level is bh.BotStatusLevel.DEGRADED
+    assert any("bot_health_alert" in s for s in status.signals)
+
+
+def test_explicit_env_override_beats_cadence_derived(monkeypatch):
+    """An operator can pin a per-loop threshold via env if the
+    cadence-derived default isn't right for their deploy."""
+    monkeypatch.setenv("BOT_HEALTH_LOOP_STALE_FX_REFRESH_SECONDS", "300")
+    now = 1_000_000.0
+    # 400 s ago — past the override (300 s), well within the
+    # cadence-derived threshold (1260 s).
+    status = bh.compute_bot_status(
+        inflight_count=0,
+        ipn_drops_total=0,
+        loop_ticks={"fx_refresh": now - 400.0},
+        expected_loops=("fx_refresh",),
+        db_error=None,
+        login_throttle_active_keys=0,
+        now=now,
+        process_start_epoch=now - 100_000.0,
+    )
+    assert status.level is bh.BotStatusLevel.DEGRADED
+
+
+def test_unknown_loop_uses_legacy_threshold(monkeypatch):
+    """A loop name that isn't in ``LOOP_CADENCES`` falls back to
+    the legacy single-knob ``BOT_HEALTH_LOOP_STALE_SECONDS`` so a
+    future loop can be added without touching this module."""
+    monkeypatch.setenv("BOT_HEALTH_LOOP_STALE_SECONDS", "100")
+    now = 1_000_000.0
+    status = bh.compute_bot_status(
+        inflight_count=0,
+        ipn_drops_total=0,
+        loop_ticks={"future_unknown_loop": now - 200.0},
+        expected_loops=("future_unknown_loop",),
+        db_error=None,
+        login_throttle_active_keys=0,
+        now=now,
+        process_start_epoch=now - 100_000.0,
+    )
+    assert status.level is bh.BotStatusLevel.DEGRADED
+
+
+def test_explicit_env_override_zero_falls_through(monkeypatch):
+    """A non-positive override value is rejected (mirrors the
+    fail-safe convention in ``_env_int``); the cadence-derived
+    threshold takes over."""
+    monkeypatch.setenv("BOT_HEALTH_LOOP_STALE_FX_REFRESH_SECONDS", "0")
+    now = 1_000_000.0
+    threshold = bh.LOOP_CADENCES["fx_refresh"] * 2 + 60
+    # Just under the cadence-derived threshold → fresh.
+    status = bh.compute_bot_status(
+        inflight_count=0,
+        ipn_drops_total=0,
+        loop_ticks={"fx_refresh": now - (threshold - 10)},
+        expected_loops=("fx_refresh",),
+        db_error=None,
+        login_throttle_active_keys=0,
+        now=now,
+        process_start_epoch=now - 100_000.0,
+    )
+    assert status.level is not bh.BotStatusLevel.DEGRADED
+
+
+def test_explicit_env_override_garbage_falls_through(monkeypatch):
+    """Same as above for non-int garbage."""
+    monkeypatch.setenv(
+        "BOT_HEALTH_LOOP_STALE_FX_REFRESH_SECONDS", "not-an-int"
+    )
+    now = 1_000_000.0
+    threshold = bh.LOOP_CADENCES["fx_refresh"] * 2 + 60
+    status = bh.compute_bot_status(
+        inflight_count=0,
+        ipn_drops_total=0,
+        loop_ticks={"fx_refresh": now - (threshold - 10)},
+        expected_loops=("fx_refresh",),
+        db_error=None,
+        login_throttle_active_keys=0,
+        now=now,
+        process_start_epoch=now - 100_000.0,
+    )
+    assert status.level is not bh.BotStatusLevel.DEGRADED
+
+
+def test_never_ticked_grace_window_is_per_loop():
+    """A bot booted 1h ago with no fx_refresh tick is DEGRADED
+    (fx_refresh threshold ~1260 s, uptime 3600 s > threshold) but
+    a no model_discovery tick is *not* DEGRADED (model_discovery
+    threshold ~43260 s, uptime 3600 s < threshold)."""
+    now = 1_000_000.0
+    status = bh.compute_bot_status(
+        inflight_count=0,
+        ipn_drops_total=0,
+        loop_ticks={},
+        expected_loops=("fx_refresh", "model_discovery"),
+        db_error=None,
+        login_throttle_active_keys=0,
+        now=now,
+        process_start_epoch=now - 3_600.0,
+    )
+    assert status.level is bh.BotStatusLevel.DEGRADED
+    assert len(status.signals) == 1
+    assert any("fx_refresh" in s for s in status.signals)
+    assert not any("model_discovery" in s for s in status.signals)
+
+
+def test_get_process_start_epoch_returns_module_load_time():
+    """``get_process_start_epoch`` is a stable single-value
+    accessor — repeated calls return the same value (the panel's
+    uptime gauge and the classifier's grace check must agree)."""
+    a = bh.get_process_start_epoch()
+    b = bh.get_process_start_epoch()
+    assert a == b
+    assert a > 0  # captured at module load
 
 
 def test_long_uptime_drops_total_alone_does_not_trip_attack():
