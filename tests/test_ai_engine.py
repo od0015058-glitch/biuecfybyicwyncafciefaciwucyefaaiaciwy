@@ -603,3 +603,102 @@ async def test_chat_429_no_retry_after_uses_default_cooldown(stub_db):
     openrouter_keys.clear_all_cooldowns()
     openrouter_keys._keys = []
     openrouter_keys._loaded = False
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10 bundled bug fix: persistence-after-charge
+# must NOT lose the AI reply.
+# ---------------------------------------------------------------------
+# Pre-fix: a memory-enabled user whose persist INSERT raised (NUL
+# byte in prompt or reply, transient DB hiccup, FK violation) hit
+# the outer ``except Exception`` in ``chat_with_model``, the user
+# saw ``ai_transient_error``, and ``reply_text`` was lost — even
+# though ``deduct_balance`` (line ~293) and ``log_usage`` (line
+# ~306) had ALREADY committed. Net effect: a re-prompt would
+# re-charge them. Silent double-billing whenever a NUL-bearing
+# message went through the pipeline.
+# ---------------------------------------------------------------------
+
+
+async def test_memory_persist_failure_does_not_lose_reply(stub_db, caplog):
+    """Persistence is best-effort: a failing
+    ``append_conversation_message`` after settlement must not
+    swallow the AI reply (the user was already charged)."""
+    stub_db.get_user.return_value = {
+        "free_messages_left": 0,
+        "balance_usd": 10.0,
+        "active_model": "test/m1",
+        "language_code": "en",
+        "memory_enabled": True,
+    }
+    # Persistence raises — simulating a NUL-byte in the prompt /
+    # reply that Postgres TEXT rejects. The first call (user
+    # role) raising is enough; we don't even reach the assistant
+    # call.
+    stub_db.append_conversation_message.side_effect = RuntimeError(
+        "invalid byte sequence for encoding UTF8: 0x00",
+    )
+
+    with caplog.at_level("ERROR"):
+        with _patched_session(_StubResponse()):
+            reply = await ai_engine.chat_with_model(42, "hello\x00world")
+
+    # User STILL gets the reply — no transient-error swallow.
+    assert reply == "hello back"
+    # The wallet was already debited at this point in the flow.
+    stub_db.deduct_balance.assert_awaited()
+    stub_db.log_usage.assert_awaited()
+    # Persist was attempted (raised) — we tried.
+    assert stub_db.append_conversation_message.await_count >= 1
+    # Loud-and-once log so ops can spot the row corruption.
+    assert any(
+        "memory persist failed" in record.message for record in caplog.records
+    ), "expected 'memory persist failed' log entry"
+
+
+async def test_memory_persist_assistant_failure_does_not_lose_reply(
+    stub_db, caplog,
+):
+    """The assistant-side INSERT raising must also not lose the
+    reply. Pre-fix the second call could blow up (NUL byte in
+    ``reply_text``) even if the first succeeded — same outcome:
+    user charged, no reply, double-billing on retry."""
+    stub_db.get_user.return_value = {
+        "free_messages_left": 0,
+        "balance_usd": 10.0,
+        "active_model": "test/m1",
+        "language_code": "en",
+        "memory_enabled": True,
+    }
+    # First call (user role) succeeds, second (assistant role) raises.
+    side_effects = [None, RuntimeError("transient deadlock")]
+    stub_db.append_conversation_message.side_effect = side_effects
+
+    with caplog.at_level("ERROR"):
+        with _patched_session(_StubResponse()):
+            reply = await ai_engine.chat_with_model(42, "hi")
+
+    assert reply == "hello back"
+    assert stub_db.append_conversation_message.await_count == 2
+    assert any(
+        "memory persist failed" in record.message for record in caplog.records
+    )
+
+
+async def test_memory_disabled_skips_persist_entirely(stub_db):
+    """Sanity: the wrap doesn't introduce overhead for users
+    with memory off — append is never called and the existing
+    happy-path return shape is unchanged."""
+    stub_db.get_user.return_value = {
+        "free_messages_left": 0,
+        "balance_usd": 10.0,
+        "active_model": "test/m1",
+        "language_code": "en",
+        "memory_enabled": False,
+    }
+
+    with _patched_session(_StubResponse()):
+        reply = await ai_engine.chat_with_model(42, "hi")
+
+    assert reply == "hello back"
+    stub_db.append_conversation_message.assert_not_awaited()

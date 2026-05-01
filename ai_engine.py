@@ -312,9 +312,46 @@ async def chat_with_model(telegram_id: int, user_prompt: str) -> str:
                 #    sides of the turn keeps the buffer balanced (so
                 #    each fetch returns alternating user/assistant
                 #    pairs in chronological order).
+                #
+                # Stage-15-Step-E #10 bundled fix: persistence is
+                # best-effort. Pre-fix, an INSERT that raised
+                # (``\\x00`` NUL byte in the prompt or reply —
+                # Postgres TEXT rejects with "invalid byte sequence
+                # for encoding UTF8: 0x00" — a transient connection
+                # drop, a deadlock, an FK violation if the user row
+                # was deleted between the chat starting and persist
+                # time, etc.) would bubble out to the outer
+                # ``except Exception`` at the bottom of this
+                # function, the user would see ``ai_transient_error``,
+                # and ``reply_text`` would be lost — even though the
+                # wallet had ALREADY been debited at line ~293 and
+                # the usage_log row had ALREADY been written at line
+                # ~306. Re-prompting would re-charge them. Net
+                # effect: silent double-billing whenever a memory-
+                # enabled user happened to send a prompt or receive
+                # a reply containing a NUL byte (which Telegram does
+                # allow). Fix: catch the persistence failure
+                # locally, log loud-and-once for ops, and still
+                # return the AI reply to the user. Losing one turn
+                # from the memory buffer is much better than
+                # double-billing them; the next turn re-establishes
+                # context naturally because the *current* prompt
+                # they just paid for is the one that matters most.
                 if memory_enabled:
-                    await db.append_conversation_message(telegram_id, "user", user_prompt)
-                    await db.append_conversation_message(telegram_id, "assistant", reply_text)
+                    try:
+                        await db.append_conversation_message(
+                            telegram_id, "user", user_prompt,
+                        )
+                        await db.append_conversation_message(
+                            telegram_id, "assistant", reply_text,
+                        )
+                    except Exception:
+                        log.exception(
+                            "memory persist failed for user %d after "
+                            "successful settlement; returning reply "
+                            "anyway to avoid double-billing on retry.",
+                            telegram_id,
+                        )
 
                 return reply_text
                 
