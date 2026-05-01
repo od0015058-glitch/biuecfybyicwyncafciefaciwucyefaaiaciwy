@@ -874,8 +874,38 @@ msgstr "≈ {toman:,.0f} تومان"
 msgid "wallet_toman_line_stale"
 msgstr "≈ {toman:,.0f} تومان (نرخ تقریبی)"
 
+#: strings.py:zarinpal_button
+msgid "zarinpal_button"
+msgstr "💳 پرداخت با زرین‌پال"
+
+#: strings.py:zarinpal_creating_order
+msgid "zarinpal_creating_order"
+msgstr "⏳ در حال ارتباط با درگاه زرین‌پال. لطفا صبر کنید..."
+
 #: strings.py:zarinpal_credit_notification
 msgid "zarinpal_credit_notification"
 msgstr ""
 "✅ پرداخت زرین‌پال شما با موفقیت تأیید شد.\n"
 "**${amount:.2f}** به کیف پول شما اضافه گردید."
+
+#: strings.py:zarinpal_order_text
+msgid "zarinpal_order_text"
+msgstr ""
+"🧾 **پرداخت با زرین‌پال**\n"
+"\n"
+"مبلغ: `{amount_irr:,} ریال` (≈ ${amount_usd:.2f})\n"
+"نرخ تبدیل قفل‌شده: هر دلار ≈ {rate_toman:,.0f} تومان\n"
+"\n"
+"روی دکمه زیر بزنید تا به درگاه زرین‌پال هدایت شوید.\n"
+"پس از پرداخت، حساب شما به طور خودکار شارژ می‌شود.\n"
+"\n"
+"⚠️ این لینک حدود ۲۰ دقیقه اعتبار دارد."
+
+#: strings.py:zarinpal_pay_button
+msgid "zarinpal_pay_button"
+msgstr "💳 رفتن به درگاه زرین‌پال"
+
+#: strings.py:zarinpal_unreachable
+msgid "zarinpal_unreachable"
+msgstr ""
+"❌ درگاه زرین‌پال پاسخگو نیست. لطفاً چند دقیقه بعد دوباره تلاش کنید یا از روش پرداخت دیگری استفاده کنید."
