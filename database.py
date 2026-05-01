@@ -1026,6 +1026,117 @@ class Database:
             return None
         return int(round(value))
 
+    async def list_pending_zarinpal_for_backfill(
+        self,
+        *,
+        min_age_seconds: int,
+        max_age_hours: int,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Return PENDING Zarinpal rows that need a backfill verify.
+
+        Stage-15-Step-E #8 follow-up #2. Used by the
+        :mod:`zarinpal_backfill` reaper to find orders whose user
+        closed the browser before the
+        ``?Authority=...&Status=OK`` redirect could land. Without
+        this, we'd never credit them — Zarinpal's redirect is a
+        user-agent action, not a server-to-server webhook, so the
+        user-facing tab is the *only* delivery the gateway makes
+        of the success signal.
+
+        Returns rows where:
+
+        * ``gateway = 'zarinpal'`` — TetraPay POSTs the callback
+          server-to-server with retries on 5xx, so it doesn't
+          have the browser-close gap.
+        * ``status = 'PENDING'`` — only the un-credited rows. A
+          PARTIAL row is impossible for Zarinpal (single-shot
+          settlement, no incremental credits).
+        * ``created_at < NOW() - min_age_seconds`` — give the user
+          a window to complete the redirect before the reaper
+          starts polling. 5 minutes is the documented default —
+          long enough that a slow user finishing a 3DS flow isn't
+          double-billed by a parallel reaper-driven verify, short
+          enough that a true browser-close failure is recovered
+          within the same session.
+        * ``created_at > NOW() - max_age_hours`` — DON'T touch
+          rows the :meth:`expire_stale_pending` sweeper would
+          already mark EXPIRED. The two reapers have a
+          jurisdictional split: backfill owns the window
+          ``(min_age_seconds, max_age_hours * 3600)``; expire
+          owns everything older. Setting ``max_age_hours`` below
+          ``PENDING_EXPIRATION_HOURS`` enforces that split.
+
+        Returns the columns the backfill reaper needs to drive a
+        verify+finalize: ``gateway_invoice_id`` (== authority),
+        ``telegram_id``, the locked rial figure
+        (``amount_crypto_or_rial``), and ``created_at`` for
+        ordering / observability. Sorted oldest-first so a
+        reaper running with ``limit < backlog`` always credits
+        the most-overdue user first.
+
+        Idempotent: the reaper's verify+finalize is itself
+        idempotent (FOR UPDATE + status check in
+        :meth:`finalize_payment`); two reapers running in
+        parallel can't double-credit a row even without a
+        ``FOR UPDATE SKIP LOCKED`` here. We deliberately don't
+        take a lock to keep the read path light — the verify HTTP
+        call is the bottleneck.
+        """
+        if min_age_seconds <= 0:
+            raise ValueError("min_age_seconds must be positive")
+        if max_age_hours <= 0:
+            raise ValueError("max_age_hours must be positive")
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT transaction_id,
+                       gateway_invoice_id,
+                       telegram_id,
+                       amount_crypto_or_rial,
+                       amount_usd_credited,
+                       created_at
+                FROM transactions
+                WHERE gateway = 'zarinpal'
+                  AND status = 'PENDING'
+                  AND created_at < NOW() - ($1 || ' seconds')::interval
+                  AND created_at > NOW() - ($2 || ' hours')::interval
+                ORDER BY created_at
+                LIMIT $3
+                """,
+                str(int(min_age_seconds)),
+                str(int(max_age_hours)),
+                int(limit),
+            )
+        result: list[dict] = []
+        for r in rows:
+            raw_irr = r["amount_crypto_or_rial"]
+            if raw_irr is None:
+                continue
+            try:
+                irr_value = float(raw_irr)
+            except (TypeError, ValueError):
+                continue
+            if not _is_finite_amount(irr_value) or irr_value <= 0:
+                continue
+            result.append(
+                {
+                    "transaction_id": int(r["transaction_id"]),
+                    "gateway_invoice_id": r["gateway_invoice_id"],
+                    "telegram_id": r["telegram_id"],
+                    "locked_irr": int(round(irr_value)),
+                    "locked_usd": float(r["amount_usd_credited"]),
+                    "created_at": (
+                        r["created_at"].isoformat()
+                        if r["created_at"] is not None
+                        else None
+                    ),
+                }
+            )
+        return result
+
     async def expire_stale_pending(
         self,
         *,
