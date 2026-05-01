@@ -1,0 +1,847 @@
+# Translations for the bot's user-facing strings.
+# Source of truth: strings.py in the repo root.
+# Regenerate: python -m i18n_po export
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: meowassist 1.0\nReport-Msgid-Bugs-To: \nPO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\nLast-Translator: \nLanguage-Team: \nLanguage: fa\nMIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: 8bit\n"
+
+#: strings.py:ai_chat_busy
+msgid "ai_chat_busy"
+msgstr ""
+"⏳ پاسخ پیام قبلی شما هنوز در حال پردازش است.\n"
+"لطفاً تا تکمیل آن صبر کنید و سپس پیام بعدی را بفرستید."
+
+#: strings.py:ai_insufficient_balance
+msgid "ai_insufficient_balance"
+msgstr "⚠️ اعتبار شما کافی نیست. لطفا از منوی کیف پول، حساب خود را شارژ کنید."
+
+#: strings.py:ai_local_rate_limited
+msgid "ai_local_rate_limited"
+msgstr "⏳ سرعت ارسال پیام‌های شما زیاد است. لطفاً یک لحظه صبر کنید."
+
+#: strings.py:ai_model_disabled
+msgid "ai_model_disabled"
+msgstr ""
+"⚠️ مدل فعلی شما توسط ادمین غیرفعال شده است. لطفاً از منوی مدل‌ها یک مدل دیگر انتخاب کنید."
+
+#: strings.py:ai_no_account
+msgid "ai_no_account"
+msgstr "❌ حساب کاربری شما یافت نشد. لطفا ابتدا ربات را /start کنید."
+
+#: strings.py:ai_provider_unavailable
+msgid "ai_provider_unavailable"
+msgstr "❌ سرور هوش مصنوعی موقتاً در دسترس نیست. لطفاً دوباره تلاش کنید."
+
+#: strings.py:ai_rate_limited
+msgid "ai_rate_limited"
+msgstr ""
+"⏳ این مدل در حال حاضر در سمت سرور با محدودیت نرخ مواجه شده است.\n"
+"لطفاً چند ثانیه صبر کنید یا مدل دیگری انتخاب کنید."
+
+#: strings.py:ai_rate_limited_free
+msgid "ai_rate_limited_free"
+msgstr ""
+"⏳ این مدل *رایگان* الآن بیش از حد در حال استفاده است و توسط ارائه‌دهنده بالادستی محدود شده است.\n"
+"برای داشتن پاسخ بدون انتظار، یک مدل پولی را انتخاب کنید یا یک-دو دقیقه دیگر صبر کنید."
+
+#: strings.py:ai_transient_error
+msgid "ai_transient_error"
+msgstr "❌ خطای ارتباطی موقت رخ داد. لطفاً چند لحظه دیگر دوباره تلاش کنید."
+
+#: strings.py:btn_add_crypto
+msgid "btn_add_crypto"
+msgstr "➕ شارژ حساب (Crypto)"
+
+#: strings.py:btn_amt_10
+msgid "btn_amt_10"
+msgstr "💵 $10"
+
+#: strings.py:btn_amt_25
+msgid "btn_amt_25"
+msgstr "💵 $25"
+
+#: strings.py:btn_amt_5
+msgid "btn_amt_5"
+msgstr "💵 $5"
+
+#: strings.py:btn_amt_custom
+msgid "btn_amt_custom"
+msgstr "✏️ مبلغ دلخواه (دلار)"
+
+#: strings.py:btn_amt_toman
+msgid "btn_amt_toman"
+msgstr "✏️ مبلغ دلخواه (تومان)"
+
+#: strings.py:btn_back
+msgid "btn_back"
+msgstr "🔙 بازگشت"
+
+#: strings.py:btn_back_to_menu
+msgid "btn_back_to_menu"
+msgstr "🏠 بازگشت به منو"
+
+#: strings.py:btn_back_to_wallet
+msgid "btn_back_to_wallet"
+msgstr "🔙 کیف پول"
+
+#: strings.py:btn_cancel
+msgid "btn_cancel"
+msgstr "❌ انصراف"
+
+#: strings.py:btn_close_menu
+msgid "btn_close_menu"
+msgstr "❌ بستن منو"
+
+#: strings.py:btn_force_join_check
+msgid "btn_force_join_check"
+msgstr "✅ عضو شدم"
+
+#: strings.py:btn_force_join_join
+msgid "btn_force_join_join"
+msgstr "📢 عضویت در کانال"
+
+#: strings.py:btn_home
+msgid "btn_home"
+msgstr "🏠 منوی اصلی"
+
+#: strings.py:btn_invite_friend
+msgid "btn_invite_friend"
+msgstr "🎁 دعوت از دوستان"
+
+#: strings.py:btn_lang_en
+msgid "btn_lang_en"
+msgstr "🇬🇧 English"
+
+#: strings.py:btn_lang_fa
+msgid "btn_lang_fa"
+msgstr "🇮🇷 فارسی"
+
+#: strings.py:btn_memory_disable
+msgid "btn_memory_disable"
+msgstr "⚪ خاموش کردن حافظه"
+
+#: strings.py:btn_memory_enable
+msgid "btn_memory_enable"
+msgstr "🟢 فعال کردن حافظه"
+
+#: strings.py:btn_memory_export
+msgid "btn_memory_export"
+msgstr "📥 دریافت تاریخچه گفتگو"
+
+#: strings.py:btn_memory_reset
+msgid "btn_memory_reset"
+msgstr "🆕 شروع گفتگوی جدید"
+
+#: strings.py:btn_models_free
+msgid "btn_models_free"
+msgstr "🆓 مدل‌های رایگان"
+
+#: strings.py:btn_models_next_page
+msgid "btn_models_next_page"
+msgstr "بعدی ▶️"
+
+#: strings.py:btn_models_others
+msgid "btn_models_others"
+msgstr "🌐 سایر شرکت‌ها"
+
+#: strings.py:btn_models_prev_page
+msgid "btn_models_prev_page"
+msgstr "◀️ قبلی"
+
+#: strings.py:btn_my_stats
+msgid "btn_my_stats"
+msgstr "📊 آمار مصرف من"
+
+#: strings.py:btn_promo_enter
+msgid "btn_promo_enter"
+msgstr "🎁 کد تخفیف"
+
+#: strings.py:btn_promo_remove
+msgid "btn_promo_remove"
+msgstr "❌ حذف کد تخفیف"
+
+#: strings.py:btn_receipts
+msgid "btn_receipts"
+msgstr "🧾 رسیدهای اخیر"
+
+#: strings.py:btn_receipts_more
+msgid "btn_receipts_more"
+msgstr "⏬ موارد بیشتر"
+
+#: strings.py:btn_redeem_gift
+msgid "btn_redeem_gift"
+msgstr "🎁 استفاده از کد هدیه"
+
+#: strings.py:btn_retry
+msgid "btn_retry"
+msgstr "🔄 تلاش مجدد"
+
+#: strings.py:charge_amount_lost
+msgid "charge_amount_lost"
+msgstr "❌ مبلغ یافت نشد. دوباره تلاش کنید."
+
+#: strings.py:charge_creating_invoice
+msgid "charge_creating_invoice"
+msgstr "⏳ در حال ارتباط با درگاه ناوپیمنتس. لطفا صبر کنید..."
+
+#: strings.py:charge_custom_amount_saved
+msgid "charge_custom_amount_saved"
+msgstr ""
+"💵 مبلغ ${amount:.2f} ثبت شد.\n"
+"\n"
+"🪙 ارز مورد نظر را انتخاب کنید:"
+
+#: strings.py:charge_custom_invalid
+msgid "charge_custom_invalid"
+msgstr "❌ لطفاً یک عدد معتبر وارد کنید (مثال: 15 یا 20.5)"
+
+#: strings.py:charge_custom_min_error
+msgid "charge_custom_min_error"
+msgstr "❌ حداقل مبلغ $2 است."
+
+#: strings.py:charge_custom_prompt
+msgid "charge_custom_prompt"
+msgstr ""
+"✏️ مبلغ دلخواه خود را به دلار وارد کنید:\n"
+"\n"
+"💡 حداقل: $2\n"
+"💡 مثال: 15 یا 25.5"
+
+#: strings.py:charge_gateway_unreachable
+msgid "charge_gateway_unreachable"
+msgstr "❌ درگاه پاسخگو نیست."
+
+#: strings.py:charge_gateway_unreachable_long
+msgid "charge_gateway_unreachable_long"
+msgstr "❌ درگاه در حال حاضر پاسخگو نیست. تنظیمات پنل ناوپیمنتس را چک کنید."
+
+#: strings.py:charge_invoice_error
+msgid "charge_invoice_error"
+msgstr "❌ ایجاد فاکتور با خطا مواجه شد. لطفاً دوباره تلاش کنید."
+
+#: strings.py:charge_invoice_text
+msgid "charge_invoice_text"
+msgstr ""
+"🧾 **فاکتور شارژ حساب**\n"
+"\n"
+"مبلغ شارژ خالص: `${amount}`\n"
+"ارز انتخابی: `{currency}`\n"
+"\n"
+"مبلغ قابل پرداخت (با احتساب کارمزد شبکه و درگاه):\n"
+"**`{pay_amount}`**\n"
+"\n"
+"آدرس واریز:\n"
+"`{pay_address}`\n"
+"\n"
+"⚠️ لطفاً دقیقاً همین مبلغ را واریز کنید.\n"
+"🕒 برای دریافت با نرخ بالا تا ۶۰ دقیقه فرصت دارید. پس از آن پرداخت تا ۷ روز با نرخ لحظه‌ای دنبال می‌شود. بعد از ۷ روز باید فاکتور جدید بسازید."
+
+#: strings.py:charge_min_amount_unknown
+msgid "charge_min_amount_unknown"
+msgstr ""
+"❌ مبلغ شما برای {currency} کمتر از حداقل قابل پرداخت است.\n"
+"لطفاً مبلغ بیشتری وارد کنید یا ارز دیگری (مثلاً USDT-TRC20) انتخاب کنید."
+
+#: strings.py:charge_min_amount_with_min
+msgid "charge_min_amount_with_min"
+msgstr ""
+"❌ حداقل مبلغ قابل پرداخت برای {currency} برابر است با ${min_usd:.2f}.\n"
+"لطفاً مبلغ بیشتری وارد کنید یا ارز دیگری انتخاب کنید."
+
+#: strings.py:charge_min_amount_with_min_and_alt
+msgid "charge_min_amount_with_min_and_alt"
+msgstr ""
+"❌ حداقل مبلغ قابل پرداخت برای {currency} برابر است با ${min_usd:.2f}.\n"
+"💡 برای پرداخت ${amount_usd:.2f} می‌توانید از {alt_currency} استفاده کنید."
+
+#: strings.py:charge_pick_amount
+msgid "charge_pick_amount"
+msgstr ""
+"💰 مبلغ شارژ را انتخاب کنید:\n"
+"\n"
+"💡 حداقل مبلغ: $2\n"
+"⚠️ برخی ارزها به دلیل کارمزد شبکه حداقل بالاتری دارند."
+
+#: strings.py:charge_pick_currency
+msgid "charge_pick_currency"
+msgstr ""
+"💰 مبلغ: **${amount}**\n"
+"\n"
+"🪙 ارز خود را انتخاب کنید:"
+
+#: strings.py:charge_toman_amount_saved
+msgid "charge_toman_amount_saved"
+msgstr ""
+"💵 مبلغ {entered_toman:,.0f} تومان ≈ ${amount:.2f} ثبت شد.\n"
+"(نرخ تبدیل: هر دلار ≈ {rate_toman:,.0f} تومان)\n"
+"\n"
+"🪙 روش پرداخت را انتخاب کنید:"
+
+#: strings.py:charge_toman_invalid
+msgid "charge_toman_invalid"
+msgstr "❌ لطفاً یک عدد معتبر وارد کنید (مثال: 400000 یا ۴۰۰٬۰۰۰)."
+
+#: strings.py:charge_toman_min_error
+msgid "charge_toman_min_error"
+msgstr ""
+"❌ حداقل معادل $2 است (≈ {min_toman:,.0f} تومان). شما وارد کردید: {entered_toman:,.0f} تومان."
+
+#: strings.py:charge_toman_no_rate
+msgid "charge_toman_no_rate"
+msgstr ""
+"⚠️ در حال حاضر نرخ زنده دلار به تومان در دسترس نیست.\n"
+"لطفاً چند دقیقه بعد دوباره تلاش کنید یا مبلغ را به دلار وارد کنید."
+
+#: strings.py:charge_toman_prompt
+msgid "charge_toman_prompt"
+msgstr ""
+"✏️ مبلغ مورد نظر خود را به تومان وارد کنید:\n"
+"\n"
+"💡 نرخ فعلی: هر دلار ≈ {rate_toman:,.0f} تومان\n"
+"💡 حداقل معادل: $2 (≈ {min_toman:,.0f} تومان)\n"
+"💡 مثال: 400000 یا ۴۰۰٬۰۰۰"
+
+#: strings.py:force_join_not_yet
+msgid "force_join_not_yet"
+msgstr ""
+"❌ هنوز عضو کانال نشده‌اید.\n"
+"\n"
+"لطفاً ابتدا کانال {channel} را عضو شوید و سپس دوباره دکمهٔ \"عضو شدم\" را بزنید."
+
+#: strings.py:force_join_text
+msgid "force_join_text"
+msgstr ""
+"📢 **برای استفاده از ربات ابتدا باید عضو کانال ما شوید.**\n"
+"\n"
+"لطفاً کانال {channel} را عضو شوید و سپس روی دکمهٔ \"عضو شدم\" بزنید."
+
+#: strings.py:gateway_disabled
+msgid "gateway_disabled"
+msgstr "⚠️ این روش پرداخت در حال حاضر غیرفعال است."
+
+#: strings.py:hub_btn_language
+msgid "hub_btn_language"
+msgstr "🌍 تغییر زبان"
+
+#: strings.py:hub_btn_memory
+msgid "hub_btn_memory"
+msgstr "🧠 حافظه: {state}"
+
+#: strings.py:hub_btn_models
+msgid "hub_btn_models"
+msgstr "🤖 مدل‌های هوش مصنوعی"
+
+#: strings.py:hub_btn_new_chat
+msgid "hub_btn_new_chat"
+msgstr "🆕 گفتگوی جدید"
+
+#: strings.py:hub_btn_support
+msgid "hub_btn_support"
+msgstr "💬 پشتیبانی"
+
+#: strings.py:hub_btn_wallet
+msgid "hub_btn_wallet"
+msgstr "💰 کیف پول"
+
+#: strings.py:hub_lang_label_en
+msgid "hub_lang_label_en"
+msgstr "🇬🇧 English"
+
+#: strings.py:hub_lang_label_fa
+msgid "hub_lang_label_fa"
+msgstr "🇮🇷 فارسی"
+
+#: strings.py:hub_no_active_model
+msgid "hub_no_active_model"
+msgstr "—"
+
+#: strings.py:hub_title
+msgid "hub_title"
+msgstr ""
+"🐱 **Meowassist**\n"
+"\n"
+"🤖 مدل فعال: `{active_model}`\n"
+"💰 موجودی: `${balance:.2f}`\n"
+"🌍 زبان: `{lang_label}`\n"
+"🧠 حافظه: {memory_label}\n"
+"\n"
+"از دکمه‌های زیر برای ادامه استفاده کنید:"
+
+#: strings.py:invite_text
+msgid "invite_text"
+msgstr ""
+"🎁 **دعوت از دوستان**\n"
+"\n"
+"هر کسی که با کد دعوت شما ربات را شروع کند و اولین شارژ موفق را انجام دهد،\n"
+"هم شما و هم خودش هرکدام **{bonus_percent}٪ از مبلغ شارژ (تا سقف ${bonus_max:.2f})** هدیه می‌گیرید!\n"
+"\n"
+"🔗 لینک اختصاصی شما:\n"
+"`{share_url}`\n"
+"\n"
+"🆔 یا کد دعوت شما:\n"
+"`{code}`\n"
+"\n"
+"📊 آمار شما:\n"
+"• در انتظار شارژ: {pending}\n"
+"• تکمیل شده: {paid}\n"
+"• پاداش دریافتی: ${total_bonus:.2f}"
+
+#: strings.py:invite_text_no_link
+msgid "invite_text_no_link"
+msgstr ""
+"🎁 **دعوت از دوستان**\n"
+"\n"
+"هر کسی که با کد دعوت شما ربات را شروع کند و اولین شارژ موفق را انجام دهد،\n"
+"هم شما و هم خودش هرکدام **{bonus_percent}٪ از مبلغ شارژ (تا سقف ${bonus_max:.2f})** هدیه می‌گیرید!\n"
+"\n"
+"🆔 کد دعوت شما:\n"
+"`{code}`\n"
+"\n"
+"دوست شما باید این پیام را به ربات بفرستد:\n"
+"`/start ref_{code}`\n"
+"\n"
+"📊 آمار شما:\n"
+"• در انتظار شارژ: {pending}\n"
+"• تکمیل شده: {paid}\n"
+"• پاداش دریافتی: ${total_bonus:.2f}"
+
+#: strings.py:kbd_language
+msgid "kbd_language"
+msgstr "🌍 تغییر زبان"
+
+#: strings.py:kbd_models
+msgid "kbd_models"
+msgstr "🤖 مدل‌های هوش مصنوعی"
+
+#: strings.py:kbd_support
+msgid "kbd_support"
+msgstr "🎧 پشتیبانی"
+
+#: strings.py:kbd_wallet
+msgid "kbd_wallet"
+msgstr "💰 کیف پول"
+
+#: strings.py:language_changed
+msgid "language_changed"
+msgstr "✅ زبان به فارسی تغییر یافت."
+
+#: strings.py:language_picker_title
+msgid "language_picker_title"
+msgstr "🌍 زبان مورد نظر خود را انتخاب کنید:"
+
+#: strings.py:memory_export_caption
+msgid "memory_export_caption"
+msgstr "📥 تاریخچه گفتگو ({count} پیام)"
+
+#: strings.py:memory_export_done
+msgid "memory_export_done"
+msgstr "✅ {count} پیام به صورت فایل ارسال شد"
+
+#: strings.py:memory_export_empty
+msgid "memory_export_empty"
+msgstr "📭 تاریخچه‌ای برای دریافت وجود ندارد."
+
+#: strings.py:memory_reset_done
+msgid "memory_reset_done"
+msgstr "🆕 گفتگو پاک شد ({count} پیام)"
+
+#: strings.py:memory_reset_empty
+msgid "memory_reset_empty"
+msgstr "💭 گفتگویی برای پاک کردن وجود ندارد."
+
+#: strings.py:memory_screen
+msgid "memory_screen"
+msgstr ""
+"🧠 **حافظه گفتگو**\n"
+"\n"
+"وضعیت فعلی: {state}\n"
+"\n"
+"وقتی حافظه روشن باشد، ربات پیام‌های قبلی شما را به‌خاطر می‌سپارد و می‌توانید گفتگوی چندمرحله‌ای داشته باشید. هزینه با طول گفتگو افزایش می‌یابد:\n"
+"• ۱۰ پیام ≈ ۵ برابر یک پیام مستقل\n"
+"• ۳۰ پیام ≈ ۱۵ برابر یک پیام مستقل\n"
+"\n"
+"هر زمان دکمه «گفتگوی جدید» را بزنید، حافظه پاک می‌شود (رایگان)."
+
+#: strings.py:memory_state_off
+msgid "memory_state_off"
+msgstr "⚪ خاموش"
+
+#: strings.py:memory_state_on
+msgid "memory_state_on"
+msgstr "🟢 روشن"
+
+#: strings.py:memory_toggled_off
+msgid "memory_toggled_off"
+msgstr "⚪ حافظه خاموش شد"
+
+#: strings.py:memory_toggled_on
+msgid "memory_toggled_on"
+msgstr "✅ حافظه فعال شد"
+
+#: strings.py:models_free_title
+msgid "models_free_title"
+msgstr ""
+"🆓 **مدل‌های رایگان**\n"
+"\n"
+"این مدل‌ها بدون هزینه پاسخ می‌دهند ولی ارائه‌دهنده بالادستی ممکن است درخواست‌ها را محدود کند.\n"
+"مدل فعلی: `{active_model}`\n"
+"صفحه {page} از {total_pages}"
+
+#: strings.py:models_offline_warning
+msgid "models_offline_warning"
+msgstr "⚠️ ارتباط با OpenRouter برقرار نشد؛ از فهرست محلی استفاده می‌شود."
+
+#: strings.py:models_others_title
+msgid "models_others_title"
+msgstr ""
+"🌐 **سایر شرکت‌ها**\n"
+"\n"
+"ارائه‌دهندگان دیگر مدل‌های متنی را انتخاب کنید.\n"
+"صفحه {page} از {total_pages}"
+
+#: strings.py:models_picker_empty
+msgid "models_picker_empty"
+msgstr "❌ لیست مدل‌ها در دسترس نیست. لطفاً بعداً تلاش کنید."
+
+#: strings.py:models_picker_title
+msgid "models_picker_title"
+msgstr ""
+"🤖 **انتخاب مدل هوش مصنوعی**\n"
+"\n"
+"مدل فعلی: `{active_model}`\n"
+"\n"
+"ابتدا یک ارائه‌دهنده را انتخاب کنید:"
+
+#: strings.py:models_price_format
+msgid "models_price_format"
+msgstr "${input:.2f} / ${output:.2f} per 1M"
+
+#: strings.py:models_provider_title
+msgid "models_provider_title"
+msgstr ""
+"🤖 ارائه‌دهنده: **{provider}**\n"
+"\n"
+"مدل فعلی: `{active_model}`\n"
+"\n"
+"💡 قیمت‌ها شامل کارمزد سرویس هستند و دقیقاً همان مبلغی است که از کیف پول شما کسر می‌شود.\n"
+"\n"
+"صفحه {page} از {total_pages}"
+
+#: strings.py:models_set_disabled
+msgid "models_set_disabled"
+msgstr "❌ این مدل توسط ادمین غیرفعال شده است. لطفاً مدل دیگری انتخاب کنید."
+
+#: strings.py:models_set_success
+msgid "models_set_success"
+msgstr "✅ مدل فعال شما به `{model_id}` تغییر یافت."
+
+#: strings.py:models_set_unknown
+msgid "models_set_unknown"
+msgstr "❌ این مدل در فهرست یافت نشد."
+
+#: strings.py:newchat_no_memory_hint
+msgid "newchat_no_memory_hint"
+msgstr "💡 حافظه خاموش است؛ دکمه «حافظه» در منوی اصلی را باز کنید تا فعال بشود."
+
+#: strings.py:pay_credited_full
+msgid "pay_credited_full"
+msgstr "✅ پرداخت تایید شد! مبلغ ${delta:.4f} به حساب شما اضافه شد."
+
+#: strings.py:pay_credited_total_only
+msgid "pay_credited_total_only"
+msgstr "✅ پرداخت شما تکمیل شد. در مجموع مبلغ ${total:.4f} به حساب شما اضافه شده است."
+
+#: strings.py:pay_expired_partial
+msgid "pay_expired_partial"
+msgstr ""
+"⏰ مهلت پرداخت فاکتور شما به پایان رسید. مبلغ ${credited:.4f} که قبلاً پرداخت کرده بودید به حساب شما اضافه شده است. برای پرداخت مابقی، لطفاً یک فاکتور جدید ایجاد کنید."
+
+#: strings.py:pay_expired_pending
+msgid "pay_expired_pending"
+msgstr ""
+"⏰ مهلت پرداخت فاکتور شما به پایان رسید و وجهی دریافت نشد. اگر می‌خواهید شارژ کنید، لطفاً یک فاکتور جدید ایجاد کنید."
+
+#: strings.py:pay_failed_partial
+msgid "pay_failed_partial"
+msgstr ""
+"❌ پرداخت شما ناموفق اعلام شد. مبلغ ${credited:.4f} که قبلاً موفق پرداخت شده بود همچنان در حساب شما باقی می‌ماند. اگر مبلغ بیشتری از حساب شما کسر شده، با پشتیبانی تماس بگیرید."
+
+#: strings.py:pay_failed_pending
+msgid "pay_failed_pending"
+msgstr ""
+"❌ پرداخت شما ناموفق بود. اگر مبلغی از حساب شما کسر شده است، با پشتیبانی تماس بگیرید."
+
+#: strings.py:pay_partial
+msgid "pay_partial"
+msgstr ""
+"⚠️ پرداخت شما کمتر از مبلغ فاکتور بود. مبلغ ${delta:.4f} به حساب شما اضافه شد (مجموع شارژ این فاکتور: ${total:.4f}). اگر می‌خواهید مابقی را پرداخت کنید، می‌توانید همچنان به همان آدرس واریز کنید."
+
+#: strings.py:pay_promo_bonus
+msgid "pay_promo_bonus"
+msgstr "🎁 کد تخفیف اعمال شد و مبلغ ${bonus:.4f} به‌عنوان هدیه به حساب شما اضافه شد."
+
+#: strings.py:pay_refunded_partial
+msgid "pay_refunded_partial"
+msgstr ""
+"↩️ پرداخت شما بازگشت داده شد. مبلغ ${credited:.4f} که قبلاً به حساب شما اضافه شده بود همچنان قابل استفاده است. اگر این طور نیست با پشتیبانی تماس بگیرید."
+
+#: strings.py:pay_refunded_pending
+msgid "pay_refunded_pending"
+msgstr "↩️ پرداخت شما بازگشت داده شد و به حساب شما اضافه نشد."
+
+#: strings.py:promo_active_banner_amount
+msgid "promo_active_banner_amount"
+msgstr "🎁 کد فعلی: `{code}` (${amount:.2f} هدیه)"
+
+#: strings.py:promo_active_banner_percent
+msgid "promo_active_banner_percent"
+msgstr "🎁 کد فعلی: `{code}` ({percent}٪ هدیه)"
+
+#: strings.py:promo_applied_amount
+msgid "promo_applied_amount"
+msgstr ""
+"✅ کد تخفیف `{code}` ثبت شد (${amount:.2f} هدیه روی شارژ).\n"
+"\n"
+"اکنون مبلغ شارژ را انتخاب کنید — مبلغ هدیه پس از تایید پرداخت به حساب شما اضافه می‌شود."
+
+#: strings.py:promo_applied_percent
+msgid "promo_applied_percent"
+msgstr ""
+"✅ کد تخفیف `{code}` ثبت شد ({percent}٪ هدیه روی شارژ).\n"
+"\n"
+"اکنون مبلغ شارژ را انتخاب کنید — مبلغ هدیه روی هر شارژ موفق محاسبه و به حساب شما اضافه می‌شود."
+
+#: strings.py:promo_invalid_already_used
+msgid "promo_invalid_already_used"
+msgstr "❌ شما قبلاً از این کد تخفیف استفاده کرده‌اید."
+
+#: strings.py:promo_invalid_exhausted
+msgid "promo_invalid_exhausted"
+msgstr "❌ ظرفیت استفاده از این کد تخفیف تکمیل شده."
+
+#: strings.py:promo_invalid_expired
+msgid "promo_invalid_expired"
+msgstr "❌ مهلت استفاده از این کد تخفیف به پایان رسیده."
+
+#: strings.py:promo_invalid_inactive
+msgid "promo_invalid_inactive"
+msgstr "❌ این کد تخفیف غیرفعال است."
+
+#: strings.py:promo_invalid_unknown
+msgid "promo_invalid_unknown"
+msgstr "❌ این کد تخفیف پیدا نشد."
+
+#: strings.py:promo_prompt
+msgid "promo_prompt"
+msgstr ""
+"🎁 کد تخفیف خود را وارد کنید:\n"
+"\n"
+"💡 کد به حروف کوچک/بزرگ حساس نیست."
+
+#: strings.py:promo_removed
+msgid "promo_removed"
+msgstr "❌ کد تخفیف از این پرداخت برداشته شد."
+
+#: strings.py:receipts_empty
+msgid "receipts_empty"
+msgstr ""
+"📭 هنوز رسیدی ندارید.\n"
+"\n"
+"وقتی شارژ موفق ثبت شود اینجا نمایش داده می‌شود."
+
+#: strings.py:receipts_status_partial
+msgid "receipts_status_partial"
+msgstr "⚠️"
+
+#: strings.py:receipts_status_refunded
+msgid "receipts_status_refunded"
+msgstr "🔄"
+
+#: strings.py:receipts_status_success
+msgid "receipts_status_success"
+msgstr "✅"
+
+#: strings.py:receipts_title
+msgid "receipts_title"
+msgstr "🧾 **رسیدهای اخیر**"
+
+#: strings.py:redeem_already_redeemed
+msgid "redeem_already_redeemed"
+msgstr "❌ شما قبلاً از این کد هدیه استفاده کرده‌اید."
+
+#: strings.py:redeem_bad_code
+msgid "redeem_bad_code"
+msgstr "❌ فرمت کد نامعتبر است."
+
+#: strings.py:redeem_error
+msgid "redeem_error"
+msgstr "❌ خطایی رخ داد. لطفاً بعداً تلاش کنید."
+
+#: strings.py:redeem_exhausted
+msgid "redeem_exhausted"
+msgstr "❌ ظرفیت استفاده از این کد هدیه تکمیل شده."
+
+#: strings.py:redeem_expired
+msgid "redeem_expired"
+msgstr "❌ مهلت این کد هدیه به پایان رسیده."
+
+#: strings.py:redeem_inactive
+msgid "redeem_inactive"
+msgstr "❌ این کد هدیه غیرفعال است."
+
+#: strings.py:redeem_input_prompt
+msgid "redeem_input_prompt"
+msgstr ""
+"📥 لطفاً کد هدیه خود را ارسال کنید.\n"
+"برای انصراف دکمهٔ بازگشت را بزنید."
+
+#: strings.py:redeem_not_found
+msgid "redeem_not_found"
+msgstr "❌ این کد هدیه پیدا نشد."
+
+#: strings.py:redeem_ok
+msgid "redeem_ok"
+msgstr ""
+"🎉 کد هدیه فعال شد! ${amount:.2f} به موجودی شما اضافه شد.\n"
+"موجودی فعلی: ${balance:.2f}"
+
+#: strings.py:redeem_usage
+msgid "redeem_usage"
+msgstr ""
+"📥 برای استفاده از کد هدیه:\n"
+"`/redeem CODE`\n"
+"مثال: `/redeem WELCOME5`"
+
+#: strings.py:redeem_user_unknown
+msgid "redeem_user_unknown"
+msgstr "❌ ابتدا /start را ارسال کنید و سپس دوباره تلاش کنید."
+
+#: strings.py:referral_claim_already
+msgid "referral_claim_already"
+msgstr "ℹ️ قبلاً با یک کد دعوت ثبت‌نام کرده‌اید."
+
+#: strings.py:referral_claim_ok
+msgid "referral_claim_ok"
+msgstr ""
+"🎉 از طریق دعوت یک دوست به ربات وارد شدید!\n"
+"بعد از اولین شارژ موفق، هر دو نفر پاداش می‌گیرید."
+
+#: strings.py:referral_claim_self
+msgid "referral_claim_self"
+msgstr "ℹ️ نمی‌توانید از کد دعوت خودتان استفاده کنید."
+
+#: strings.py:referral_claim_unknown
+msgid "referral_claim_unknown"
+msgstr "ℹ️ کد دعوت معتبر نیست. به ربات خوش آمدید!"
+
+#: strings.py:start_greeting
+msgid "start_greeting"
+msgstr ""
+"سلام {first_name}!\n"
+"\n"
+"به دروازه هوش مصنوعی ما خوش آمدید."
+
+#: strings.py:stats_balance_line
+msgid "stats_balance_line"
+msgstr "💰 موجودی فعلی: *${balance:.2f}*"
+
+#: strings.py:stats_empty
+msgid "stats_empty"
+msgstr ""
+"_هنوز هیچ مصرفی ثبت نشده است._\n"
+"بعد از اولین گفتگو با مدل، آمار اینجا نمایش داده می‌شود."
+
+#: strings.py:stats_lifetime_header
+msgid "stats_lifetime_header"
+msgstr "📈 *مجموع از ابتدا*"
+
+#: strings.py:stats_lifetime_line
+msgid "stats_lifetime_line"
+msgstr ""
+"  • تعداد درخواست: *{calls:,}*\n"
+"  • مجموع توکن: *{tokens:,}*\n"
+"  • هزینهٔ کل: *${cost:.4f}*"
+
+#: strings.py:stats_title
+msgid "stats_title"
+msgstr "📊 **آمار مصرف شما**"
+
+#: strings.py:stats_top_models_header
+msgid "stats_top_models_header"
+msgstr "🔝 *مدل‌های پرکاربرد ({days} روز اخیر)*"
+
+#: strings.py:stats_top_models_line
+msgid "stats_top_models_line"
+msgstr "  {rank}. `{model}` — {calls:,} درخواست، ${cost:.4f}"
+
+#: strings.py:stats_window_header
+msgid "stats_window_header"
+msgstr "🕒 *{days} روز اخیر*"
+
+#: strings.py:stats_window_line
+msgid "stats_window_line"
+msgstr ""
+"  • تعداد درخواست: *{calls:,}*\n"
+"  • مجموع توکن: *{tokens:,}*\n"
+"  • هزینه: *${cost:.4f}*"
+
+#: strings.py:support_text
+msgid "support_text"
+msgstr ""
+"🎧 **پشتیبانی فنی**\n"
+"\n"
+"برای ارتباط با ادمین به آیدی @Mahan\\_Admin پیام دهید."
+
+#: strings.py:tetrapay_button
+msgid "tetrapay_button"
+msgstr "💳 پرداخت با کارت ایرانی"
+
+#: strings.py:tetrapay_creating_order
+msgid "tetrapay_creating_order"
+msgstr "⏳ در حال ارتباط با درگاه پرداخت ایرانی. لطفا صبر کنید..."
+
+#: strings.py:tetrapay_credit_notification
+msgid "tetrapay_credit_notification"
+msgstr ""
+"✅ پرداخت شما با موفقیت تأیید شد.\n"
+"**${amount:.2f}** به کیف پول شما اضافه گردید."
+
+#: strings.py:tetrapay_order_text
+msgid "tetrapay_order_text"
+msgstr ""
+"🧾 **پرداخت با کارت ایرانی**\n"
+"\n"
+"مبلغ: `{amount_irr:,} ریال` (≈ ${amount_usd:.2f})\n"
+"نرخ تبدیل قفل‌شده: هر دلار ≈ {rate_toman:,.0f} تومان\n"
+"\n"
+"روی دکمه زیر بزنید تا به درگاه پرداخت هدایت شوید.\n"
+"پس از پرداخت، حساب شما به طور خودکار شارژ می‌شود.\n"
+"\n"
+"⚠️ این لینک حدود ۲۰ دقیقه اعتبار دارد."
+
+#: strings.py:tetrapay_pay_button
+msgid "tetrapay_pay_button"
+msgstr "💳 رفتن به درگاه پرداخت"
+
+#: strings.py:tetrapay_unreachable
+msgid "tetrapay_unreachable"
+msgstr ""
+"❌ درگاه پرداخت ایرانی پاسخگو نیست. لطفاً چند دقیقه بعد دوباره تلاش کنید یا از ارز دیجیتال استفاده کنید."
+
+#: strings.py:wallet_text
+msgid "wallet_text"
+msgstr ""
+"👛 **کیف پول شما**\n"
+"\n"
+"موجودی فعلی: ${balance:.2f}{toman_line}\n"
+"\n"
+"برای شارژ حساب کلیک کنید:"
+
+#: strings.py:wallet_toman_line
+msgid "wallet_toman_line"
+msgstr "≈ {toman:,.0f} تومان"
+
+#: strings.py:wallet_toman_line_stale
+msgid "wallet_toman_line_stale"
+msgstr "≈ {toman:,.0f} تومان (نرخ تقریبی)"
