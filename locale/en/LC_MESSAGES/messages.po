@@ -14,6 +14,28 @@ msgstr ""
 "⏳ Your previous message is still being processed.\n"
 "Please wait for it to finish before sending another one."
 
+#. 🖼️ دریافت تصویر از تلگرام ممکن نشد. لطفاً دوباره تلاش کنید.
+#: strings.py:ai_image_download_failed
+msgid "ai_image_download_failed"
+msgstr "🖼️ Couldn't fetch your image from Telegram. Please try again."
+
+#. 🖼️ این تصویر برای پردازش بسیار بزرگ است. لطفاً تصویر کوچک‌تری بفرستید (حداکثر چند مگابایت).
+#: strings.py:ai_image_oversize
+msgid "ai_image_oversize"
+msgstr ""
+"🖼️ This image is too large to process. Please send a smaller image (a few megabytes max)."
+
+#. 🖼️ تعداد تصاویر هر پیام بیشتر از حد مجاز است (حداکثر {max_images} عکس در هر پیام).
+#: strings.py:ai_image_too_many
+msgid "ai_image_too_many"
+msgstr "🖼️ Too many images in one message (max {max_images} per message)."
+
+#. 🖼️ فرمت این تصویر پشتیبانی نمی‌شود. لطفاً تصویر را با فرمت JPEG، PNG، GIF یا WEBP بفرستید.
+#: strings.py:ai_image_unsupported_format
+msgid "ai_image_unsupported_format"
+msgstr ""
+"🖼️ This image format isn't supported. Please send a JPEG, PNG, GIF or WEBP image."
+
 #. ⚠️ اعتبار شما کافی نیست. لطفا از منوی کیف پول، حساب خود را شارژ کنید.
 #: strings.py:ai_insufficient_balance
 msgid "ai_insufficient_balance"
@@ -29,6 +51,12 @@ msgstr "⏳ You're sending messages too quickly. Please wait a moment."
 msgid "ai_model_disabled"
 msgstr ""
 "⚠️ Your active model has been disabled by the admin. Please choose another model from the Models menu."
+
+#. 🖼️ مدل فعلی شما از ارسال تصویر پشتیبانی نمی‌کند. برای پرسش درباره‌ی عکس، یک مدل بینایی (Vision) مثل GPT-4o، Claude 3 یا Gemini 1.5 از منوی مدل‌ها انتخاب کنید.
+#: strings.py:ai_model_no_vision
+msgid "ai_model_no_vision"
+msgstr ""
+"🖼️ Your active model doesn't support images. Pick a vision-capable model (e.g. GPT-4o, Claude 3, Gemini 1.5) from the Models menu and try again."
 
 #. ❌ حساب کاربری شما یافت نشد. لطفا ابتدا ربات را /start کنید.
 #: strings.py:ai_no_account

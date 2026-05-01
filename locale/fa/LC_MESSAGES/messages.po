@@ -12,6 +12,25 @@ msgstr ""
 "⏳ پاسخ پیام قبلی شما هنوز در حال پردازش است.\n"
 "لطفاً تا تکمیل آن صبر کنید و سپس پیام بعدی را بفرستید."
 
+#: strings.py:ai_image_download_failed
+msgid "ai_image_download_failed"
+msgstr "🖼️ دریافت تصویر از تلگرام ممکن نشد. لطفاً دوباره تلاش کنید."
+
+#: strings.py:ai_image_oversize
+msgid "ai_image_oversize"
+msgstr ""
+"🖼️ این تصویر برای پردازش بسیار بزرگ است. لطفاً تصویر کوچک‌تری بفرستید (حداکثر چند مگابایت)."
+
+#: strings.py:ai_image_too_many
+msgid "ai_image_too_many"
+msgstr ""
+"🖼️ تعداد تصاویر هر پیام بیشتر از حد مجاز است (حداکثر {max_images} عکس در هر پیام)."
+
+#: strings.py:ai_image_unsupported_format
+msgid "ai_image_unsupported_format"
+msgstr ""
+"🖼️ فرمت این تصویر پشتیبانی نمی‌شود. لطفاً تصویر را با فرمت JPEG، PNG، GIF یا WEBP بفرستید."
+
 #: strings.py:ai_insufficient_balance
 msgid "ai_insufficient_balance"
 msgstr "⚠️ اعتبار شما کافی نیست. لطفا از منوی کیف پول، حساب خود را شارژ کنید."
@@ -24,6 +43,11 @@ msgstr "⏳ سرعت ارسال پیام‌های شما زیاد است. لطف
 msgid "ai_model_disabled"
 msgstr ""
 "⚠️ مدل فعلی شما توسط ادمین غیرفعال شده است. لطفاً از منوی مدل‌ها یک مدل دیگر انتخاب کنید."
+
+#: strings.py:ai_model_no_vision
+msgid "ai_model_no_vision"
+msgstr ""
+"🖼️ مدل فعلی شما از ارسال تصویر پشتیبانی نمی‌کند. برای پرسش درباره‌ی عکس، یک مدل بینایی (Vision) مثل GPT-4o، Claude 3 یا Gemini 1.5 از منوی مدل‌ها انتخاب کنید."
 
 #: strings.py:ai_no_account
 msgid "ai_no_account"

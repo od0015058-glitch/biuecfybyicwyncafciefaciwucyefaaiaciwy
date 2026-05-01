@@ -702,3 +702,224 @@ async def test_memory_disabled_skips_persist_entirely(stub_db):
 
     assert reply == "hello back"
     stub_db.append_conversation_message.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10 second slice: vision integration.
+# ---------------------------------------------------------------------
+# The ``image_data_uris`` keyword argument routes a multimodal user
+# turn through the existing settlement / OpenRouter pipeline. The
+# tests below pin:
+#   - the vision-capability gate fires *before* any wallet debit or
+#     OpenRouter call when the active model is text-only,
+#   - the multimodal payload is assembled correctly when the model
+#     IS vision-capable (text + image_url parts, in that order),
+#   - the existing positional-arg call shape (no images) keeps
+#     working unchanged.
+# ---------------------------------------------------------------------
+
+_TINY_DATA_URI = (
+    "data:image/jpeg;base64,"
+    "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAEBAQEBAQEBAQEBAQEB"
+)
+
+
+async def test_vision_gate_rejects_non_vision_model_no_charge(stub_db):
+    """A user whose ``active_model`` is text-only sending an image
+    must get ``ai_model_no_vision`` *before* any wallet debit or
+    OpenRouter call — pre-fix none of this gating existed because
+    the keyword was absent; this is the regression pin."""
+    stub_db.get_user.return_value = {
+        "free_messages_left": 0,
+        "balance_usd": 10.0,
+        "active_model": "openai/gpt-3.5-turbo",  # NOT vision-capable
+        "language_code": "en",
+        "memory_enabled": False,
+    }
+
+    with _patched_session(_StubResponse()):
+        reply = await ai_engine.chat_with_model(
+            42, "what's in this", image_data_uris=[_TINY_DATA_URI],
+        )
+
+    # The localised key is ``ai_model_no_vision`` — assert by
+    # substring so the test isn't tied to copy edits in strings.py.
+    assert "vision" in reply.lower()
+    # No wallet impact, no log_usage row, no OpenRouter call —
+    # the gate fires *before* settlement.
+    stub_db.deduct_balance.assert_not_awaited()
+    stub_db.log_usage.assert_not_awaited()
+    stub_db.decrement_free_message.assert_not_awaited()
+
+
+async def test_vision_gate_passes_for_vision_capable_model(stub_db):
+    """A vision-capable ``active_model`` must let the multimodal
+    request through to the OpenRouter call. We verify the
+    settlement primitives are awaited (i.e. the gate did NOT
+    short-circuit) and the reply is the canonical happy-path."""
+    stub_db.get_user.return_value = {
+        "free_messages_left": 0,
+        "balance_usd": 10.0,
+        "active_model": "openai/gpt-4o",  # vision-capable
+        "language_code": "en",
+        "memory_enabled": False,
+    }
+
+    with _patched_session(_StubResponse()):
+        reply = await ai_engine.chat_with_model(
+            42, "describe this", image_data_uris=[_TINY_DATA_URI],
+        )
+
+    assert reply == "hello back"
+    # Settlement happened — vision turn billed like any other turn.
+    stub_db.deduct_balance.assert_awaited()
+    stub_db.log_usage.assert_awaited()
+
+
+async def test_vision_payload_assembly_uses_multimodal_shape(stub_db):
+    """When a vision-capable model gets images, the payload's
+    last user-message must be the multimodal dict shape
+    (content as a list of typed parts) — not the plain-string
+    shape used for text-only turns."""
+    stub_db.get_user.return_value = {
+        "free_messages_left": 0,
+        "balance_usd": 10.0,
+        "active_model": "anthropic/claude-3-opus",  # vision-capable
+        "language_code": "en",
+        "memory_enabled": False,
+    }
+
+    captured: dict = {}
+
+    class _CapturingResponse(_StubResponse):
+        async def json(self):
+            return _ok_openrouter_body()
+
+    class _CapturingSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        def post(self, *_args, **kwargs):
+            captured["json"] = kwargs.get("json")
+            return _CapturingResponse()
+
+    with patch.object(
+        ai_engine.aiohttp,
+        "ClientSession",
+        MagicMock(return_value=_CapturingSession()),
+    ):
+        reply = await ai_engine.chat_with_model(
+            7, "hi", image_data_uris=[_TINY_DATA_URI],
+        )
+
+    assert reply == "hello back"
+    posted = captured["json"]
+    last_user = posted["messages"][-1]
+    assert last_user["role"] == "user"
+    # Multimodal: content is a list of typed parts, text first.
+    assert isinstance(last_user["content"], list)
+    assert last_user["content"][0]["type"] == "text"
+    assert last_user["content"][0]["text"] == "hi"
+    assert last_user["content"][1]["type"] == "image_url"
+    assert last_user["content"][1]["image_url"]["url"].startswith(
+        "data:image/jpeg;base64,",
+    )
+
+
+async def test_vision_invalid_uri_returns_provider_unavailable(
+    stub_db, caplog,
+):
+    """If the helper hands us a malformed data URI (caller
+    bypassed validation, future refactor regression), the
+    multimodal-assembly try/except must catch ``VisionError``
+    and surface a localised message — never a poller-level
+    crash. No wallet impact: the gate fires before settlement."""
+    stub_db.get_user.return_value = {
+        "free_messages_left": 0,
+        "balance_usd": 10.0,
+        "active_model": "openai/gpt-4o",
+        "language_code": "en",
+        "memory_enabled": False,
+    }
+
+    with caplog.at_level("ERROR"):
+        with _patched_session(_StubResponse()):
+            reply = await ai_engine.chat_with_model(
+                42, "hi", image_data_uris=["http://not-a-data-uri/foo.jpg"],
+            )
+
+    # We render the catch-all instead of crashing.
+    assert reply  # non-empty
+    # No spend, no log_usage. The gate fired before settlement.
+    stub_db.deduct_balance.assert_not_awaited()
+    stub_db.log_usage.assert_not_awaited()
+
+
+async def test_vision_no_images_keyword_keeps_text_payload_shape(stub_db):
+    """A call with ``image_data_uris=None`` (or omitted) must
+    still produce a plain-string user-content payload — i.e.
+    the existing 19+ positional-only call sites in this test
+    file are unaffected."""
+    captured: dict = {}
+
+    class _CapturingResponse(_StubResponse):
+        async def json(self):
+            return _ok_openrouter_body()
+
+    class _CapturingSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        def post(self, *_args, **kwargs):
+            captured["json"] = kwargs.get("json")
+            return _CapturingResponse()
+
+    with patch.object(
+        ai_engine.aiohttp,
+        "ClientSession",
+        MagicMock(return_value=_CapturingSession()),
+    ):
+        reply = await ai_engine.chat_with_model(7, "hello")  # no kw
+
+    assert reply == "hello back"
+    posted = captured["json"]
+    last_user = posted["messages"][-1]
+    assert last_user == {"role": "user", "content": "hello"}
+
+
+async def test_vision_empty_list_treated_as_no_images(stub_db):
+    """``image_data_uris=[]`` must be treated as 'no images' —
+    i.e. NOT trip the vision-capability gate, NOT use the
+    multimodal payload shape. Defensive: handler-side
+    validation might accidentally pass an empty list."""
+    stub_db.get_user.return_value = {
+        "free_messages_left": 0,
+        "balance_usd": 10.0,
+        "active_model": "openai/gpt-3.5-turbo",  # NOT vision
+        "language_code": "en",
+        "memory_enabled": False,
+    }
+
+    with _patched_session(_StubResponse()):
+        reply = await ai_engine.chat_with_model(
+            42, "hi", image_data_uris=[],
+        )
+
+    # Falls through to normal text path — gate didn't fire.
+    assert reply == "hello back"
+    stub_db.deduct_balance.assert_awaited()
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10 (this PR) bundled fix: NUL-byte sanitisation
+# at the database layer (root cause of the previous-PR symptom).
+# ---------------------------------------------------------------------
+# These tests live in test_database_queries.py — see also the unit
+# tests there. We don't repeat them here; this comment is a cross-
+# reference for future readers who reach for ai_engine first.

@@ -377,6 +377,28 @@ _STRINGS: dict[str, dict[str, str]] = {
             "⏳ پاسخ پیام قبلی شما هنوز در حال پردازش است.\n"
             "لطفاً تا تکمیل آن صبر کنید و سپس پیام بعدی را بفرستید."
         ),
+        # Stage-15-Step-E #10: vision (image) chat error replies.
+        "ai_model_no_vision": (
+            "🖼️ مدل فعلی شما از ارسال تصویر پشتیبانی نمی‌کند. "
+            "برای پرسش درباره‌ی عکس، یک مدل بینایی (Vision) "
+            "مثل GPT-4o، Claude 3 یا Gemini 1.5 از منوی مدل‌ها انتخاب کنید."
+        ),
+        "ai_image_oversize": (
+            "🖼️ این تصویر برای پردازش بسیار بزرگ است. "
+            "لطفاً تصویر کوچک‌تری بفرستید (حداکثر چند مگابایت)."
+        ),
+        "ai_image_unsupported_format": (
+            "🖼️ فرمت این تصویر پشتیبانی نمی‌شود. "
+            "لطفاً تصویر را با فرمت JPEG، PNG، GIF یا WEBP بفرستید."
+        ),
+        "ai_image_too_many": (
+            "🖼️ تعداد تصاویر هر پیام بیشتر از حد مجاز است "
+            "(حداکثر {max_images} عکس در هر پیام)."
+        ),
+        "ai_image_download_failed": (
+            "🖼️ دریافت تصویر از تلگرام ممکن نشد. "
+            "لطفاً دوباره تلاش کنید."
+        ),
         # ---- Payment notifications ----
         "pay_credited_full": "✅ پرداخت تایید شد! مبلغ ${delta:.4f} به حساب شما اضافه شد.",
         "pay_credited_total_only": (
@@ -805,6 +827,28 @@ _STRINGS: dict[str, dict[str, str]] = {
         "ai_chat_busy": (
             "⏳ Your previous message is still being processed.\n"
             "Please wait for it to finish before sending another one."
+        ),
+        # Stage-15-Step-E #10: vision (image) chat error replies.
+        "ai_model_no_vision": (
+            "🖼️ Your active model doesn't support images. "
+            "Pick a vision-capable model (e.g. GPT-4o, Claude 3, "
+            "Gemini 1.5) from the Models menu and try again."
+        ),
+        "ai_image_oversize": (
+            "🖼️ This image is too large to process. "
+            "Please send a smaller image (a few megabytes max)."
+        ),
+        "ai_image_unsupported_format": (
+            "🖼️ This image format isn't supported. "
+            "Please send a JPEG, PNG, GIF or WEBP image."
+        ),
+        "ai_image_too_many": (
+            "🖼️ Too many images in one message "
+            "(max {max_images} per message)."
+        ),
+        "ai_image_download_failed": (
+            "🖼️ Couldn't fetch your image from Telegram. "
+            "Please try again."
         ),
         # ---- Payment notifications ----
         "pay_credited_full": "✅ Payment confirmed! ${delta:.4f} has been added to your wallet.",
