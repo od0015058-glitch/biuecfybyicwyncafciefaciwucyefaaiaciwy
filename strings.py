@@ -122,6 +122,10 @@ _STRINGS: dict[str, dict[str, str]] = {
         "stats_top_models_line": (
             "  {rank}. `{model}` — {calls:,} درخواست، ${cost:.4f}"
         ),
+        # Stage-15-Step-E #2 follow-up: window selector buttons.
+        # ``{days}روزه`` = "<days>-day" — short enough to keep the
+        # four buttons on one row in a Telegram message.
+        "stats_window_btn": "{days} روزه",
         # ---- Wallet redeem button (Stage-8-Part-3.5) ----
         "btn_redeem_gift": "🎁 استفاده از کد هدیه",
         "redeem_input_prompt": (
@@ -577,6 +581,8 @@ _STRINGS: dict[str, dict[str, str]] = {
         "stats_top_models_line": (
             "  {rank}. `{model}` — {calls:,} calls, ${cost:.4f}"
         ),
+        # Stage-15-Step-E #2 follow-up: window selector buttons.
+        "stats_window_btn": "{days}d",
         # ---- Wallet redeem button (Stage-8-Part-3.5) ----
         "btn_redeem_gift": "🎁 Redeem gift code",
         "redeem_input_prompt": (

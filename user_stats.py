@@ -230,11 +230,21 @@ def _iter_top_models(rows: Iterable[dict]) -> Iterable[dict]:
     """Yield only well-formed rows from ``rows``.
 
     A row missing ``model`` / with a non-string model id, or with
-    a non-finite cost, is skipped rather than rendered as a broken
-    line. The DB method ``get_user_spending_summary`` already
-    filters these out, but a future caller passing a hand-built
-    snapshot (e.g. a unit test) shouldn't be able to crash the
-    formatter.
+    a non-finite ``cost_usd`` / non-finite ``calls``, is skipped
+    rather than rendered as a broken line. The DB method
+    :meth:`Database.get_user_spending_summary` already coerces both
+    fields to plain Python ``int`` / ``float`` so this never fires
+    against real DB output, but a future caller passing a
+    hand-built snapshot (e.g. a unit test) shouldn't be able to
+    crash the formatter — and a corrupted aggregate that *does*
+    leak ``Inf`` / ``NaN`` through (operator-injected bogus
+    ``cost_deducted_usd`` rows on the DB → ``SUM`` returns
+    ``Decimal('Infinity')`` → asyncpg → ``float`` cast → ``inf``)
+    must NOT show up as ``$0.0000`` next to a real model name.
+    Pre-fix the row was silently coerced to zero by
+    :func:`_safe_float`, lying to the user about which model their
+    spend went to. Post-fix the row is dropped entirely so the
+    "top models" list shrinks rather than misattributes spend.
     """
     for r in rows:
         if not isinstance(r, dict):
@@ -242,11 +252,38 @@ def _iter_top_models(rows: Iterable[dict]) -> Iterable[dict]:
         model = r.get("model")
         if not isinstance(model, str) or not model:
             continue
+        # Honour the docstring: a non-finite cost / calls is
+        # corruption, not "$0". Drop the row.
+        cost_raw = r.get("cost_usd")
+        if not _is_finite_number(cost_raw):
+            continue
+        calls_raw = r.get("calls")
+        if not _is_finite_number(calls_raw):
+            continue
         yield {
             "model": model,
-            "calls": _safe_int(r.get("calls")),
-            "cost_usd": _safe_float(r.get("cost_usd")),
+            "calls": _safe_int(calls_raw),
+            "cost_usd": _safe_float(cost_raw),
         }
+
+
+def _is_finite_number(value: object) -> bool:
+    """True iff ``value`` is a finite int/float (and NOT a bool).
+
+    Shared predicate for :func:`_iter_top_models`'s row filter so
+    the cost / calls checks stay in lock-step. ``bool`` is
+    subclassed off ``int`` in Python, but ``True`` / ``False``
+    silently rendering as ``$1.00`` / ``$0.00`` cost was never the
+    intent — same explicit rejection :func:`_safe_float` /
+    :func:`_safe_int` already do.
+    """
+    if isinstance(value, bool):
+        return False
+    if not isinstance(value, (int, float)):
+        return False
+    if isinstance(value, float) and not math.isfinite(value):
+        return False
+    return True
 
 
 __all__ = ["format_stats_summary"]
