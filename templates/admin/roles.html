@@ -1,0 +1,221 @@
+{% extends "_layout.html" %}
+
+{% block title %}Admin roles{% endblock %}
+
+{% block extra_head %}
+<style>
+  .roles-grid {
+    display: grid;
+    grid-template-columns: 1fr 360px;
+    gap: 24px;
+    align-items: start;
+  }
+  @media (max-width: 1100px) {
+    .roles-grid { grid-template-columns: 1fr; }
+  }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 500;
+  }
+  .badge-viewer {
+    background: rgba(79, 140, 255, 0.12);
+    color: var(--accent);
+    border: 1px solid rgba(79, 140, 255, 0.3);
+  }
+  .badge-operator {
+    background: rgba(255, 200, 0, 0.12);
+    color: #f0c14b;
+    border: 1px solid rgba(255, 200, 0, 0.3);
+  }
+  .badge-super {
+    background: rgba(255, 107, 107, 0.12);
+    color: var(--danger);
+    border: 1px solid rgba(255, 107, 107, 0.3);
+  }
+  code.tg {
+    background: var(--bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+  }
+  button.danger {
+    background: transparent;
+    color: var(--danger);
+    border: 1px solid var(--danger);
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  button.danger:hover { background: rgba(255, 107, 107, 0.1); }
+  form.inline { display: inline; margin: 0; }
+  .alert-success {
+    background: rgba(74, 222, 128, 0.1);
+    border: 1px solid var(--success);
+    color: var(--success);
+  }
+  .alert-info {
+    background: rgba(79, 140, 255, 0.1);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+  }
+  .hint {
+    color: var(--text-muted);
+    font-size: 11px;
+    margin-top: 4px;
+  }
+  .explainer {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 14px;
+    margin-bottom: 16px;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  .explainer strong { color: var(--text); }
+  .explainer ul { margin: 8px 0 0 18px; padding: 0; }
+  .explainer li { margin: 2px 0; }
+  .notes-cell {
+    color: var(--text-muted);
+    font-style: italic;
+    max-width: 280px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+</style>
+{% endblock %}
+
+{% block main %}
+<h2>Admin roles</h2>
+
+<div class="explainer">
+  <strong>DB-tracked admin roles</strong> graduate the bot's admin surface
+  beyond the legacy single-password env list. Each role grants a different
+  slice of the Telegram-side admin commands (and, in a future PR, the web
+  panel itself).
+  <ul>
+    <li><strong>viewer</strong> — read-only. <code class="tg">/admin_metrics</code>,
+        <code class="tg">/admin_balance</code>, this dashboard.</li>
+    <li><strong>operator</strong> — viewer + <code class="tg">/admin_broadcast</code>,
+        promo / gift code CRUD.</li>
+    <li><strong>super</strong> — operator + <code class="tg">/admin_credit</code>,
+        <code class="tg">/admin_debit</code>, refunds, user-field edits.
+        Equivalent to a legacy <code class="tg">ADMIN_USER_IDS</code> entry.</li>
+  </ul>
+  Telegram ids in <code class="tg">ADMIN_USER_IDS</code> remain super by virtue
+  of the env-list backward-compat fallback even without a row here.
+</div>
+
+{% if flash %}
+<div class="alert alert-{{ flash.kind }}">{{ flash.message }}</div>
+{% endif %}
+
+{% if db_error %}
+<div class="alert alert-warn">{{ db_error }}</div>
+{% endif %}
+
+<div class="roles-grid">
+  <div class="panel">
+    <h3>DB-tracked roles ({{ rows|length }})</h3>
+    {% if rows %}
+    <table>
+      <thead>
+        <tr>
+          <th>Telegram ID</th>
+          <th>Role</th>
+          <th>Granted</th>
+          <th>By</th>
+          <th>Notes</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+        <tr>
+          <td><code class="tg">{{ r.telegram_id }}</code></td>
+          <td>
+            {% if r.role == 'super' %}
+              <span class="badge badge-super">super</span>
+            {% elif r.role == 'operator' %}
+              <span class="badge badge-operator">operator</span>
+            {% else %}
+              <span class="badge badge-viewer">{{ r.role }}</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if r.granted_at %}
+              {{ r.granted_at[:19].replace('T', ' ') }}
+            {% else %}
+              —
+            {% endif %}
+          </td>
+          <td>
+            {% if r.granted_by %}
+              <code class="tg">{{ r.granted_by }}</code>
+            {% else %}
+              —
+            {% endif %}
+          </td>
+          <td class="notes-cell" title="{{ r.notes or '' }}">
+            {{ r.notes or '' }}
+          </td>
+          <td>
+            <form class="inline" method="post"
+                  action="/admin/roles/{{ r.telegram_id }}/revoke"
+                  onsubmit="return confirm('Revoke DB-tracked role for {{ r.telegram_id }}?');">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button type="submit" class="danger">Revoke</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p style="color: var(--text-muted); margin: 0;">
+      No DB-tracked admin roles yet. Legacy
+      <code class="tg">ADMIN_USER_IDS</code> entries still have full access
+      via the env-list fallback.
+    </p>
+    {% endif %}
+  </div>
+
+  <div class="panel">
+    <h3>Grant a role</h3>
+    <form method="post" action="/admin/roles">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+      <div class="field">
+        <label for="telegram_id">Telegram user id</label>
+        <input type="text" id="telegram_id" name="telegram_id"
+               placeholder="123456789" required pattern="[0-9]+">
+        <div class="hint">Numeric Telegram id (positive integer).</div>
+      </div>
+
+      <div class="field">
+        <label for="role">Role</label>
+        <select id="role" name="role" required>
+          <option value="viewer">viewer (read-only)</option>
+          <option value="operator">operator (broadcasts + promos + gifts)</option>
+          <option value="super">super (full access)</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="notes">Notes (optional)</label>
+        <textarea id="notes" name="notes" rows="3" maxlength="500"
+                  placeholder="Why this person, when, anything ops needs to remember"></textarea>
+        <div class="hint">Free-form. Stored verbatim. Max 500 chars.</div>
+      </div>
+
+      <button type="submit" class="primary">Grant role</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

@@ -255,8 +255,23 @@ NowPayments crypto invoices.
   `/admin_credit`). Backward compatible: any Telegram id in
   `ADMIN_USER_IDS` keeps `super` access through
   `admin_roles.effective_role`'s env-list fallback so legacy
-  deploys don't change behaviour. Web-side role gating + a
-  `/admin/roles` web page are the remaining follow-ups.
+  deploys don't change behaviour. **`/admin/roles` web page
+  (Stage-15-Step-E #5 follow-up #2)** is the browser counterpart
+  to the Telegram CLI: `GET /admin/roles` lists every DB-tracked
+  grant with telegram id, role badge, granted-at, granted-by,
+  and notes columns; `POST /admin/roles` writes a grant; `POST
+  /admin/roles/{telegram_id}/revoke` drops the row. Same
+  `ADMIN_PASSWORD`-gated cookie as the rest of the panel, both
+  write paths CSRF-protected, every action audit-logged with the
+  same `role_grant` / `role_revoke` slugs the Telegram side
+  emits (so the `/admin/audit` filter dropdown shows web and
+  Telegram grants in one feed). Notes are NUL-byte-stripped
+  before INSERT (mirrors the Stage-15-Step-E #10 fix on
+  `append_conversation_message`) so a clipboard paste with
+  embedded `\x00` doesn't demote the whole grant to a generic
+  "DB write failed" error. Web-side per-handler role gating
+  remains the open follow-up; today the page lives behind the
+  same single-password gate as every other admin tab.
 - **Telethon-driven live-bot integration test scaffold (first
   slice)** — `tests/integration/` ships a Telethon-based scaffold
   that drives a *live* test bot via a real Telegram user account

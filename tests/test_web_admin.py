@@ -433,6 +433,14 @@ def _stub_db(
             if gift_code_redemption_aggregates_result is not None
             else _DEFAULT_GIFT_AGG
         )
+    # Stage-15-Step-E #5 follow-up #2: admin-roles web page stubs. The
+    # standard stub returns an empty role list and a successful grant /
+    # revoke. Tests that exercise the failure paths construct their own
+    # AsyncMock and pass it directly via ``db=`` instead of going
+    # through ``_stub_db``.
+    db.list_admin_roles = AsyncMock(return_value=[])
+    db.set_admin_role = AsyncMock(return_value="viewer")
+    db.delete_admin_role = AsyncMock(return_value=True)
     # Surface the canonical refundable-gateways set on the stub so the
     # transactions template can iterate it without reaching for the
     # real Database class — matches the production import path.
@@ -9054,3 +9062,415 @@ async def test_openrouter_keys_get_renders_empty_pool_message(
     assert resp.status == 200
     body = await resp.text()
     assert "No OpenRouter API keys configured" in body
+
+
+# ======================================================================
+# Stage-15-Step-E #5 follow-up #2: /admin/roles web page
+# ======================================================================
+#
+# Mirrors the pattern of the gifts handlers: list (GET), create (POST),
+# revoke (POST). All three under the same ADMIN_PASSWORD-gated cookie.
+# The role-CRUD primitives themselves were shipped in PR #123 / #124;
+# these tests pin the new web surface, the audit-log writes, the CSRF
+# protection, and the Stage-15-Step-E #10 NUL-strip stowaway fix on
+# ``Database.set_admin_role``.
+
+
+async def _login_and_get_roles_csrf(client, password: str = "pw") -> str:
+    """Log in, fetch the roles page, scrape its CSRF token."""
+    await _login(client, password)
+    resp = await client.get("/admin/roles")
+    assert resp.status == 200
+    body = await resp.text()
+    import re
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+    assert m, "Expected CSRF token in /admin/roles form"
+    return m.group(1)
+
+
+async def test_roles_get_requires_auth(aiohttp_client, make_admin_app):
+    client = await aiohttp_client(make_admin_app(password="pw", db=_stub_db()))
+    resp = await client.get("/admin/roles", allow_redirects=False)
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+
+
+async def test_roles_get_renders_empty_state(aiohttp_client, make_admin_app):
+    """No DB-tracked rows → page still renders with empty-state copy."""
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/roles")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert "No DB-tracked admin roles yet" in body
+    assert "ADMIN_USER_IDS" in body
+    db.list_admin_roles.assert_awaited_once_with(limit=200)
+
+
+async def test_roles_get_lists_rows(aiohttp_client, make_admin_app):
+    rows = [
+        {
+            "telegram_id": 12345,
+            "role": "super",
+            "granted_at": "2026-04-30T12:34:56+00:00",
+            "granted_by": 9999,
+            "notes": "Founding admin",
+        },
+        {
+            "telegram_id": 67890,
+            "role": "operator",
+            "granted_at": "2026-04-29T10:20:30+00:00",
+            "granted_by": None,
+            "notes": None,
+        },
+    ]
+    db = _stub_db()
+    db.list_admin_roles = AsyncMock(return_value=rows)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/roles")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert "12345" in body
+    assert "67890" in body
+    assert "super" in body
+    assert "operator" in body
+    assert "Founding admin" in body
+    assert 'action="/admin/roles/12345/revoke"' in body
+    assert 'action="/admin/roles/67890/revoke"' in body
+    # Granted-at is rendered with the T → space substitution.
+    assert "2026-04-30 12:34:56" in body
+
+
+async def test_roles_get_db_error_renders_banner(aiohttp_client, make_admin_app):
+    db = _stub_db()
+    db.list_admin_roles = AsyncMock(side_effect=RuntimeError("boom"))
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/roles")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert "Database query failed" in body
+
+
+async def test_layout_has_roles_nav_link(aiohttp_client, make_admin_app):
+    """Sidebar link for /admin/roles ships with the page."""
+    client = await aiohttp_client(make_admin_app(password="pw", db=_stub_db()))
+    await _login(client, "pw")
+    resp = await client.get("/admin/")
+    body = await resp.text()
+    assert 'href="/admin/roles"' in body
+
+
+async def test_roles_create_requires_auth(aiohttp_client, make_admin_app):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    resp = await client.post(
+        "/admin/roles",
+        data={"telegram_id": "1", "role": "viewer"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+    db.set_admin_role.assert_not_awaited()
+
+
+async def test_roles_create_happy_path(aiohttp_client, make_admin_app):
+    db = _stub_db()
+    db.set_admin_role = AsyncMock(return_value="operator")
+    db.record_admin_audit = AsyncMock()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_roles_csrf(client, "pw")
+    # Reset audit counter so the assertion only sees the role_grant write
+    # (login-success audits also flow through this hook).
+    db.record_admin_audit.reset_mock()
+
+    resp = await client.post(
+        "/admin/roles",
+        data={
+            "csrf_token": csrf,
+            "telegram_id": "12345",
+            "role": "operator",
+            "notes": "Promoted by ops",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/roles"
+
+    db.set_admin_role.assert_awaited_once()
+    args, kwargs = db.set_admin_role.await_args
+    # Telegram id passed positionally, then role.
+    assert args[0] == 12345
+    assert args[1] == "operator"
+    assert kwargs.get("granted_by") is None
+    assert kwargs.get("notes") == "Promoted by ops"
+
+    db.record_admin_audit.assert_awaited_once()
+    audit_kwargs = db.record_admin_audit.await_args.kwargs
+    assert audit_kwargs.get("action") == "role_grant"
+    assert audit_kwargs.get("target") == "user:12345"
+    assert audit_kwargs.get("outcome") == "ok"
+    assert audit_kwargs.get("meta", {}).get("role") == "operator"
+
+    # Flash should surface on the next GET. Jinja autoescapes the
+    # single quote — match the rendered form rather than the raw text.
+    resp2 = await client.get("/admin/roles")
+    body = await resp2.text()
+    assert "alert-success" in body
+    assert "Granted role" in body
+    assert "operator" in body
+    assert "12345" in body
+
+
+async def test_roles_create_rejects_missing_csrf(aiohttp_client, make_admin_app):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.post(
+        "/admin/roles",
+        data={"telegram_id": "1", "role": "viewer"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.set_admin_role.assert_not_awaited()
+    resp2 = await client.get("/admin/roles")
+    body = await resp2.text()
+    assert "CSRF" in body
+
+
+async def test_roles_create_rejects_wrong_csrf(aiohttp_client, make_admin_app):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login_and_get_roles_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/roles",
+        data={
+            "csrf_token": "obviously-wrong",
+            "telegram_id": "1",
+            "role": "viewer",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.set_admin_role.assert_not_awaited()
+
+
+async def test_roles_create_missing_telegram_id(aiohttp_client, make_admin_app):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_roles_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/roles",
+        data={"csrf_token": csrf, "telegram_id": "", "role": "viewer"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.set_admin_role.assert_not_awaited()
+    resp2 = await client.get("/admin/roles")
+    body = await resp2.text()
+    assert "Enter a Telegram user id" in body
+
+
+async def test_roles_create_bad_telegram_id(aiohttp_client, make_admin_app):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_roles_csrf(client, "pw")
+    for bad in ("not-a-number", "0", "-12"):
+        resp = await client.post(
+            "/admin/roles",
+            data={"csrf_token": csrf, "telegram_id": bad, "role": "viewer"},
+            allow_redirects=False,
+        )
+        assert resp.status == 302
+    db.set_admin_role.assert_not_awaited()
+    resp2 = await client.get("/admin/roles")
+    body = await resp2.text()
+    assert "positive integer" in body
+
+
+async def test_roles_create_bad_role(aiohttp_client, make_admin_app):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_roles_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/roles",
+        data={"csrf_token": csrf, "telegram_id": "1", "role": "godmode"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.set_admin_role.assert_not_awaited()
+    resp2 = await client.get("/admin/roles")
+    body = await resp2.text()
+    assert "Role must be one of" in body
+
+
+async def test_roles_create_notes_too_long(aiohttp_client, make_admin_app):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_roles_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/roles",
+        data={
+            "csrf_token": csrf,
+            "telegram_id": "1",
+            "role": "viewer",
+            "notes": "x" * 1000,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.set_admin_role.assert_not_awaited()
+    resp2 = await client.get("/admin/roles")
+    body = await resp2.text()
+    assert "at most 500 characters" in body
+
+
+async def test_roles_create_db_value_error_surfaces_message(
+    aiohttp_client, make_admin_app
+):
+    """The DB layer's defence-in-depth ValueError text shows up in the flash."""
+    db = _stub_db()
+    db.set_admin_role = AsyncMock(side_effect=ValueError("role must be one of [...]"))
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_roles_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/roles",
+        data={"csrf_token": csrf, "telegram_id": "1", "role": "viewer"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    resp2 = await client.get("/admin/roles")
+    body = await resp2.text()
+    assert "role must be one of" in body
+
+
+async def test_roles_create_db_error_surfaces_generic_message(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    db.set_admin_role = AsyncMock(side_effect=RuntimeError("pool exhausted"))
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_roles_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/roles",
+        data={"csrf_token": csrf, "telegram_id": "1", "role": "viewer"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    resp2 = await client.get("/admin/roles")
+    body = await resp2.text()
+    assert "Database write failed" in body
+
+
+async def test_roles_revoke_requires_auth(aiohttp_client, make_admin_app):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    resp = await client.post(
+        "/admin/roles/1/revoke",
+        data={"csrf_token": "anything"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+    db.delete_admin_role.assert_not_awaited()
+
+
+async def test_roles_revoke_happy_path(aiohttp_client, make_admin_app):
+    db = _stub_db()
+    db.delete_admin_role = AsyncMock(return_value=True)
+    db.record_admin_audit = AsyncMock()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_roles_csrf(client, "pw")
+    db.record_admin_audit.reset_mock()
+    resp = await client.post(
+        "/admin/roles/12345/revoke",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.delete_admin_role.assert_awaited_once_with(12345)
+    db.record_admin_audit.assert_awaited_once()
+    kwargs = db.record_admin_audit.await_args.kwargs
+    assert kwargs.get("action") == "role_revoke"
+    assert kwargs.get("target") == "user:12345"
+    assert kwargs.get("outcome") == "ok"
+
+    resp2 = await client.get("/admin/roles")
+    body = await resp2.text()
+    assert "alert-success" in body
+    assert "Revoked DB-tracked role for 12345" in body
+
+
+async def test_roles_revoke_no_row_shows_info_and_audits_noop(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    db.delete_admin_role = AsyncMock(return_value=False)
+    db.record_admin_audit = AsyncMock()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_roles_csrf(client, "pw")
+    db.record_admin_audit.reset_mock()
+    resp = await client.post(
+        "/admin/roles/99999/revoke",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.delete_admin_role.assert_awaited_once_with(99999)
+    # Even a noop revoke must hit the audit log so a forensic
+    # operator can see "someone tried but no row existed".
+    db.record_admin_audit.assert_awaited_once()
+    kwargs = db.record_admin_audit.await_args.kwargs
+    assert kwargs.get("outcome") == "noop"
+    resp2 = await client.get("/admin/roles")
+    body = await resp2.text()
+    assert "alert-info" in body
+    assert "nothing to revoke" in body
+
+
+async def test_roles_revoke_rejects_missing_csrf(aiohttp_client, make_admin_app):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.post(
+        "/admin/roles/1/revoke",
+        data={},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.delete_admin_role.assert_not_awaited()
+
+
+async def test_roles_revoke_invalid_url_id(aiohttp_client, make_admin_app):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_roles_csrf(client, "pw")
+    # Negative id slips past the URL parser but is rejected by the handler.
+    resp = await client.post(
+        "/admin/roles/-1/revoke",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.delete_admin_role.assert_not_awaited()
+    resp2 = await client.get("/admin/roles")
+    body = await resp2.text()
+    assert "Invalid telegram id" in body
+
+
+async def test_roles_revoke_db_error(aiohttp_client, make_admin_app):
+    db = _stub_db()
+    db.delete_admin_role = AsyncMock(side_effect=RuntimeError("pool blip"))
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_roles_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/roles/1/revoke",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    resp2 = await client.get("/admin/roles")
+    body = await resp2.text()
+    assert "Database write failed" in body

@@ -4012,6 +4012,27 @@ class Database:
                 f"role must be one of {sorted(self.ADMIN_ROLE_VALUES)}; "
                 f"got {role!r}"
             )
+        # Strip U+0000 NUL bytes from ``notes`` before INSERT. Postgres
+        # TEXT rejects ``\x00`` outright with ``invalid byte sequence
+        # for encoding "UTF8": 0x00`` — same regression class
+        # ``append_conversation_message`` documented in
+        # Stage-15-Step-E #10 (PR #128). The new ``/admin/roles`` web
+        # form exposes ``notes`` as a free-form textarea that an
+        # operator might paste binary-y content into; strip-and-warn
+        # at the DB layer so the audit trail keeps the rest of the
+        # note text instead of demoting the whole grant to a
+        # misleading "DB write failed" error. Telegram is the other
+        # surface (the ``/admin_role_grant`` handler routes notes
+        # through here too) — same fix protects both.
+        clean_notes = notes
+        if isinstance(notes, str) and "\x00" in notes:
+            clean_notes = notes.replace("\x00", "")
+            log.warning(
+                "set_admin_role: stripping %d NUL byte(s) from notes "
+                "for telegram_id=%d (Postgres TEXT rejects \\x00); "
+                "preserving the rest of the text",
+                notes.count("\x00"), int(telegram_id),
+            )
         async with self.pool.acquire() as connection:
             await connection.execute(
                 """
@@ -4027,7 +4048,7 @@ class Database:
                 int(telegram_id),
                 normalized,
                 int(granted_by) if granted_by is not None else None,
-                notes,
+                clean_notes,
             )
         return normalized
 
