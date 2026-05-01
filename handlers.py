@@ -54,6 +54,7 @@ from rate_limit import (
 from referral import build_share_url, parse_referral_payload
 from strings import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, all_button_labels, t
 from tetrapay import create_order as tetrapay_create_order
+from zarinpal import create_order as zarinpal_create_order
 from vision import (
     MAX_IMAGES_PER_MESSAGE,
     VisionError,
@@ -2549,18 +2550,31 @@ async def process_toman_amount_input(message: Message, state: FSMContext):
     # rate lock would expose users to settlement-time rate moves.
     active_currencies = _active_pay_currencies()
     tetrapay_enabled = not is_gateway_disabled("tetrapay")
+    # Stage-15-Step-E #8 follow-up #1: Zarinpal Telegram FSM. Same
+    # entry shape as TetraPay — both quote IRR and lean on the locked
+    # Toman rate the user already accepted on the Toman-entry path.
+    # The two buttons live on a row of their own at the top of the
+    # currency picker so they're never visually competing with the
+    # crypto grid below.
+    zarinpal_enabled = not is_gateway_disabled("zarinpal")
     if tetrapay_enabled:
         builder.button(text=t(lang, "tetrapay_button"), callback_data="cur_tetrapay")
+    if zarinpal_enabled:
+        builder.button(text=t(lang, "zarinpal_button"), callback_data="cur_zarinpal")
     for label, ticker in active_currencies:
         builder.button(text=label, callback_data=f"cur_{ticker}")
     # Back returns to the Toman prompt, not the USD one.
     builder.button(text=t(lang, "btn_back"), callback_data="amt_toman")
     builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
-    # Layout: TetraPay button alone on top (when enabled), then the
-    # 3-wide crypto grid, then the back/home footer.
+    # Layout: card-gateway buttons (TetraPay + Zarinpal, when enabled)
+    # share the top row, then the 3-wide crypto grid, then the
+    # back/home footer. The card row width = number of enabled card
+    # gateways so a single-enabled deploy doesn't stretch the lone
+    # button across the chat width.
+    card_buttons = int(tetrapay_enabled) + int(zarinpal_enabled)
     crypto_layout = _currency_grid_layout(len(active_currencies))
-    if tetrapay_enabled:
-        builder.adjust(1, *crypto_layout, 2)
+    if card_buttons:
+        builder.adjust(card_buttons, *crypto_layout, 2)
     else:
         builder.adjust(*crypto_layout, 2)
 
@@ -2610,13 +2624,29 @@ async def _start_tetrapay_invoice(
     await state.clear()
     await callback.message.edit_text(t(lang, "tetrapay_creating_order"))
 
+    # Stage-15-Step-E #8 follow-up #1 bundled bug fix: tighten the
+    # rate-validation gate. Pre-fix the check accepted any
+    # ``int | float`` including ``float('nan')`` / ``float('inf')``
+    # / ``-1.0`` / ``True`` (since ``bool`` is a subclass of ``int``,
+    # ``True <= 0`` is False so it slipped through too). A poisoned
+    # FSM ``toman_rate_at_entry`` would then trickle into
+    # ``tetrapay_create_order`` → ``usd_to_irr_amount`` which raises
+    # ``ValueError`` on non-finite / non-positive rates — the
+    # handler caught that as a generic ``Exception`` and rendered
+    # ``tetrapay_unreachable`` (misleading: the gateway is fine,
+    # our FSM is corrupted). Reject up-front so the user sees the
+    # correct ``charge_toman_no_rate`` re-entry prompt.
     if (
         toman_rate_at_entry is None
+        or isinstance(toman_rate_at_entry, bool)
         or not isinstance(toman_rate_at_entry, (int, float))
+        or not math.isfinite(float(toman_rate_at_entry))
+        or float(toman_rate_at_entry) <= 0
     ):
         log.error(
-            "TetraPay order start: missing toman_rate_at_entry in FSM "
-            "for user=%s; refusing", callback.from_user.id,
+            "TetraPay order start: missing/invalid toman_rate_at_entry=%r "
+            "in FSM for user=%s; refusing",
+            toman_rate_at_entry, callback.from_user.id,
         )
         builder = InlineKeyboardBuilder()
         builder.button(text=t(lang, "btn_retry"), callback_data="amt_toman")
@@ -2706,6 +2736,143 @@ async def _start_tetrapay_invoice(
     await callback.answer()
 
 
+async def _start_zarinpal_invoice(
+    callback: CallbackQuery,
+    state: FSMContext,
+    *,
+    lang: str,
+    amount_usd: float,
+    toman_rate_at_entry: float | None,
+    promo_code: str | None,
+    promo_bonus_usd: float,
+) -> None:
+    """Stage-15-Step-E #8 follow-up #1: spin up a Zarinpal order.
+
+    Twin of :func:`_start_tetrapay_invoice`. Zarinpal redirects the
+    user's BROWSER back to ``${WEBHOOK_BASE_URL}/zarinpal-callback``
+    with ``?Authority=…&Status=OK|NOK`` query params (server-side
+    polling for settlement is the alternative — see the backfill
+    reaper item in HANDOFF). The Telegram side's job is just to mint
+    the order, persist a PENDING row keyed on ``authority``, and hand
+    the user the StartPay URL.
+
+    Failure modes (all of which are user-facing):
+
+    * The locked rate is missing or non-finite — the FSM data was
+      corrupted between Toman entry and currency picking. Render the
+      same "no rate available" message the Toman-entry path uses.
+    * :func:`zarinpal.create_order` raises (transport, missing
+      merchant id / WEBHOOK_BASE_URL, gateway returned non-100).
+      Render ``zarinpal_unreachable``.
+    * :meth:`Database.create_pending_transaction` returns ``False``
+      (defensive guards or gateway_invoice_id collision). Render
+      ``charge_invoice_error`` and log loudly — collision on
+      cryptographically random Authority is statistically impossible
+      so we'd want to know.
+    """
+    await state.clear()
+    await callback.message.edit_text(t(lang, "zarinpal_creating_order"))
+
+    # Same defense-in-depth as ``_start_tetrapay_invoice``: reject
+    # non-finite / non-positive / bool rates up-front so a poisoned
+    # FSM doesn't get re-rendered as a misleading ``unreachable``
+    # message. See the comment in ``_start_tetrapay_invoice`` for
+    # the full rationale.
+    if (
+        toman_rate_at_entry is None
+        or isinstance(toman_rate_at_entry, bool)
+        or not isinstance(toman_rate_at_entry, (int, float))
+        or not math.isfinite(float(toman_rate_at_entry))
+        or float(toman_rate_at_entry) <= 0
+    ):
+        log.error(
+            "Zarinpal order start: missing/invalid toman_rate_at_entry=%r "
+            "in FSM for user=%s; refusing",
+            toman_rate_at_entry, callback.from_user.id,
+        )
+        builder = InlineKeyboardBuilder()
+        builder.button(text=t(lang, "btn_retry"), callback_data="amt_toman")
+        builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+        builder.adjust(2)
+        await callback.message.edit_text(
+            t(lang, "charge_toman_no_rate"), reply_markup=builder.as_markup()
+        )
+        await callback.answer()
+        return
+
+    try:
+        order = await zarinpal_create_order(
+            amount_usd=amount_usd,
+            rate_toman_per_usd=float(toman_rate_at_entry),
+            description="Meowassist wallet top-up",
+            user_id=callback.from_user.id,
+        )
+    except Exception as exc:
+        # Catches both ``ZarinpalError`` (gateway returned non-100,
+        # missing merchant id, missing fields in response) AND
+        # transport errors (aiohttp.ClientError,
+        # asyncio.TimeoutError). Same fail-shape as the TetraPay /
+        # NowPayments paths.
+        log.exception(
+            "Zarinpal create_order failed for user=%s amount_usd=%.2f: %s",
+            callback.from_user.id, amount_usd, exc,
+        )
+        builder = InlineKeyboardBuilder()
+        builder.button(text=t(lang, "btn_retry"), callback_data="amt_toman")
+        builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+        builder.adjust(2)
+        await callback.message.edit_text(
+            t(lang, "zarinpal_unreachable"), reply_markup=builder.as_markup()
+        )
+        await callback.answer()
+        return
+
+    inserted = await db.create_pending_transaction(
+        telegram_id=callback.from_user.id,
+        gateway="zarinpal",
+        currency_used="IRR",
+        amount_crypto=float(order.amount_irr),
+        amount_usd=order.amount_usd,
+        gateway_invoice_id=order.authority,
+        promo_code=promo_code,
+        promo_bonus_usd=promo_bonus_usd,
+        gateway_locked_rate_toman_per_usd=order.locked_rate_toman_per_usd,
+    )
+    if not inserted:
+        log.error(
+            "Zarinpal create_pending_transaction refused for "
+            "authority=%s user=%s — defensive guard fired or "
+            "duplicate authority (statistically impossible)",
+            order.authority, callback.from_user.id,
+        )
+        builder = InlineKeyboardBuilder()
+        builder.button(text=t(lang, "btn_retry"), callback_data="amt_toman")
+        builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+        builder.adjust(2)
+        await callback.message.edit_text(
+            t(lang, "charge_invoice_error"), reply_markup=builder.as_markup()
+        )
+        await callback.answer()
+        return
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text=t(lang, "zarinpal_pay_button"), url=order.payment_url)
+    builder.button(text=t(lang, "btn_back"), callback_data="amt_toman")
+    builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
+    builder.adjust(1, 2)
+    await callback.message.edit_text(
+        t(
+            lang, "zarinpal_order_text",
+            amount_irr=order.amount_irr,
+            amount_usd=order.amount_usd,
+            rate_toman=order.locked_rate_toman_per_usd,
+        ),
+        parse_mode="Markdown",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("cur_"))
 async def process_custom_currency_selection(callback: CallbackQuery, state: FSMContext):
     currency = callback.data.split("_", 1)[1]
@@ -2740,6 +2907,23 @@ async def process_custom_currency_selection(callback: CallbackQuery, state: FSMC
     # already enforced upstream in ``process_toman_amount_input``.
     if currency == "tetrapay":
         await _start_tetrapay_invoice(
+            callback,
+            state,
+            lang=lang,
+            amount_usd=float(amount),
+            toman_rate_at_entry=data.get("toman_rate_at_entry"),
+            promo_code=promo_code,
+            promo_bonus_usd=promo_bonus_usd,
+        )
+        return
+
+    # Stage-15-Step-E #8 follow-up #1: Zarinpal branch. Same shape as
+    # TetraPay — IRR-quoted, leans on the locked Toman rate from the
+    # entry-side ``toman_rate_at_entry`` snapshot. Branches before
+    # the NowPayments per-currency floor check for the same reason
+    # TetraPay does (no crypto-style network minimum applies).
+    if currency == "zarinpal":
+        await _start_zarinpal_invoice(
             callback,
             state,
             lang=lang,
