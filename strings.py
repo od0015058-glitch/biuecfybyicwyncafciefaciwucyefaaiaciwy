@@ -1172,22 +1172,51 @@ def t(lang: str | None, key: str, **kwargs: object) -> str:
     Resolution order:
 
     1. ``_OVERRIDES[(lang, key)]`` — admin-set runtime override.
-    2. ``_STRINGS[lang][key]`` — compiled default for the requested locale.
-    3. ``_STRINGS[DEFAULT_LANGUAGE][key]`` — fallback to the default locale.
-    4. The bare slug itself, with a one-shot WARNING logged so dictionary
+    2. ``i18n_runtime.gettext_lookup(lang, key)`` — community
+       translation loaded from
+       ``locale/<lang>/LC_MESSAGES/messages.po``. Returns ``None``
+       when the runtime cache hasn't been initialised, the entry
+       is missing, or ``msgstr`` is empty (gettext convention for
+       "untranslated") so the caller falls through to (3).
+       Stage-15-Step-E #7 follow-up #1 added this layer.
+    3. ``_STRINGS[lang][key]`` — compiled default for the requested locale.
+    4. ``_STRINGS[DEFAULT_LANGUAGE][key]`` — fallback to the default locale
+       (with the same admin-override + ``.po`` precedence applied to
+       the default locale).
+    5. The bare slug itself, with a one-shot WARNING logged so dictionary
        drift surfaces in ops logs instead of silently shipping a slug to
-       the user. Pre-Stage-9-Step-1.6 step (4) was a silent return.
+       the user. Pre-Stage-9-Step-1.6 step (5) was a silent return.
+
+    The ``.po`` layer (2) is opt-in: ``i18n_runtime.init_translations``
+    must have been called for it to return anything (otherwise
+    :func:`i18n_runtime.gettext_lookup` returns ``None`` and we
+    fall straight through to ``_STRINGS``). Tests that don't care
+    about the ``.po`` layer don't need to do anything special; the
+    behaviour is identical to the pre-#7-#1 lookup chain.
     """
+    # Late import keeps ``strings`` import-time cheap and avoids a
+    # circular dependency: ``i18n_runtime`` imports ``strings``
+    # (lazily, also at call time) for ``SUPPORTED_LANGUAGES``.
+    import i18n_runtime
+
     if lang not in _STRINGS:
         lang = DEFAULT_LANGUAGE
     template = _OVERRIDES.get((lang, key))
     if template is None:
+        template = i18n_runtime.gettext_lookup(lang, key)
+    if template is None:
         template = _STRINGS[lang].get(key)
         if template is None and lang != DEFAULT_LANGUAGE:
-            # Try the override cache for the default locale before
-            # falling back to its compiled default — admin overrides
-            # should win regardless of which locale we're rendering.
+            # Try the override cache for the default locale, then
+            # the .po layer for the default locale, before falling
+            # back to its compiled default — admin overrides should
+            # win regardless of which locale we're rendering, and
+            # the same applies to community translations.
             template = _OVERRIDES.get((DEFAULT_LANGUAGE, key))
+            if template is None:
+                template = i18n_runtime.gettext_lookup(
+                    DEFAULT_LANGUAGE, key
+                )
             if template is None:
                 template = _STRINGS[DEFAULT_LANGUAGE].get(key)
     if template is None:
