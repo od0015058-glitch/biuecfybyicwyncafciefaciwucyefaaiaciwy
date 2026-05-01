@@ -331,3 +331,88 @@ def test_upsert_fx_snapshot_uses_single_row_upsert_pattern():
     assert "fx_rates_snapshot" in src
     assert "VALUES (1," in src
     assert "ON CONFLICT (id) DO UPDATE" in src
+
+
+# ---------------------------------------------------------------------
+# _parse_float_env — NaN / Inf guard (Stage-15-Step-E #6 bundled bug fix)
+# ---------------------------------------------------------------------
+
+
+class TestParseFloatEnvNonFiniteGuard:
+    """Guard against ``FX_RATE_ALERT_THRESHOLD_PERCENT=nan`` (or
+    ``inf``) silently disabling the rate-move alert.
+
+    ``float("nan")`` parses successfully; before the fix the function
+    returned the NaN through unchanged, and the call site
+    (``abs(delta) >= NaN`` is always ``False``) silently dropped
+    every alert. Same regression class fixed in
+    ``model_discovery._parse_float_env``.
+    """
+
+    def test_nan_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("FX_TEST_NAN", "nan")
+        assert fx_rates._parse_float_env("FX_TEST_NAN", 12.5) == 12.5
+
+    def test_uppercase_nan_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("FX_TEST_NAN_U", "NaN")
+        assert fx_rates._parse_float_env("FX_TEST_NAN_U", 7.0) == 7.0
+
+    def test_inf_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("FX_TEST_INF", "inf")
+        assert fx_rates._parse_float_env("FX_TEST_INF", 12.5) == 12.5
+
+    def test_negative_inf_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("FX_TEST_NEG_INF", "-inf")
+        assert fx_rates._parse_float_env("FX_TEST_NEG_INF", 12.5) == 12.5
+
+    def test_finite_value_passes_through(self, monkeypatch):
+        monkeypatch.setenv("FX_TEST_OK", "8.5")
+        assert fx_rates._parse_float_env("FX_TEST_OK", 12.5) == 8.5
+
+    def test_blank_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("FX_TEST_BLANK", "")
+        assert fx_rates._parse_float_env("FX_TEST_BLANK", 12.5) == 12.5
+
+    def test_garbage_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("FX_TEST_GARBAGE", "twelve")
+        assert fx_rates._parse_float_env("FX_TEST_GARBAGE", 12.5) == 12.5
+
+    def test_negative_finite_passes_through(self, monkeypatch):
+        # Negative is a *semantic* concern at the call site (a
+        # negative threshold turns "alert on big moves" into "alert
+        # on every move"), not a parser concern. The parser is
+        # generic; the call site is responsible for clamping. This
+        # test pins the contract so a future tightening of the
+        # parser is a deliberate decision rather than a stealth
+        # behaviour change.
+        monkeypatch.setenv("FX_TEST_NEG", "-5")
+        assert fx_rates._parse_float_env("FX_TEST_NEG", 12.5) == -5.0
+
+
+class TestParseFloatEnvNonFiniteGuardSilencesRateMoveAlert:
+    """End-to-end pin: ``FX_RATE_ALERT_THRESHOLD_PERCENT=nan`` must
+    fall back to the default (5%) — NOT silently disable the alert.
+
+    The pre-fix behaviour was that the env value passed through as
+    NaN, the threshold check ``abs(delta) >= NaN`` returned ``False``
+    for every model on every poll, and admins were never DM'd about
+    a rate move. With the guard in place a misconfigured env value
+    falls back to the default and the alert system keeps working.
+    """
+
+    @pytest.mark.asyncio
+    async def test_nan_threshold_env_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("FX_RATE_ALERT_THRESHOLD_PERCENT", "nan")
+        monkeypatch.setattr(fx_rates, "_fetch_one", AsyncMock(return_value=87_500.0))
+        bot = MagicMock(send_message=AsyncMock())
+        with patch("database.db.upsert_fx_snapshot", AsyncMock()), \
+             patch("admin.get_admin_user_ids", return_value=[111]):
+            await fx_rates.refresh_usd_to_toman_once(bot=bot)  # seed cache
+            # 20% jump — well above the *default* 5% threshold,
+            # which is what we should fall back to when env=nan.
+            monkeypatch.setattr(
+                fx_rates, "_fetch_one", AsyncMock(return_value=105_000.0)
+            )
+            await fx_rates.refresh_usd_to_toman_once(bot=bot)
+        # The DM fired → fallback worked → bug is fixed.
+        bot.send_message.assert_called()

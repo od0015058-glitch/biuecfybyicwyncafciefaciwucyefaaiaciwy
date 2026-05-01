@@ -53,6 +53,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -95,14 +96,31 @@ def _parse_int_env(name: str, default: int) -> int:
 
 
 def _parse_float_env(name: str, default: float) -> float:
+    """Tolerant float env parser: blank / malformed / non-finite → ``default``.
+
+    Same regression class as ``model_discovery._parse_float_env``:
+    ``float("nan")`` / ``float("inf")`` parse successfully but
+    silently disable the threshold check at the call site (every
+    comparison against NaN is ``False``; nothing finite exceeds Inf).
+    Reject non-finite values explicitly so a bogus
+    ``FX_RATE_ALERT_THRESHOLD_PERCENT=nan`` falls back to the
+    default rather than turning the FX rate-move alert system off.
+    """
     raw = os.getenv(name, "").strip()
     if not raw:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         log.warning("%s=%r not a float; using default %.2f", name, raw, default)
         return default
+    if not math.isfinite(value):
+        log.warning(
+            "%s=%r parsed as non-finite (%s); using default %.2f",
+            name, raw, value, default,
+        )
+        return default
+    return value
 
 
 def _get_interval_seconds() -> int:

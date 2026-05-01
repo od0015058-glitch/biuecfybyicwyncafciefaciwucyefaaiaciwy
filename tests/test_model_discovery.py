@@ -762,3 +762,72 @@ async def test_upsert_model_prices_empty_short_circuits():
     database_module.db.pool = _FailingPool()
     n = await database_module.db.upsert_model_prices({})
     assert n == 0
+
+
+# ---------------------------------------------------------------------
+# _parse_float_env — NaN / Inf guard (Stage-15-Step-E #6 bundled bug fix)
+# ---------------------------------------------------------------------
+
+
+class TestParseFloatEnvNonFiniteGuard:
+    """Guard against ``PRICE_ALERT_THRESHOLD_PERCENT=nan`` (or
+    ``inf``) silently disabling the price-move alert.
+
+    Pre-fix, ``float("nan")`` parsed successfully and propagated
+    through to the call site, where ``abs(delta_pct) >= NaN`` is
+    always ``False`` — every alert was silently dropped no matter
+    how big the price move. With the guard the value falls back to
+    the default 20% threshold and alerts fire normally. The same
+    fix lives in ``fx_rates._parse_float_env``; this test class
+    pins the discovery side independently so a regression in either
+    module doesn't go unnoticed.
+    """
+
+    def test_nan_falls_back_to_default(self, monkeypatch):
+        import model_discovery
+        monkeypatch.setenv("DISCOVERY_TEST_NAN", "nan")
+        assert model_discovery._parse_float_env(
+            "DISCOVERY_TEST_NAN", 20.0
+        ) == 20.0
+
+    def test_uppercase_nan_falls_back_to_default(self, monkeypatch):
+        import model_discovery
+        monkeypatch.setenv("DISCOVERY_TEST_NAN_U", "NaN")
+        assert model_discovery._parse_float_env(
+            "DISCOVERY_TEST_NAN_U", 20.0
+        ) == 20.0
+
+    def test_inf_falls_back_to_default(self, monkeypatch):
+        import model_discovery
+        monkeypatch.setenv("DISCOVERY_TEST_INF", "inf")
+        assert model_discovery._parse_float_env(
+            "DISCOVERY_TEST_INF", 20.0
+        ) == 20.0
+
+    def test_negative_inf_falls_back_to_default(self, monkeypatch):
+        import model_discovery
+        monkeypatch.setenv("DISCOVERY_TEST_NEG_INF", "-inf")
+        assert model_discovery._parse_float_env(
+            "DISCOVERY_TEST_NEG_INF", 20.0
+        ) == 20.0
+
+    def test_finite_value_passes_through(self, monkeypatch):
+        import model_discovery
+        monkeypatch.setenv("DISCOVERY_TEST_OK", "15")
+        assert model_discovery._parse_float_env(
+            "DISCOVERY_TEST_OK", 20.0
+        ) == 15.0
+
+    def test_blank_falls_back_to_default(self, monkeypatch):
+        import model_discovery
+        monkeypatch.setenv("DISCOVERY_TEST_BLANK", "")
+        assert model_discovery._parse_float_env(
+            "DISCOVERY_TEST_BLANK", 20.0
+        ) == 20.0
+
+    def test_garbage_falls_back_to_default(self, monkeypatch):
+        import model_discovery
+        monkeypatch.setenv("DISCOVERY_TEST_GARBAGE", "twenty-five")
+        assert model_discovery._parse_float_env(
+            "DISCOVERY_TEST_GARBAGE", 20.0
+        ) == 20.0

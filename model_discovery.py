@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 from dataclasses import dataclass
 
@@ -77,15 +78,33 @@ _MAX_NEW_MODELS_PER_NOTIFICATION: int = int(
 
 
 def _parse_float_env(name: str, default: float) -> float:
-    """Tolerant float env parser: blank / malformed → ``default``."""
+    """Tolerant float env parser: blank / malformed / non-finite → ``default``.
+
+    ``float("nan")`` / ``float("inf")`` / ``float("-inf")`` parse
+    successfully — but feeding any of them into a threshold check
+    (``abs(delta) >= threshold``) silently disables the alert path
+    because every comparison against NaN is ``False`` and nothing
+    finite can exceed +Inf. The latent regression from that gap was
+    a misconfigured ``PRICE_ALERT_THRESHOLD_PERCENT=nan`` quietly
+    turning off the entire price-move alert system rather than
+    surfacing a configuration error and falling back to the default.
+    Reject non-finite values explicitly so the failure mode is loud.
+    """
     raw = os.getenv(name, "").strip()
     if not raw:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         log.warning("%s=%r is not a float; using default %.2f", name, raw, default)
         return default
+    if not math.isfinite(value):
+        log.warning(
+            "%s=%r parsed as non-finite (%s); using default %.2f",
+            name, raw, value, default,
+        )
+        return default
+    return value
 
 
 # Threshold (percent) above which a per-side price move becomes an
