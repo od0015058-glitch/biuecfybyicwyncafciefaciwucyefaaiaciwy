@@ -69,7 +69,14 @@ _LOOP_METRIC_NAMES: tuple[str, ...] = (
     "pending_alert",
     "pending_reaper",
     "bot_health_alert",
+    "zarinpal_backfill",
 )
+
+
+# Track which unknown loop names we've already warned about so a
+# typo'd name doesn't spam the log every tick. Set rather than dict
+# because we only need membership semantics.
+_LOOP_TICK_UNKNOWN_NAMES_WARNED: set[str] = set()
 
 
 def record_loop_tick(name: str, *, ts: float | None = None) -> None:
@@ -77,8 +84,28 @@ def record_loop_tick(name: str, *, ts: float | None = None) -> None:
 
     ``ts`` defaults to ``time.time()``. Tests pass a frozen value to
     pin the rendered gauge.
+
+    Bundled bug fix (Stage-15-Step-E #8 follow-up #2): if *name* is
+    not in :data:`_LOOP_METRIC_NAMES`, the tick is still stored
+    (so :func:`get_loop_last_tick` keeps working for ad-hoc
+    inspection) but a WARN is logged exactly once per process.
+    Pre-fix, a typo in a `record_loop_tick("zarinpal_baackfill")`
+    call site would silently drop the gauge from `/metrics` —
+    Prometheus' "loop is stuck" alert (``time() -
+    last_run_epoch > N``) would then perpetually fire because the
+    gauge is forever 0, masquerading as a real outage. Logging
+    the typo at boot time when the loop first ticks makes the
+    drift discoverable.
     """
     _LOOP_LAST_TICK[name] = ts if ts is not None else time.time()
+    if name not in _LOOP_METRIC_NAMES and name not in _LOOP_TICK_UNKNOWN_NAMES_WARNED:
+        _LOOP_TICK_UNKNOWN_NAMES_WARNED.add(name)
+        log.warning(
+            "record_loop_tick(%r): name not in _LOOP_METRIC_NAMES; "
+            "gauge will NOT be exposed via /metrics. Add it to the "
+            "tuple in metrics.py to surface the heartbeat.",
+            name,
+        )
 
 
 def get_loop_last_tick(name: str) -> float | None:
@@ -89,6 +116,7 @@ def get_loop_last_tick(name: str) -> float | None:
 def reset_loop_ticks_for_tests() -> None:
     """Clear the loop-tick registry. Tests-only."""
     _LOOP_LAST_TICK.clear()
+    _LOOP_TICK_UNKNOWN_NAMES_WARNED.clear()
 
 
 # ── IP allowlist ───────────────────────────────────────────────────
