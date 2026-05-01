@@ -2055,7 +2055,7 @@ The user's process for this project — **do not deviate**:
     coerce to $0 — there's no row to drop — but the top-models
     row with corrupt cost is now dropped). Total suite: 1961
     passing (was 1944 + 17 new).
-14. **Stage-15-Step-E #1 follow-up #1 OPENED** (PR-after-#139) —
+14. **Stage-15-Step-E #1 follow-up #1 MERGED** (PR-after-#139) —
     `/history` slash-command alias + chat-token rate-limit
     gate + `_build_history_export_document(user_id, username)`
     helper shared between `memory_export_handler` (wallet-menu
@@ -2084,7 +2084,7 @@ The user's process for this project — **do not deviate**:
     most recent always survives, single-second timing budget
     catches an O(n²) regression). Total suite: 1970 tests
     passing (1961 from `main` after #139 + 9 new).
-15. **Stage-15-Step-E #5 follow-up #2 OPENED** (PR-after-#140) —
+15. **Stage-15-Step-E #5 follow-up #2 MERGED** (PR-after-#140) —
     `/admin/roles` web page mirroring the Telegram `/admin_role_*`
     triplet. New routes: `GET /admin/roles` lists every DB-tracked
     grant with telegram id, role badge, granted-at, granted-by, and
@@ -2123,7 +2123,7 @@ The user's process for this project — **do not deviate**:
     pin) + 3 in `tests/test_database_queries.py` (NUL strip + log
     warn / non-NUL passthrough / `notes=None` early-out). Total
     suite: 1994 tests passing (1970 + 24 new).
-16. **Stage-15-Step-E #5 follow-up #3 OPENED** (PR-after-#145) —
+16. **Stage-15-Step-E #5 follow-up #3 MERGED** (PR-after-#145) —
     first-login auto-promote of `ADMIN_USER_IDS` env-list admins to
     a real `admin_roles` row. New helper
     `admin_roles.ensure_env_admins_have_roles(db, admin_ids)` is
@@ -2158,7 +2158,7 @@ The user's process for this project — **do not deviate**:
     input / empty-input no-op / custom notes pass-through) plus
     the `parse_admin_user_ids` non-positive regression pin.
     Total suite: 2117 tests passing (2106 + 11 new).
-17. **Stage-15-Step-E #6 follow-ups #2 + #3 OPENED** (PR-after-#146)
+17. **Stage-15-Step-E #6 follow-ups #2 + #3 MERGED** (PR-after-#146)
     — optional GH Actions integration workflow + manual smoke
     recipe doc. New `.github/workflows/integration.yml` runs the
     Telethon-based integration suite on a manual
@@ -2198,7 +2198,7 @@ The user's process for this project — **do not deviate**:
     bytes / `object()`) plus a regression pin that
     `prompt=None` with a non-empty image list still works (the
     documented "image-only" calling convention).
-18. **Stage-15-Step-E #7 follow-up #2 OPENED** (PR-after-#147) —
+18. **Stage-15-Step-E #7 follow-up #2 MERGED** (PR-after-#147) —
     importer side of the .po round-trip. New
     `python -m i18n_po import <lang> <path>` CLI bulk-loads a
     translator's .po into the runtime `bot_strings` override
@@ -2240,7 +2240,7 @@ The user's process for this project — **do not deviate**:
     / `total_seen` arithmetic / CLI argparse coverage / NUL
     byte strip in value / NUL byte strip in updated_by / clean
     input passthrough. Suite: 2106 → 2127 passing (+21 new).
-19. **Stage-15-Step-E #2 follow-up #3 OPENED** (PR-after-#148) —
+19. **Stage-15-Step-E #2 follow-up #3 MERGED** (PR-after-#148) —
     per-day spending breakdown ASCII bars on the user-facing
     `/stats` screen. New `Database.get_user_daily_spending(
     telegram_id, days)` groups `usage_logs` by
@@ -2288,7 +2288,7 @@ The user's process for this project — **do not deviate**:
     row drop / NaN cost row drop / Persian locale rendering /
     window-truncation for stale snapshots / `_empty_stats_snapshot`
     includes `daily` key. Suite: 2106 → 2123 passing (+17 new).
-19. **Stage-15-Step-E #9 follow-up #2 OPENED** (PR-after-#148) —
+20. **Stage-15-Step-E #9 follow-up #2 MERGED** (PR-after-#148) —
     monetization CSV export at `GET
     /admin/monetization/export.csv?window=7|30|90`. Streams a single
     CSV with a `scope` column (`lifetime` / `window` /
@@ -2334,7 +2334,7 @@ The user's process for this project — **do not deviate**:
     audit row written / HTML page exposes the export link /
     audit-action labels include both export slugs. Suite:
     2106 → 2120 passing (+14 new).
-19. **Stage-15-Step-E #8 follow-up #2 OPENED** (PR-after-#148) —
+21. **Stage-15-Step-E #8 follow-up #2 MERGED** (PR-after-#148) —
     Zarinpal browser-close backfill reaper. Closes the gap where
     Zarinpal settles an order whose user closes the browser
     before the `?Authority=…&Status=OK` redirect lands. New
@@ -2388,7 +2388,7 @@ The user's process for this project — **do not deviate**:
     known names / one warn per distinct unknown name /
     `zarinpal_backfill` is in `_LOOP_METRIC_NAMES` / reset
     clears warned set. Suite: 2106 → 2125 passing (+19 new).
-20. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+22. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-21. **Read the §11 working agreement before doing anything.**
+23. **Read the §11 working agreement before doing anything.**
