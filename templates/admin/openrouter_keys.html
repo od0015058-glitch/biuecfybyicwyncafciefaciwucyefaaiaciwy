@@ -1,0 +1,105 @@
+{% extends "_layout.html" %}
+
+{% block title %}OpenRouter keys — ops view{% endblock %}
+
+{% block extra_head %}
+<style>
+  .or-row {
+    display: grid;
+    grid-template-columns: 60px 1fr 140px 140px 200px;
+    align-items: center;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border);
+    gap: 16px;
+  }
+  .or-row.header {
+    font-size: 11px;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    letter-spacing: 0.04em;
+  }
+  .or-row:last-child { border-bottom: none; }
+  .or-idx {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13px;
+  }
+  .or-status-ok { color: var(--success); font-weight: 600; }
+  .or-status-cool { color: var(--danger); font-weight: 600; }
+  .or-counter {
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+  .or-counter.hot { color: var(--danger); }
+  .summary {
+    color: var(--text-muted);
+    font-size: 13px;
+    margin-bottom: 16px;
+  }
+  .or-empty {
+    color: var(--text-muted);
+    font-style: italic;
+    padding: 24px 0;
+    text-align: center;
+  }
+</style>
+{% endblock %}
+
+{% block main %}
+<h2>OpenRouter keys — ops view</h2>
+
+{% if flash %}
+<div class="alert alert-{{ flash.kind }}">{{ flash.message }}</div>
+{% endif %}
+
+<p class="summary">
+  Per-key health for the multi-key OpenRouter pool. Each row shows one
+  pool slot's cooldown state plus the per-process counters that drive
+  the matching <code>meowassist_openrouter_key_*</code> Prometheus
+  family. Counters reset on every process restart and on a deliberate
+  <code>load_keys()</code> call. Key material is never rendered — keys
+  are referenced by 0-based pool index only.
+</p>
+
+{% if rows %}
+<div class="panel">
+  <div class="or-row header">
+    <span>Idx</span>
+    <span>Status</span>
+    <span>Cooldown left</span>
+    <span>429s</span>
+    <span>Fallbacks absorbed</span>
+  </div>
+  {% for row in rows %}
+  <div class="or-row">
+    <span class="or-idx">#{{ row.index }}</span>
+    {% if row.rate_limited %}
+    <span class="or-status-cool">cooldown</span>
+    {% else %}
+    <span class="or-status-ok">available</span>
+    {% endif %}
+    <span class="or-counter {% if row.rate_limited %}hot{% endif %}">
+      {% if row.cooldown_remaining_secs is not none %}
+      {{ "%.0f"|format(row.cooldown_remaining_secs) }}s
+      {% else %}
+      —
+      {% endif %}
+    </span>
+    <span class="or-counter {% if row.count_429 %}hot{% endif %}">
+      {{ row.count_429 }}
+    </span>
+    <span class="or-counter">{{ row.count_fallback }}</span>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="panel">
+  <div class="or-empty">
+    No OpenRouter API keys configured. Set
+    <code>OPENROUTER_API_KEY</code> or
+    <code>OPENROUTER_API_KEY_1</code> through
+    <code>OPENROUTER_API_KEY_10</code> in the environment.
+  </div>
+</div>
+{% endif %}
+{% endblock %}

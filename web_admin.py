@@ -4761,6 +4761,72 @@ async def models_enable_post(request: web.Request) -> web.StreamResponse:
     return await _models_toggle_post(request, enable=True)
 
 
+async def openrouter_keys_get(request: web.Request) -> web.StreamResponse:
+    """``GET /admin/openrouter-keys`` — per-key OpenRouter ops view.
+
+    Stage-15-Step-E #4 follow-up. Surfaces the in-process state that
+    drives the matching ``meowassist_openrouter_key_*`` Prometheus
+    family, so an operator without a Prometheus stack still has
+    eyes-on visibility:
+
+    * Cooldown state + remaining seconds — directly off
+      ``key_status_snapshot()``.
+    * ``count_429`` — number of 429 events recorded against this
+      slot since process start.
+    * ``count_fallback`` — number of times this slot absorbed a
+      fallback after another slot's sticky key went hot.
+
+    Counters are reset on a deliberate ``load_keys()`` reload (so
+    a key rotation doesn't carry stale meaning forward) and on
+    every process restart. Key material itself is **not** rendered;
+    rows are keyed by 0-based pool index — same discipline the
+    Prometheus exposition follows. Render is read-only; mutations
+    (force-clear cooldowns) live on ``/admin/control`` so the
+    "panic button" surface stays in one place.
+    """
+    from openrouter_keys import (
+        get_key_429_counters,
+        get_key_fallback_counters,
+        key_status_snapshot,
+    )
+
+    snapshot = key_status_snapshot()
+    counts_429 = get_key_429_counters()
+    counts_fallback = get_key_fallback_counters()
+
+    rows: list[dict[str, object]] = []
+    for entry in snapshot:
+        idx = int(entry.get("index", -1))
+        rows.append(
+            {
+                "index": idx,
+                "rate_limited": bool(entry.get("rate_limited", False)),
+                "cooldown_remaining_secs": entry.get(
+                    "cooldown_remaining_secs"
+                ),
+                "count_429": int(counts_429.get(idx, 0)),
+                "count_fallback": int(counts_fallback.get(idx, 0)),
+            }
+        )
+
+    ctx = {
+        "active_page": "openrouter_keys",
+        "csrf_token": csrf_token_for(request),
+        "flash": None,
+        "rows": rows,
+    }
+    response = aiohttp_jinja2.render_template(
+        "openrouter_keys.html", request, ctx,
+    )
+    flash = pop_flash(request, response)
+    if flash is not None:
+        ctx["flash"] = flash
+        response = aiohttp_jinja2.render_template(
+            "openrouter_keys.html", request, ctx,
+        )
+    return response
+
+
 async def gateways_get(request: web.Request) -> web.StreamResponse:
     """GET /admin/gateways — list all payment gateways with toggles."""
     from admin_toggles import get_disabled_gateways
@@ -5709,6 +5775,11 @@ def setup_admin_routes(
     app.router.add_get("/admin/gateways", _require_auth(gateways_get))
     app.router.add_post("/admin/gateways/disable", _require_auth(gateways_disable_post))
     app.router.add_post("/admin/gateways/enable", _require_auth(gateways_enable_post))
+
+    # Stage-15-Step-E #4 follow-up: per-key OpenRouter ops view.
+    app.router.add_get(
+        "/admin/openrouter-keys", _require_auth(openrouter_keys_get),
+    )
 
     # Stage-15-Step-F: bot health & emergency control panel.
     app.router.add_get("/admin/control", _require_auth(control_get))

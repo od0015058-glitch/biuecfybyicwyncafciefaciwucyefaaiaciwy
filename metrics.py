@@ -404,6 +404,86 @@ def render_metrics() -> str:
         )
     )
 
+    # Stage-15-Step-E #4 follow-up: per-key counters + cooldown
+    # gauge. Each metric is labelled by the 0-based pool ``index``;
+    # we deliberately do NOT label by api_key to keep secret material
+    # out of the rendered exposition (a leaked /metrics scrape
+    # would otherwise leak the keys themselves). The label values
+    # are stringified ints so they pass the same
+    # ``_escape_label_value`` discipline the IPN-drop counters use.
+    from openrouter_keys import (
+        get_key_429_counters,
+        get_key_fallback_counters,
+        key_status_snapshot,
+    )
+
+    parts.extend(
+        _format_labelled_counter(
+            "meowassist_openrouter_key_429_total",
+            (
+                "OpenRouter 429 events recorded against a pool key, "
+                "labelled by 0-based pool index."
+            ),
+            "index",
+            {str(idx): n for idx, n in get_key_429_counters().items()},
+        )
+    )
+
+    parts.extend(
+        _format_labelled_counter(
+            "meowassist_openrouter_key_fallback_total",
+            (
+                "Sticky-key fallback events: a user's sticky key "
+                "was in cooldown so the picker walked forward and "
+                "this index absorbed the request. Labelled by the "
+                "absorbing pool index."
+            ),
+            "index",
+            {
+                str(idx): n
+                for idx, n in get_key_fallback_counters().items()
+            },
+        )
+    )
+
+    # Per-key cooldown-remaining gauge. Emitted as a labelled gauge
+    # family using the same label-value escape discipline as the
+    # counter families above. We render *all* pool keys (not just
+    # currently-cooled ones) so an operator's `sum(...)` query
+    # gives the real pool size.
+    cooldown_gauges_help = (
+        "Seconds remaining in the per-key OpenRouter cooldown; "
+        "0 means the key is currently available."
+    )
+    parts.extend(
+        _format_help_and_type(
+            "meowassist_openrouter_key_cooldown_remaining_seconds",
+            cooldown_gauges_help,
+            "gauge",
+        )
+    )
+    for row in key_status_snapshot():
+        idx = row.get("index")
+        remaining = row.get("cooldown_remaining_secs")
+        # ``None`` means "not in cooldown" — render as 0 so the
+        # PromQL ``> 0`` filter cleanly catches the cooled keys.
+        value: float = 0.0
+        if isinstance(remaining, (int, float)):
+            v = float(remaining)
+            if v == v and v not in (float("inf"), float("-inf")):
+                value = max(0.0, v)
+        idx_label = _escape_label_value(str(idx))
+        # Render the value with the same shortest-round-trip-safe
+        # format the un-labelled gauge helper uses.
+        if float(value).is_integer():
+            rendered = str(int(value))
+        else:
+            rendered = str(float(value))
+        parts.append(
+            "meowassist_openrouter_key_cooldown_remaining_seconds"
+            f'{{index="{idx_label}"}} {rendered}'
+        )
+
     # Stage-15-Step-F: coarse bot-health score. Operators alert on
     # ``meowassist_bot_status_score >= 4`` to catch under-attack /
     # down without parsing the level label. The classifier reads

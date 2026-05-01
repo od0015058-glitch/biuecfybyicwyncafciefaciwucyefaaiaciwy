@@ -8895,3 +8895,162 @@ async def test_control_force_stop_post_requires_auth(
     import asyncio
     await asyncio.sleep(0.1)
     assert captured == []
+
+
+# ── Stage-15-Step-E #4 follow-up: /admin/openrouter-keys ops view ──
+
+
+def _setup_or_keys_pool(monkeypatch):
+    """Helper: deterministic 3-key pool for the ops-view tests.
+
+    Mirrors the fixture in ``tests/test_metrics.py`` and
+    ``tests/test_openrouter_keys.py`` so each module remains
+    self-contained.
+    """
+    import openrouter_keys
+
+    monkeypatch.setenv("OPENROUTER_API_KEY_1", "kwa")
+    monkeypatch.setenv("OPENROUTER_API_KEY_2", "kwb")
+    monkeypatch.setenv("OPENROUTER_API_KEY_3", "kwc")
+    openrouter_keys._keys = []
+    openrouter_keys._loaded = False
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys.reset_key_counters_for_tests()
+    openrouter_keys.load_keys()
+
+
+async def test_openrouter_keys_get_requires_auth(
+    aiohttp_client, make_admin_app
+):
+    """``GET /admin/openrouter-keys`` is auth-gated like every other
+    /admin/* page — an unauthenticated request must redirect to the
+    login screen rather than 200 the per-key counters body."""
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    resp = await client.get("/admin/openrouter-keys", allow_redirects=False)
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+
+
+async def test_openrouter_keys_get_renders_one_row_per_pool_key(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """The page renders one row per pool key. The HTML must include
+    the index (#0, #1, #2) and the "available" status text for keys
+    that aren't in cooldown."""
+    _setup_or_keys_pool(monkeypatch)
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+
+    resp = await client.get("/admin/openrouter-keys")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "OpenRouter keys" in body
+    # 3 keys → 3 rows. Index labels ``#0`` / ``#1`` / ``#2`` appear.
+    assert "#0" in body
+    assert "#1" in body
+    assert "#2" in body
+    # All three slots are healthy by default.
+    assert body.count(">available<") == 3
+
+
+async def test_openrouter_keys_get_renders_cooldown_status(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """A pool key in cooldown renders 'cooldown' instead of
+    'available' — and its remaining seconds appear (>0)."""
+    import openrouter_keys
+
+    _setup_or_keys_pool(monkeypatch)
+    openrouter_keys.mark_key_rate_limited("kwb", retry_after_secs=42.0)
+
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+
+    resp = await client.get("/admin/openrouter-keys")
+    body = await resp.text()
+    assert ">cooldown<" in body
+    # Two slots still available.
+    assert body.count(">available<") == 2
+
+
+async def test_openrouter_keys_get_renders_per_key_counters(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """The page surfaces the per-key 429 + fallback counters that
+    drive the matching Prometheus families."""
+    import openrouter_keys
+
+    _setup_or_keys_pool(monkeypatch)
+    # idx 0 records 2 × 429; idx 2 absorbs a fallback after idx 1
+    # was marked hot.
+    openrouter_keys.mark_key_rate_limited("kwa")
+    openrouter_keys.mark_key_rate_limited("kwa")
+    openrouter_keys.mark_key_rate_limited("kwb")
+    openrouter_keys.key_for_user(1)  # sticky idx 1 → fallback to idx 2
+
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+
+    resp = await client.get("/admin/openrouter-keys")
+    body = await resp.text()
+    # Two 429 counts on idx 0 are visible somewhere in the body.
+    # Use a regex anchored on the column class to avoid matching
+    # cooldown-second text that might also be "2".
+    import re
+    counter_cells = re.findall(
+        r'<span class="or-counter[^"]*">\s*(\d+)\s*</span>', body
+    )
+    # 3 rows × 3 numeric cells (cooldown remaining, count_429,
+    # count_fallback) = 9 numbers. The "2" for idx 0's 429 count
+    # must be in there.
+    assert "2" in counter_cells
+
+
+async def test_openrouter_keys_get_does_not_leak_api_key_strings(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """The page must NEVER render the api_key string itself —
+    rows are referenced by 0-based pool index only. Same
+    discipline ``key_status_snapshot`` follows."""
+    _setup_or_keys_pool(monkeypatch)
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+
+    resp = await client.get("/admin/openrouter-keys")
+    body = await resp.text()
+    # The fixture loads "kwa" / "kwb" / "kwc" — none must appear in
+    # the rendered body.
+    assert "kwa" not in body
+    assert "kwb" not in body
+    assert "kwc" not in body
+
+
+async def test_openrouter_keys_get_renders_empty_pool_message(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """Empty pool → empty-state message instead of an empty table.
+    Operators with no keys configured still see useful copy.
+    """
+    import openrouter_keys
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    for i in range(1, 11):
+        monkeypatch.delenv(f"OPENROUTER_API_KEY_{i}", raising=False)
+    openrouter_keys._keys = []
+    openrouter_keys._loaded = False
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys.reset_key_counters_for_tests()
+
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+
+    resp = await client.get("/admin/openrouter-keys")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "No OpenRouter API keys configured" in body

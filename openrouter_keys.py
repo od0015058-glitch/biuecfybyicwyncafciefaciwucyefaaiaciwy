@@ -116,6 +116,86 @@ DEFAULT_COOLDOWN_SECS: float = 60.0
 # operator shift.
 MAX_COOLDOWN_SECS: float = 3600.0
 
+# ── Per-key Prometheus counters (Stage-15-Step-E #4 follow-up) ────
+#
+# Two monotonically-increasing counters keyed by 0-based pool
+# index. Indexed by *index* rather than by api_key string to keep
+# the api_key material out of the rendered ``/metrics`` body — same
+# discipline ``key_status_snapshot`` already follows. Index is
+# stable across a single process lifetime (the pool only changes
+# on a deliberate ``load_keys()`` call); a key rotation event
+# resets the counters via ``_reset_key_counters_on_load`` to avoid
+# carrying stale meaning from a key that no longer exists.
+#
+# * ``_429_total`` — incremented every time
+#   :func:`mark_key_rate_limited` registers a fresh cooldown for
+#   a given pool key. Re-marking an already-cooled key still
+#   counts (each 429 is a separate event the operator wants to
+#   see in the rate plot).
+# * ``_fallback_total`` — incremented every time
+#   :func:`key_for_user` would have returned the user's sticky
+#   key but the sticky was in cooldown, so we walked forward to
+#   a different pool member. Tracked against the *fallback* index
+#   (the slot that absorbed the traffic), not the sticky index,
+#   so a dashboard "fallback rate per key" plot answers the
+#   question "which key is taking the load when others go hot".
+#
+# Public-but-private: read-back accessors expose both as plain
+# dicts for ``metrics.render_metrics`` and tests; mutation goes
+# through :func:`_increment_key_429` and
+# :func:`_increment_key_fallback` so a future migration to a
+# different counter backend (e.g. prometheus_client) only
+# touches three call sites.
+_KEY_429_COUNTERS: dict[int, int] = {}
+_KEY_FALLBACK_COUNTERS: dict[int, int] = {}
+
+
+def _increment_key_429(idx: int) -> None:
+    """Bump the 429 counter for pool index *idx*.
+
+    Tolerates a negative or out-of-range *idx* by silently
+    no-oping — a future caller that resolves an index from a
+    stale snapshot shouldn't be able to poison the counter
+    table with a negative slot.
+    """
+    if idx < 0:
+        return
+    _KEY_429_COUNTERS[idx] = _KEY_429_COUNTERS.get(idx, 0) + 1
+
+
+def _increment_key_fallback(idx: int) -> None:
+    """Bump the fallback counter for pool index *idx*."""
+    if idx < 0:
+        return
+    _KEY_FALLBACK_COUNTERS[idx] = _KEY_FALLBACK_COUNTERS.get(idx, 0) + 1
+
+
+def get_key_429_counters() -> dict[int, int]:
+    """Read-only snapshot of the per-key 429 counters.
+
+    Returns a fresh ``dict`` so the caller can't mutate the
+    in-process registry (``metrics.render_metrics`` iterates over
+    this in a hot path; same shallow-copy discipline the IPN-drop
+    accessors follow).
+    """
+    return dict(_KEY_429_COUNTERS)
+
+
+def get_key_fallback_counters() -> dict[int, int]:
+    """Read-only snapshot of the per-key fallback counters."""
+    return dict(_KEY_FALLBACK_COUNTERS)
+
+
+def reset_key_counters_for_tests() -> None:
+    """Tests-only — wipe both counter dicts.
+
+    Production paths never call this; tests use it to start each
+    case from a known zero state. Mirrors
+    ``clear_all_cooldowns`` for the cooldown table.
+    """
+    _KEY_429_COUNTERS.clear()
+    _KEY_FALLBACK_COUNTERS.clear()
+
 
 def load_keys() -> None:
     """(Re-)load API keys from the environment.
@@ -151,6 +231,39 @@ def load_keys() -> None:
         _keys = []
         log.warning("No OPENROUTER_API_KEY* env vars found.")
     _loaded = True
+    # The per-key counters are keyed by pool index. A reload that
+    # changes pool composition (numbered → bare, or a key
+    # rotated out) makes the old indices ambiguous: idx 0 used to
+    # mean "first numbered key", but after the reload it means
+    # "the bare key" — keeping the old counts would mislabel the
+    # dashboard's per-key plot. Cheap to reset; production reloads
+    # are rare (tests, manual hot-reload).
+    _KEY_429_COUNTERS.clear()
+    _KEY_FALLBACK_COUNTERS.clear()
+    # Bundled bug fix (Stage-15-Step-E #4 follow-up #2): drop any
+    # cooldown entries whose api_key is no longer in the new pool.
+    # Pre-fix, ``load_keys()`` left stale cooldown entries in
+    # ``_cooldowns`` after a hot key rotation — the entries
+    # referenced api_key strings that no longer existed in
+    # ``_keys`` and could only ever expire passively via
+    # :func:`_drop_expired_cooldowns`. Within the cap of
+    # :data:`MAX_COOLDOWN_SECS` (1 h) the table self-cleaned, but
+    # while they sat there the cooldown dict's size was no longer
+    # bounded by ``len(_keys)`` (the invariant the comment near
+    # ``_cooldowns``'s definition explicitly promises). On a tight
+    # rotation cycle (operator script that swaps keys every minute
+    # to dodge upstream throttling) the cooldown table grew
+    # unbounded for the first hour after every swap before
+    # eventually settling. The fix prunes any entry whose key
+    # string isn't in the freshly-loaded ``_keys`` list — the
+    # remaining cooldowns are still legitimate (their key is
+    # still in the pool, the cooldown still has time on its
+    # deadline). Tested in
+    # ``test_load_keys_evicts_stale_cooldown_entries``.
+    pool = set(_keys)
+    stale = [k for k in _cooldowns if k not in pool]
+    for k in stale:
+        _cooldowns.pop(k, None)
 
 
 def _ensure_loaded() -> None:
@@ -268,6 +381,15 @@ def mark_key_rate_limited(
     existing = _cooldowns.get(api_key)
     if existing is None or existing < deadline:
         _cooldowns[api_key] = deadline
+    # Increment the per-key 429 counter against the pool index
+    # of *this* api_key. ``index`` lookup is O(N) but N <= 10
+    # so it doesn't matter; we resolve here so the counter
+    # stays index-keyed (key string never leaves this module).
+    try:
+        idx = _keys.index(api_key)
+    except ValueError:  # pragma: no cover — guarded above
+        idx = -1
+    _increment_key_429(idx)
     log.warning(
         "OpenRouter key (len=%d) put in cooldown for %.1fs "
         "(pool size=%d, available=%d).",
@@ -382,6 +504,13 @@ def key_for_user(telegram_id: int) -> str:
     for offset in range(1, n):
         idx = (sticky_idx + offset) % n
         if _keys[idx] not in _cooldowns:
+            # Record which pool slot absorbed the fallback so a
+            # "fallback rate per key" dashboard plot answers
+            # "which key is taking the load when others go hot".
+            # The sticky idx is logged below for the same incident
+            # — the pair lets the operator correlate sticky→fallback
+            # routes if needed.
+            _increment_key_fallback(idx)
             log.info(
                 "Routing user %d off cooldown'd sticky key "
                 "(idx=%d) to fallback idx=%d.",

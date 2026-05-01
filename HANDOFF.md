@@ -671,8 +671,8 @@ What's shipped this PR:
 What remains (next AI's TODO):
 
 * **Cross-replica cooldown coordination** — current state is process-local. Two replicas of the bot will track their own cooldowns independently. For the first slice this is acceptable (60s default cooldown clears within minutes) but a real multi-replica deployment should park the cooldown table in Redis with a short TTL. Pattern: `_redis.setex(f"openrouter:cooldown:{api_key_hash}", retry_after_secs, "1")` and `_redis.exists(...)` for the membership check. Hash the api_key first so the Redis keyspace doesn't leak it.
-* **`/admin/openrouter-keys` ops view** — the snapshot from `key_status_snapshot()` is ready to render but no admin route surfaces it yet. Add a route that lists each key's cooldown remaining and links into the existing admin layout. Pairs nicely with the Stage-15-Step-A `/metrics` exposition: emit `openrouter_key_cooldown_remaining_seconds{index="N"}` so Prometheus catches a stuck key.
-* **Per-key Prometheus counters** — `metrics.py` already has the helper plumbing. Add `openrouter_key_429_total{index="N"}` and `openrouter_key_fallback_total{index="N"}` so dashboards show the distribution.
+* ✅ **`/admin/openrouter-keys` ops view** — shipped in Stage-15-Step-E #4 follow-up #1. Renders one row per pool key with cooldown status + remaining seconds + per-key 429 / fallback counters. Auth-gated like every other `/admin/*` page; no api_key strings ever leave the module (rows are referenced by 0-based pool index).
+* ✅ **Per-key Prometheus counters** — shipped in the same follow-up. `metrics.py` now emits three new families: `meowassist_openrouter_key_429_total{index="N"}` (counter), `meowassist_openrouter_key_fallback_total{index="N"}` (counter), and `meowassist_openrouter_key_cooldown_remaining_seconds{index="N"}` (gauge).
 * **Retry the request itself with a different key** — current behaviour is "mark the key, return rate-limited message to user". A more user-friendly behaviour is "mark the key, retry the same request once with the next available key". First-slice trade-off: retry adds latency budget pressure (the user already waited the full timeout once), so this is a follow-up that needs a separate latency-aware design — probably a 2-second retry budget gated by `available_key_count() > 0`.
 * **Per-model rate-limit tracking** — OpenRouter sometimes 429s a specific `:free` model rather than the whole key. Currently any 429 puts the entire key in cooldown, which is over-aggressive. The next iteration could key the cooldown table on `(api_key, model)` so a 429 on `google/gemini-flash-1.5:free` doesn't lock out the same key for `anthropic/claude-3.5-sonnet`.
 
@@ -1870,7 +1870,54 @@ The user's process for this project — **do not deviate**:
     the role slugs because they pre-date Step-F. New regression
     test `test_audit_filter_dropdown_includes_role_crud_actions`
     pins both labels so a future PR can't drop them again.
-11. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+11. **Stage-15-Step-E #4 follow-up #1 MERGED** (PR-after-#136) —
+    closes the two biggest open Step-E #4 TODOs in one PR:
+    `/admin/openrouter-keys` ops view + per-key Prometheus
+    counters. The web page renders one row per pool slot with
+    cooldown status, remaining seconds, the per-key 429 count,
+    and the per-key fallback count. Three new Prometheus
+    families exposed off `/metrics`:
+    `meowassist_openrouter_key_429_total{index="N"}` (counter,
+    bumped every time `mark_key_rate_limited` registers a fresh
+    cooldown for a slot); `meowassist_openrouter_key_fallback_total{index="N"}`
+    (counter, bumped every time `key_for_user` walked forward
+    off the user's hot sticky and another slot absorbed the
+    request — labelled by the absorbing index, so a "fallback
+    rate per key" plot answers 'which key is taking the load
+    when others go hot'); and
+    `meowassist_openrouter_key_cooldown_remaining_seconds{index="N"}`
+    (gauge, available slots render 0 so a PromQL `> 0` filter
+    cleanly catches the cooled keys). Counters are reset on a
+    deliberate `load_keys()` call so a key rotation doesn't
+    carry stale per-index meaning forward; key material itself
+    is **never** rendered into the web page or the metrics
+    body — every surface keys by 0-based pool index only.
+    Bundled bug fix: `load_keys()` now evicts cooldown entries
+    whose api_key isn't in the freshly-loaded pool. Pre-fix, a
+    hot key rotation (operator script that swaps keys to dodge
+    upstream throttling) left stale cooldown entries in
+    `_cooldowns` for up to `MAX_COOLDOWN_SECS` (1 h) — within
+    that window the cooldown table size was no longer bounded
+    by `len(_keys)`, violating the invariant the comment near
+    `_cooldowns`'s definition explicitly promises. On a tight
+    rotation cycle the table grew unbounded for the first hour
+    after every swap before eventually settling. New regression
+    tests: 12 in `tests/test_openrouter_keys.py` (counter
+    initialisation, increment lifecycle, absorber-vs-source
+    semantics, no-fallback-on-sticky-available, no-fallback-on-all-cooled,
+    counter reset on load_keys, the bundled cooldown-eviction
+    bug fix, and the no-stale-counter-on-rotation contract);
+    4 in `tests/test_metrics.py` (the three new metric
+    families render with correct HELP/TYPE preambles and label
+    rows, plus an empty-pool case that verifies HELP/TYPE
+    preambles still emit without data rows so PromQL `rate(...)`
+    queries don't blow up against an absent counter); and 6 in
+    `tests/test_web_admin.py` (auth gate, three-row render,
+    cooldown-status row, per-key counter render, no-api-key-leak
+    invariant, and empty-pool empty-state copy). Sidebar nav
+    link `🔑 OpenRouter keys` added to `_layout.html` so the
+    page is discoverable from any admin tab.
+12. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-12. **Read the §11 working agreement before doing anything.**
+13. **Read the §11 working agreement before doing anything.**

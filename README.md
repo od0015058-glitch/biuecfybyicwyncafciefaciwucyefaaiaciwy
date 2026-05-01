@@ -279,8 +279,22 @@ NowPayments crypto invoices.
   time their sticky key is the one under pressure. When **all**
   keys are in cooldown the picker returns the sticky pick
   anyway with a warning, so the user gets at least one attempt
-  rather than a hard "no service" error. First slice of
-  Stage-15-Step-E #4.
+  rather than a hard "no service" error. **Stage-15-Step-E #4
+  follow-up:** the `/admin/openrouter-keys` ops view renders one
+  row per pool slot with cooldown status, remaining seconds, the
+  per-process 429 count, and the per-process fallback count
+  (how many times this slot absorbed a fallback after another
+  slot's sticky key went hot). The matching Prometheus families
+  off `/metrics` are
+  `meowassist_openrouter_key_429_total{index="N"}`,
+  `meowassist_openrouter_key_fallback_total{index="N"}`, and
+  `meowassist_openrouter_key_cooldown_remaining_seconds{index="N"}`
+  — keyed by 0-based pool index, never by api_key, so a leaked
+  scrape doesn't carry the keys themselves. Counters reset on
+  every deliberate `load_keys()` reload so a key rotation
+  doesn't carry stale per-index meaning forward. Cross-replica
+  cooldown coordination (Redis-backed) and per-model 429
+  tracking remain follow-ups.
 - **Bot health & emergency control panel** — new `/admin/control`
   page surfaces a traffic-light status tile (idle / healthy /
   busy / degraded / under-attack / down) classified by
