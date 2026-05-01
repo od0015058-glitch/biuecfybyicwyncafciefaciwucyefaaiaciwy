@@ -3275,6 +3275,53 @@ class Database:
                 top_models_limit,
             )
 
+        def _finite_int(raw) -> int:
+            """Bundled bug fix (Stage-15-Step-E #2 follow-up #3):
+            ``int(row["tokens"] or 0)`` crashed with ``ValueError``
+            if ``row["tokens"]`` was ``Decimal('NaN')`` from a
+            corrupted aggregate (an old ``log_usage`` call pre-PR
+            #75 could write a NaN into ``cost_deducted_usd``;
+            ``prompt_tokens`` is INT NOT NULL so this can't happen
+            for tokens today, but ``SUM(prompt_tokens +
+            completion_tokens)`` returns ``Decimal`` from asyncpg
+            and a future schema change to BIGINT or numeric would
+            allow NaN through). Falls back to ``0`` for any
+            non-finite / non-numeric / negative value."""
+            if raw is None:
+                return 0
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                return 0
+            if not _is_finite_amount(value):
+                return 0
+            try:
+                return max(int(value), 0)
+            except (TypeError, ValueError, OverflowError):
+                return 0
+
+        def _finite_float(raw) -> float:
+            """Bundled bug fix (Stage-15-Step-E #2 follow-up #3):
+            ``float(row["cost"] or 0)`` did NOT substitute ``0``
+            for ``Decimal('NaN')`` because ``Decimal('NaN')`` is
+            *truthy* in Python — ``Decimal('NaN') or 0`` returns
+            the ``Decimal('NaN')``, then ``float(...)`` produces
+            ``nan``. The user-facing renderer's
+            :func:`user_stats._safe_float` already clamps NaN to
+            zero, but the snapshot dict shouldn't leak NaN to
+            other potential callers (admin tooling, future
+            Prometheus tiles, tests). Scrub at the DB boundary
+            so the dict only contains finite floats."""
+            if raw is None:
+                return 0.0
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                return 0.0
+            if not _is_finite_amount(value):
+                return 0.0
+            return value
+
         def _agg_row(row) -> dict:
             if row is None:
                 return {
@@ -3283,9 +3330,9 @@ class Database:
                     "total_cost_usd": 0.0,
                 }
             return {
-                "total_calls": int(row["calls"] or 0),
-                "total_tokens": int(row["tokens"] or 0),
-                "total_cost_usd": float(row["cost"] or 0),
+                "total_calls": _finite_int(row["calls"]),
+                "total_tokens": _finite_int(row["tokens"]),
+                "total_cost_usd": _finite_float(row["cost"]),
             }
 
         return {
@@ -3295,12 +3342,116 @@ class Database:
             "top_models": [
                 {
                     "model": r["model"],
-                    "calls": int(r["calls"]),
-                    "cost_usd": float(r["cost"] or 0),
+                    "calls": _finite_int(r["calls"]),
+                    "cost_usd": _finite_float(r["cost"]),
                 }
                 for r in top_rows
             ],
         }
+
+    async def get_user_daily_spending(
+        self,
+        telegram_id: int,
+        *,
+        days: int = 30,
+    ) -> list[dict]:
+        """Stage-15-Step-E #2 follow-up #3: per-day spending series.
+
+        Returns one row per day in the last *days* days that has at
+        least one ``usage_logs`` row, oldest first::
+
+            [
+              {"date": "2026-04-25", "calls": int, "cost_usd": float},
+              ...
+            ]
+
+        Days with zero usage are omitted from the result; the
+        formatter is expected to pad missing days with zero-height
+        bars so the date axis stays continuous. Omitting them at
+        the DB layer keeps the transferred row count bounded by
+        the user's actual activity (a 365-day window for a user
+        with two days of activity returns two rows, not 365).
+
+        The query mirrors the per-window aggregate in
+        :meth:`get_user_spending_summary`: same filter
+        (``telegram_id = $1 AND created_at >= NOW() - ($2 ||
+        ' days')::interval``), same ``cost_deducted_usd`` scrub
+        (NaN / Inf legacy rows are suppressed via the same
+        ``_finite_float`` helper used above), same ``date_trunc``
+        bucket policy. Days are emitted as ISO ``YYYY-MM-DD``
+        strings so the Telegram renderer can drop them straight
+        into the rendered output without a server-time ↔ user-tz
+        round-trip.
+
+        Empty-data case: a user with zero rows in the window
+        returns ``[]``. Callers should treat the empty list the
+        same as ``lifetime_calls == 0`` in
+        :func:`user_stats.format_stats_summary` and skip the
+        breakdown entirely.
+
+        Window clamping: identical to
+        :meth:`get_user_spending_summary` — ``days`` is clamped
+        to ``[1, USER_STATS_WINDOW_DAYS_MAX]`` so a buggy caller
+        passing ``days=10000`` can't tar-pit the DB.
+
+        Defensive against a non-positive ``telegram_id`` (raises
+        ``ValueError``) — same shape as
+        :meth:`list_user_transactions`.
+        """
+        if not isinstance(telegram_id, int) or telegram_id <= 0:
+            raise ValueError(
+                "telegram_id is required and must be a positive integer; "
+                f"got {telegram_id!r}"
+            )
+        days = max(1, min(int(days), self.USER_STATS_WINDOW_DAYS_MAX))
+        tid = int(telegram_id)
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT date_trunc('day', created_at)::date AS day,
+                       COUNT(*)::int AS calls,
+                       COALESCE(SUM(cost_deducted_usd), 0) AS cost
+                FROM usage_logs
+                WHERE telegram_id = $1
+                  AND created_at >= NOW() - ($2 || ' days')::interval
+                GROUP BY 1
+                ORDER BY 1
+                """,
+                tid,
+                str(int(days)),
+            )
+
+        def _finite_float(raw) -> float:
+            if raw is None:
+                return 0.0
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                return 0.0
+            if not _is_finite_amount(value):
+                return 0.0
+            return value
+
+        result: list[dict] = []
+        for r in rows:
+            day = r["day"]
+            if day is None:
+                continue
+            try:
+                day_iso = day.isoformat()
+            except AttributeError:
+                # date_trunc('day', ...)::date returns a date object
+                # in asyncpg; if a future migration changes the cast
+                # the formatter shouldn't crash. Skip the row.
+                continue
+            result.append(
+                {
+                    "date": day_iso,
+                    "calls": int(r["calls"] or 0),
+                    "cost_usd": _finite_float(r["cost"]),
+                }
+            )
+        return result
 
     async def get_system_metrics(
         self, *, pending_alert_threshold_hours: int = 2

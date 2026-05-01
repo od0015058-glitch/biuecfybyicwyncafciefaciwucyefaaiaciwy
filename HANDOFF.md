@@ -959,7 +959,9 @@ What remains (next AI's TODO):
 
 * ✅ **`/stats` slash-command alias** — shipped in the Stage-15-Step-E #2 follow-up. `cmd_stats` (`@router.message(Command("stats"))`) renders the same screen as the wallet-menu button but as a fresh message bubble (`message.answer`) instead of an in-place edit. Optional positional arg picks a non-default window: `/stats 7` / `/stats 90` / `/stats 365`. Garbage args (`/stats abc`) silently coerce to the default — same forgiveness policy as the receipts-pagination cursor. Both the slash and the wallet-menu paths route through `_build_stats_render`, so the two surfaces can never drift on copy or layout.
 * ✅ **Window selector buttons (7d / 30d / 90d / 365d)** — shipped in the same follow-up. Top-row inline keyboard on the stats screen; the currently-selected window is prefixed with `✓` so the user can tell which one they're on without scrolling. Callback shape `stats_window:<days>` — parsed by `stats_window_select_handler`; an unrecognised value (stale-deploy callback, hand-crafted client) falls back to the 30d default rather than 500-ing. Re-uses `_build_stats_render` so the entire pipeline is one definition.
-* **Per-day / per-week breakdowns** — the original spec mentioned "daily/weekly graphs". The first slice + this follow-up ship lifetime totals + an operator-selectable rolling window (7 / 30 / 90 / 365 days). A real day-over-day series would need a new query: `SELECT date_trunc('day', created_at), SUM(cost_deducted_usd) FROM usage_logs WHERE telegram_id = $1 AND created_at >= NOW() - INTERVAL '30 days' GROUP BY 1 ORDER BY 1`. Render as ASCII bars (one row per day) in Telegram — image-based graphs would need a separate dependency surface (`matplotlib` / `Pillow`) which is **explicitly out of scope** until the operator approves the new dep.
+* ✅ **Per-day breakdown (ASCII bars)** — shipped in the Stage-15-Step-E #2 follow-up #3. New `Database.get_user_daily_spending(telegram_id, days)` groups `usage_logs` by `date_trunc('day', created_at)::date` over the requested rolling window, returning `{"date": "YYYY-MM-DD", "calls": int, "cost_usd": float}` rows oldest-first; the user-facing renderer (`user_stats._format_daily_bars`) emits one row per day in a fenced code block (`█` filled / `░` empty), with bar widths proportional to `cost / max(cost)` over the visible window. Missing days inside the window are padded as zero-height bars so the date axis stays continuous from oldest → newest. Image-based graphs are still out of scope — the bar chart is rendered as monospaced text inside Telegram's existing message envelope, no new dependency surface needed.
+* **Per-week / longer-period graphs** — `get_user_daily_spending` returns daily granularity only; a weekly bucket would need either a new query (`date_trunc('week', created_at)`) or formatter-side aggregation. Punting until product confirms the granularity is needed — the 30 / 90 / 365-day windows already let the user see month-over-month patterns at a glance.
+* **Image-based graphs** — would need a separate dependency surface (`matplotlib` / `Pillow`) which is **explicitly out of scope** until the operator approves the new dep.
 * **CSV export of full `usage_logs`** — pairs nicely with the conversation export from Step-E #1. The admin panel already has a JSON view at `/admin/users/<id>/usage`; a user-facing CSV button on the stats screen would close the loop.
 * **Schema-rotation hook** — if the operator ever needs to "reset" a user's stats without deleting their wallet history, document that this is `DELETE FROM usage_logs WHERE telegram_id = $1`. Currently the only data-deletion surfaces are `mem_reset` (conversation buffer) and the admin panel's user-deletion flow.
 
@@ -2119,7 +2121,55 @@ The user's process for this project — **do not deviate**:
     pin) + 3 in `tests/test_database_queries.py` (NUL strip + log
     warn / non-NUL passthrough / `notes=None` early-out). Total
     suite: 1994 tests passing (1970 + 24 new).
-16. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+16. **Stage-15-Step-E #2 follow-up #3 OPENED** (PR-after-#149) —
+    per-day spending breakdown ASCII bars on the user-facing
+    `/stats` screen. New `Database.get_user_daily_spending(
+    telegram_id, days)` groups `usage_logs` by
+    `date_trunc('day', created_at)::date` over the requested
+    rolling window, returning ``[{"date": "YYYY-MM-DD",
+    "calls": int, "cost_usd": float}, ...]`` oldest-first.
+    Renderer (`user_stats._format_daily_bars`) emits one row per
+    day inside a Markdown fenced code block with a fixed-width
+    bar (`█` filled / `░` empty, 16 chars wide), proportional
+    to ``cost / max(cost)`` over the visible window. Missing-
+    usage days are padded as zero-height bars so the date axis
+    stays continuous from oldest → newest. Image-based graphs
+    are still out of scope — the chart is rendered as
+    monospaced text inside Telegram's existing message envelope,
+    no new dependency surface needed. Wired into
+    `_build_stats_render` (which now also serves
+    `cmd_stats` + `stats_window_select_handler`) with a
+    best-effort `try/except` around the new query so a
+    transient DB error doesn't crash the whole stats screen —
+    the user still sees lifetime + window totals + top models
+    without the chart. Bundled real bug fix:
+    `Database.get_user_spending_summary` did not scrub `NaN` /
+    `Inf` values out of the `cost_usd` column. The pattern
+    `float(row["cost"] or 0)` would NOT substitute `0` for
+    `Decimal('NaN')` because `Decimal('NaN')` is *truthy* in
+    Python — `Decimal('NaN') or 0` returns the `Decimal('NaN')`,
+    then `float(...)` produces `nan`. The user-facing renderer's
+    `_safe_float` already clamped at render time but the
+    snapshot dict leaked NaN to other potential callers (admin
+    tooling, future Prometheus tiles, tests). Worse, the
+    parallel `int(row["tokens"] or 0)` path *crashed* with
+    `ValueError` if a future schema change to numeric tokens let
+    a NaN through. The new `_finite_int` / `_finite_float`
+    helpers in `get_user_spending_summary` and
+    `get_user_daily_spending` scrub at the DB boundary so the
+    snapshot dict contains finite floats only. 17 new tests in
+    `tests/test_user_stats.py` covering: SQL shape (user-scope
+    filter, interval bounds, GROUP BY 1, ORDER BY 1) /
+    ISO-date + finite-float coercion / NaN+Inf cost scrub /
+    NULL day skip / days clamp ([1, USER_STATS_WINDOW_DAYS_MAX])
+    / non-positive telegram-id refusal / NaN top_models cost
+    scrub / NaN tokens scrub / formatter empty-state / formatter
+    populated-state code-block + bar widths / missing-day
+    padding / zero-height bar for zero-cost day / invalid-date
+    row drop / NaN cost row drop / Persian locale rendering /
+    window-truncation for stale snapshots / `_empty_stats_snapshot`
+    includes `daily` key. Suite: 2106 → 2123 passing (+17 new).
+17. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-17. **Read the §11 working agreement before doing anything.**
+18. **Read the §11 working agreement before doing anything.**

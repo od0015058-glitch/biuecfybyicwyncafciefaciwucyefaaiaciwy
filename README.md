@@ -215,7 +215,18 @@ NowPayments crypto invoices.
   / `90d` / `365d`) on the stats screen pivots between rolling
   windows in-place — the currently-selected window is prefixed
   with `✓` so the user can read which one they're on without
-  scrolling.
+  scrolling. Stage-15-Step-E #2 follow-up #3: per-day spending
+  breakdown rendered as ASCII bars in a fenced code block at the
+  bottom of the stats screen (`Database.get_user_daily_spending`
+  groups `usage_logs` by `date_trunc('day', created_at)` over the
+  selected window). Bar widths are proportional to the day's cost
+  relative to the busiest day in the window; missing-usage days
+  are padded as zero-height bars so the date axis stays
+  continuous from oldest → newest. Defense-in-depth: the
+  formatter drops malformed rows (non-ISO date, NaN/Inf cost) and
+  the snapshot dict only contains finite floats — pre-fix
+  `float(Decimal('NaN') or 0)` propagated NaN through to other
+  callers because `Decimal('NaN')` is truthy in Python.
 - **Opt-in Telegram webhook mode** — set `TELEGRAM_WEBHOOK_SECRET`
   to switch from long-polling to webhook delivery. The bot mounts
   a `POST /telegram-webhook/<secret>` route on the same aiohttp
