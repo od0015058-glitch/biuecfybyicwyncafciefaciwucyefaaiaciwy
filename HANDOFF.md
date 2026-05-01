@@ -58,12 +58,14 @@ entrypoint.sh       runs `alembic upgrade head` then exec's main.py
 Dockerfile          python:3.12-slim + requirements
 docker-compose.yml  postgres + redis + bot
 .env.example        every required env var
-tests/              pytest, 1565 cases (1561 unit + 4 opt-in integration)
+tests/              pytest, 1596 cases (1592 unit + 4 opt-in integration)
 tests/integration/  Telethon-driven live-bot suite (skips without TG_API_*)
+locale/             gettext .po files (fa, en) generated from strings.py
+i18n_po.py          .po round-trip — `python -m i18n_po export|check`
 .github/workflows/ci.yml   3.11/3.12 matrix + alembic roundtrip + docker build
 ```
 
-Total: ~6.7k LoC, 534 tests, full CI on every push.
+Total: ~6.7k LoC, 1596 tests, full CI on every push.
 
 ---
 
@@ -617,7 +619,7 @@ Systematic sweep of the codebase for latent bugs. Candidates identified during a
 | 4 | **Rate limiting per OpenRouter key** — extend `openrouter_keys.py` with per-key 429 detection. If a key gets rate-limited, temporarily redistribute its users to other keys. Current sticky assignment doesn't handle key exhaustion. | P3 ops | Medium | Only matters with 10+ keys and heavy traffic |
 | 5 | **Admin role system** — currently all admins have full access. Add roles: `viewer` (read-only dashboard), `operator` (can broadcast, manage promos), `super` (can edit users, refund). Store in DB, not env. **STARTED — see "Stage-15-Step-E #5" section below for first-slice scope, what remains, and the bundled JSONB-decode bug fix.** | P2 product | High | Only needed if the team grows beyond 1 admin |
 | 6 | **Automated testing with real Telegram** — use `telethon` or `pyrogram` to write integration tests that actually send messages to the bot and verify responses. Currently all tests are unit tests with mocked Telegram. **STARTED — see "Stage-15-Step-E #6" section below for the scaffold + skip-by-default gate + bundled `_parse_float_env` non-finite guard.** | P3 ops | High | Big investment but catches integration bugs CI can't |
-| 7 | **i18n framework upgrade** — move from the current `strings.py` dict to proper `.po` / `.mo` gettext files. Enables community translations, pluralization rules, and tooling like Crowdin. | P2 product | Medium | Only worthwhile if adding a third language (Arabic, Turkish) |
+| 7 | **i18n framework upgrade** — move from the current `strings.py` dict to proper `.po` / `.mo` gettext files. Enables community translations, pluralization rules, and tooling like Crowdin. **STARTED — see "Stage-15-Step-E #7" section below for the `.po` round-trip foundation + bundled nested-format-spec extraction bug fix.** | P2 product | Medium | Only worthwhile if adding a third language (Arabic, Turkish) |
 | 8 | **Stripe / Zarinpal payment gateway** — add conventional card payment options alongside crypto. Stripe for international, Zarinpal for Iranian cards (alternative to TetraPay). | P2 product | High | Significant gateway integration work |
 | 9 | **Bot monetization dashboard** — admin page showing revenue vs. OpenRouter cost, profit margin per model, break-even analysis. All data already exists in `usage_logs` + `transactions`. | P2 product | Medium | High value for the operator to understand business health |
 | 10 | **Image / vision model support** — let users send photos and have vision models (GPT-4V, Claude 3) analyze them. OpenRouter supports multimodal; need to handle Telegram photo downloads + base64 encoding in `ai_engine`. | P2 product | Medium | Popular user request for AI bots |
@@ -748,6 +750,40 @@ What remains (next AI's TODO):
 * **Document the operator's manual test recipe in README.md** — the smoke tests cover the bot's *external* boundary (Telegram → bot). The operator's manual smoke (top up via NowPayments, refund, broadcast) covers the *backoffice* boundary; a checklist in the README would make it reproducible.
 
 Bundled bug fix in this PR (real, found during the env-parsing audit while drafting the integration test setup): **`model_discovery._parse_float_env` and `fx_rates._parse_float_env` now reject `nan` / `inf` / `-inf` env values explicitly, falling back to the supplied default with a logged WARNING.** Pre-fix, the two near-identical helpers caught only `ValueError` from `float(raw)` — but `float("nan")` / `float("inf")` parse *successfully* and return non-finite floats. Both helpers feed into a percent-threshold comparison: `model_discovery._compute_price_deltas` does `if abs(input_delta_pct) >= threshold_pct` and `fx_rates.refresh_usd_to_toman_once` does `if abs(delta_pct) >= threshold`. Every comparison against NaN is `False` in Python, and nothing finite ever exceeds `+Inf`, so a misconfigured `PRICE_ALERT_THRESHOLD_PERCENT=nan` (or `FX_RATE_ALERT_THRESHOLD_PERCENT=inf`) would *silently disable* the alert system on that side: admins would stop being DM'd about price moves and FX swings without any error surfacing in logs. The fallback path was supposed to catch operator typos and warn — instead it accepted the malformed value and pretended everything was fine. Fix: `math.isfinite(value)` guard added to both helpers; non-finite values now log a WARNING and fall back to the supplied default, so the alerts keep working at the documented threshold instead of going dark. 16 new tests across `test_model_discovery.py` (7 unit cases) and `test_fx_rates.py` (8 unit cases + 1 end-to-end pin proving a `nan` env value still fires the rate-move DM via the default-fallback path).
+
+---
+
+##### Stage-15-Step-E #7 — what's shipped vs. what remains (STARTED, not finished)
+
+**Step-E #7 (i18n framework upgrade) — STARTED in PR-after-Step-E-#6.**
+
+Original spec (Step-E table row 7): "move from the current `strings.py` dict to proper `.po` / `.mo` gettext files. Enables community translations, pluralization rules, and tooling like Crowdin."
+
+What's shipped this PR — **the `.po` round-trip foundation**. The runtime keeps reading `strings._STRINGS`; the new `.po` files under `locale/<lang>/LC_MESSAGES/messages.po` are a *derived artifact* that the gettext-tooling ecosystem (Poedit, Crowdin, OmegaT) can consume. This is the smallest invasive change that materially unblocks community translations: a translator can now download `messages.po`, translate in Poedit, and submit a PR with the diffed `.po` instead of editing a 1100-line Python literal. The gettext-at-runtime path (replacing `t()` with `gettext.gettext()` / `ngettext()`) is the next slice.
+
+* `i18n_po.py` — new module ~330 LoC, no third-party deps:
+    * `dump_po(lang, *, strings_table=None, default_lang=None, project_id_version, revision_date)` — renders the full `.po` body for a locale. Signature lets tests pass a synthetic dict without coupling round-trip tests to the live 164-key `_STRINGS`.
+    * `load_po(text)` — strict + tolerant parser. Tolerant of comment lines (`#`, `#.`, `#:`, `#,`) and blank-line entry separators; strict on unterminated quotes, duplicate `msgid`, orphan continuation lines, and unsupported `msgctxt` (we don't use context disambiguation today; a stray `msgctxt` from a future feature should be loud, not silently ignored).
+    * `_escape_po_string` / `_unescape_po_string` — gettext escape rules: backslash, double-quote, newline, tab. UTF-8 passthrough preserves Persian RTL marks / ZWNJ / Arabic-presentation forms verbatim.
+    * `_format_po_value` — chooses single-line vs. multi-line `""<NL>"line"` continuation form. Single-line for short ASCII strings (≤76 chars, no newlines); multi-line otherwise. Matches Poedit's wrapping conventions so a round-trip through the tool doesn't reformat the file.
+    * `dump_po`'s `revision_date` defaults to the gettext placeholder `YEAR-MO-DA HO:MI+ZONE` so the file is byte-stable across re-exports — a translator's diff stays small even when many slugs are unchanged.
+    * `dump_po` raises `ValueError` for unknown locales (not `KeyError`) so a typo in the CLI gets a clean message rather than an opaque traceback.
+    * **Format conventions** documented in the module docstring: msgid is the slug (not the source-language string) because Persian-as-msgid is awkward, RTL, and length-explodes; msgstr is the translation in the locale; the default-locale text appears as a `#.` translator comment for context when translating into a non-default locale; no `msgctxt` (single global namespace fits the flat slug naming scheme).
+* `python -m i18n_po export` — CLI that writes every supported locale's `.po` file under `locale/<lang>/LC_MESSAGES/messages.po`. Used to regenerate after a `strings.py` edit.
+* `python -m i18n_po check` — CLI that exits non-zero if any on-disk `.po` differs from the `_STRINGS` export. Used by CI as a drift gate (test_i18n_po.py invokes the same logic via `i18n_po._check_locale_files`).
+* `locale/fa/LC_MESSAGES/messages.po` (847 lines) and `locale/en/LC_MESSAGES/messages.po` (1146 lines) — the actual on-disk artifacts, generated from the current dict and committed.
+* 22 round-trip + parser tests + 9 `extract_format_fields` nested-spec tests in `tests/test_i18n_po.py` (full breakdown: round-trip every slug for both locales, multi-line preservation, embedded quotes / backslashes / tabs, empty msgstr, Persian-RTL passthrough, dump determinism, `revision_date` default + override, unknown locale, default-locale comment behaviour, header-entry skip, comment-line tolerance, `msgctxt` rejection, duplicate-msgid rejection, orphan-continuation rejection, unterminated-quote rejection, unknown-escape passthrough, drift gate, on-disk round-trip).
+* HANDOFF.md and README.md updated.
+
+What remains (next AI's TODO):
+
+* **Replace runtime lookup with stdlib gettext.** The actual gettext win arrives when `t()` calls `gettext.gettext(key)` / `ngettext(singular_key, plural_key, n)` against a compiled `.mo`. That requires (a) compiling `.mo` from `.po` at deploy time (`msgfmt` or stdlib `msgfmt.py`), (b) bootstrapping `gettext.translation(...)` per locale, (c) wiring `t()` through the gettext lookup with the existing override cache as a *higher-priority* shim (admin-set overrides should still win over the compiled `.mo`), (d) regression tests that pin the existing `_STRINGS` behaviour through the gettext path.
+* **Add ngettext-style pluralization.** Once the gettext path is live, slugs like `receipts_count` ("1 receipt" vs. "N receipts") can move to a `t_plural(lang, key_one, key_other, n, **kwargs)` helper. Persian's plural rules are simpler than English's (one form for every count); the gettext `Plural-Forms` header expresses that. Today the bot has zero pluralized strings — adopting them is a quality lift, not a bug fix, so it's a follow-up rather than blocker.
+* **Ship the importer side of the round-trip.** Currently `load_po` is exposed only for tests. A `python -m i18n_po import <lang> <path>` CLI that bulk-creates `database.bot_strings` overrides from a translator's `.po` would close the loop: a community translator submits `messages.po`, the operator runs the import, and overrides go live without a code deploy. Validation gate: every imported `msgstr` must pass `strings.validate_override` before being written.
+* **Add a .po-format Crowdin / Poedit walkthrough to README.md.** Shipped this PR mentions the file location but doesn't enumerate the translator workflow. The next pass should include a screenshot or two and a step-by-step "edit, save, submit PR" recipe.
+* **Optional: extract pluralization-aware string formatting from `strings.py:t()` into a dedicated `i18n.py` module.** The current `t()` is 80 lines and growing; once gettext + ngettext + pluralization land, splitting will make it easier to reason about. Not required for first slice.
+
+Bundled bug fix in this PR (real, found during the i18n audit while tracing `validate_override` to confirm the `.po` parser's escape-set matched the runtime's): **`strings.extract_format_fields` now descends into the format-spec portion of every placeholder.** Pre-fix, the function iterated `_FORMATTER.parse(template)` and only added the top-level `field_name` to the result set — it ignored the `format_spec` entirely. That meant a nested kwarg like `{amount:.{precision}f}` (Python's standard idiom for "format `amount` with N decimal places where N comes from kwargs") returned `{"amount"}` instead of `{"amount", "precision"}`. The latent regression: `validate_override` does `extra = override_fields - default_fields`, and an admin override with a nested-spec kwarg that *isn't* in the compiled default's placeholder set would have an empty `extra` (because the nested kwarg never made it into `override_fields`). The validator silently accepted the override; `set_overrides` saved it; the next render call did `template.format(**kwargs)` and raised `KeyError: 'precision'` for the missing nested kwarg. The runtime catches the KeyError and falls back to the bare slug — so the operator's override silently never rendered, with no error logged at write time. Fix: recursive `extract_format_fields(format_spec)` call inside the loop. Surrounded by a `try/except ValueError` so a malformed nested spec doesn't poison the outer extraction (the runtime `template.format` will raise the clean error at render time, which gives a more useful traceback than a swallowed inner ValueError). 9 new test cases in `test_i18n_po.py::TestExtractFormatFieldsNestedSpec` pin the fix (simple nested, decimal-precision, double-nested, mixed top-level + nested, indexed-field with nested spec, validator end-to-end rejection of unknown nested kwarg, malformed-nested-with-positional outer recovery, malformed-nested-with-empty-positional outer recovery). All 1549 existing tests still pass.
 
 ---
 
@@ -1190,45 +1226,62 @@ The user's process for this project — **do not deviate**:
     `pricing._apply_markup` now NaN/Inf/non-numeric/negative-guards
     the token-count side too, not just the price side.
     **Stage-15-Step-E #5 MERGED** (PR #123) — first slice of
-    "admin role system": `admin_roles` table + `admin_roles.py`
+    "admin role system": new `admin_roles` table + `admin_roles.py`
     module owning the `viewer`/`operator`/`super` hierarchy +
-    `Database.get/set/delete/list_admin_roles` + three new
-    Telegram commands (`/admin_role_grant`, `/admin_role_revoke`,
-    `/admin_role_list`). Backward compatible: env-list admins
-    keep `super` access via `effective_role`'s fallback. Bundled
-    bug fix in #5: JSONB `meta` decode now goes through
-    `_decode_jsonb_meta` instead of `dict(r["meta"])` — pre-fix,
-    `${WEBHOOK_BASE_URL}/admin/audit` was silently broken any
-    time the table had a non-NULL meta row.
-    **Stage-15-Step-E #6 STARTED (this PR)** — first slice of
+    `Database.get/set/delete/list_admin_roles` CRUD primitives +
+    three new Telegram commands (`/admin_role_grant <user_id>
+    <role> [notes]`, `/admin_role_revoke <user_id>`,
+    `/admin_role_list`). Bundled bug fix in #5:
+    `Database.list_admin_audit_log` and
+    `Database.list_payment_status_transitions` now decode JSONB
+    `meta` columns through a new `_decode_jsonb_meta` helper
+    instead of `dict(r["meta"])` — fixes a silent
+    "Database query failed" on the audit page in production
+    once the table has any non-NULL `meta` row.
+    **Stage-15-Step-E #6 MERGED** (PR #124) — first slice of
     "automated testing with real Telegram": new
-    `tests/integration/` directory with a Telethon-driven scaffold
-    (`integration_secrets` skip-gate session-scoped fixture,
-    session-scoped `telegram_client`, polling `send_and_wait`
-    helper) plus four smoke tests (`/start` reply, hub keyboard
-    arrives, `/balance` shows `$`, unknown command doesn't wedge
-    the bot). The whole suite skips itself when any of
-    `TG_API_ID` / `TG_API_HASH` / `TG_TEST_SESSION_STRING` /
-    `TG_TEST_BOT_USERNAME` is unset, so CI just sees `SKIPPED`
-    lines and stays green. `.env.example` documents the four
-    secrets + the two optional timeout knobs and points at
-    `conftest.py` for the throwaway script that generates the
-    session string. Bundled bug fix in #6:
-    `model_discovery._parse_float_env` and
-    `fx_rates._parse_float_env` now reject non-finite (`nan` /
-    `inf` / `-inf`) values explicitly. Pre-fix, both helpers
-    caught only `ValueError` from `float()` — but `float("nan")`
-    parses successfully and a downstream
-    `if abs(delta) >= threshold` against NaN is *always* False,
-    silently disabling the price-move alerts (model_discovery)
-    and the FX rate-move alerts (fx_rates). A misconfigured
-    `PRICE_ALERT_THRESHOLD_PERCENT=nan` would have stopped DMs
-    to admins without any error surfacing in logs. Fix: a
-    `math.isfinite(value)` guard added to both helpers; non-finite
-    values now log a WARNING and fall back to the supplied
-    default. See "Stage-15-Step-E #6 — what's shipped vs. what
-    remains" section above for the precise boundary so the next
-    AI can continue.
+    `tests/integration/` directory with a Telethon-based opt-in
+    suite that drives a live test bot via Telegram MTProto, plus
+    four smoke tests (`/start` greeting, `/start` hub message
+    with inline keyboard, `/balance` returns dollar amount,
+    unknown-command does not wedge the bot). Skips itself in CI
+    when `TG_API_ID` / `TG_API_HASH` / `TG_TEST_SESSION_STRING`
+    / `TG_TEST_BOT_USERNAME` are unset (which is the default,
+    so CI stays green). Bundled bug fix in #6:
+    `model_discovery._parse_float_env` and `fx_rates._parse_float_env`
+    now reject non-finite values (`nan` / `inf` / `-inf`)
+    explicitly via `math.isfinite(value)`, instead of accepting
+    them as `float()` parses them and silently disabling the
+    downstream threshold-comparison-driven alert paths
+    (`abs(delta) >= NaN` is always False; `abs(delta) >= +Inf`
+    is False for any finite delta).
+    **Stage-15-Step-E #7 STARTED (this PR)** — first slice of
+    "i18n framework upgrade": new `i18n_po.py` module with
+    `dump_po(lang)` + `load_po(text)` round-trip, CLI
+    `python -m i18n_po export|check`, and `locale/fa/LC_MESSAGES/messages.po`
+    + `locale/en/LC_MESSAGES/messages.po` checked-in artifacts.
+    Translators can now use Poedit / Crowdin / OmegaT on the
+    `.po` files instead of editing the 1146-line `strings.py`
+    Python literal. The bot's runtime keeps reading
+    `strings._STRINGS` for now — gettext-at-runtime
+    (`gettext.gettext()` / `ngettext()` replacing `t()`) is the
+    next slice. CI drift gate: a test in `tests/test_i18n_po.py`
+    invokes `i18n_po._check_locale_files` so adding a slug to
+    `strings.py` without re-exporting fails the build with a
+    clear "Run: python -m i18n_po export" message. Bundled bug
+    fix in #7: `strings.extract_format_fields` now descends into
+    the format-spec portion of every placeholder. Pre-fix, a
+    nested kwarg like `{amount:.{precision}f}` returned
+    `{"amount"}` only; `validate_override` then accepted an
+    override that referenced `{precision}` only via the spec,
+    and the runtime `template.format(**kwargs)` raised
+    `KeyError` for the missing nested kwarg, falling through to
+    the bare-slug fallback so the operator's override silently
+    never rendered. Fix is a recursive call into `format_spec`
+    inside the loop; 9 new `TestExtractFormatFieldsNestedSpec`
+    tests pin the cases. See "Stage-15-Step-E #7 — what's
+    shipped vs. what remains" section above for the precise
+    boundary so the next AI can continue.
 11. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.

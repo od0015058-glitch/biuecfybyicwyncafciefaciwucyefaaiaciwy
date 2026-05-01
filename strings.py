@@ -949,11 +949,21 @@ def extract_format_fields(template: str) -> set[str]:
     uses keyword arguments, so a positional placeholder in an admin
     override is by definition broken.
 
+    **Nested placeholders in the format spec are also extracted.**
+    ``"{amount:.{precision}f}"`` returns ``{"amount", "precision"}`` —
+    the spec itself is a format-string-fragment that ``str.format``
+    resolves against ``**kwargs``, so a kwarg referenced *only* in
+    the spec is just as required as one in the body. Pre-fix,
+    :func:`validate_override` accepted such overrides and the runtime
+    ``template.format(**kwargs)`` then raised ``KeyError`` for the
+    nested kwarg, falling through to the bare-slug fallback so the
+    operator's override silently never rendered.
+
     Raises :class:`ValueError` if *template* has invalid format
     syntax (unclosed brace, bare ``{``, ``}``, etc.).
     """
     fields: set[str] = set()
-    for _literal, field_name, _format_spec, _conversion in _FORMATTER.parse(
+    for _literal, field_name, format_spec, _conversion in _FORMATTER.parse(
         template
     ):
         if field_name is None:
@@ -973,6 +983,25 @@ def extract_format_fields(template: str) -> set[str]:
                 "string overrides; use named placeholders like {balance}."
             )
         fields.add(head)
+        # Descend into the format spec — it's another format-string
+        # fragment that ``str.format`` resolves against the same
+        # kwargs. ``Formatter.parse`` reports the spec as a flat
+        # string; recursively extracting from it picks up nested
+        # references like ``{amount:.{precision}f}``. Empty / missing
+        # specs short-circuit the recursion. Catch ValueError from
+        # malformed nested syntax so the outer caller still sees the
+        # original *template's* validation error rather than a
+        # confusing inner-spec error.
+        if format_spec:
+            try:
+                fields.update(extract_format_fields(format_spec))
+            except ValueError:
+                # Nested syntax is broken — let the outer template's
+                # ``str.format`` raise the clean error at runtime
+                # instead of swallowing it here. Returning the
+                # already-collected fields keeps the validator's
+                # "this slug accepts <X>" hint informative.
+                pass
     return fields
 
 

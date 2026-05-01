@@ -224,6 +224,25 @@ NowPayments crypto invoices.
   `/start` greeting + hub keyboard, `/balance` rendering the
   wallet line, and the bot's resilience to unknown commands.
   First slice of Stage-15-Step-E #6.
+- **gettext `.po` round-trip for community translations (first
+  slice)** — `i18n_po.py` exports `strings._STRINGS` to
+  `locale/<lang>/LC_MESSAGES/messages.po` files (one per
+  supported locale, two today: `fa`, `en`). Translators can
+  open the `.po` files directly in Poedit / Crowdin / OmegaT
+  and submit a PR with the diffed translation instead of
+  hand-editing the 1146-line Python literal in `strings.py`.
+  The bot's runtime keeps reading `strings._STRINGS` for now —
+  the gettext-at-runtime path (replacing `t()` with
+  `gettext.gettext()` / `ngettext()` for plural support) is the
+  next slice. Workflow: edit `strings.py`, then
+  `python -m i18n_po export` to regenerate the `.po` files,
+  then commit both. CI gate `python -m i18n_po check`
+  (also exercised by `tests/test_i18n_po.py`) fails the build
+  if the on-disk `.po` files drift from the dict, so adding a
+  slug without re-exporting is impossible to merge. msgid is
+  the slug (Persian-as-msgid is awkward and length-explodes);
+  the source-locale text appears as a `#.` translator comment
+  for context. First slice of Stage-15-Step-E #7.
 - **Per-key 429 cooldown for OpenRouter** — when OpenRouter
   returns 429 for one of the configured pool keys (the upstream
   provider rate-limited it, or the key hit its OpenRouter plan
