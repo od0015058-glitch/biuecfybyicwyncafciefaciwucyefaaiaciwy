@@ -211,7 +211,17 @@ NowPayments crypto invoices.
   CPU. **Backward-compatible default**: when the env var is unset,
   the bot continues to use long-polling exactly as before. See
   `.env.example` (Stage-15-Step-E #3 block) for the recovery
-  procedure if you flip back.
+  procedure if you flip back. Stage-15-Step-E #3 follow-up:
+  `set_webhook` retries up to 3 times with 1s/2s exponential
+  backoff on transient `TelegramServerError` /
+  `TelegramNetworkError`; opt-in IP allowlist via
+  `TELEGRAM_WEBHOOK_IP_ALLOWLIST=default` (or a comma-separated
+  CIDR list) layers Telegram's published delivery ranges
+  (`149.154.160.0/20`, `91.108.4.0/22`) on top of the secret
+  check; stateless `GET /telegram-webhook/healthz` returns 200
+  with a tiny JSON body for load-balancer / k8s liveness probes
+  (no secret in the response, no Telegram round-trip per probe,
+  not rate-limited).
 - **DB-tracked admin roles wired into every Telegram-side handler**
   — `viewer`, `operator`, and `super` roles live in the
   `admin_roles` table; the hierarchy lives in `admin_roles.py`

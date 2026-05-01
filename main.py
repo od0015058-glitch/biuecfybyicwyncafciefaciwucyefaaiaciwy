@@ -31,10 +31,12 @@ from rate_limit import (
 )
 from telegram_webhook import (
     WebhookConfigError,
+    install_telegram_webhook_healthz_route,
+    install_telegram_webhook_ip_filter,
     install_telegram_webhook_route,
     is_webhook_mode_enabled,
     load_webhook_config,
-    register_webhook_with_telegram,
+    register_webhook_with_retry,
     remove_webhook_from_telegram,
 )
 from web_admin import setup_admin_routes
@@ -139,6 +141,13 @@ async def start_webhook_server(
                 app, dispatcher=dp, bot=bot, config=webhook_config
             )
             register_rate_limited_webhook_path(app, webhook_config.path)
+            # Stage-15-Step-E #3 follow-up: opt-in IP allowlist
+            # (no-op when TELEGRAM_WEBHOOK_IP_ALLOWLIST is unset)
+            # and a stateless ``/telegram-webhook/healthz`` probe.
+            install_telegram_webhook_ip_filter(
+                app, config=webhook_config,
+            )
+            install_telegram_webhook_healthz_route(app, webhook_config)
             app["telegram_webhook_config"] = webhook_config
 
     port = int(os.getenv("WEBHOOK_PORT", "8080"))
@@ -339,7 +348,15 @@ async def main():
             # waiting for shutdown. The dispatcher's startup hooks
             # were wired in by ``setup_application`` inside
             # ``install_telegram_webhook_route``.
-            await register_webhook_with_telegram(bot, webhook_config)
+            #
+            # Stage-15-Step-E #3 follow-up: retry-with-backoff on
+            # transient 5xx / network errors from the Bot API
+            # (3 attempts, 1s/2s exponential backoff by default).
+            # A ``TelegramBadRequest`` (HTTP 400 — typo'd URL or
+            # invalid secret_token shape) is NOT retried; that's
+            # a deploy-side typo and burning retries on it just
+            # delays the loud failure the operator needs to fix.
+            await register_webhook_with_retry(bot, webhook_config)
             log.info(
                 "Bot is in webhook mode; updates flow via "
                 "%s. Long-polling is suspended for the duration "
