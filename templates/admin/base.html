@@ -107,6 +107,35 @@
       text-transform: uppercase;
       letter-spacing: 0.6px;
     }
+    /* Stage-15-Step-E #9 follow-up #1: segmented window selector
+       (7d / 30d / 90d). Compact pill row that lives next to a panel
+       heading. The active option is rendered as a non-link <span> so
+       the operator can't click the current view. */
+    .window-selector {
+      display: inline-flex;
+      gap: 4px;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+    }
+    .window-selector a,
+    .window-selector .window-selector-active {
+      padding: 4px 10px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      text-decoration: none;
+      color: var(--text-muted);
+    }
+    .window-selector a:hover {
+      color: var(--text);
+      border-color: var(--text-muted);
+    }
+    .window-selector .window-selector-active {
+      color: var(--text);
+      background: var(--bg);
+      border-color: var(--text-muted);
+      font-weight: 600;
+    }
     .stat-grid {
       display: grid;
       grid-template-columns: repeat(4, 1fr);
