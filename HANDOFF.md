@@ -711,7 +711,7 @@ What remains (next AI's TODO):
 * ~~**Add `/admin/roles` web page** mirroring the Telegram CLI.~~ ✅ **shipped in Stage-15-Step-E #5 follow-up #2 (this PR).** Browser counterpart to the `/admin_role_*` triplet: `GET /admin/roles` lists every DB-tracked grant (telegram id, role badge, granted-at, granted-by, notes, revoke button); `POST /admin/roles` writes a grant via `Database.set_admin_role`; `POST /admin/roles/{telegram_id}/revoke` drops the row via `Database.delete_admin_role`. Same auth as the rest of the panel (`ADMIN_PASSWORD`-gated cookie). Both write paths CSRF-protected via `verify_csrf_token` and audit-logged via `_record_audit_safe` with the existing `role_grant` / `role_revoke` slugs (already in `AUDIT_ACTION_LABELS`, so they show up in the `/admin/audit` filter dropdown without a follow-up patch). Form validation rejects empty / non-positive telegram ids, invalid role names (via `admin_roles.normalize_role`), and notes longer than 500 characters; failures surface a flash banner instead of silently no-op-ing. Per-user web auth (telegram-id-keyed credentials) remains the larger redesign called out in `bullet below — not in scope. **Bundled bug fix:** `Database.set_admin_role` now strips U+0000 NUL bytes from the `notes` argument before INSERT, mirroring the Stage-15-Step-E #10 fix on `append_conversation_message` (PR #128). Postgres TEXT rejects `\x00` outright with `invalid byte sequence for encoding "UTF8": 0x00`; the new web textarea is the surface most likely to hit this (an admin pasting from a binary file), but `/admin_role_grant`'s Telegram path also benefits — a NUL-bearing note used to demote the whole grant to a misleading "DB write failed — see logs" error. Strip-and-warn at the DB layer keeps the rest of the note text and logs the strip count loud-and-once for ops triage. **24 new tests** (21 in `tests/test_web_admin.py` covering auth gate / empty state / row rendering / DB error / sidebar nav / happy-path grant + revoke / CSRF protection / every validation branch / DB-error surfacing / noop revoke audit; 3 in `tests/test_database_queries.py` covering NUL strip + log warn / non-NUL passthrough / None notes early-out).
 * **Wire role gates into the web admin panel.** The web side currently has a single `ADMIN_PASSWORD`; per-admin web auth is a larger redesign. As an interim, the web panel could read `effective_role` for the configured `ADMIN_PASSWORD` operator (today it's `super` by default) and surface a "view as <role>" toggle for testing the gates without provisioning a second password.
 * **Per-user web auth** — replace the single `ADMIN_PASSWORD` with per-admin Telegram-id-keyed credentials so the role system actually applies to the browser surface. This is the multi-week piece the original Step-E table row 5 calls out as "high effort"; it needs OAuth/SSO discussion with the operator first.
-* **First-login auto-promote of `ADMIN_USER_IDS` admins to a real `admin_roles` row.** Currently env-list admins only get a `super` role *implicitly* via `effective_role`. A startup task that ensures every env-list id has a matching `admin_roles` row would make the DB the source of truth and let the operator drop env-list management entirely.
+* ~~**First-login auto-promote of `ADMIN_USER_IDS` admins to a real `admin_roles` row.**~~ ✅ **shipped in Stage-15-Step-E #5 follow-up #3 (this PR).** New helper `admin_roles.ensure_env_admins_have_roles(db, admin_ids)` runs from the boot path in `main.main()` after `db.init` and the disabled-toggle warmup. For each id in `parse_admin_user_ids(os.getenv("ADMIN_USER_IDS"))`, it checks `db.get_admin_role(id)`; if the row is absent it UPSERTs a `super` row with `granted_by=None` and `notes="auto-promoted from ADMIN_USER_IDS at boot"`. Defensive contract: never **downgrade** (an existing DB role for an env-list user — e.g. an `operator` left there by a super demoting them but keeping the env entry as a safety net — is preserved); never **escalate non-env users** (only ids in the env list are touched); never **block boot** (any DB error is logged and bypassed; the env-list fallback in `effective_role` keeps working until the next boot); never **auto-promote non-positive ids** (Telegram never issues 0 / negative user ids, so a typo there is silently dropped). Returns a counter dict `{promoted, skipped_existing, skipped_invalid, errors}` so the boot log surfaces "we promoted N admins this boot" without re-querying. **Idempotent:** the second boot finds the rows from the first and bumps `skipped_existing` instead of rewriting. **Bundled bug fix:** `parse_admin_user_ids` now drops non-positive integer entries with a logged WARN. Pre-fix, a typo (`ADMIN_USER_IDS=123,-456`) or accidental chat-id paste would silently put a never-matchable row in the admin set; with the new auto-promote layered on top, the same typo would also seed a bogus `admin_roles` row in the DB. Drop them at parse time so every downstream consumer (`is_admin`, `_resolve_actor_role`, the new auto-promote) sees a clean set. 11 new tests in `tests/test_admin_roles.py` covering: promote-missing happy path, **doesn't downgrade** an existing operator/viewer, idempotent on second call, skips non-positive (-5, 0), skips non-int (None, "not-a-number") + zero-coerce, get_admin_role failure isolation, set_admin_role failure isolation, dedupes input, empty-input no-op, custom-notes pass-through, plus the `parse_admin_user_ids` non-positive regression pin.
 
 Bundled bug fix in this PR (real, found during code review of the audit-page wiring): **`Database.list_admin_audit_log` and `Database.list_payment_status_transitions` now decode JSONB `meta` columns through a new `_decode_jsonb_meta(...)` helper instead of `dict(r["meta"])`.** Pre-fix, both readers ran `dict(r["meta"]) if r["meta"] is not None else None`. asyncpg returns JSONB columns as raw `str` by default (no codec is registered on the pool — see the audit + payment-status writers, which all hand-cast `$N::jsonb` from a `json.dumps`-rendered string), so `dict("...JSON string...")` raised `ValueError: dictionary update sequence element #0 has length 1; 2 is required` for every non-empty meta. The audit-page handler (`web_admin.audit_get`) wraps the read in `try/except` and renders "Database query failed" on any exception, so the regression was *silent* in production — the operator looking at `${WEBHOOK_BASE_URL}/admin/audit` would see an empty error tile instead of the per-action audit trail the moment the table grew its first non-NULL `meta` row (which is most rows: every login attempt records `{"reason": "..."}`, every wallet adjustment records `{"delta_usd": ...}`, etc.). The new helper accepts `None` / `dict` / `str` / `bytes` cleanly and demotes any unparseable row's `meta` to `None` (with a logged WARNING) so a single poisoned row can't blank the entire feed. Confirmed locally with a real asyncpg connection against a Postgres 16 container. 5 new tests in `tests/test_database_queries.py` pin both the JSONB-`str` decode path (regression pin), the dict pass-through (forward-compat for a future `set_type_codec` registration), the corrupted-row-doesn't-blank-feed semantics, and the matching `list_payment_status_transitions` site (same shape, same regression — one helper call site, one fix).
 
@@ -2119,7 +2119,42 @@ The user's process for this project — **do not deviate**:
     pin) + 3 in `tests/test_database_queries.py` (NUL strip + log
     warn / non-NUL passthrough / `notes=None` early-out). Total
     suite: 1994 tests passing (1970 + 24 new).
-16. **Stage-15-Step-E #8 follow-up #2 OPENED** (PR-after-#148) —
+16. **Stage-15-Step-E #5 follow-up #3 OPENED** (PR-after-#145) —
+    first-login auto-promote of `ADMIN_USER_IDS` env-list admins to
+    a real `admin_roles` row. New helper
+    `admin_roles.ensure_env_admins_have_roles(db, admin_ids)` is
+    called from `main.main()` after `db.init` and the disabled-
+    toggle warmup. For each id in
+    `parse_admin_user_ids(os.getenv("ADMIN_USER_IDS"))`, the helper
+    checks `db.get_admin_role(id)` and, when absent, UPSERTs a
+    `super` row with `granted_by=None` and a "auto-promoted from
+    ADMIN_USER_IDS at boot" notes marker. Defensive contract:
+    never **downgrade** (an existing DB role for an env-list user
+    is preserved — the env list is the floor, not the ceiling),
+    never **escalate non-env users**, never **block boot** (DB
+    errors are logged and bypassed; the env-list fallback in
+    `effective_role` keeps working), and never **auto-promote
+    non-positive ids** (Telegram never issues 0 / negative user
+    ids). Returns a counter dict
+    `{promoted, skipped_existing, skipped_invalid, errors}` so the
+    boot log surfaces "we promoted N admins this boot" without
+    re-querying. Idempotent — a second boot finds the rows from
+    the first and bumps `skipped_existing`. Bundled real bug fix:
+    `parse_admin_user_ids` now drops non-positive integer entries
+    with a logged WARN. Pre-fix, a typo (`ADMIN_USER_IDS=123,-456`)
+    or accidental chat-id paste would silently put a never-
+    matchable row in the admin set; with the new auto-promote
+    layered on top, the same typo would also seed a bogus
+    `admin_roles` row in the DB. Drop them at parse time so every
+    downstream consumer (`is_admin`, `_resolve_actor_role`, the
+    new auto-promote) sees a clean set. New tests: 11 in
+    `tests/test_admin_roles.py` (promote-missing happy / never
+    downgrade / idempotent / skip non-positive / skip non-int /
+    get-failure isolation / set-failure isolation / dedupes
+    input / empty-input no-op / custom notes pass-through) plus
+    the `parse_admin_user_ids` non-positive regression pin.
+    Total suite: 2117 tests passing (2106 + 11 new).
+17. **Stage-15-Step-E #8 follow-up #2 OPENED** (PR-after-#146) —
     Zarinpal browser-close backfill reaper. Closes the gap where
     Zarinpal settles an order whose user closes the browser
     before the `?Authority=…&Status=OK` redirect lands. New
@@ -2173,7 +2208,7 @@ The user's process for this project — **do not deviate**:
     known names / one warn per distinct unknown name /
     `zarinpal_backfill` is in `_LOOP_METRIC_NAMES` / reset
     clears warned set. Suite: 2106 → 2125 passing (+19 new).
-17. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+18. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-18. **Read the §11 working agreement before doing anything.**
+19. **Read the §11 working agreement before doing anything.**
