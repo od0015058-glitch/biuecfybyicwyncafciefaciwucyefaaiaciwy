@@ -326,7 +326,27 @@ NowPayments crypto invoices.
       taps an inline-keyboard button and waits for the bot's
       reply (handles both the "edit the same message in place"
       callback-query path and the "post a new message" path).
-  Stage-15-Step-E #6 first slice + follow-up #1.
+  Stage-15-Step-E #6 first slice + follow-up #1. **Optional CI
+  workflow (Stage-15-Step-E #6 follow-up #2)** —
+  `.github/workflows/integration.yml` runs the suite on a manual
+  `workflow_dispatch` trigger. Operator stores the four secrets
+  in repo Settings → Secrets and variables → Actions, then
+  Actions tab → "Integration tests (live Telegram)" → "Run
+  workflow". Manual-only because (a) PR forks can't read the
+  session-string secret without leaking it, and (b) every run
+  sends real Telegram messages and debits the test wallet.
+  Pinned by 9 stdlib-only sanity tests in
+  `tests/test_workflows.py` so a future edit can't silently
+  remove the `workflow_dispatch` gate, drop a secret env binding,
+  or remove the 15-minute job timeout. **Manual smoke recipe**
+  (when you don't want to set up the CI workflow): from a local
+  shell with the four env vars exported, run
+  `pytest tests/integration/ -v` against the test bot. The suite
+  finishes in <5 minutes and prints `PASSED` / `FAILED` per case
+  with full Telegram round-trip output. To regenerate
+  `TG_TEST_SESSION_STRING`, paste the docstring snippet from
+  `tests/integration/conftest.py` into a python REPL with the
+  api_id + api_hash on hand.
 - **gettext `.po` round-trip + runtime lookup for community
   translations** — `i18n_po.py` exports `strings._STRINGS` to
   `locale/<lang>/LC_MESSAGES/messages.po` files (one per

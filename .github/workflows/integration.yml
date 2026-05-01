@@ -1,0 +1,115 @@
+name: Integration tests (live Telegram)
+
+# Stage-15-Step-E #6 follow-up #2 — opt-in workflow for the Telethon-based
+# integration suite that drives a real test bot via a real user account.
+#
+# Why a separate workflow:
+#
+# * **Secrets surface.** The suite needs four secrets (``TG_API_ID``,
+#   ``TG_API_HASH``, ``TG_TEST_SESSION_STRING``, ``TG_TEST_BOT_USERNAME``)
+#   that the operator has to register in repo Settings → Secrets and
+#   variables → Actions. They MUST NOT live in the default ``ci.yml``
+#   matrix because PRs from forks can't read repo secrets — the suite
+#   would just skip with no signal that the secrets even exist.
+#
+# * **Side effects.** Every run sends Telegram messages, debits the
+#   test wallet, and otherwise touches a live bot. The operator must
+#   opt in (``workflow_dispatch``) before the suite kicks off. Pinning
+#   it behind a manual trigger also keeps CI minutes low — the bulk
+#   of value comes from the unit suite, which the default ``ci.yml``
+#   already runs on every push.
+#
+# * **Slow.** A typical FSM flow takes ~15-30 seconds because each
+#   step waits for a real Telegram round-trip. The default unit suite
+#   finishes in <30s; layering even one integration test on top would
+#   triple that. Keep them quarantined.
+#
+# How to run:
+#
+# 1. Set the four secrets in the repo Settings → Secrets and variables
+#    → Actions:
+#       * ``TG_API_ID``                 (integer, from my.telegram.org)
+#       * ``TG_API_HASH``               (32-char hex)
+#       * ``TG_TEST_SESSION_STRING``    (Telethon StringSession)
+#       * ``TG_TEST_BOT_USERNAME``      (the test bot's @handle, no @)
+# 2. Go to Actions → Integration tests (live Telegram) → Run workflow.
+# 3. (Optional) Pick the branch to run against. Default is ``main``.
+#
+# When the secrets are NOT set the workflow still runs but the suite
+# skips itself cleanly (the ``integration_secrets`` fixture in
+# ``tests/integration/conftest.py`` does the gating). The job stays
+# green; the operator just sees a "SKIPPED" banner in the pytest
+# output. That's intentional — a fork PR / unauthenticated run
+# should never fail the workflow purely for missing secrets.
+
+on:
+  # Manual trigger only — operator opts in. NEVER add ``push`` / ``pull_request``
+  # here without first auditing the secrets-leak risk for fork PRs.
+  workflow_dispatch:
+    inputs:
+      pytest_args:
+        description: |
+          Extra args passed to pytest. Default targets only the
+          integration suite. Override with e.g. ``-k smoke`` to run
+          just the smoke tests.
+        required: false
+        default: "tests/integration/ -v"
+
+# Cancel an in-flight integration run when a fresh manual trigger lands —
+# the operator is most likely re-kicking after a config tweak.
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    name: Telethon integration suite
+    runs-on: ubuntu-latest
+    # Hard cap so a hung Telethon client (e.g. the bot is offline,
+    # the session string is stale) can't burn the workflow's full
+    # 6-hour budget. The suite normally finishes in <5 minutes.
+    timeout-minutes: 15
+
+    env:
+      TG_API_ID: ${{ secrets.TG_API_ID }}
+      TG_API_HASH: ${{ secrets.TG_API_HASH }}
+      TG_TEST_SESSION_STRING: ${{ secrets.TG_TEST_SESSION_STRING }}
+      TG_TEST_BOT_USERNAME: ${{ secrets.TG_TEST_BOT_USERNAME }}
+      # Optional knobs (with safe defaults if the secret isn't set):
+      TG_TEST_TIMEOUT_SECONDS: ${{ vars.TG_TEST_TIMEOUT_SECONDS }}
+      TG_TEST_SETTLE_SECONDS: ${{ vars.TG_TEST_SETTLE_SECONDS }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Report secret presence (without leaking values)
+        # Quick visibility for the operator: did the workflow find
+        # the secrets, or is it about to skip the whole suite? This
+        # is the only place we touch the secrets directly — the rest
+        # of the workflow goes through env vars.
+        run: |
+          for var in TG_API_ID TG_API_HASH TG_TEST_SESSION_STRING TG_TEST_BOT_USERNAME; do
+            if [ -n "${!var}" ]; then
+              echo "$var: present"
+            else
+              echo "$var: MISSING — suite will SKIP at fixture time"
+            fi
+          done
+
+      - name: Run integration suite
+        run: |
+          pytest ${{ inputs.pytest_args || 'tests/integration/ -v' }}

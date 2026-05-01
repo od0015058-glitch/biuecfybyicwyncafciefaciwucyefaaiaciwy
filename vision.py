@@ -336,7 +336,20 @@ def build_multimodal_user_message(
             entry is not a non-empty ``data:image/...;base64,``
             URI string (caught early so a typo doesn't reach
             OpenRouter as a wasted token-burn 400).
+        VisionError(reason="invalid_input", ...): ``prompt`` is
+            not ``str | None`` or ``image_data_uris`` is not a
+            list. Pre-fix, a non-string-truthy ``prompt`` (e.g.
+            a dict from a fuzzed payload) would crash
+            ``(prompt or "").strip()`` with ``AttributeError``
+            and bypass the documented ``VisionError`` contract,
+            leaking the implementation detail to the caller.
     """
+    if prompt is not None and not isinstance(prompt, str):
+        raise VisionError(
+            "invalid_input",
+            f"prompt must be str or None, got "
+            f"{type(prompt).__name__}",
+        )
     text_part = (prompt or "").strip()
     if not isinstance(image_data_uris, list):
         raise VisionError(
