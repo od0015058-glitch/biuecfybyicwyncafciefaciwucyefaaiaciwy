@@ -645,9 +645,9 @@ What's shipped this PR:
 What remains (next AI's TODO):
 
 * **`.pdf` export** — the original spec mentioned both `.txt` and `.pdf`. PDF needs `reportlab` or `weasyprint` added to `requirements.txt`. **Important for Persian users:** RTL rendering is a known PDF pain point — `reportlab` needs an Arabic shaping library (`python-bidi` + `arabic-reshaper`). Confirm with the operator which dependency surface is acceptable before adding.
-* **`/history` command alias** — currently the only entry point is the inline-keyboard button on the memory screen. Add a `Command("history")` handler (~5 lines) that calls `memory_export_handler`'s body. Keep it in the same file.
+* ✅ **`/history` command alias** — shipped in the Stage-15-Step-E #1 follow-up. `cmd_history` (`@router.message(Command("history"))`) re-uses the new `_build_history_export_document(user_id, username)` helper so the slash and the wallet-menu button can never drift on filename / encoding / trim semantics.
 * **Pagination for very long buffers** — current 1 MB cap drops oldest rows. A heavy user with months of memory ON could legitimately want all of it; chunk the rendered text into multiple `.txt` files (`-part-1.txt`, `-part-2.txt`, ...) when above ~10 MB. Telegram's document cap is 50 MB.
-* **Rate limiting** — the menu button is fine (Telegram debounces callback queries). If `/history` text command lands, gate it behind the same chat-token bucket as `cmd_chat` so a user can't spam-export their buffer to DoS the DB.
+* ✅ **Rate limiting** — shipped in the same follow-up. `cmd_history` consumes a token from the existing `consume_chat_token` bucket before hitting the DB; same throttle, same forgiveness window as the AI-chat path. The menu button stays unrate-limited (Telegram itself debounces callback queries).
 * **Schema-rotation hook** — if the operator ever needs to comply with a "delete all my data" request, `Database.clear_conversation` already exists. Document that the export button is the user-facing read side and `mem_reset` is the user-facing delete side.
 
 ##### Stage-15-Step-E #4 — what's shipped vs. what remains (STARTED, not finished)
@@ -1978,7 +1978,54 @@ The user's process for this project — **do not deviate**:
     preserved, 200 OK, no-secret-leak in body, no auth
     required, not in rate-limited path set). Total suite:
     1944 tests passing (was 1917 + 27 new).
-13. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+13. **Stage-15-Step-E #2 follow-up #1 MERGED** (PR-after-#138) —
+    `/stats` slash-command alias + window selector buttons +
+    `_build_stats_render` shared helper between
+    `hub_stats_handler` (wallet-menu callback) and
+    `cmd_stats`. Selector callback shape `stats_window:<days>`
+    with 7 / 30 / 90 / 365 day choices, selected window
+    prefixed with `✓`, garbage values silently coerce to 30d.
+    Bundled real bug fix: `user_stats._iter_top_models` now
+    drops top-models rows whose `cost_usd` or `calls` are
+    non-finite (NaN, ±Inf, bool) instead of misattributing the
+    user's spend as `$0.0000` next to the model name. New
+    `_is_finite_number` helper enforces strict checks (rejects
+    `bool`, which is an `int` subclass that would otherwise
+    sneak through).  Total suite: 1961 tests passing (was 1944
+    + 17 new — entry-point tests, window-selector behaviour,
+    keyboard shape, callback parsing, garbage-arg coercion,
+    plus the bundled-fix regression-pin).
+14. **Stage-15-Step-E #1 follow-up #1 OPENED** (PR-after-#139) —
+    `/history` slash-command alias + chat-token rate-limit
+    gate + `_build_history_export_document(user_id, username)`
+    helper shared between `memory_export_handler` (wallet-menu
+    callback) and `cmd_history` so the two surfaces can never
+    drift on filename / encoding / trim semantics. Slash path
+    consumes from the existing `consume_chat_token` bucket
+    before touching the DB — a user who's already exhausted
+    their AI-prompt budget can't pivot to spamming an unbounded
+    `Database.get_full_conversation` table scan. Empty-buffer
+    case lands as a fresh `message.answer` chat bubble (the
+    callback toast pattern needs a callback query to attach
+    to). Same defensive `from_user is None` / FSM-clear shape
+    as `cmd_start` / `cmd_redeem` / `cmd_stats`. Bundled real
+    bug fix: `conversation_export.format_history_as_text`'s
+    trim loop was O(n²) on the kept-rows count — pre-fix, a
+    user with a 5 MB buffer triggering trim would burn ~50 MB
+    of repeated UTF-8 encoding work for the ~4 MB they had to
+    drop, every time they hit "Export". Post-fix the loop
+    pre-computes each message's encoded byte size once and
+    runs a single forward pass: O(n) bytes processed. New
+    tests cover the slash-command happy path, empty buffer
+    flash, rate-limit short-circuit (must not touch the DB),
+    `from_user=None` defensive return, FSM clear, trim
+    caption-count regression-pin, `/history@bot` group-chat
+    suffix, plus the perf-fix behaviour-pin (drops only oldest,
+    most recent always survives, single-second timing budget
+    catches an O(n²) regression). Total suite: 1953 tests
+    passing (was 1944 + 9 new — measured against `main`,
+    will be 1961 + 9 = 1970 once #139 lands).
+15. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-14. **Read the §11 working agreement before doing anything.**
+16. **Read the §11 working agreement before doing anything.**
