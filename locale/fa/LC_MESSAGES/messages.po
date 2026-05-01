@@ -845,3 +845,9 @@ msgstr "≈ {toman:,.0f} تومان"
 #: strings.py:wallet_toman_line_stale
 msgid "wallet_toman_line_stale"
 msgstr "≈ {toman:,.0f} تومان (نرخ تقریبی)"
+
+#: strings.py:zarinpal_credit_notification
+msgid "zarinpal_credit_notification"
+msgstr ""
+"✅ پرداخت زرین‌پال شما با موفقیت تأیید شد.\n"
+"**${amount:.2f}** به کیف پول شما اضافه گردید."

@@ -84,15 +84,39 @@ _MIN_PLAUSIBLE_TOMAN = 10_000.0
 _MAX_PLAUSIBLE_TOMAN = 1_000_000.0
 
 
-def _parse_int_env(name: str, default: int) -> int:
+def _parse_int_env(name: str, default: int, *, minimum: int = 1) -> int:
+    """Tolerant integer env parser with a hard floor.
+
+    Stage-15-Step-E #8 bundled bug fix: previously this helper had
+    no ``minimum`` floor, so a misconfigured
+    ``FX_REFRESH_INTERVAL_SECONDS=0`` (a typo for ``60``) would
+    busy-loop the FX refresher hammering the upstream API every
+    iteration as fast as the network allowed — likely getting the
+    API key rate-limited or banned. A negative value would silently
+    degrade ``asyncio.sleep`` to a yield.
+
+    The ``minimum`` floor closes that gap. Default ``minimum=1``
+    mirrors the canonical pattern in
+    :func:`pending_expiration._read_int_env`. Callers that legitimately
+    want to allow ``0`` (or below) can opt out by passing
+    ``minimum=0`` (or a negative).
+    """
     raw = os.getenv(name, "").strip()
     if not raw:
         return default
     try:
-        return int(raw)
+        value = int(raw)
     except ValueError:
         log.warning("%s=%r not an int; using default %d", name, raw, default)
         return default
+    if value < minimum:
+        log.warning(
+            "%s=%d is below the minimum %d (would busy-loop the "
+            "refresher); clamping",
+            name, value, minimum,
+        )
+        return minimum
+    return value
 
 
 def _parse_float_env(name: str, default: float) -> float:

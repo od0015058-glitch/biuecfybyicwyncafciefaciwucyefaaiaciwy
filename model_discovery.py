@@ -65,16 +65,77 @@ log = logging.getLogger("bot.model_discovery")
 # Default refresh interval. 6h is a sensible balance: new models
 # typically ship during business hours in one of a handful of
 # timezones, and a 6h cadence means the alert lands the same day.
-_DISCOVERY_INTERVAL_SECONDS: int = int(
-    os.getenv("DISCOVERY_INTERVAL_SECONDS", str(6 * 60 * 60))
-)
+_DEFAULT_DISCOVERY_INTERVAL_SECONDS: int = 6 * 60 * 60
+_DEFAULT_MAX_MODELS_PER_DM: int = 10
 
-# Hard cap per DM so we never bust Telegram's 4 096-char message
-# limit when a provider ships a big family drop. 10 lines of
-# "<id> — <name>" comfortably fits with the header / footer.
-_MAX_NEW_MODELS_PER_NOTIFICATION: int = int(
-    os.getenv("DISCOVERY_MAX_MODELS_PER_DM", "10")
-)
+
+def _parse_positive_int_env(
+    name: str, default: int, *, minimum: int = 1
+) -> int:
+    """Tolerant integer env parser with a hard floor.
+
+    Blank / malformed values fall back to ``default`` with a loud
+    log so a deploy-time typo (``DISCOVERY_INTERVAL_SECONDS=abc``)
+    can't take the bot off the air on import. Values below
+    ``minimum`` are clamped up to ``minimum`` — without that floor a
+    typo (``DISCOVERY_INTERVAL_SECONDS=0`` for ``60``) would
+    busy-loop the discovery refresher hammering OpenRouter, and a
+    negative value would silently degrade ``asyncio.sleep`` to a
+    yield (every refresh iteration would run as fast as the network
+    allows). Same regression class as
+    ``fx_rates._parse_int_env`` — fixed there in this same Step-E
+    #8 PR for symmetry. Same canonical floor pattern as
+    :func:`pending_expiration._read_int_env`.
+
+    Stage-15-Step-E #8 bundled bug fix: previously these two env
+    parses were inline ``int(os.getenv(...))`` calls at module-import
+    time, with neither a try/except (so a non-numeric value crashed
+    the import and the bot wouldn't start) nor a floor (so a
+    misconfigured ``DISCOVERY_INTERVAL_SECONDS=0`` would busy-loop
+    the discovery and likely get the OpenRouter API key
+    rate-limited).
+    """
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning(
+            "%s=%r is not an integer; falling back to %d",
+            name, raw, default,
+        )
+        return default
+    if value < minimum:
+        log.warning(
+            "%s=%d is below the minimum %d (would %s); clamping",
+            name, value, minimum,
+            "busy-loop" if minimum > 0 else "underflow",
+        )
+        return minimum
+    return value
+
+
+def _get_discovery_interval_seconds() -> int:
+    return _parse_positive_int_env(
+        "DISCOVERY_INTERVAL_SECONDS",
+        _DEFAULT_DISCOVERY_INTERVAL_SECONDS,
+    )
+
+
+def _get_max_models_per_dm() -> int:
+    return _parse_positive_int_env(
+        "DISCOVERY_MAX_MODELS_PER_DM",
+        _DEFAULT_MAX_MODELS_PER_DM,
+    )
+
+
+# Module-level constants kept for backward-compat with any external
+# caller that imported them directly (and as readable defaults for
+# the docstrings above). The runtime path now reads through the
+# functions so a test can ``monkeypatch.setenv`` between cases.
+_DISCOVERY_INTERVAL_SECONDS: int = _get_discovery_interval_seconds()
+_MAX_NEW_MODELS_PER_NOTIFICATION: int = _get_max_models_per_dm()
 
 
 def _parse_float_env(name: str, default: float) -> float:
@@ -518,7 +579,17 @@ async def discover_new_models_loop(
     so a transient OpenRouter / DB blip doesn't take the loop off
     the air.
     """
-    interval = interval_seconds if interval_seconds is not None else _DISCOVERY_INTERVAL_SECONDS
+    # ``is not None`` (not ``or``) so a test-time ``interval_seconds=0``
+    # tight loop works. The env path reads through
+    # ``_get_discovery_interval_seconds`` which floors the value at 1 —
+    # a misconfigured ``DISCOVERY_INTERVAL_SECONDS=0`` would otherwise
+    # busy-loop the OpenRouter catalog refresh and get the API key
+    # rate-limited (Stage-15-Step-E #8 bundled bug fix).
+    interval = (
+        interval_seconds
+        if interval_seconds is not None
+        else _get_discovery_interval_seconds()
+    )
     while True:
         try:
             await run_discovery_pass(bot)

@@ -939,6 +939,61 @@ class Database:
             return None
         return float(row["amount_usd_credited"])
 
+    async def get_pending_invoice_amount_irr(
+        self, gateway_invoice_id: str
+    ) -> int | None:
+        """Look up the integer rial figure for a PENDING / PARTIAL invoice.
+
+        Returns ``transactions.amount_crypto_or_rial`` as ``int``,
+        or ``None`` if the invoice is unknown or already in a
+        terminal status.
+
+        Stage-15-Step-E #8. Used by the Zarinpal callback handler to
+        recover the original rial amount before passing it to
+        ``zarinpal.verify_payment``. Zarinpal's verify endpoint
+        requires the SAME amount that was sent on ``create_order``
+        (server-side mismatch defense against a tampered redirect),
+        so we have to read the locked figure back from our own
+        ledger rather than trusting any field that arrived in the
+        URL query string.
+
+        Cast to ``int`` because the rial figure is always an integer
+        — Shaparak doesn't settle fractional rials. The DB column is
+        ``DECIMAL`` so legacy crypto rows have a fractional part; we
+        ``round()`` defensively before the cast so a hand-edited
+        legacy row can't trip a ``ValueError``. Returns ``None`` on
+        a non-finite value (legacy poisoned row); the caller surfaces
+        that as a "refusing to verify" branch.
+
+        Same race-tolerance contract as
+        :meth:`get_pending_invoice_amount_usd`: no ``FOR UPDATE``,
+        because the verify HTTP call is too slow to hold a row lock
+        across.
+        """
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT status, amount_crypto_or_rial
+                FROM transactions
+                WHERE gateway_invoice_id = $1
+                """,
+                gateway_invoice_id,
+            )
+        if row is None:
+            return None
+        if row["status"] not in ("PENDING", "PARTIAL"):
+            return None
+        raw = row["amount_crypto_or_rial"]
+        if raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not _is_finite_amount(value) or value <= 0:
+            return None
+        return int(round(value))
+
     async def expire_stale_pending(
         self,
         *,

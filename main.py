@@ -21,6 +21,7 @@ from metrics import install_metrics_route
 from model_discovery import discover_new_models_loop
 from payments import payment_webhook, refresh_min_amounts_loop
 from tetrapay import tetrapay_webhook
+from zarinpal import zarinpal_callback
 from pending_alert import start_pending_alert_task
 from pending_expiration import start_pending_expiration_task
 from rate_limit import (
@@ -73,6 +74,18 @@ async def start_webhook_server(
     # responsible for parsing, dedupe, the authoritative ``/api/verify``
     # call, and the idempotent ``finalize_payment``.
     app.router.add_post("/tetrapay-webhook", tetrapay_webhook)
+    # Stage-15-Step-E #8: Zarinpal (Rial card) callback. Unlike the
+    # TetraPay POST webhook, Zarinpal redirects the user's browser
+    # to this URL with ``?Authority=...&Status=OK|NOK`` query
+    # parameters — so the route is GET, not POST. Same rate-limit
+    # bucket (a refresh-loop on the callback URL can't bypass the
+    # bucket; ``register_rate_limited_webhook_path`` adds it to the
+    # filtered set the middleware reads). The handler is responsible
+    # for the authoritative ``/v4/payment/verify.json`` call and the
+    # idempotent ``finalize_payment`` — same defensive pattern as
+    # TetraPay.
+    app.router.add_get("/zarinpal-callback", zarinpal_callback)
+    register_rate_limited_webhook_path(app, "/zarinpal-callback")
 
     # Stage-15-Step-A: Prometheus ``/metrics`` endpoint for internal
     # scraping. IP-allowlisted (default ``127.0.0.1,::1``) so a

@@ -1144,3 +1144,11 @@ msgstr "≈ {toman:,.0f} TMN"
 #: strings.py:wallet_toman_line_stale
 msgid "wallet_toman_line_stale"
 msgstr "≈ {toman:,.0f} TMN (approx)"
+
+#. ✅ پرداخت زرین‌پال شما با موفقیت تأیید شد.
+#. **${amount:.2f}** به کیف پول شما اضافه گردید.
+#: strings.py:zarinpal_credit_notification
+msgid "zarinpal_credit_notification"
+msgstr ""
+"✅ Your Zarinpal payment has been confirmed.\n"
+"**${amount:.2f}** has been added to your wallet."
