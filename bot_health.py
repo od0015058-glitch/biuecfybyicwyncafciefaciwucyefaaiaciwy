@@ -180,6 +180,7 @@ def compute_bot_status(
     *,
     inflight_count: int,
     ipn_drops_total: int,
+    ipn_drops_recent: int = 0,
     loop_ticks: Mapping[str, float],
     expected_loops: Iterable[str],
     db_error: str | None,
@@ -192,7 +193,23 @@ def compute_bot_status(
 
     * ``inflight_count`` — current count from
       ``rate_limit.chat_inflight_count()``.
-    * ``ipn_drops_total`` — sum of every gateway's drop-counter dict.
+    * ``ipn_drops_total`` — sum of every gateway's drop-counter dict
+      since process boot. Used only for the *informational*
+      HEALTHY summary ("N IPN drop(s) since boot"). DO NOT use
+      this for UNDER_ATTACK classification: a long-running deploy
+      slowly accumulates one bad-signature row a day and would
+      eventually false-fire UNDER_ATTACK after ~3 months of normal
+      uptime. UNDER_ATTACK reads ``ipn_drops_recent`` instead.
+    * ``ipn_drops_recent`` — drops observed in a recent rate-window
+      the *caller* tracks. The :mod:`bot_health_alert` loop
+      records the previous total at every tick and passes the
+      delta-since-last-tick here so an actual flood (≥ threshold
+      drops in one alert interval) trips UNDER_ATTACK without
+      false-firing on slow-burn drops accumulated over months.
+      Snapshot callers (Prometheus, dashboard) that don't track a
+      window pass ``0`` and rely on the loop-DM channel for
+      under-attack detection. Default 0 to keep the snapshot
+      callers' call-sites unchanged.
     * ``loop_ticks`` — map of loop-name → last-success epoch
       (from ``metrics.get_loop_last_tick``). Loops not yet ticked
       are absent from the map (or set to 0.0).
@@ -214,8 +231,8 @@ def compute_bot_status(
     Severity ordering (highest wins):
 
     1. ``DOWN`` if ``db_error`` is set.
-    2. ``UNDER_ATTACK`` if drop counters or login-throttle keys
-       cross thresholds.
+    2. ``UNDER_ATTACK`` if recent drop counters or login-throttle
+       keys cross thresholds.
     3. ``DEGRADED`` if any expected loop is stale.
     4. ``BUSY`` if in-flight chat slots exceed the busy threshold.
     5. ``HEALTHY`` if there's any active load.
@@ -250,10 +267,10 @@ def compute_bot_status(
 
     # 2. UNDER_ATTACK — flood signals.
     attack_signals: list[str] = []
-    if ipn_drops_total >= ipn_attack_t:
+    if ipn_drops_recent >= ipn_attack_t:
         attack_signals.append(
-            f"{ipn_drops_total} IPN deliveries dropped this process "
-            f"(threshold {ipn_attack_t})"
+            f"{ipn_drops_recent} IPN deliveries dropped in the recent "
+            f"window (threshold {ipn_attack_t})"
         )
     if login_throttle_active_keys >= login_attack_t:
         attack_signals.append(

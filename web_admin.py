@@ -5019,9 +5019,24 @@ async def control_get(request: web.Request) -> web.StreamResponse:
 
     from bot_health import compute_bot_status
 
+    # Read the bot-health alert loop's most-recent rate-windowed drop
+    # count so the panel + the loop + Prometheus all classify
+    # identically. The panel can't observe a rate-of-drops on its own
+    # (each request is a snapshot, not a window) so we delegate to
+    # the loop's bookkeeping. ``0`` until the loop has ticked once.
+    try:
+        from bot_health_alert import latest_observed_recent_drops
+
+        ipn_drops_recent = latest_observed_recent_drops()
+    except Exception:
+        log.exception("control: latest_observed_recent_drops failed")
+        ipn_drops_recent = 0
+    signals["ipn_drops_recent"] = ipn_drops_recent
+
     status = compute_bot_status(
         inflight_count=signals["inflight_count"],
         ipn_drops_total=signals["ipn_drops_total"],
+        ipn_drops_recent=ipn_drops_recent,
         loop_ticks=signals["loop_ticks_for_classifier"],
         expected_loops=signals["loop_names_for_classifier"],
         db_error=db_error,
