@@ -869,7 +869,7 @@ What remains for future Step-E #9 PRs:
 
   Bundled bug fix in this PR (real, found while writing the window-selector tests and cross-checking the `_empty_monetization_summary` fallback shape): **the DB-error / dev-mode fallback hardcoded `gross_margin_pct=0.0` for both lifetime and window blocks.** Pre-fix, when `db.get_monetization_summary` raised (transient pool issue, asyncpg disconnect, etc.) OR when the page was hit in dev-mode without a DB, the empty-fallback shape returned `gross_margin_pct=0.0` regardless of the configured markup. The pricing tile then rendered "Current markup multiplier: 2.0000× (gross margin pinned at **0.00%** of every charged dollar)" — wildly misleading, because the gross-margin percentage is purely a function of the markup (`(markup - 1) / markup * 100`) and doesn't need transactional data. An operator hitting the page during a 30-second DB blip would see the right markup figure but the wrong margin percentage. Fix: derive `gross_margin_pct` from the `markup` argument inside `_empty_monetization_summary` so the DB-error path matches the happy-path math. Pinned by a parametrized test exercising `markup ∈ {0.0, 1.0, 1.5, 2.0, 4.0}` and a route-level regression test that monkeypatches `pricing.get_markup` and stubs the DB to raise.
 * **Daily / weekly time-series chart** — the current page is a snapshot. A small Chart.js (or HTML canvas) sparkline showing daily revenue / OR cost / margin would let an operator spot trends without exporting CSVs.
-* **CSV export** — same shape as `/admin/transactions/export.csv`. Operator pipes into a spreadsheet for monthly P&L.
+* ~~**CSV export**~~ ✅ **shipped (Stage-15-Step-E #9 follow-up #2 PR).** New `GET /admin/monetization/export.csv?window=7|30|90` endpoint streams a single CSV with a `scope` column (`lifetime` / `window` / `window_by_model`) so an operator can pivot it for monthly P&L without screen-scraping. Header pinned by the test (`scope, window_days, model, requests, revenue_usd, charged_usd, openrouter_cost_usd, gross_margin_usd, gross_margin_pct, net_profit_usd, markup`); empty cells where a column doesn't apply (model + requests blank for scope-level rows; revenue + margin_pct + net blank for the per-model rows). Honours the same `?window=` allowlist as the HTML page — anything else falls back to 30. Pulls `MONETIZATION_CSV_TOP_MODELS_LIMIT=1000` rows (vs. the on-screen `_MONETIZATION_TOP_MODELS_LIMIT=10`) so the long-tail models are included for offline analysis; `Cache-Control: no-store` and `Content-Disposition: attachment; filename="monetization-{N}d-YYYYMMDDTHHMMSSZ.csv"` so a later admin session on the same machine can't pull a cached copy. Each successful export records a `monetization_export_csv` audit row with the window + row count + db_error flag in `meta`. The HTML page grew an "⬇ Export CSV" link in the page header carrying the active `?window=` into the export. **Bundled bug fix:** `transactions_export_csv` was being recorded by `record_admin_audit` since Stage-9-Step-7 but was missed when the audit-dropdown sweep landed in Stage-15-Step-F follow-up #3 — operators filtering "CSV exports only" couldn't pick the slug out of the audit-page dropdown and had to scroll the full unfiltered feed. Fix: added both `transactions_export_csv` AND `monetization_export_csv` to `AUDIT_ACTION_LABELS`, with a regression test that pins both labels.
 * **Per-user contribution** — "top 10 users by revenue contributed in the last 30 days". Requires a join from `transactions` → `users`, similar to the existing `/admin/users` filtering. Useful for "should we reach out to whales?" segmenting.
 * **Markup history tracking** — record `COST_MARKUP` changes in a small `markup_changes` table so the implied-OR-cost calculation can use the markup that was active when each `usage_logs` row was created, rather than today's markup uniformly. Removes the lifetime-drift caveat.
 * **Break-even analysis** — given current monthly run-rate (revenue, OR cost, fixed overhead from env), how many active users / requests does the bot need to break even? Out-of-scope for the data model right now since "fixed overhead" isn't anywhere in the schema.
@@ -2238,6 +2238,52 @@ The user's process for this project — **do not deviate**:
     / `total_seen` arithmetic / CLI argparse coverage / NUL
     byte strip in value / NUL byte strip in updated_by / clean
     input passthrough. Suite: 2106 → 2127 passing (+21 new).
+19. **Stage-15-Step-E #9 follow-up #2 OPENED** (PR-after-#148) —
+    monetization CSV export at `GET
+    /admin/monetization/export.csv?window=7|30|90`. Streams a single
+    CSV with a `scope` column (`lifetime` / `window` /
+    `window_by_model`) so an operator can pivot it for monthly P&L
+    without screen-scraping. Honours the same `?window=` allowlist
+    as the HTML page; pulls `MONETIZATION_CSV_TOP_MODELS_LIMIT=1000`
+    rows (vs. the on-screen `_MONETIZATION_TOP_MODELS_LIMIT=10`)
+    so the long-tail models are included for offline analysis.
+    `Cache-Control: no-store` + timestamped filename
+    (`monetization-{N}d-YYYYMMDDTHHMMSSZ.csv`) follow the same
+    pattern as `transactions_csv_get`. Each successful export
+    writes a `monetization_export_csv` audit row with the window
+    + row count + db_error flag in `meta`. The HTML page grew an
+    "⬇ Export CSV" link in the header carrying the active
+    `?window=` into the export. **Bundled real bug fix:**
+    `transactions_export_csv` was being recorded by
+    `record_admin_audit` since Stage-9-Step-7 but was missed when
+    the audit-dropdown sweep landed in Stage-15-Step-F follow-up
+    #3 — operators filtering "CSV exports only" on the audit page
+    couldn't pick the slug out of the dropdown and had to scroll
+    the full unfiltered feed. Fix: added BOTH
+    `transactions_export_csv` AND `monetization_export_csv` to
+    `AUDIT_ACTION_LABELS`, with a regression test that pins both
+    labels so a future PR can't drop them again — same shape as
+    the existing `role_grant` / `role_revoke` pin from
+    Stage-15-Step-E #5 follow-up #1. New helpers:
+    `_format_usd_csv` (4dp, no comma, scrubs NaN/Inf to
+    `"0.0000"` mirroring `Database._finite_float`),
+    `_format_monetization_csv_rows` (pure-function serializer,
+    drops non-dict by_model entries, parametrised over the
+    summary shape so a future schema bump surfaces here as a
+    `KeyError` rather than silent data loss),
+    `monetization_csv_get` (the route handler with fail-soft
+    DB-error path that still emits an empty-zero CSV with the
+    markup populated). 14 new tests in `tests/test_web_admin.py`
+    covering: header pin / populated-summary row shape /
+    empty-by_model / non-dict by_model entry skip / NaN+Inf
+    scrub for `_format_usd_csv` / auth required / route
+    end-to-end (CSV body + headers + filename + cache-control)
+    / `?window=` allowlist threading / invalid-window fall-back
+    (parametrised over 6 bad inputs) / `top_models_limit=1000`
+    pin / DB-error fail-soft renders empty CSV with markup /
+    audit row written / HTML page exposes the export link /
+    audit-action labels include both export slugs. Suite:
+    2106 → 2120 passing (+14 new).
 19. **Stage-15-Step-E #8 follow-up #2 OPENED** (PR-after-#148) —
     Zarinpal browser-close backfill reaper. Closes the gap where
     Zarinpal settles an order whose user closes the browser

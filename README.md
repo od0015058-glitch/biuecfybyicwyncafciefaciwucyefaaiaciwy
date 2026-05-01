@@ -30,7 +30,16 @@ NowPayments crypto invoices.
   contributors are at the top. Footnotes on the page spell out the
   assumptions (implied OR cost drifts when `COST_MARKUP` changes;
   net profit is forward-looking — assumes every credited dollar
-  will eventually burn).
+  will eventually burn). The **"⬇ Export CSV" button** at the
+  top-right (Stage-15-Step-E #9 follow-up #2) downloads the same
+  data as a single CSV with a `scope` column (`lifetime` /
+  `window` / `window_by_model`) so an operator can pivot it for
+  monthly P&amp;L without screen-scraping; the export uses
+  `MONETIZATION_CSV_TOP_MODELS_LIMIT=1000` (vs. the on-screen
+  `_MONETIZATION_TOP_MODELS_LIMIT=10`) so the long-tail models are
+  included for offline analysis. Each export records a
+  `monetization_export_csv` audit row with the active window and
+  row count.
 - Telegram-side admin commands (`/admin`, `/admin_metrics`,
   `/admin_credit`, `/admin_broadcast`, …) for ops via DMs.
 - **Canonical slash-command menu** — on every startup the bot
