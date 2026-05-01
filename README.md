@@ -257,23 +257,33 @@ NowPayments crypto invoices.
   `admin_roles.effective_role`'s env-list fallback so legacy
   deploys don't change behaviour. Web-side role gating + a
   `/admin/roles` web page are the remaining follow-ups.
-- **Telethon-driven live-bot integration test scaffold (first
-  slice)** — `tests/integration/` ships a Telethon-based scaffold
-  that drives a *live* test bot via a real Telegram user account
-  (MTProto, not the Bot API — bots can't DM other bots). The
-  suite skips itself cleanly when any of `TG_API_ID` /
-  `TG_API_HASH` / `TG_TEST_SESSION_STRING` /
-  `TG_TEST_BOT_USERNAME` is unset, so CI's
-  `pytest -v` just emits `SKIPPED [reason]` lines and stays
+- **Telethon-driven live-bot integration test suite** —
+  `tests/integration/` ships a Telethon-based suite that drives a
+  *live* test bot via a real Telegram user account (MTProto, not
+  the Bot API — bots can't DM other bots). The suite skips itself
+  cleanly when any of `TG_API_ID` / `TG_API_HASH` /
+  `TG_TEST_SESSION_STRING` / `TG_TEST_BOT_USERNAME` is unset, so
+  CI's `pytest -v` just emits `SKIPPED [reason]` lines and stays
   green. To run locally, set the four secrets (the throwaway
   session-string generation script lives in
   `tests/integration/conftest.py`) and point
   `TG_TEST_BOT_USERNAME` at a *dedicated test bot, not the
   production bot* — a flaky test must not be able to credit /
-  refund / broadcast to real users. Four smoke tests cover the
-  `/start` greeting + hub keyboard, `/balance` rendering the
-  wallet line, and the bot's resilience to unknown commands.
-  First slice of Stage-15-Step-E #6.
+  refund / broadcast to real users. Coverage:
+    - **Smoke tests** (`tests/integration/test_smoke.py`) — the
+      `/start` greeting + hub keyboard, `/balance` rendering the
+      wallet line, and the bot's resilience to unknown commands.
+    - **FSM coverage** (`tests/integration/test_fsm_flows.py`) —
+      `/redeem` two-step (enter FSM → bad code → reject + clean
+      exit), hub-keyboard geometry pin, wallet-button
+      callback-query → wallet card with `$` balance line, and
+      `/redeem` → `/start` mid-FSM clears state (regression
+      against pre-PR-110's `cmd_start` consuming slash commands
+      as raw FSM input). The new `click_button_and_wait` helper
+      taps an inline-keyboard button and waits for the bot's
+      reply (handles both the "edit the same message in place"
+      callback-query path and the "post a new message" path).
+  Stage-15-Step-E #6 first slice + follow-up #1.
 - **gettext `.po` round-trip for community translations (first
   slice)** — `i18n_po.py` exports `strings._STRINGS` to
   `locale/<lang>/LC_MESSAGES/messages.po` files (one per

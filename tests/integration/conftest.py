@@ -79,6 +79,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
@@ -119,8 +120,18 @@ def _read_float_env(name: str, default: float) -> float:
     except ValueError:
         log.warning("%s=%r is not a float; using default %.2f", name, raw, default)
         return default
-    if not (value >= 0.0):  # NaN safe — NaN comparison is False on both sides
-        log.warning("%s=%r is not >= 0; using default %.2f", name, raw, default)
+    # Stage-15-Step-E #6 follow-up #1 bundled bug fix: reject NaN AND
+    # non-finite (``+inf`` / ``-inf``) floats here. Pre-fix the guard
+    # was just ``if not (value >= 0.0)`` — which the comment claimed
+    # was "NaN safe", but it let ``+inf`` through (``inf >= 0.0`` is
+    # ``True``). An operator setting ``TG_TEST_SETTLE_SECONDS=inf``
+    # would then hit ``await asyncio.sleep(inf)`` inside
+    # ``send_and_wait`` and the suite would hang forever instead of
+    # reporting a clear configuration error. ``math.isfinite`` is
+    # NaN-safe (returns ``False`` for NaN) so we drop both classes
+    # in a single check.
+    if not math.isfinite(value) or value < 0.0:
+        log.warning("%s=%r is not a finite >= 0 float; using default %.2f", name, raw, default)
         return default
     return value
 
@@ -241,6 +252,127 @@ async def send_and_wait(
         raise asyncio.TimeoutError(
             f"timed out after {deadline:.1f}s waiting for a reply from "
             f"@{bot_username} to {text!r}"
+        )
+
+    return _impl
+
+
+@pytest.fixture
+async def click_button_and_wait(
+    telegram_client: Any,
+    integration_secrets: dict[str, str],
+    integration_timeouts: dict[str, float],
+) -> Callable[..., Awaitable[Any]]:
+    """Return ``async click_button_and_wait(message, *, text=..., index=...) -> Message``.
+
+    Stage-15-Step-E #6 follow-up #1: extends the suite from "send a
+    text → expect a text reply" to "tap an inline-keyboard button →
+    expect the bot's edit / next message". Two paths covered:
+
+    * If the bot **edits the same message** (the conventional
+      callback-query reply), the helper waits for the edit by
+      polling the original message's ``edit_date`` until it changes
+      or a brand-new bot message arrives.
+    * If the bot **sends a new message** in response (e.g. a hub →
+      sub-page flow that posts a fresh card), the helper falls
+      through and returns the new incoming message.
+
+    Two ways to identify the button:
+
+    * ``text="..."`` — case-insensitive substring match against the
+      button caption (works for emoji-prefixed labels, e.g. you can
+      pass ``text="wallet"`` and it matches "💰 Wallet").
+    * ``index=(row, col)`` — explicit grid coordinates for tests
+      that target the geometry of the keyboard rather than its
+      labels (so they don't break on i18n string renames).
+
+    Exactly one of ``text`` / ``index`` must be supplied.
+    """
+    bot_username = integration_secrets["TG_TEST_BOT_USERNAME"].lstrip("@")
+
+    async def _impl(
+        message: Any,
+        *,
+        text: str | None = None,
+        index: tuple[int, int] | None = None,
+        timeout_seconds: float | None = None,
+    ) -> Any:
+        if (text is None) == (index is None):
+            raise ValueError(
+                "click_button_and_wait: pass exactly one of text=... / index=..."
+            )
+        markup = getattr(message, "reply_markup", None)
+        rows = getattr(markup, "rows", None) if markup is not None else None
+        if not rows:
+            raise AssertionError(
+                f"message {message.id!r} has no inline keyboard "
+                "(reply_markup.rows is empty)"
+            )
+
+        # Resolve which button to click.
+        target_text: str | None = None
+        if index is not None:
+            r, c = index
+            try:
+                target_text = rows[r].buttons[c].text
+            except (IndexError, AttributeError) as exc:
+                raise AssertionError(
+                    f"index {index!r} out of range for keyboard "
+                    f"with {len(rows)} row(s)"
+                ) from exc
+        else:
+            assert text is not None  # narrow for type-checker
+            needle = text.lower()
+            for row in rows:
+                for btn in row.buttons:
+                    if needle in (btn.text or "").lower():
+                        target_text = btn.text
+                        break
+                if target_text is not None:
+                    break
+            if target_text is None:
+                labels = [b.text for r in rows for b in r.buttons]
+                raise AssertionError(
+                    f"button matching {text!r} not found in keyboard; "
+                    f"available labels: {labels!r}"
+                )
+
+        original_edit_date = getattr(message, "edit_date", None)
+        # Tell Telethon to push the click. ``message.click(text=...)``
+        # is the high-level API; it sends the callback to the bot.
+        await message.click(text=target_text)
+        await asyncio.sleep(integration_timeouts["settle_seconds"])
+
+        deadline = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else integration_timeouts["reply_seconds"]
+        )
+        loop = asyncio.get_event_loop()
+        end = loop.time() + deadline
+        while loop.time() < end:
+            # 1) Did the bot edit the original message?
+            refreshed = await telegram_client.get_messages(
+                bot_username, ids=message.id
+            )
+            if refreshed is not None:
+                refreshed_edit = getattr(refreshed, "edit_date", None)
+                if refreshed_edit is not None and refreshed_edit != original_edit_date:
+                    return refreshed
+            # 2) Or did the bot send a brand-new message?
+            async for msg in telegram_client.iter_messages(
+                bot_username, min_id=message.id, limit=20
+            ):
+                if msg.out:
+                    continue
+                if msg.id == message.id:
+                    continue
+                return msg
+            await asyncio.sleep(0.5)
+        raise asyncio.TimeoutError(
+            f"timed out after {deadline:.1f}s waiting for the bot's "
+            f"reply to a button-click on message {message.id!r} "
+            f"(button {target_text!r}, bot @{bot_username})"
         )
 
     return _impl
