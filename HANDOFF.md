@@ -1060,11 +1060,9 @@ What remains for a follow-up PR:
   classification but not the *history*. A follow-up could add a
   rolling-window timeline (last 1h / 6h / 24h) of the level changes
   driven by the existing audit-log table.
-* **Proactive Telegram-DM alerts on degraded/under-attack** — the
-  proactive-DM loop (`pending_alert.py`) already has the plumbing
-  to DM admins on threshold crosses; a tiny extension that DMs
-  on `bot_status_score >= 3` for >5 minutes would close the loop
-  for off-hours operators who don't sit on the panel.
+* **Proactive Telegram-DM alerts on degraded/under-attack** —
+  *shipped in Stage-15-Step-F follow-up #1 (`bot_health_alert.py`)*.
+  See that section below.
 * **Per-loop "freshness" thresholds** — currently every loop shares
   the same `BOT_HEALTH_LOOP_STALE_SECONDS=1800` (30 min) threshold,
   but `model_discovery` ticks every 6h by design while `fx_rates`
@@ -1090,6 +1088,115 @@ Files in this PR (Stage-15-Step-F):
   force-stop primitive + dataclass.
 * `tests/test_web_admin.py` — 4 new TOTP-Persian-digits tests + 11
   new `/admin/control` route tests.
+
+---
+
+#### Stage-15-Step-F follow-up #1: Proactive bot-health Telegram DMs (queued 2026-05-01)
+
+The Step-F panel made the *current* state visible to an operator
+who's *looking at it*. The user's stated need —
+*"every thing i need to have in my hands for times that is bot is
+crashing or not responding or under attack"* — also covers the case
+where they're not looking at the panel. This follow-up adds a
+proactive admin-DM loop so a degraded / under-attack / down event
+pages the operator on Telegram the moment it happens.
+
+What this PR ships:
+
+* **`bot_health_alert.py`** (new) — long-running asyncio task that
+  wakes every `BOT_HEALTH_ALERT_INTERVAL_SECONDS` (default 60),
+  runs the same `bot_health.compute_bot_status` classifier the panel
+  + Prometheus use, and DMs admins on transitions to DEGRADED /
+  UNDER_ATTACK / DOWN. **Single source of truth for the level** —
+  the alert loop, the panel, and the gauge agree, because the loop
+  populates a module-level `latest_observed_recent_drops()` cache
+  that the panel + `metrics.render_metrics` read.
+* **Per-level dedupe + recovery DMs.** A bad level is DMed once per
+  `(level, hour-anchor)` so a still-bad state re-fires once per
+  hour rather than once per tick. Level *escalation* (e.g.
+  DEGRADED → DOWN) re-fires immediately even within the same
+  anchor. A bad → good transition fires a single recovery DM
+  ("✅ Bot health recovered: healthy (was under_attack)") and
+  clears the dispatched-level state so the next bad transition
+  re-fires immediately rather than waiting for the next hour.
+* **Per-admin fault isolation.** A `TelegramForbiddenError` (admin
+  blocked the bot) on admin A doesn't stop admin B's notification.
+  A `TelegramAPIError` is logged with stack and skipped — we'd
+  rather miss one admin than have the loop die silently and let
+  the bot stay quiet during an incident. Mirrors
+  `pending_alert.notify_admins_of_stuck_pending`.
+* **Wired into `main.main`** alongside the existing background loops
+  (`pending_alert`, `pending_expiration`, `model_discovery`,
+  `fx_refresher`, `min_amount_refresher`). Cancelled + awaited
+  during shutdown so the asyncio loop closes cleanly.
+* **Heartbeat metric** — `meowassist_bot_health_alert_last_run_epoch`
+  joins the existing `_LOOP_METRIC_NAMES` set so the loop itself
+  can be alerted on (a stale alert loop is exactly the kind of
+  thing that would silently break this safety net).
+* **BUSY does not page.** BUSY is by definition the bot doing real
+  work — a heavy-traffic surge it's correctly handling shouldn't
+  spam the operator. Only DEGRADED / UNDER_ATTACK / DOWN are in
+  the bad-levels set.
+
+Bundled bug fix in this PR (real, found while wiring the alert
+loop into `bot_health.compute_bot_status`): **the UNDER_ATTACK
+classification on IPN-drop floods used the *since-boot* total
+rather than a *recent-window* delta**, so a long-running deploy
+that slowly accumulated one bad-signature row a day would, after
+~3 months of normal uptime, silently and permanently false-fire
+UNDER_ATTACK on the dashboard / panel / Prometheus while nothing
+was actually wrong. The fix splits the parameter:
+`compute_bot_status` now accepts `ipn_drops_total` (informational —
+"N IPN drop(s) since boot" surfaces in the HEALTHY summary) and
+`ipn_drops_recent` (rate-window — drives UNDER_ATTACK
+classification). The alert loop tracks the previous tick's total
+and passes the delta-since-last-tick as `ipn_drops_recent`.
+Snapshot callers (Prometheus, `/admin/control`) read the loop's
+`latest_observed_recent_drops()` so the panel + the gauge + the
+loop classify identically. A new regression test
+(`test_long_uptime_drops_total_alone_does_not_trip_attack`) pins
+the contract: 10× threshold of since-boot drops with zero recent
+drops must classify HEALTHY, not UNDER_ATTACK.
+
+What remains for a follow-up PR:
+
+* **Per-channel routing** — currently every admin DM goes to every
+  admin. A future slice could let a deployer route DEGRADED-level
+  alerts to a Telegram group while keeping UNDER_ATTACK / DOWN as
+  per-admin DMs.
+* **Sustained-threshold gating** — a transient one-tick spike (e.g.
+  a single chain-confirmation lag flipping `pending_reaper` to
+  stale for 30s) currently DMs immediately. A future slice could
+  add an "N consecutive ticks at level X" gate before the first
+  DM, with the trade-off that the operator hears about real
+  incidents 1-N tick-intervals later. The current behaviour favours
+  early signal over noise reduction; whether that's the right
+  trade-off depends on the deploy's loop cadences.
+* **Alert audit log** — DMs aren't currently recorded in the
+  `audit_log` table, so an operator reviewing what fired during
+  an incident has to scrape Telegram. Adding a row per DM would
+  close that gap.
+
+Files in this PR (Stage-15-Step-F follow-up #1):
+
+* `bot_health.py` — split `ipn_drops_total` / `ipn_drops_recent`
+  parameter on `compute_bot_status`; the bundled bug fix.
+* `bot_health_alert.py` (new) — alert loop module.
+* `main.py` — `start_bot_health_alert_task` boot + cancel-on-shutdown.
+* `metrics.py` — added `bot_health_alert` to `_LOOP_METRIC_NAMES`;
+  `render_metrics` reads `latest_observed_recent_drops()` for the
+  gauge so the gauge agrees with the panel + the loop.
+* `web_admin.py` — `control_get` reads `latest_observed_recent_drops()`
+  and passes it to `compute_bot_status` so the panel agrees with
+  the loop.
+* `tests/test_bot_health.py` — 4 existing UNDER_ATTACK tests
+  updated to use the renamed parameter; 1 new regression test
+  pinning the long-uptime-doesn't-false-fire contract.
+* `tests/test_bot_health_alert.py` (new) — 23 tests covering env
+  parsing, alert formatting, per-admin fault isolation, the pure
+  pass (idle, first-incident, hour-anchor dedupe, level
+  escalation, recovery, BUSY doesn't page, the panel-cache
+  contract, negative-delta clamp, error propagation).
 
 ---
 

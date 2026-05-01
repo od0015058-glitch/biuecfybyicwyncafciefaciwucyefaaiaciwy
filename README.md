@@ -295,6 +295,23 @@ NowPayments crypto invoices.
   5=down) so existing alerting rules can target
   `meowassist_bot_status_score >= 4` to page on under-attack /
   down. First slice of Stage-15-Step-F.
+- **Proactive bot-health Telegram DMs** — new `bot_health_alert.py`
+  background loop wakes every `BOT_HEALTH_ALERT_INTERVAL_SECONDS`
+  (default 60), runs the same `bot_health.compute_bot_status`
+  classifier the panel uses, and DMs admins on transitions to
+  DEGRADED / UNDER_ATTACK / DOWN — and on recovery back to
+  HEALTHY. Per-level dedupe with an hour anchor avoids same-state
+  spam while still re-firing immediately on level escalation
+  (DEGRADED → DOWN). Per-admin fault isolation (a blocked admin
+  doesn't stop notifications to the others). Bundled bug fix:
+  `compute_bot_status` previously used the *since-boot* IPN drop
+  total to detect UNDER_ATTACK, which would silently false-fire
+  on long-running deploys that slowly accumulated bad-signature
+  rows. The classifier now reads a rate-windowed
+  `ipn_drops_recent` count maintained by the alert loop, so the
+  panel + the gauge + the loop classify identically and
+  long-uptime deploys no longer self-trip. Stage-15-Step-F
+  follow-up #1.
 
 For the full project history, file map, and roadmap **read [HANDOFF.md](./HANDOFF.md)**.
 

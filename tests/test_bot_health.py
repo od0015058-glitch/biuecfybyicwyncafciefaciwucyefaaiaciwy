@@ -130,7 +130,8 @@ def test_degraded_summary_truncates_long_signal_list():
 def test_under_attack_on_ipn_drop_spike():
     status = bh.compute_bot_status(
         inflight_count=0,
-        ipn_drops_total=bh.DEFAULT_IPN_DROP_ATTACK_THRESHOLD,
+        ipn_drops_total=0,
+        ipn_drops_recent=bh.DEFAULT_IPN_DROP_ATTACK_THRESHOLD,
         loop_ticks={},
         expected_loops=(),
         db_error=None,
@@ -138,6 +139,30 @@ def test_under_attack_on_ipn_drop_spike():
     )
     assert status.level is bh.BotStatusLevel.UNDER_ATTACK
     assert status.score == 4
+
+
+def test_long_uptime_drops_total_alone_does_not_trip_attack():
+    """Bug-fix regression: a long-running deploy that has accumulated
+    well over the attack threshold of drops *since boot* must NOT be
+    classified UNDER_ATTACK when no drops have occurred in the recent
+    rate-window. Pre-fix, ``ipn_drops_total`` drove the comparison and
+    a 6-month-old deploy with one bad-signature row a day would
+    silently false-fire UNDER_ATTACK on the dashboard while nothing
+    was actually happening."""
+    status = bh.compute_bot_status(
+        inflight_count=0,
+        ipn_drops_total=bh.DEFAULT_IPN_DROP_ATTACK_THRESHOLD * 10,
+        ipn_drops_recent=0,
+        loop_ticks={},
+        expected_loops=(),
+        db_error=None,
+        login_throttle_active_keys=0,
+    )
+    assert status.level is bh.BotStatusLevel.HEALTHY
+    # The since-boot count is still surfaced as informational so
+    # the panel can show "N IPN drop(s) since boot" — just not
+    # cause an attack alert.
+    assert any("since boot" in s for s in status.signals)
 
 
 def test_under_attack_on_login_throttle_saturation():
@@ -156,7 +181,8 @@ def test_under_attack_on_login_throttle_saturation():
 def test_under_attack_combines_ipn_and_login_signals():
     status = bh.compute_bot_status(
         inflight_count=0,
-        ipn_drops_total=bh.DEFAULT_IPN_DROP_ATTACK_THRESHOLD + 50,
+        ipn_drops_total=0,
+        ipn_drops_recent=bh.DEFAULT_IPN_DROP_ATTACK_THRESHOLD + 50,
         loop_ticks={},
         expected_loops=(),
         db_error=None,
@@ -172,6 +198,7 @@ def test_down_when_db_error_set_overrides_other_signals():
     status = bh.compute_bot_status(
         inflight_count=200,
         ipn_drops_total=10_000,
+        ipn_drops_recent=10_000,
         loop_ticks={},
         expected_loops=("fx_refresh",),
         db_error="connection refused",
@@ -188,7 +215,8 @@ def test_under_attack_outranks_degraded():
     threat first."""
     status = bh.compute_bot_status(
         inflight_count=0,
-        ipn_drops_total=bh.DEFAULT_IPN_DROP_ATTACK_THRESHOLD,
+        ipn_drops_total=0,
+        ipn_drops_recent=bh.DEFAULT_IPN_DROP_ATTACK_THRESHOLD,
         loop_ticks={"fx_refresh": 1.0},
         expected_loops=("fx_refresh",),
         db_error=None,
@@ -238,7 +266,8 @@ def test_status_score_helper_matches_status_score_field():
         elif level is bh.BotStatusLevel.UNDER_ATTACK:
             s = bh.compute_bot_status(
                 inflight_count=0,
-                ipn_drops_total=bh.DEFAULT_IPN_DROP_ATTACK_THRESHOLD,
+                ipn_drops_total=0,
+                ipn_drops_recent=bh.DEFAULT_IPN_DROP_ATTACK_THRESHOLD,
                 loop_ticks={}, expected_loops=(), db_error=None,
                 login_throttle_active_keys=0,
             )

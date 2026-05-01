@@ -68,6 +68,7 @@ _LOOP_METRIC_NAMES: tuple[str, ...] = (
     "catalog_refresh",
     "pending_alert",
     "pending_reaper",
+    "bot_health_alert",
 )
 
 
@@ -411,6 +412,19 @@ def render_metrics() -> str:
     # admin panel, and Prometheus.
     from bot_health import compute_bot_status, status_score
 
+    # Read the bot-health alert loop's most-recent rate-windowed drop
+    # count so the gauge agrees with the panel + the loop's
+    # classification. The Prometheus path is a snapshot — it can't
+    # observe a rate-of-drops on its own — so we delegate to the
+    # loop's bookkeeping. ``0`` until the loop has ticked once.
+    try:
+        from bot_health_alert import latest_observed_recent_drops
+
+        ipn_drops_recent = latest_observed_recent_drops()
+    except Exception:
+        # Don't let the gauge take the rest of /metrics offline.
+        ipn_drops_recent = 0
+
     status = compute_bot_status(
         inflight_count=chat_inflight_count(),
         ipn_drops_total=(
@@ -418,6 +432,7 @@ def render_metrics() -> str:
             + sum(get_tetrapay_drop_counters().values())
             + sum(get_zarinpal_drop_counters().values())
         ),
+        ipn_drops_recent=ipn_drops_recent,
         loop_ticks={
             name: _LOOP_LAST_TICK.get(name, 0.0)
             for name in _LOOP_METRIC_NAMES

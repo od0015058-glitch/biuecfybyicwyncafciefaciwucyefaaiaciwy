@@ -22,6 +22,7 @@ from model_discovery import discover_new_models_loop
 from payments import payment_webhook, refresh_min_amounts_loop
 from tetrapay import tetrapay_webhook
 from zarinpal import zarinpal_callback
+from bot_health_alert import start_bot_health_alert_task
 from pending_alert import start_pending_alert_task
 from pending_expiration import start_pending_expiration_task
 from rate_limit import (
@@ -284,6 +285,15 @@ async def main():
     # contract + per-admin fault isolation policy.
     pending_alert_task = start_pending_alert_task(bot)
 
+    # Stage-15-Step-F follow-up: bot-health alert loop. Wakes every
+    # BOT_HEALTH_ALERT_INTERVAL_SECONDS (default 60), runs the same
+    # bot_health classifier the dashboard / Prometheus / control
+    # panel use, and DMs admins on transitions to DEGRADED /
+    # UNDER_ATTACK / DOWN (and on recovery). Per-level dedupe with
+    # an hour anchor; the loop never crashes on a single tick error.
+    # See bot_health_alert.py for the full contract.
+    bot_health_alert_task = start_bot_health_alert_task(bot)
+
     # Background refresher for NowPayments per-currency min-amounts.
     # Keeps the in-memory cache warm so the checkout pre-flight check
     # (see handlers._preflight_min_amount_check) never blocks on a
@@ -379,6 +389,13 @@ async def main():
             pass
         except Exception:
             log.exception("pending-alert loop exited with error")
+        bot_health_alert_task.cancel()
+        try:
+            await bot_health_alert_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("bot-health-alert loop exited with error")
         await runner.cleanup()
         await db.close()
         await bot.session.close()
