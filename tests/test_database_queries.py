@@ -1984,9 +1984,17 @@ async def test_refund_transaction_locks_with_for_update():
 async def test_refundable_gateways_constant():
     """Pin the canonical set so a future refactor can't accidentally
     add ``admin`` / ``gift`` (which would then double-debit on the
-    user detail page) or drop a real gateway."""
+    user detail page) or drop a real gateway.
+
+    Stage-15-Step-E #9: ``zarinpal`` joined the set after Step-E #8
+    shipped the gateway integration. Pre-fix, an admin clicking
+    refund on a Zarinpal SUCCESS row got
+    ``REFUND_REFUSAL_GATEWAY_NOT_REFUNDABLE`` even though Zarinpal
+    supports refunds — the gateway is a card PSP with the same
+    refund semantics as TetraPay.
+    """
     assert database_module.Database.REFUNDABLE_GATEWAYS == frozenset(
-        {"nowpayments", "tetrapay"}
+        {"nowpayments", "tetrapay", "zarinpal"}
     )
 
 
@@ -2523,3 +2531,340 @@ async def test_list_payment_status_transitions_decodes_jsonb_string_meta():
 
     rows = await db.list_payment_status_transitions()
     assert rows[0]["meta"] == {"received_usd": 4.95}
+
+
+# =========================================================================
+# Stage-15-Step-E #9: get_monetization_summary
+# =========================================================================
+#
+# These tests pin the contract of the new monetization snapshot
+# (revenue / refunds / OpenRouter cost / per-model profit). Same
+# style as the ``test_get_system_metrics_*`` block above —
+# fetchrow / fetch are mocked with deterministic values, the
+# resulting dict shape is asserted, and SQL string assertions
+# guard the WHERE-clause invariants (revenue excludes internal
+# gateways; refunds use ``refunded_at`` for the windowed filter,
+# not ``completed_at``; usage_logs filter is symmetric).
+
+
+def _make_monetization_conn(
+    *,
+    revenue: float = 0.0,
+    promo_bonus: float = 0.0,
+    paying_users: int = 0,
+    refunded: float = 0.0,
+    gross_charge: float = 0.0,
+    calls: int = 0,
+    active_users: int = 0,
+    per_model_rows: list[dict] | None = None,
+):
+    """Build a connection stub whose fetchrow/fetch returns the
+    payloads ``get_monetization_summary`` expects.
+
+    The order of the three ``fetchrow`` calls in the production
+    code is (revenue, refunds, usage). We mirror that ordering
+    via ``side_effect``.
+    """
+    conn = _make_conn()
+    fetchrow_returns = iter([
+        {
+            "revenue": revenue,
+            "promo_bonus": promo_bonus,
+            "paying_users": paying_users,
+        },
+        {"refunded": refunded},
+        {
+            "gross_charge": gross_charge,
+            "calls": calls,
+            "active_users": active_users,
+        },
+    ])
+    conn.fetchrow = AsyncMock(side_effect=lambda *a, **k: next(fetchrow_returns))
+    conn.fetch = AsyncMock(return_value=per_model_rows or [])
+    return conn
+
+
+async def test_get_monetization_summary_returns_full_shape():
+    """Pin every key the dashboard template reads. A future
+    refactor can't silently drop a key without breaking this.
+    """
+    conn = _make_monetization_conn(
+        revenue=120.0,
+        promo_bonus=8.0,
+        paying_users=5,
+        refunded=3.0,
+        gross_charge=60.0,
+        calls=200,
+        active_users=12,
+        per_model_rows=[
+            {"model": "gpt-4o", "calls": 150, "gross_charge": 50.0},
+            {"model": "claude-3", "calls": 50, "gross_charge": 10.0},
+        ],
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.get_monetization_summary(window_days=30)
+
+    assert set(result.keys()) == {
+        "window_days", "markup",
+        "revenue_usd", "refunded_usd", "promo_bonus_paid_usd",
+        "gross_charge_usd", "openrouter_cost_usd",
+        "gross_profit_usd", "calls_total",
+        "active_users", "paying_users",
+        "per_model",
+    }
+    assert result["window_days"] == 30
+    assert result["revenue_usd"] == 120.0
+    assert result["refunded_usd"] == 3.0
+    assert result["promo_bonus_paid_usd"] == 8.0
+    assert result["gross_charge_usd"] == 60.0
+    assert result["calls_total"] == 200
+    assert result["active_users"] == 12
+    assert result["paying_users"] == 5
+    # markup is the live env value — pricing.get_markup() defaults to 1.5.
+    assert result["markup"] >= 1.0
+    # gross_profit = revenue - refunded - openrouter_cost
+    assert result["openrouter_cost_usd"] == pytest.approx(
+        result["gross_charge_usd"] / result["markup"]
+    )
+    assert result["gross_profit_usd"] == pytest.approx(
+        result["revenue_usd"] - result["refunded_usd"] - result["openrouter_cost_usd"]
+    )
+    # per_model rows preserve order from the SQL (already sorted DESC by gross_charge).
+    assert [r["model"] for r in result["per_model"]] == ["gpt-4o", "claude-3"]
+    # Each row carries calls + gross_charge + or_cost + profit.
+    for row in result["per_model"]:
+        assert set(row.keys()) == {
+            "model", "calls", "gross_charge_usd",
+            "openrouter_cost_usd", "profit_usd",
+        }
+        assert row["openrouter_cost_usd"] == pytest.approx(
+            row["gross_charge_usd"] / result["markup"]
+        )
+        assert row["profit_usd"] == pytest.approx(
+            row["gross_charge_usd"] - row["openrouter_cost_usd"]
+        )
+
+
+async def test_get_monetization_summary_revenue_excludes_internal_gateways():
+    """Revenue must filter out ``admin`` (manual credit) and ``gift``
+    (gift-code redemption) just like ``get_system_metrics`` does —
+    those are free-money-from-nothing and would inflate the P&L
+    figure if counted as revenue.
+    """
+    conn = _make_monetization_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_monetization_summary()
+
+    # Find the revenue query among the three fetchrow calls.
+    fetchrow_calls = conn.fetchrow.await_args_list
+    revenue_sql = next(
+        (call.args[0] for call in fetchrow_calls
+         if "amount_usd_credited" in call.args[0] and "SUCCESS" in call.args[0]),
+        None,
+    )
+    assert revenue_sql is not None, "revenue query not found among fetchrows"
+    # The exclusion clause must list both admin and gift.
+    assert "gateway NOT IN ('admin', 'gift')" in revenue_sql
+    # And only count credited rows, never PENDING/FAILED.
+    assert "status IN ('SUCCESS', 'PARTIAL')" in revenue_sql
+
+
+async def test_get_monetization_summary_refunds_filter_by_refunded_at_not_completed_at():
+    """Windowed refunds must use ``refunded_at`` — that's when the
+    money actually left the wallet. ``completed_at`` is when the
+    original credit landed and is already in the past for any
+    refund-eligible row, so filtering refunds by ``completed_at``
+    would silently undercount refunds in short windows (a credit
+    from 30d ago refunded yesterday wouldn't show up in the 7-day
+    refund tile).
+    """
+    conn = _make_monetization_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_monetization_summary(window_days=7)
+
+    fetchrow_calls = conn.fetchrow.await_args_list
+    refunded_sql = next(
+        (call.args[0] for call in fetchrow_calls
+         if "REFUNDED" in call.args[0]),
+        None,
+    )
+    assert refunded_sql is not None, "refunded query not found among fetchrows"
+    assert "refunded_at" in refunded_sql
+    # Defensive: the windowed clause does NOT use completed_at on
+    # the refund query (would be wrong — see docstring).
+    assert "completed_at >= NOW()" not in refunded_sql
+
+
+async def test_get_monetization_summary_lifetime_window_drops_time_filters():
+    """``window_days=None`` is "lifetime". The SQL must NOT carry
+    any ``NOW() - INTERVAL`` clause — otherwise the operator's
+    "lifetime" view would silently truncate to whatever interval
+    leaked through.
+    """
+    conn = _make_monetization_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_monetization_summary(window_days=None)
+
+    all_sqls = [
+        call.args[0] for call in conn.fetchrow.await_args_list
+    ] + [
+        call.args[0] for call in conn.fetch.await_args_list
+    ]
+    for sql in all_sqls:
+        assert "INTERVAL" not in sql, (
+            f"lifetime window leaked an INTERVAL filter into a query "
+            f"({sql!r}) — every horizon-bounded clause must be gated by "
+            f"window_days is not None"
+        )
+
+
+async def test_get_monetization_summary_windowed_passes_int_to_sql():
+    """``window_days=7`` must be passed as the ``$1`` parameter, NOT
+    interpolated into the SQL string. Otherwise an attacker /
+    misconfigured admin URL with ``?window=7;DROP TABLE users``
+    could turn the page into a SQL-injection vector.
+    """
+    conn = _make_monetization_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_monetization_summary(window_days=7)
+
+    # Every SQL call carrying an INTERVAL clause must also have an
+    # int positional bind for the day count.
+    for call in conn.fetchrow.await_args_list:
+        sql = call.args[0]
+        if "INTERVAL '1 day'" in sql:
+            # The first positional arg after the SQL is the int.
+            assert call.args[1] == 7
+            # The SQL must not contain "7" inline (would be string
+            # interpolation; the test pin guards against that).
+            assert "INTERVAL '7" not in sql
+
+
+async def test_get_monetization_summary_clamps_invalid_window():
+    """``window_days=0`` and negative values are nonsense — they'd
+    produce an empty window. Must raise rather than silently
+    returning zero data; otherwise an admin pasting ``?window=0``
+    would see "no revenue ever" and panic.
+    """
+    conn = _make_monetization_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    with pytest.raises(ValueError):
+        await db.get_monetization_summary(window_days=0)
+    with pytest.raises(ValueError):
+        await db.get_monetization_summary(window_days=-30)
+
+
+async def test_get_monetization_summary_clamps_top_models_limit():
+    """``top_models_limit`` is clamped to ``[1, MAX]`` so a pasted
+    ``?limit=99999`` URL can't load 100k rows into a memory dict.
+    """
+    conn = _make_monetization_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_monetization_summary(top_models_limit=99999)
+    # The bind for LIMIT is the LAST positional arg of the per-model
+    # fetch; assert it was clamped.
+    fetch_call = conn.fetch.await_args
+    limit_arg = fetch_call.args[-1]
+    assert limit_arg == database_module.Database.MONETIZATION_TOP_MODELS_LIMIT_MAX
+
+    # And clamped up from zero / negative.
+    conn.fetchrow = AsyncMock(side_effect=lambda *a, **k: {
+        "revenue": 0.0, "promo_bonus": 0.0, "paying_users": 0,
+        "refunded": 0.0,
+        "gross_charge": 0.0, "calls": 0, "active_users": 0,
+    })
+    conn.fetch = AsyncMock(return_value=[])
+    await db.get_monetization_summary(top_models_limit=-5)
+    fetch_call = conn.fetch.await_args
+    assert fetch_call.args[-1] == 1
+
+
+async def test_get_monetization_summary_zero_revenue_does_not_crash():
+    """Zero-revenue / zero-charge windows must produce a valid dict
+    (never NaN or division-by-zero in the OpenRouter-cost or
+    margin computation). The web handler computes margin% so the
+    DB layer just needs to not blow up on zeros.
+    """
+    conn = _make_monetization_conn(
+        revenue=0.0, refunded=0.0, gross_charge=0.0,
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.get_monetization_summary(window_days=30)
+
+    assert result["revenue_usd"] == 0.0
+    assert result["openrouter_cost_usd"] == 0.0
+    assert result["gross_profit_usd"] == 0.0
+    assert result["per_model"] == []
+
+
+async def test_get_monetization_summary_falls_back_when_markup_is_invalid(
+    monkeypatch,
+):
+    """Defense-in-depth: ``pricing.get_markup`` already clamps to
+    ``[1.0, +inf]`` and rejects NaN, but a future regression
+    returning ``0`` / ``-1`` / ``nan`` would otherwise produce
+    ``inf`` / ``-X`` / ``nan`` in the OpenRouter-cost column.
+    Method must defensively re-floor to 1.5 in that case.
+    """
+    import pricing
+    monkeypatch.setattr(pricing, "get_markup", lambda: 0.0)
+
+    conn = _make_monetization_conn(gross_charge=10.0)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.get_monetization_summary()
+
+    # markup floored to 1.5 → openrouter_cost = 10 / 1.5
+    assert result["markup"] == 1.5
+    assert result["openrouter_cost_usd"] == pytest.approx(10.0 / 1.5)
+
+
+async def test_get_monetization_summary_per_model_sort_is_deterministic():
+    """The per-model query has a tie-breaker on ``model_used`` so
+    two models with equal gross_charge return in stable order.
+    Without the tie-breaker, Postgres returns rows in
+    physical-storage order — the operator would see the per-model
+    rows flicker between page reloads even though the underlying
+    data didn't change.
+    """
+    conn = _make_monetization_conn()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_monetization_summary()
+
+    fetch_sql = conn.fetch.await_args.args[0]
+    # ORDER BY must include both gross_charge DESC and model_used ASC.
+    assert "ORDER BY gross_charge DESC, model_used ASC" in fetch_sql
+
+
+async def test_transactions_gateway_values_includes_zarinpal():
+    """Stage-15-Step-E #9 bundled bug fix: PR #126 added the Zarinpal
+    gateway but did not extend ``TRANSACTIONS_GATEWAY_VALUES``.
+    Filtering ``/admin/transactions?gateway=zarinpal`` raised
+    ``ValueError: unknown gateway filter`` even though the ledger
+    was now persisting rows with that gateway.
+    """
+    assert "zarinpal" in database_module.Database.TRANSACTIONS_GATEWAY_VALUES
+    # The pre-existing gateways must still be in the set — pin them
+    # so a future "rename / dedupe" refactor can't remove them by
+    # accident.
+    for legacy in ("nowpayments", "tetrapay", "admin", "gift"):
+        assert legacy in database_module.Database.TRANSACTIONS_GATEWAY_VALUES

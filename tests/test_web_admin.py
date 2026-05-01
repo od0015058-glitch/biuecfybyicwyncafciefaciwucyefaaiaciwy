@@ -1358,13 +1358,19 @@ async def test_dashboard_renders_ipn_health_tile_with_drop_counts(
     """Stage-15-Step-D #5: the new IPN-health panel surfaces every
     drop-counter reason with its current count.
 
-    The counters live in :mod:`payments` and :mod:`tetrapay` and
-    are read each render via :func:`web_admin._collect_ipn_health`.
-    Patching the accessors gives us deterministic values for the
-    template assertions.
+    The counters live in :mod:`payments`, :mod:`tetrapay`, and
+    :mod:`zarinpal` and are read each render via
+    :func:`web_admin._collect_ipn_health`. Patching the accessors
+    gives us deterministic values for the template assertions.
+
+    Stage-15-Step-E #9: extended to also assert the new Zarinpal
+    sub-tile (added in this PR as a bundled bug fix — Step-E #8
+    shipped the gateway but never wired its drop counters into
+    the operator-visible dashboard).
     """
     import payments
     import tetrapay
+    import zarinpal
     monkeypatch.setattr(
         payments,
         "get_ipn_drop_counters",
@@ -1384,6 +1390,17 @@ async def test_dashboard_renders_ipn_health_tile_with_drop_counts(
             "non_success_callback": 5,
             "unknown_invoice": 2,
             "verify_failed": 0,
+        },
+    )
+    monkeypatch.setattr(
+        zarinpal,
+        "get_zarinpal_drop_counters",
+        lambda: {
+            "missing_authority": 0,
+            "non_success_callback": 4,
+            "unknown_invoice": 1,
+            "verify_failed": 2,
+            "replay": 0,
         },
     )
 
@@ -1407,6 +1424,7 @@ async def test_dashboard_renders_ipn_health_tile_with_drop_counts(
     # Per-gateway sub-headings + the reason-code rows.
     assert "NowPayments" in body
     assert "TetraPay" in body
+    assert "Zarinpal" in body
     for reason in (
         "bad_signature", "bad_json", "missing_payment_id", "replay",
         "missing_authority", "non_success_callback",
@@ -1430,6 +1448,7 @@ async def test_dashboard_renders_ipn_health_all_zero_message(
     """
     import payments
     import tetrapay
+    import zarinpal
     monkeypatch.setattr(
         payments,
         "get_ipn_drop_counters",
@@ -1444,6 +1463,14 @@ async def test_dashboard_renders_ipn_health_all_zero_message(
             "verify_failed": 0,
         },
     )
+    monkeypatch.setattr(
+        zarinpal,
+        "get_zarinpal_drop_counters",
+        lambda: {
+            "missing_authority": 0, "non_success_callback": 0,
+            "unknown_invoice": 0, "verify_failed": 0, "replay": 0,
+        },
+    )
 
     db = _stub_db()
     client = await aiohttp_client(make_admin_app(password="letmein", db=db))
@@ -1455,6 +1482,8 @@ async def test_dashboard_renders_ipn_health_all_zero_message(
     body = await resp.text()
     assert "no NowPayments IPN drops recorded since startup" in body
     assert "no TetraPay webhook drops recorded since startup" in body
+    # Stage-15-Step-E #9: same defensive empty-state on the new tile.
+    assert "no Zarinpal callback drops recorded since startup" in body
 
 
 async def test_dashboard_ipn_health_resilient_to_accessor_failure(
@@ -1519,6 +1548,245 @@ async def test_dashboard_fallback_dicts_match_template_keys(
     # match the template's reads, otherwise jinja would 500).
     assert "Total users" in body
     assert "Active (7d)" in body
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #9: /admin/monetization (P&L view)
+# ---------------------------------------------------------------------
+
+
+def _stub_monetization_summary(
+    *,
+    window_days: int | None = 30,
+    revenue_usd: float = 100.0,
+    refunded_usd: float = 5.0,
+    promo_bonus_paid_usd: float = 2.0,
+    gross_charge_usd: float = 30.0,
+    calls_total: int = 50,
+    active_users: int = 12,
+    paying_users: int = 4,
+    per_model: list[dict] | None = None,
+    markup: float = 1.5,
+) -> dict:
+    """Build the monetization-summary shape the web handler reads.
+
+    Mirrors the keys ``Database.get_monetization_summary`` returns —
+    keeps the fixture aligned with the production contract so a
+    drift on either side surfaces as a test failure.
+    """
+    openrouter_cost = gross_charge_usd / markup
+    return {
+        "window_days": window_days,
+        "markup": markup,
+        "revenue_usd": revenue_usd,
+        "refunded_usd": refunded_usd,
+        "promo_bonus_paid_usd": promo_bonus_paid_usd,
+        "gross_charge_usd": gross_charge_usd,
+        "openrouter_cost_usd": openrouter_cost,
+        "gross_profit_usd": revenue_usd - refunded_usd - openrouter_cost,
+        "calls_total": calls_total,
+        "active_users": active_users,
+        "paying_users": paying_users,
+        "per_model": per_model
+        if per_model is not None
+        else [
+            {
+                "model": "openrouter/auto",
+                "calls": 30,
+                "gross_charge_usd": 12.0,
+                "openrouter_cost_usd": 12.0 / markup,
+                "profit_usd": 12.0 - (12.0 / markup),
+            },
+        ],
+    }
+
+
+async def test_monetization_requires_auth(aiohttp_client, make_admin_app):
+    """Stage-15-Step-E #9: an unauthenticated GET must redirect to
+    the login page just like every other ``/admin/`` route — no
+    revenue numbers leak to a logged-out attacker.
+    """
+    client = await aiohttp_client(make_admin_app())
+    resp = await client.get("/admin/monetization", allow_redirects=False)
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+
+
+async def test_monetization_renders_default_30d_window(
+    aiohttp_client, make_admin_app
+):
+    """No ``?window=`` param → defaults to 30d. The page must
+    render the headline tiles, the per-model table, and the
+    window-selector nav.
+    """
+    db = _stub_db()
+    db.get_monetization_summary = AsyncMock(
+        return_value=_stub_monetization_summary()
+    )
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+
+    # Page structure
+    assert "Monetization" in body
+    assert "Window" in body
+    # All five window tabs render in the selector.
+    for label in ("Last 24h", "Last 7 days", "Last 30 days",
+                  "Last 90 days", "Lifetime"):
+        assert label in body, f"missing window tab {label!r}"
+    # Headline tiles
+    assert "Revenue" in body
+    assert "Refunds" in body
+    assert "Gross AI charge" in body
+    assert "Est. OpenRouter cost" in body
+    assert "Gross profit" in body
+    assert "Margin" in body
+    # Per-model table renders the row for our stub model.
+    assert "openrouter/auto" in body
+    # ``get_monetization_summary`` was called with the default window (30).
+    db.get_monetization_summary.assert_awaited_once()
+    call_kwargs = db.get_monetization_summary.await_args.kwargs
+    assert call_kwargs.get("window_days") == 30
+
+
+async def test_monetization_window_param_dispatches_to_right_days(
+    aiohttp_client, make_admin_app
+):
+    """The ``?window=7d`` query param must translate to
+    ``window_days=7`` on the DB call. Same for the other slugs;
+    ``all`` translates to ``None`` (lifetime).
+    """
+    cases = [
+        ("24h", 1),
+        ("7d", 7),
+        ("30d", 30),
+        ("90d", 90),
+        ("all", None),
+    ]
+    for slug, expected_days in cases:
+        db = _stub_db()
+        db.get_monetization_summary = AsyncMock(
+            return_value=_stub_monetization_summary(window_days=expected_days)
+        )
+        client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+        await client.post(
+            "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+        )
+        resp = await client.get(f"/admin/monetization?window={slug}")
+        assert resp.status == 200, await resp.text()
+        call_kwargs = db.get_monetization_summary.await_args.kwargs
+        assert call_kwargs.get("window_days") == expected_days, (
+            f"slug={slug!r} expected window_days={expected_days!r} "
+            f"but DB was called with {call_kwargs.get('window_days')!r}"
+        )
+
+
+async def test_monetization_unknown_window_falls_back_to_default(
+    aiohttp_client, make_admin_app
+):
+    """An admin pasting a stale URL with ``?window=12month`` must
+    not 500 — the unknown slug falls back to the default 30d.
+    """
+    db = _stub_db()
+    db.get_monetization_summary = AsyncMock(
+        return_value=_stub_monetization_summary()
+    )
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization?window=12month")
+    assert resp.status == 200
+    call_kwargs = db.get_monetization_summary.await_args.kwargs
+    # Falls back to the 30d default.
+    assert call_kwargs.get("window_days") == 30
+
+
+async def test_monetization_db_error_renders_zero_shape(
+    aiohttp_client, make_admin_app
+):
+    """If ``get_monetization_summary`` raises, the page renders the
+    empty shape with the error banner — never 500s. Mirrors the
+    main dashboard's defensive fallback.
+    """
+    db = _stub_db()
+    db.get_monetization_summary = AsyncMock(
+        side_effect=RuntimeError("kaboom")
+    )
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert "Database query failed" in body
+    # Headline tile labels still render (proves the empty-shape's
+    # keys match the template's reads).
+    assert "Revenue" in body
+    assert "Gross profit" in body
+
+
+async def test_monetization_zero_revenue_renders_em_dash_for_margin(
+    aiohttp_client, make_admin_app
+):
+    """Zero-revenue windows must render an em-dash placeholder for
+    margin% — never ``inf`` / ``nan`` / ``0%``. ``0%`` would be
+    misleading because there's no signal yet.
+    """
+    db = _stub_db()
+    db.get_monetization_summary = AsyncMock(
+        return_value=_stub_monetization_summary(
+            revenue_usd=0.0,
+            refunded_usd=0.0,
+            gross_charge_usd=0.0,
+            per_model=[],
+        )
+    )
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    # The em-dash signals "no signal yet".
+    assert "—" in body
+    # Defensive: never render a NaN / Inf number in the page body.
+    # Use word-boundary regex so prose like "infra" / "Infinity in JS"
+    # doesn't false-positive — we want to catch ``$nan`` / ``$inf`` /
+    # ``-inf%`` tokens that come from a poisoned float, not the
+    # English word "infra" used in the explanation footer.
+    import re
+    for pattern in (r"\$nan\b", r"\$inf\b", r"-inf%", r"\bnan%",
+                    r"\binf%", r"\bNaN\b", r"\bInfinity\b"):
+        assert not re.search(pattern, body), (
+            f"zero-revenue window leaked {pattern!r} into the rendered "
+            f"page — defensive guard regressed"
+        )
+
+
+async def test_monetization_link_in_sidebar_when_authed(
+    aiohttp_client, make_admin_app
+):
+    """The sidebar nav must surface the new monetization link so
+    operators can discover it. Otherwise the page is technically
+    reachable but invisible.
+    """
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "/admin/monetization" in body
+    assert "Monetization" in body
 
 
 # ---------------------------------------------------------------------

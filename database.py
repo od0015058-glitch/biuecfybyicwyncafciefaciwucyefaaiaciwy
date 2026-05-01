@@ -709,7 +709,20 @@ class Database:
     # :meth:`admin_adjust_balance` (which writes its own ledger row)
     # so the refund flow refuses them — there's no underlying gateway
     # transaction to mark refunded.
-    REFUNDABLE_GATEWAYS: frozenset[str] = frozenset({"nowpayments", "tetrapay"})
+    # Stage-15-Step-E #9 bundled bug fix: Zarinpal was added in
+    # Step-E #8 (PR #126) but the refundable-gateways set was not
+    # updated to include it. The admin refund flow at
+    # ``/admin/transactions`` therefore rejected every Zarinpal
+    # SUCCESS row with ``REFUND_REFUSAL_GATEWAY_NOT_REFUNDABLE`` —
+    # an admin processing a card-dispute refund could not reverse
+    # the payment via the panel even though Zarinpal supports
+    # refunds (the operator would have to off-ledger debit via
+    # ``admin_adjust_balance``, losing the audit-trail link to the
+    # original transaction). Same regression class as the matching
+    # ``TRANSACTIONS_GATEWAY_VALUES`` gap fixed in this same PR.
+    REFUNDABLE_GATEWAYS: frozenset[str] = frozenset(
+        {"nowpayments", "tetrapay", "zarinpal"}
+    )
 
     async def refund_transaction(
         self,
@@ -2672,8 +2685,18 @@ class Database:
     # Used to reject bogus filter values at the ``list_transactions``
     # boundary rather than at the SQL layer — keeps PostgreSQL from
     # ever seeing an arbitrary admin-supplied string.
+    # Stage-15-Step-E #9 bundled bug fix: Zarinpal was added in
+    # Step-E #8 (PR #126) but this filter-allowlist was not updated
+    # to match. ``list_transactions(gateway="zarinpal")`` therefore
+    # raised ``ValueError: unknown gateway filter`` — the admin
+    # transaction browser at ``/admin/transactions`` couldn't filter
+    # by Zarinpal even though the ledger now persists rows with that
+    # gateway. The handler caught the ValueError and rendered an
+    # error banner, so an admin investigating "show me all the
+    # Zarinpal payments" via the filter dropdown would have hit a
+    # dead end. Sister fix: ``REFUNDABLE_GATEWAYS`` above.
     TRANSACTIONS_GATEWAY_VALUES: frozenset[str] = frozenset(
-        {"nowpayments", "tetrapay", "admin", "gift"}
+        {"nowpayments", "tetrapay", "zarinpal", "admin", "gift"}
     )
     # Mirror for ``status`` column — the state-machine values the
     # codebase uses anywhere. ``PARTIAL`` is the NowPayments
@@ -3422,6 +3445,257 @@ class Database:
             "pending_alert_threshold_hours": int(
                 pending_alert_threshold_hours
             ),
+        }
+
+    # ------------------------------------------------------------------
+    # Stage-15-Step-E #9: monetization dashboard
+    # ------------------------------------------------------------------
+    # Caps on the per-model breakdown. The dashboard renders a single
+    # table; small enough to read at a glance, large enough that a
+    # diverse model mix doesn't truncate the long tail.
+    MONETIZATION_TOP_MODELS_LIMIT_DEFAULT: int = 10
+    MONETIZATION_TOP_MODELS_LIMIT_MAX: int = 50
+    # ``window_days`` upper bound. Lifetime is requested by passing
+    # ``None`` — this cap only applies to the bounded-window code
+    # path so a very large value can't degrade into a full table scan
+    # while looking like it's bounded.
+    MONETIZATION_WINDOW_DAYS_MAX: int = 3650  # ~10 years
+
+    async def get_monetization_summary(
+        self,
+        *,
+        window_days: int | None = None,
+        top_models_limit: int | None = None,
+    ) -> dict:
+        """P&L-style snapshot for the admin monetization dashboard.
+
+        Stage-15-Step-E #9 first slice: ``HANDOFF.md`` table row
+        9 — "admin page showing revenue vs. OpenRouter cost,
+        profit margin per model, break-even analysis." Every
+        scalar comes from the existing ``transactions`` and
+        ``usage_logs`` columns; this method just slices them in a
+        single round-trip with a windowed filter so the operator
+        can see "last 24h" / "last 7d" / "last 30d" / lifetime
+        without four separate manual queries.
+
+        ``window_days=None`` is lifetime (no time filter).
+        ``window_days=N`` filters BOTH the transactions side
+        (``completed_at`` / ``refunded_at``) and the usage_logs
+        side (``created_at``) so the two halves of the P&L cover
+        the same horizon — an asymmetric window would silently
+        report 30-day revenue against lifetime cost (or vice
+        versa) and make the gross-profit number meaningless.
+
+        Returns a dict shaped like::
+
+            {
+              "window_days": int | None,
+              "markup": float,
+              "revenue_usd": float,             # SUCCESS+PARTIAL gateway top-ups, sum amount_usd_credited
+              "refunded_usd": float,            # REFUNDED gateway rows, sum amount_usd_credited
+              "promo_bonus_paid_usd": float,    # SUCCESS+PARTIAL gateway top-ups, sum promo_bonus_usd
+              "gross_charge_usd": float,        # sum cost_deducted_usd over usage_logs (= what users paid us for AI)
+              "openrouter_cost_usd": float,     # gross_charge_usd / markup (estimate; markup is current, not historical)
+              "gross_profit_usd": float,        # revenue_usd - refunded_usd - openrouter_cost_usd
+              "calls_total": int,
+              "active_users": int,              # distinct telegram_id in usage_logs over window
+              "paying_users": int,              # distinct telegram_id with SUCCESS+PARTIAL in window
+              "per_model": [
+                {
+                  "model": str,
+                  "calls": int,
+                  "gross_charge_usd": float,
+                  "openrouter_cost_usd": float,
+                  "profit_usd": float,
+                },
+                ...  # up to top_models_limit rows, sorted by gross_charge_usd DESC
+              ],
+            }
+
+        ``markup`` is :func:`pricing.get_markup`'s *current* value.
+        OpenRouter cost is therefore an **estimate**: if the
+        operator changed ``COST_MARKUP`` mid-window, historical
+        rows priced under the old markup are reported as if they
+        were priced under the new one. The schema currently does
+        not persist a per-row OpenRouter cost (a deliberate
+        simplification — the user-charged figure is the
+        authoritative ledger value for accounting), so a
+        backfill column + a 30-day reconciliation pass is the
+        next slice's work. Documented in ``HANDOFF.md``
+        "Stage-15-Step-E #9 — what's shipped vs. what remains".
+
+        Refunds: a SUCCESS row that gets refunded has its status
+        flipped to REFUNDED in the same row (not a separate
+        ledger entry), so summing ``amount_usd_credited`` where
+        ``status='REFUNDED'`` gives the gross-refund figure for
+        the window. The matching wallet-debit happens in
+        :meth:`refund_transaction` and the user's balance is
+        already adjusted; this method reports the gross figure
+        for the operator's P&L view.
+        """
+        if window_days is not None:
+            window_days = int(window_days)
+            if window_days <= 0:
+                raise ValueError(
+                    f"window_days must be a positive int or None; "
+                    f"got {window_days!r}"
+                )
+            if window_days > self.MONETIZATION_WINDOW_DAYS_MAX:
+                window_days = self.MONETIZATION_WINDOW_DAYS_MAX
+        if top_models_limit is None:
+            top_models_limit = self.MONETIZATION_TOP_MODELS_LIMIT_DEFAULT
+        top_models_limit = max(
+            1,
+            min(int(top_models_limit), self.MONETIZATION_TOP_MODELS_LIMIT_MAX),
+        )
+
+        # Read the markup ONCE, before the queries, so every
+        # downstream OpenRouter-cost computation in this snapshot
+        # uses the same divisor. A racing env reload (the helper
+        # re-reads on each call) between rows would otherwise
+        # leave the per-model rows inconsistent with the totals.
+        from pricing import get_markup
+        markup = get_markup()
+        # Defensive: ``get_markup`` already clamps to ``[1.0, +inf]``
+        # and rejects non-finite values, so this is belt-and-braces.
+        # Division by markup happens below; a markup of 0 / NaN /
+        # negative would produce a meaningless OpenRouter-cost
+        # column. Re-floor to the ``pricing`` default so the
+        # dashboard never renders ``$nan`` or division-by-zero.
+        if not _is_finite_amount(markup) or markup <= 0:
+            log.warning(
+                "get_monetization_summary: get_markup() returned "
+                "%r; falling back to 1.5 for the OpenRouter-cost "
+                "computation. Investigate pricing.get_markup.",
+                markup,
+            )
+            markup = 1.5
+
+        # Filter clauses — built once and re-used so the
+        # transactions side and the usage_logs side line up on
+        # the same horizon. ``completed_at`` / ``refunded_at`` are
+        # the natural "money landed" timestamps for the
+        # transactions table; ``created_at`` is the natural
+        # timestamp for usage_logs (which doesn't have a
+        # ``completed_at``).
+        if window_days is None:
+            tx_completed_filter = ""
+            tx_refunded_filter = ""
+            usage_filter = ""
+            window_args: tuple = ()
+        else:
+            tx_completed_filter = (
+                "AND completed_at >= NOW() - ($1::int * INTERVAL '1 day')"
+            )
+            tx_refunded_filter = (
+                "AND refunded_at >= NOW() - ($1::int * INTERVAL '1 day')"
+            )
+            usage_filter = (
+                "AND created_at >= NOW() - ($1::int * INTERVAL '1 day')"
+            )
+            window_args = (window_days,)
+
+        async with self.pool.acquire() as connection:
+            # Revenue / promo-bonus-paid / paying-users come from
+            # the same SUCCESS+PARTIAL filter — single
+            # ``fetchrow`` so they're snapshot-consistent.
+            revenue_row = await connection.fetchrow(
+                f"""
+                SELECT
+                    COALESCE(SUM(amount_usd_credited), 0) AS revenue,
+                    COALESCE(SUM(promo_bonus_usd), 0) AS promo_bonus,
+                    COUNT(DISTINCT telegram_id) AS paying_users
+                FROM transactions
+                WHERE status IN ('SUCCESS', 'PARTIAL')
+                  AND gateway NOT IN ('admin', 'gift')
+                  {tx_completed_filter}
+                """,
+                *window_args,
+            )
+            refunded_row = await connection.fetchrow(
+                f"""
+                SELECT COALESCE(SUM(amount_usd_credited), 0) AS refunded
+                FROM transactions
+                WHERE status = 'REFUNDED'
+                  AND gateway NOT IN ('admin', 'gift')
+                  {tx_refunded_filter}
+                """,
+                *window_args,
+            )
+            usage_row = await connection.fetchrow(
+                f"""
+                SELECT
+                    COALESCE(SUM(cost_deducted_usd), 0) AS gross_charge,
+                    COUNT(*) AS calls,
+                    COUNT(DISTINCT telegram_id) AS active_users
+                FROM usage_logs
+                WHERE TRUE
+                  {usage_filter}
+                """,
+                *window_args,
+            )
+            # Per-model breakdown. Sort by gross_charge_usd DESC
+            # so the highest-revenue models bubble to the top —
+            # operators care about "what's making us money" more
+            # than "what's getting called". Tie-break on
+            # ``model_used`` for deterministic ordering across
+            # page reloads (otherwise Postgres returns rows in
+            # physical-storage order on a tie).
+            per_model_rows = await connection.fetch(
+                f"""
+                SELECT
+                    model_used AS model,
+                    COUNT(*)::int AS calls,
+                    COALESCE(SUM(cost_deducted_usd), 0) AS gross_charge
+                FROM usage_logs
+                WHERE TRUE
+                  {usage_filter}
+                GROUP BY model_used
+                ORDER BY gross_charge DESC, model_used ASC
+                LIMIT ${len(window_args) + 1}
+                """,
+                *window_args,
+                top_models_limit,
+            )
+
+        revenue_usd = float(revenue_row["revenue"] or 0)
+        promo_bonus_paid_usd = float(revenue_row["promo_bonus"] or 0)
+        paying_users = int(revenue_row["paying_users"] or 0)
+        refunded_usd = float(refunded_row["refunded"] or 0)
+        gross_charge_usd = float(usage_row["gross_charge"] or 0)
+        calls_total = int(usage_row["calls"] or 0)
+        active_users = int(usage_row["active_users"] or 0)
+
+        openrouter_cost_usd = gross_charge_usd / markup
+        gross_profit_usd = revenue_usd - refunded_usd - openrouter_cost_usd
+
+        per_model: list[dict] = []
+        for row in per_model_rows:
+            row_gross = float(row["gross_charge"] or 0)
+            row_or_cost = row_gross / markup
+            per_model.append(
+                {
+                    "model": row["model"],
+                    "calls": int(row["calls"]),
+                    "gross_charge_usd": row_gross,
+                    "openrouter_cost_usd": row_or_cost,
+                    "profit_usd": row_gross - row_or_cost,
+                }
+            )
+
+        return {
+            "window_days": window_days,
+            "markup": markup,
+            "revenue_usd": revenue_usd,
+            "refunded_usd": refunded_usd,
+            "promo_bonus_paid_usd": promo_bonus_paid_usd,
+            "gross_charge_usd": gross_charge_usd,
+            "openrouter_cost_usd": openrouter_cost_usd,
+            "gross_profit_usd": gross_profit_usd,
+            "calls_total": calls_total,
+            "active_users": active_users,
+            "paying_users": paying_users,
+            "per_model": per_model,
         }
 
     # ---- bot_strings (Stage-9-Step-1.6) ---------------------------

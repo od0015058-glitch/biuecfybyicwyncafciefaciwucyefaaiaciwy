@@ -155,13 +155,28 @@ NowPayments crypto invoices.
     for: 5m
   ```
 - **IPN-health dashboard tile** — `/admin/` shows a per-process
-  drop-counter table for both NowPayments and TetraPay so an
-  operator can spot a misconfigured webhook (signature mismatch,
-  unknown invoice, transient verify failures) at a glance without
-  shelling into the Prometheus scrape. Counters reset on every
-  bot restart; for long-running history, pull `/metrics` into
-  Prometheus. Gateway tiles are independently fault-isolated — a
-  future regression in one accessor cannot blank the other half.
+  drop-counter table for NowPayments, TetraPay, and **Zarinpal**
+  (Stage-15-Step-E #9 wired Zarinpal up alongside the new
+  monetization page) so an operator can spot a misconfigured
+  webhook / callback (signature mismatch, missing authority,
+  unknown invoice, transient verify failures) at a glance
+  without shelling into the Prometheus scrape. Counters reset
+  on every bot restart; for long-running history, pull
+  `/metrics` into Prometheus. Gateway tiles are independently
+  fault-isolated — a future regression in one accessor cannot
+  blank the others.
+- **Monetization dashboard** (Stage-15-Step-E #9) — new admin
+  page at `${WEBHOOK_BASE_URL}/admin/monetization` showing a
+  windowed P&L view: revenue (gateway top-ups, internal admin /
+  gift credits excluded), refunds, gross AI charge, estimated
+  OpenRouter cost (gross charge ÷ `COST_MARKUP`), gross profit,
+  margin %, plus a per-model breakdown table with profit per
+  model. Window selector along the top toggles between last 24h
+  / 7 days / 30 days / 90 days / lifetime — both halves of the
+  P&L (transactions side and `usage_logs` side) clip to the same
+  horizon so the gross-profit number is apples-to-apples.
+  Revenue uses `completed_at`, refunds use `refunded_at`, AI
+  usage uses `created_at`.
 - **Conversation history export** — the memory screen now has a
   "📥 Export conversation" button that ships the user's full
   persisted buffer back as a `.txt` document (role labels +

@@ -60,6 +60,7 @@ import hashlib
 import hmac
 import io
 import logging
+import math
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -525,16 +526,32 @@ async def logout(request: web.Request) -> web.StreamResponse:
 def _collect_ipn_health() -> dict:
     """Snapshot the per-process IPN drop counters for the dashboard tile.
 
-    Stage-15-Step-D #5. ``payments.get_ipn_drop_counters()`` and
-    ``tetrapay.get_tetrapay_drop_counters()`` are both
-    process-local and reset to zero on every restart, so the tile
-    is labelled "since last restart" in the template. Each gateway
-    is collected behind its own ``try`` so a future regression in
-    one accessor (or a missing-import edge case in tests) cannot
-    blank out the other half of the panel.
+    Stage-15-Step-D #5. ``payments.get_ipn_drop_counters()``,
+    ``tetrapay.get_tetrapay_drop_counters()``, and
+    ``zarinpal.get_zarinpal_drop_counters()`` are all process-local
+    and reset to zero on every restart, so the tile is labelled
+    "since last restart" in the template. Each gateway is
+    collected behind its own ``try`` so a future regression in one
+    accessor (or a missing-import edge case in tests) cannot blank
+    out the other gateways' counts.
+
+    Stage-15-Step-E #9 bundled bug fix: Zarinpal was added in
+    Step-E #8 (PR #126) and emits its own per-process drop
+    counters via ``get_zarinpal_drop_counters`` — but this
+    snapshot helper was never extended to include them, so an
+    operator looking at the IPN-health tile saw only NowPayments
+    + TetraPay drops while Zarinpal drops (missing-authority,
+    non-success-callback, unknown-invoice, verify-failed, replay)
+    accumulated invisibly. A genuine surge of forged-callback
+    traffic against ``/zarinpal-callback``, or a wave of
+    browser-close races leaving authorities pointing at unknown
+    invoices, would have been silent in the dashboard until an
+    admin grepped the logs. Mirrors the existing TetraPay tile
+    structure.
     """
     nowpayments: dict[str, int]
     tetrapay: dict[str, int]
+    zarinpal_drops: dict[str, int]
     try:
         from payments import get_ipn_drop_counters
 
@@ -549,11 +566,20 @@ def _collect_ipn_health() -> dict:
     except Exception:
         log.exception("dashboard: get_tetrapay_drop_counters failed")
         tetrapay = {}
+    try:
+        from zarinpal import get_zarinpal_drop_counters
+
+        zarinpal_drops = dict(get_zarinpal_drop_counters())
+    except Exception:
+        log.exception("dashboard: get_zarinpal_drop_counters failed")
+        zarinpal_drops = {}
     return {
         "nowpayments": nowpayments,
         "tetrapay": tetrapay,
+        "zarinpal": zarinpal_drops,
         "nowpayments_total": sum(nowpayments.values()),
         "tetrapay_total": sum(tetrapay.values()),
+        "zarinpal_total": sum(zarinpal_drops.values()),
     }
 
 
@@ -611,6 +637,134 @@ async def dashboard(request: web.Request) -> web.StreamResponse:
             "active_page": "dashboard",
         },
     )
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #9: monetization dashboard
+# ---------------------------------------------------------------------
+# The four windows the page offers via the ``window`` query param.
+# Lifetime is the explicit ``"all"`` value; everything else is a
+# fixed positive integer of days mirrored in the SQL filter.
+MONETIZATION_WINDOW_OPTIONS: tuple[tuple[str, str, int | None], ...] = (
+    # (slug, human label, window_days passed to get_monetization_summary)
+    ("24h", "Last 24h", 1),
+    ("7d", "Last 7 days", 7),
+    ("30d", "Last 30 days", 30),
+    ("90d", "Last 90 days", 90),
+    ("all", "Lifetime", None),
+)
+# The default window mirrors the dashboard's existing top-models tile
+# (30-day) so the new page reads the same horizon at first glance.
+MONETIZATION_DEFAULT_WINDOW_SLUG: str = "30d"
+
+
+def _resolve_monetization_window(slug: str | None) -> tuple[str, int | None]:
+    """Map the ``?window=`` query param to ``(slug, window_days)``.
+
+    Unknown / missing values fall back to the default; we never
+    raise — an admin pasting a stale URL should land on the
+    default page rather than seeing an error.
+    """
+    if slug:
+        for s, _label, days in MONETIZATION_WINDOW_OPTIONS:
+            if s == slug:
+                return s, days
+    for s, _label, days in MONETIZATION_WINDOW_OPTIONS:
+        if s == MONETIZATION_DEFAULT_WINDOW_SLUG:
+            return s, days
+    # Unreachable in practice (the default is always in the tuple),
+    # but be defensive — fall through to lifetime so the page still
+    # renders if someone trims the OPTIONS tuple in a future refactor.
+    return "all", None
+
+
+async def monetization(request: web.Request) -> web.StreamResponse:
+    """GET /admin/monetization — windowed P&L view.
+
+    Stage-15-Step-E #9 first slice. Renders the same shape as the
+    main dashboard: top-row tiles for the headline numbers
+    (revenue / refunds / OpenRouter cost / gross profit / margin
+    %), a per-model breakdown table, and the window selector
+    along the top so the operator can flip between "last 24h" /
+    "last 7 days" / etc. without reloading the page from a
+    different URL.
+
+    The DB call is wrapped in the same defensive pattern as
+    :func:`dashboard` — a missing DB or a query failure still
+    renders the empty shape so the page never 500s.
+    """
+    slug, window_days = _resolve_monetization_window(
+        request.query.get("window")
+    )
+
+    db = request.app.get(APP_KEY_DB)
+    summary: dict
+    db_error: str | None = None
+    empty_summary: dict = {
+        "window_days": window_days,
+        "markup": 1.5,
+        "revenue_usd": 0.0,
+        "refunded_usd": 0.0,
+        "promo_bonus_paid_usd": 0.0,
+        "gross_charge_usd": 0.0,
+        "openrouter_cost_usd": 0.0,
+        "gross_profit_usd": 0.0,
+        "calls_total": 0,
+        "active_users": 0,
+        "paying_users": 0,
+        "per_model": [],
+    }
+    if db is None:
+        summary = dict(empty_summary)
+        db_error = "No database wired up (development mode)."
+    else:
+        try:
+            summary = await db.get_monetization_summary(
+                window_days=window_days,
+            )
+        except Exception:
+            log.exception("monetization: get_monetization_summary failed")
+            summary = dict(empty_summary)
+            db_error = "Database query failed — see logs."
+
+    # Margin percent — gross_profit / revenue. We compute it here
+    # rather than in the DB layer so the template stays
+    # arithmetic-free, and so a zero-revenue window renders ``None``
+    # (not ``inf`` / ``nan``) which the template handles as "no
+    # signal yet" rather than a misleading "0% margin".
+    revenue = float(summary.get("revenue_usd", 0.0) or 0.0)
+    profit = float(summary.get("gross_profit_usd", 0.0) or 0.0)
+    margin_percent: float | None
+    if revenue > 0 and _is_finite_render_amount(revenue) and _is_finite_render_amount(profit):
+        margin_percent = profit / revenue * 100.0
+    else:
+        margin_percent = None
+
+    return aiohttp_jinja2.render_template(
+        "monetization.html",
+        request,
+        {
+            "summary": summary,
+            "margin_percent": margin_percent,
+            "db_error": db_error,
+            "window_options": MONETIZATION_WINDOW_OPTIONS,
+            "current_window_slug": slug,
+            "active_page": "monetization",
+        },
+    )
+
+
+def _is_finite_render_amount(value: float) -> bool:
+    """``math.isfinite`` wrapper that tolerates ``None`` cleanly.
+
+    Mirrors :func:`database._is_finite_amount` but lives here so
+    the web layer doesn't have to reach into the DB module's
+    private helpers.
+    """
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
 
 
 # ---------------------------------------------------------------------
@@ -4817,6 +4971,10 @@ def setup_admin_routes(
     app.router.add_get(
         "/admin",
         lambda r: web.HTTPFound(location="/admin/"),
+    )
+    # Stage-15-Step-E #9: monetization dashboard (P&L view).
+    app.router.add_get(
+        "/admin/monetization", _require_auth(monetization)
     )
 
     # Stage-8-Part-2: promo codes.

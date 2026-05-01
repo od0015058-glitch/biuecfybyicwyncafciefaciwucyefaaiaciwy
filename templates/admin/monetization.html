@@ -1,0 +1,133 @@
+{% extends "_layout.html" %}
+
+{% block title %}Monetization{% endblock %}
+
+{% block main %}
+<h2>Monetization</h2>
+
+{% if db_error %}
+<div class="alert alert-warn">{{ db_error }}</div>
+{% endif %}
+
+<div class="panel" style="margin-bottom: 1em;">
+  <h3 style="margin: 0 0 0.5em 0;">Window</h3>
+  <p style="margin: 0 0 0.5em 0; color: var(--text-muted); font-size: 0.85em;">
+    Time horizon for both halves of the P&amp;L. Revenue uses
+    <code>completed_at</code>, refunds use <code>refunded_at</code>,
+    AI usage uses <code>created_at</code> — all clipped to the
+    same window so the gross-profit number is apples-to-apples.
+  </p>
+  <nav class="window-tabs" style="display: flex; gap: 0.5em; flex-wrap: wrap;">
+    {% for slug, label, _days in window_options %}
+      {% if slug == current_window_slug %}
+        <strong style="padding: 0.25em 0.75em; background: var(--accent); color: var(--accent-contrast); border-radius: 3px;">{{ label }}</strong>
+      {% else %}
+        <a href="/admin/monetization?window={{ slug }}" style="padding: 0.25em 0.75em; border: 1px solid var(--text-muted); border-radius: 3px; text-decoration: none;">{{ label }}</a>
+      {% endif %}
+    {% endfor %}
+  </nav>
+</div>
+
+<div class="stat-grid">
+  <div class="stat">
+    <div class="label">Revenue</div>
+    <div class="value">${{ "{:,.2f}".format(summary.revenue_usd) }}</div>
+    <div class="stat-sub" style="display: block; font-size: 0.55em; color: var(--text-muted); margin-top: 0.25em;">
+      {{ "{:,}".format(summary.paying_users) }} paying user{{ "" if summary.paying_users == 1 else "s" }}
+    </div>
+  </div>
+  <div class="stat">
+    <div class="label">Refunds</div>
+    <div class="value">${{ "{:,.2f}".format(summary.refunded_usd) }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Promo bonus paid</div>
+    <div class="value">${{ "{:,.2f}".format(summary.promo_bonus_paid_usd) }}</div>
+    <div class="stat-sub" style="display: block; font-size: 0.55em; color: var(--text-muted); margin-top: 0.25em;">
+      already netted in revenue figure
+    </div>
+  </div>
+  <div class="stat">
+    <div class="label">Gross AI charge</div>
+    <div class="value">${{ "{:,.4f}".format(summary.gross_charge_usd) }}</div>
+    <div class="stat-sub" style="display: block; font-size: 0.55em; color: var(--text-muted); margin-top: 0.25em;">
+      {{ "{:,}".format(summary.calls_total) }} call{{ "" if summary.calls_total == 1 else "s" }} from {{ "{:,}".format(summary.active_users) }} active user{{ "" if summary.active_users == 1 else "s" }}
+    </div>
+  </div>
+  <div class="stat">
+    <div class="label">Est. OpenRouter cost</div>
+    <div class="value">${{ "{:,.4f}".format(summary.openrouter_cost_usd) }}</div>
+    <div class="stat-sub" style="display: block; font-size: 0.55em; color: var(--text-muted); margin-top: 0.25em;">
+      gross_charge ÷ markup ({{ "{:.2f}".format(summary.markup) }}×)
+    </div>
+  </div>
+  <div class="stat">
+    <div class="label">Gross profit</div>
+    <div class="value">${{ "{:,.2f}".format(summary.gross_profit_usd) }}</div>
+    <div class="stat-sub" style="display: block; font-size: 0.55em; color: var(--text-muted); margin-top: 0.25em;">
+      revenue − refunds − OpenRouter cost
+    </div>
+  </div>
+  <div class="stat">
+    <div class="label">Margin %</div>
+    <div class="value">
+      {% if margin_percent is none %}
+        <span style="color: var(--text-muted);">—</span>
+      {% else %}
+        {{ "{:.1f}".format(margin_percent) }}%
+      {% endif %}
+    </div>
+    <div class="stat-sub" style="display: block; font-size: 0.55em; color: var(--text-muted); margin-top: 0.25em;">
+      profit ÷ revenue
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <h3>Per-model profitability</h3>
+  <p style="margin: 0 0 0.75em 0; color: var(--text-muted); font-size: 0.85em;">
+    Top {{ summary.per_model|length }} models by gross AI charge in this window. The
+    OpenRouter-cost column is an estimate using the current
+    <code>COST_MARKUP</code> ({{ "{:.2f}".format(summary.markup) }}×) — historical
+    rows priced under a different markup are reported as if they were
+    priced under the current one.
+  </p>
+  {% if summary.per_model %}
+  <table>
+    <thead>
+      <tr>
+        <th>Model</th>
+        <th>Calls</th>
+        <th>Gross AI charge</th>
+        <th>Est. OpenRouter cost</th>
+        <th>Profit</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in summary.per_model %}
+      <tr>
+        <td><code>{{ row.model }}</code></td>
+        <td>{{ "{:,}".format(row.calls) }}</td>
+        <td>${{ "{:,.4f}".format(row.gross_charge_usd) }}</td>
+        <td>${{ "{:,.4f}".format(row.openrouter_cost_usd) }}</td>
+        <td>${{ "{:,.4f}".format(row.profit_usd) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p style="color: var(--text-muted);">No usage in this window.</p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <h3 style="margin-top: 0;">How this is computed</h3>
+  <ul style="margin: 0; padding-left: 1.25em; color: var(--text-muted); font-size: 0.85em; line-height: 1.5;">
+    <li><strong>Revenue</strong>: <code>SUM(amount_usd_credited)</code> over <code>transactions</code> with <code>status IN ('SUCCESS', 'PARTIAL')</code> and <code>gateway NOT IN ('admin', 'gift')</code>. Internal ledger adjustments (admin credit, gift codes) are excluded — they aren't real revenue.</li>
+    <li><strong>Refunds</strong>: same filter but <code>status = 'REFUNDED'</code>. Reversals of real top-ups via the admin panel.</li>
+    <li><strong>Gross AI charge</strong>: <code>SUM(cost_deducted_usd)</code> over <code>usage_logs</code>. Every call to OpenRouter logs its marked-up cost; this is what users actually paid for AI in the window.</li>
+    <li><strong>OpenRouter cost</strong>: gross AI charge ÷ <code>COST_MARKUP</code>. The schema doesn't persist a per-row OpenRouter cost yet (next slice), so this is the operator's best current estimate.</li>
+    <li><strong>Gross profit</strong>: revenue − refunds − OpenRouter cost. Excludes infra (server, IP, gateway fees) and tax — those aren't tracked in this DB.</li>
+  </ul>
+</div>
+{% endblock %}
