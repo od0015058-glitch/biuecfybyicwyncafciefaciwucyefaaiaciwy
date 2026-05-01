@@ -26,6 +26,10 @@ from conversation_export import (
     format_history_as_text,
 )
 from database import db
+from usage_csv_export import (
+    format_usage_logs_as_csv,
+    usage_filename_for,
+)
 from force_join import (
     FORCE_JOIN_CHECK_CALLBACK,
     force_join_check_callback,
@@ -1714,12 +1718,21 @@ def _build_stats_keyboard(
             text=f"{prefix}{t(lang, 'stats_window_btn', days=choice)}",
             callback_data=f"stats_window:{choice}",
         )
+    # Stage-15-Step-E #2 follow-up: CSV export of the user's full
+    # usage_logs. Placed above the back/home row so a user
+    # comparing the on-screen totals to "the source data" sees
+    # the export button without scrolling. Width is its own row
+    # so it visually doesn't read as just-another-window-button.
+    builder.button(
+        text=t(lang, "btn_export_usage_csv"),
+        callback_data="usage_export",
+    )
     builder.button(
         text=t(lang, "btn_back_to_wallet"), callback_data="back_to_wallet"
     )
     builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
-    # 4 window buttons on top, back+home on bottom.
-    builder.adjust(4, 2)
+    # 4 window buttons on top, export on its own row, back+home on bottom.
+    builder.adjust(4, 1, 2)
     return builder
 
 
@@ -1935,6 +1948,140 @@ async def cmd_stats(message: Message, state: FSMContext):
     )
     await message.answer(
         text, reply_markup=builder.as_markup(), parse_mode="Markdown"
+    )
+
+
+# ----------------------------------------------------------------------
+# Stage-15-Step-E #2 follow-up: usage-log CSV export.
+#
+# Mirrors the conversation-history export shape from
+# Stage-15-Step-E #1: shared private builder pulls the rows + renders
+# the CSV bytes; the callback (``usage_export``) and the slash-command
+# (``/usage_csv``) entry points both call the builder so the two
+# surfaces can never drift on filename / encoding / trim semantics.
+# ----------------------------------------------------------------------
+
+
+async def _build_usage_csv_export_document(
+    user_id: int,
+) -> tuple[BufferedInputFile, int] | None:
+    """Pull + render the user's full usage-log CSV.
+
+    Returns ``(document, kept_count)`` ready for ``answer_document``,
+    or ``None`` when the user has zero ``usage_logs`` rows. Caller
+    decides empty-case communication: the callback path raises an
+    alert toast (button stays visible so re-tapping after a chat
+    works); the slash path lands a fresh chat-bubble (the toast
+    needs a callback query attached).
+
+    ``kept_count`` is the number of data rows actually in the
+    file. :func:`usage_csv_export.format_usage_logs_as_csv` may
+    have front-trimmed the *oldest* rows to stay under
+    ``EXPORT_MAX_BYTES`` (5 MB); the caller surfaces this count
+    in the caption + toast so a heavy user whose buffer was
+    trimmed under them doesn't see "Usage report (50 000 rows)"
+    while the actual file only contained the most recent ~30 000.
+
+    Stage-15-Step-E #2 follow-up.
+    """
+    rows = await db.export_user_usage_logs(user_id)
+    if not rows:
+        return None
+    csv_bytes, kept = format_usage_logs_as_csv(rows)
+    document = BufferedInputFile(
+        csv_bytes,
+        filename=usage_filename_for(user_id),
+    )
+    return document, kept
+
+
+@router.callback_query(F.data == "usage_export")
+async def usage_export_handler(callback: CallbackQuery, state: FSMContext):
+    """Stage-15-Step-E #2 follow-up: export the user's full
+    ``usage_logs`` history as a CSV document.
+
+    Pulls every usage_log row for the current user (clamped at the
+    DB layer to ``USAGE_LOGS_EXPORT_MAX_ROWS``), renders to a CSV
+    via :func:`usage_csv_export.format_usage_logs_as_csv`, and
+    sends it back as a Telegram document. The original stats
+    screen is left in place so the user can hit "Back" or export
+    again — same shape as :func:`memory_export_handler`.
+
+    Empty-buffer case is communicated via toast — the button
+    stays visible so it's discoverable, but tapping it when
+    there's nothing to export yields a clear "no usage" message
+    rather than an empty file.
+
+    No rate-limit on the callback path — Telegram's own callback-
+    debouncing provides a soft cap, mirroring
+    :func:`memory_export_handler`. The slash-command alias
+    (:func:`cmd_usage_csv`) does gate on ``consume_chat_token``
+    because a typed command can be fired repeatedly.
+    """
+    await state.clear()
+    user_id = callback.from_user.id
+    lang = await _get_user_language(user_id)
+    result = await _build_usage_csv_export_document(user_id)
+    if result is None:
+        await callback.answer(
+            t(lang, "usage_csv_export_empty"), show_alert=True
+        )
+        return
+    document, kept = result
+    await callback.message.answer_document(
+        document,
+        caption=t(lang, "usage_csv_export_caption", count=kept),
+    )
+    await callback.answer(t(lang, "usage_csv_export_done", count=kept))
+
+
+@router.message(Command("usage_csv"))
+async def cmd_usage_csv(message: Message, state: FSMContext):
+    """Slash-command alias for the stats-screen "Download CSV"
+    button.
+
+    Re-uses :func:`_build_usage_csv_export_document` so the
+    slash surface and the menu-button surface ship identical
+    files — same filename pattern, same trim semantics, same
+    caption count. Same shape as :func:`cmd_history`.
+
+    Rate-limited via :func:`consume_chat_token`. The callback
+    path is fine without rate-limiting (Telegram itself debounces
+    callback queries), but a typed slash command can be fired
+    repeatedly to thrash :meth:`Database.export_user_usage_logs`,
+    which does a full unbounded select against the
+    ``idx_usage_logs_telegram_created`` index up to the configured
+    cap. Sharing the chat-token bucket means a user who's already
+    exhausted their AI-prompt budget can't pivot to spamming
+    exports — same throttle, same forgiveness window.
+
+    Same defensive ``from_user is None`` / FSM-clear shape as
+    :func:`cmd_start` / :func:`cmd_redeem` / :func:`cmd_stats`.
+    Empty-buffer case lands as a fresh chat bubble (the toast
+    alert pattern from the callback path needs a callback query
+    to attach to, which we don't have here).
+    """
+    await state.clear()
+    if message.from_user is None:
+        # Anonymous group admin / channel-bot edge case — same
+        # guard as cmd_start / cmd_redeem / cmd_stats / cmd_history.
+        return
+    user_id = message.from_user.id
+    lang = await _get_user_language(user_id)
+    if not await consume_chat_token(user_id):
+        log.info(
+            "usage_csv rate-limited telegram_id=%s", user_id,
+        )
+        await message.answer(t(lang, "ai_local_rate_limited"))
+        return
+    result = await _build_usage_csv_export_document(user_id)
+    if result is None:
+        await message.answer(t(lang, "usage_csv_export_empty"))
+        return
+    document, kept = result
+    await message.answer_document(
+        document,
+        caption=t(lang, "usage_csv_export_caption", count=kept),
     )
 
 

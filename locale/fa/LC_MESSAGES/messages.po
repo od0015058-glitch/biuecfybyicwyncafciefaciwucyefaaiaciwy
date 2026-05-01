@@ -122,6 +122,10 @@ msgstr "❌ انصراف"
 msgid "btn_close_menu"
 msgstr "❌ بستن منو"
 
+#: strings.py:btn_export_usage_csv
+msgid "btn_export_usage_csv"
+msgstr "📤 دریافت CSV مصرف"
+
 #: strings.py:btn_force_join_check
 msgid "btn_force_join_check"
 msgstr "✅ عضو شدم"
@@ -865,6 +869,18 @@ msgstr "💳 رفتن به درگاه پرداخت"
 msgid "tetrapay_unreachable"
 msgstr ""
 "❌ درگاه پرداخت ایرانی پاسخگو نیست. لطفاً چند دقیقه بعد دوباره تلاش کنید یا از ارز دیجیتال استفاده کنید."
+
+#: strings.py:usage_csv_export_caption
+msgid "usage_csv_export_caption"
+msgstr "📤 گزارش مصرف ({count} ردیف) در قالب CSV"
+
+#: strings.py:usage_csv_export_done
+msgid "usage_csv_export_done"
+msgstr "✅ {count} ردیف از گزارش مصرف به‌صورت فایل ارسال شد"
+
+#: strings.py:usage_csv_export_empty
+msgid "usage_csv_export_empty"
+msgstr "📭 هنوز هیچ گزارش مصرفی برای خروجی‌گرفتن ثبت نشده است."
 
 #: strings.py:wallet_text
 msgid "wallet_text"
