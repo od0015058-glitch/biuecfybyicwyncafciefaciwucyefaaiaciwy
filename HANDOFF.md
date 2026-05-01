@@ -824,7 +824,7 @@ What remains (next AI's TODO):
 * ~~**Telegram FSM integration.**~~ ✅ **shipped (Stage-15-Step-E #8 follow-up #1 PR).** Added a "💳 پرداخت با زرین‌پال" / "💳 Pay with Zarinpal" button on the Toman-entry currency-picker keyboard next to the existing TetraPay button (rendered conditionally on `not is_gateway_disabled("zarinpal")` — the same admin-toggle hook the TetraPay button already uses, so disabling Zarinpal at runtime hides the button without code changes). The picker layout now packs the card-gateway buttons into a single top row whose width tracks the count of enabled card gateways, so a single-enabled deploy doesn't stretch the lone button across the chat width. Routed `cur_zarinpal` through `process_custom_currency_selection` to a new `_start_zarinpal_invoice` helper that mirrors `_start_tetrapay_invoice` 1:1: clear FSM, validate the locked `toman_rate_at_entry` snapshot, call `zarinpal.create_order` (catches both `ZarinpalError` and transport / timeout exceptions, renders `zarinpal_unreachable` with retry / home buttons), call `Database.create_pending_transaction(gateway="zarinpal", currency_used="IRR", gateway_invoice_id=order.authority, gateway_locked_rate_toman_per_usd=order.locked_rate_toman_per_usd, ...)`, and render `zarinpal_order_text` with the gateway-issued StartPay URL on an `InlineKeyboardBuilder.button(url=...)` "Go to Zarinpal" button. Promo `promo_code` / `promo_bonus_usd` ride through to the PENDING row identically to the TetraPay path so settlement credits the bonus. New strings (5): `zarinpal_button`, `zarinpal_creating_order`, `zarinpal_order_text`, `zarinpal_pay_button`, `zarinpal_unreachable` — both `fa` and `en` defined; `.po` files regenerated via `python -m i18n_po export` to keep the drift gate green. 23 new unit tests in `tests/test_zarinpal_telegram_fsm.py`: keyboard wiring (button presence with all combos of {tetrapay, zarinpal} ∈ enabled / disabled), `process_custom_currency_selection` routing (happy path, gateway-disabled toast, lost-amount toast), `_start_zarinpal_invoice` happy path (asserts `create_pending_transaction` kwargs, asserts the StartPay URL ends up on the keyboard), promo data ride-through, missing-rate path renders `charge_toman_no_rate`, `create_order` exception renders `zarinpal_unreachable`, `create_pending_transaction` returning `False` renders `charge_invoice_error` (and crucially, doesn't hand out a payment URL), bundled-bug-fix gate (parametrized over NaN / Inf / negative / zero / `bool` / accidental-string `toman_rate_at_entry`), and an i18n-coverage check confirming every new slug exists in both languages. Total test suite is now **2017 passing** (was 1994 pre-PR).
 
   Bundled bug fix in this PR (real, found while writing `_start_zarinpal_invoice` and back-checking the existing `_start_tetrapay_invoice` validation gate): **`_start_tetrapay_invoice`'s `toman_rate_at_entry` validation was too permissive.** Pre-fix the gate was `toman_rate_at_entry is None or not isinstance(toman_rate_at_entry, (int, float))`, which accepted `float('nan')`, `float('inf')`, `-1.0`, `0.0`, and `True` (`bool` is a subclass of `int`, so `isinstance(True, (int, float))` is True). A poisoned FSM `toman_rate_at_entry` would slip past the gate, get coerced via `float(toman_rate_at_entry)` and passed into `tetrapay_create_order(rate_toman_per_usd=...)` → `usd_to_irr_amount` which raises `ValueError` on non-finite / non-positive rates. The handler caught that `ValueError` as a generic `Exception` and rendered `tetrapay_unreachable` — misleading the user into thinking the gateway was down when actually our FSM data was corrupted (correct UX is to send them back to the Toman-entry prompt to re-enter a fresh rate). Fix: tightened the gate in BOTH `_start_tetrapay_invoice` AND the new `_start_zarinpal_invoice` to also reject `bool`, non-finite floats, and non-positive values up-front; the user sees `charge_toman_no_rate` with a retry button to `amt_toman` (the Toman-entry prompt). Pinned by a parametrized test that exercises every poisoned-rate shape.
-* **Backfill reaper for browser-close races.** Zarinpal can settle an order whose user closes the browser before the `?Authority=…&Status=OK` redirect lands — without a backfill, we'd never credit them. The current `pending_expiration` reaper would EXPIRE the row after 24h. A small periodic task that calls `verify_payment` for any PENDING Zarinpal row older than ~5 minutes (and finalizes if the gateway says it settled) closes that gap. Probably ~80 LoC + ~10 tests. The TetraPay path doesn't need this because TetraPay POSTs the callback server-to-server and retries on 5xx — only the user-redirect model has the browser-close gap.
+* ~~**Backfill reaper for browser-close races.**~~ ✅ **shipped (Stage-15-Step-E #8 follow-up #2 PR).** New `zarinpal_backfill.py` module spawns an async task at boot that wakes every `ZARINPAL_BACKFILL_INTERVAL_MIN` minutes (default 5) and verifies any PENDING Zarinpal row in the window `(min_age, max_age)` (default 5 min — 23 h). For each row: `zarinpal.verify_payment(authority, locked_irr)` (gateway authoritative settlement check) → `Database.finalize_payment(authority, locked_usd)` (idempotent — FOR UPDATE + status check guards against double-credit if the user reopens their tab while the reaper is mid-tick) → user DM via the same `zarinpal_credit_notification` string the redirect callback would have sent → audit row marked `actor="zarinpal_backfill"` so forensics can distinguish backfill credits from callback credits. Per-process counters (`rows_examined`, `credited`, `verify_failed`, `transport_error`, `finalize_noop`, `audit_failed`) exposed via `get_zarinpal_backfill_counters()` for ops panels. Heartbeat exposed as `meowassist_zarinpal_backfill_last_run_epoch` via the standard `record_loop_tick` plumbing. Jurisdictional split with the existing expire reaper: backfill owns `(min_age_seconds, max_age_hours * 3600)`; expire owns everything older — the README documents the recommended 1-hour buffer between `ZARINPAL_BACKFILL_MAX_AGE_HOURS=23` and `PENDING_EXPIRATION_HOURS=24`. Wired into `main.start_webhook_server` directly after the existing `start_pending_expiration_task`, cancelled cleanly on shutdown. New DB query `Database.list_pending_zarinpal_for_backfill(min_age_seconds, max_age_hours, limit)` filters by `gateway='zarinpal' AND status='PENDING'` with both age bounds, orders oldest-first, and coerces the `amount_crypto_or_rial` to a positive integer (filtering NULL / non-finite / non-positive legacy rows so the reaper doesn't crash on a corrupt row). Bundled real bug fix: `metrics.record_loop_tick(name)` now logs a WARN exactly once per process when *name* is not in `_LOOP_METRIC_NAMES`. Pre-fix, a typo'd loop name (e.g. `record_loop_tick("zarinpal_baackfill")`) would silently store the tick but the gauge would never appear in the `/metrics` exposition — Prometheus' "loop is stuck" alert (`time() - last_run_epoch > N`) would then perpetually fire on the (forever-zero) gauge, masquerading as a real outage. The new warning surfaces the typo at the loop's first tick. Tracking set `_LOOP_TICK_UNKNOWN_NAMES_WARNED` is also cleared by `reset_loop_ticks_for_tests` so each test starts fresh. 19 new tests in `tests/test_zarinpal_backfill.py` covering: SQL shape (`gateway='zarinpal'`, status filter, both age bounds, oldest-first ordering, return-shape coercion) / invalid-bounds rejection (`min_age <= 0`, `max_age <= 0`, `limit <= 0`) / NULL+zero+negative IRR row filtering / happy path (verify→finalize→DM→audit) / verify-rejected (no finalize, no DM) / transport-error (no finalize) / finalize-noop (callback raced ahead) / per-row crash isolation / empty result / DB query error / DM failure (TelegramForbiddenError) doesn't block credit / `_read_int_env` unset+garbage+below-minimum / `record_loop_tick` warn-once / no-warn for known names / one warn per distinct unknown name / `zarinpal_backfill` is in `_LOOP_METRIC_NAMES` / reset clears warned set.
 * **Designed success / failure HTML pages.** The current `_HTML_SUCCESS` / `_HTML_FAILURE` are intentionally minimal — RTL Persian-only, sans-serif, centered text, no styling beyond a single-color heading. The user is expected to flip back to Telegram for the canonical confirmation. A designer pass with brand colors, a logo, and an English fallback would be a nice-to-have polish.
 * **Drop-counter visibility on `/admin/`.** `web_admin._collect_ipn_health` already renders TetraPay + NowPayments tiles. Adding a third tile for Zarinpal is a 5-line `for accessor in (..., zarinpal.get_zarinpal_drop_counters)` extension. Deferred to keep this PR scoped to the gateway integration itself.
 
@@ -2284,6 +2284,60 @@ The user's process for this project — **do not deviate**:
     audit row written / HTML page exposes the export link /
     audit-action labels include both export slugs. Suite:
     2106 → 2120 passing (+14 new).
+19. **Stage-15-Step-E #8 follow-up #2 OPENED** (PR-after-#148) —
+    Zarinpal browser-close backfill reaper. Closes the gap where
+    Zarinpal settles an order whose user closes the browser
+    before the `?Authority=…&Status=OK` redirect lands. New
+    `zarinpal_backfill.py` module spawns a periodic asyncio task
+    at boot (interval `ZARINPAL_BACKFILL_INTERVAL_MIN`, default
+    5 min) that for each PENDING Zarinpal row in the
+    `(min_age, max_age)` window calls
+    `zarinpal.verify_payment` → `Database.finalize_payment` →
+    sends the standard credit DM → writes an audit row marked
+    `actor="zarinpal_backfill"`. New DB query
+    `Database.list_pending_zarinpal_for_backfill(
+    min_age_seconds, max_age_hours, limit)` filters by
+    `gateway='zarinpal' AND status='PENDING'` with both age
+    bounds and coerces legacy NULL / non-finite / non-positive
+    `amount_crypto_or_rial` rows out of the result. Heartbeat
+    via `record_loop_tick("zarinpal_backfill")` exposed as
+    `meowassist_zarinpal_backfill_last_run_epoch`. Per-process
+    counters (`rows_examined` / `credited` / `verify_failed` /
+    `transport_error` / `finalize_noop` / `audit_failed`)
+    available via `get_zarinpal_backfill_counters()` for future
+    ops panel integration. Jurisdictional split with the existing
+    `pending_expiration` reaper enforced by env-var convention:
+    backfill owns up to 23h, expire owns 24h+, with a 1-hour
+    buffer documented in the README. Wired into
+    `main.start_webhook_server` directly after
+    `start_pending_expiration_task`, cancelled cleanly on
+    shutdown. TetraPay and NowPayments don't need this because
+    their callbacks are server-to-server POSTs that retry on
+    5xx — only Zarinpal's user-redirect model has the
+    browser-close gap. Bundled real bug fix:
+    `metrics.record_loop_tick(name)` now logs a WARN exactly
+    once per process when *name* is not in
+    `_LOOP_METRIC_NAMES`. Pre-fix, a typo'd loop name would
+    silently store the tick but the gauge would never appear in
+    the `/metrics` exposition — Prometheus' "loop is stuck"
+    alert (`time() - last_run_epoch > N`) would then perpetually
+    fire on the (forever-zero) gauge, masquerading as a real
+    outage. The new warning surfaces the typo at the loop's
+    first tick. The dedupe set is also cleared by
+    `reset_loop_ticks_for_tests` so each test starts fresh. 19
+    new tests in `tests/test_zarinpal_backfill.py` covering: SQL
+    shape (gateway+status filters, both age bounds, ordering,
+    return-shape coercion) / invalid-bounds rejection / NULL +
+    zero + negative IRR row filtering / happy path
+    (verify→finalize→DM→audit) / verify-rejected (no finalize,
+    no DM) / transport-error (no finalize) / finalize-noop
+    (callback raced ahead) / per-row crash isolation / empty
+    result / DB query error / DM failure (TelegramForbiddenError)
+    doesn't block credit / `_read_int_env` unset+garbage+
+    below-minimum / `record_loop_tick` warn-once / no-warn for
+    known names / one warn per distinct unknown name /
+    `zarinpal_backfill` is in `_LOOP_METRIC_NAMES` / reset
+    clears warned set. Suite: 2106 → 2125 passing (+19 new).
 20. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
