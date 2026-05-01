@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 import i18n_runtime
 import strings
 from admin import parse_admin_user_ids, router as admin_router
+from admin_roles import ensure_env_admins_have_roles
 from admin_toggles import load_disabled_gateways, load_disabled_models
 from bot_commands import publish_bot_commands
 from database import db
@@ -278,6 +279,29 @@ async def main():
     # leftover entries the bot has no handlers for. See bot_commands.
     admin_ids = parse_admin_user_ids(os.getenv("ADMIN_USER_IDS"))
     await publish_bot_commands(bot, admin_ids)
+
+    # Stage-15-Step-E #5 follow-up #3: auto-promote env-list admins
+    # to a real ``admin_roles`` row so the DB is the source of
+    # truth. Best-effort — any DB failure is logged and the env-list
+    # fallback in :func:`admin_roles.effective_role` keeps the legacy
+    # admin surface working until the next boot.
+    try:
+        promote_counts = await ensure_env_admins_have_roles(
+            db, admin_ids
+        )
+        log.info(
+            "ensure_env_admins_have_roles: promoted=%d "
+            "skipped_existing=%d skipped_invalid=%d errors=%d",
+            promote_counts["promoted"],
+            promote_counts["skipped_existing"],
+            promote_counts["skipped_invalid"],
+            promote_counts["errors"],
+        )
+    except Exception:
+        log.exception(
+            "ensure_env_admins_have_roles boot hook failed; "
+            "continuing with env-list fallback"
+        )
 
     # Stage-15-Step-E #3: pre-resolve the webhook config so a typo in
     # ``TELEGRAM_WEBHOOK_SECRET`` halts boot here (loud) rather than
