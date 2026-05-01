@@ -745,9 +745,11 @@ What remains (next AI's TODO):
 
 * ~~**Add coverage for the FSM flows**~~ ✅ **shipped (Stage-15-Step-E #6 follow-up #1 PR).** Added `tests/integration/test_fsm_flows.py` with five new live-bot tests: `/redeem` → bad-code reject (asserts the FSM exits cleanly and the bot still answers `/start` afterwards), hub-keyboard geometry pin (≥1 row, ≥2 buttons), wallet-button click + `$` balance assertion (the new callback-query path — see next bullet), free-text-on-hub doesn't wedge the FSM, and `/redeem` → `/start` mid-FSM clears the state (regression for the pre-PR-110 `cmd_start` bug that consumed slash commands as raw text inside FSM states). All five gated by the same `integration_secrets` fixture so CI stays green; locally they require `TG_API_ID` / `TG_API_HASH` / `TG_TEST_SESSION_STRING` / `TG_TEST_BOT_USERNAME` to run.
 * ~~**Add coverage for the inline keyboard / callback-query path**~~ ✅ **shipped (Stage-15-Step-E #6 follow-up #1 PR).** New `click_button_and_wait(message, *, text=..., index=...)` helper in `tests/integration/conftest.py` taps a button on a previously-received bot message and waits for the bot's reply — handles BOTH the conventional "edit the same message in place" callback-query path (polls `edit_date` until it changes) AND the "post a brand-new message in response" path (polls `iter_messages(min_id=message.id)`). Buttons can be matched by case-insensitive substring (`text="wallet"` matches `"💰 Wallet"`) OR by grid coordinates (`index=(row, col)`) for tests that target geometry rather than i18n labels. Pinned end-to-end by `test_wallet_button_click_renders_wallet_card`.
-* **Wire the suite into a separate optional CI job** — the current implementation skips by default. A follow-up should add a *manually-triggered* GH Actions workflow that injects the secrets and runs `pytest tests/integration -v`. Operator decides cadence; weekly nightly is a reasonable default. Don't gate every PR on it because Telegram MTProto can be flaky and we don't want to block merges on transient network blips.
+* ~~**Wire the suite into a separate optional CI job**~~ ✅ **shipped in Stage-15-Step-E #6 follow-up #2 (this PR).** New `.github/workflows/integration.yml` runs the suite on a manual `workflow_dispatch` trigger only — never on push / pull_request, so a fork PR can't kick off a run with no access to the session-string secret. Operator stores the four secrets in repo Settings → Secrets and variables → Actions, then Actions tab → "Integration tests (live Telegram)" → "Run workflow". Job-level 15-minute `timeout-minutes` so a hung Telethon client (stale session, offline bot) can't burn the workflow's full 6-hour budget. `concurrency: cancel-in-progress: true` so a fresh manual trigger cancels stale ones (most likely after a config tweak). Pre-step prints which secrets are present (without their values) so the operator gets explicit signal in the run log if a binding is missing. **Pinned by 9 stdlib-only sanity tests** in `tests/test_workflows.py` — the project has zero runtime YAML dependency, so the tests use regex over the file text instead of pulling in PyYAML. The tests assert: file exists, has a `name`, is `workflow_dispatch`-only (no `push:` / `pull_request:` / `schedule:` / `release:` trigger), has a 1–60-min `timeout-minutes`, binds all four secrets via `${{ secrets.TG_* }}`, declares a concurrency group with `cancel-in-progress: true`, pins Python 3.11/3.12, installs `requirements-dev.txt` (telethon lives there), and the original `ci.yml` still exists.
 * **Spin up a dedicated test bot and seed an opinionated test account** — the current docs say "use a separate bot, not production". A follow-up should script `BOT_TOKEN_TEST` provisioning + a fixture user with `$10` of seed credits so refund / debit smoke tests don't need a real top-up.
-* **Document the operator's manual test recipe in README.md** — the smoke tests cover the bot's *external* boundary (Telegram → bot). The operator's manual smoke (top up via NowPayments, refund, broadcast) covers the *backoffice* boundary; a checklist in the README would make it reproducible.
+* ~~**Document the operator's manual test recipe in README.md**~~ ✅ **shipped in Stage-15-Step-E #6 follow-up #2 (this PR, alongside the GH Actions job).** README now documents the **manual smoke recipe**: from a local shell with the four env vars exported, run `pytest tests/integration/ -v` against the test bot. Suite finishes in <5 minutes and prints `PASSED` / `FAILED` per case with full Telegram round-trip output. To regenerate `TG_TEST_SESSION_STRING`, paste the docstring snippet from `tests/integration/conftest.py` into a python REPL with the api_id + api_hash on hand. Backoffice smoke (top up via NowPayments, refund, broadcast) is still operator-driven and not yet scripted; that's a deeper follow-up.
+
+Bundled bug fix in this PR (real, found while reviewing `vision.py` for the upcoming Stage-15-Step-E #10 follow-ups): **`vision.build_multimodal_user_message` now type-checks `prompt` against `str | None` before the `(prompt or "").strip()` call.** Pre-fix, a non-string truthy `prompt` (e.g. a dict from a fuzzed payload, a list mistakenly passed through, or a payload manipulated by a future caller) would slip past the `or ""` short-circuit and crash with `AttributeError: 'dict' object has no attribute 'strip'` instead of the documented `VisionError(reason="invalid_input")` contract. The function's docstring promises every bad input shape produces a clean `VisionError`; the fix closes that gap. 7 new tests in `tests/test_vision.py` cover the type-guard rejection (parametrized over dict / list / int / float / bytes / `object()`) plus a regression pin that `prompt=None` with a non-empty image list still works (the documented "image-only" calling convention).
 
 Stage-15-Step-E #6 follow-up #1 also lands a separate "always-on" unit-test file at `tests/test_integration_conftest_helpers.py` (31 unit tests, runs in CI with no Telegram secrets) that exercises the `_read_int_env` / `_read_float_env` env-var parsers shipped by the integration `conftest.py`. Without this, the integration helpers were untested in CI — they only ran when an operator opted into the full suite locally.
 
@@ -2154,7 +2156,47 @@ The user's process for this project — **do not deviate**:
     input / empty-input no-op / custom notes pass-through) plus
     the `parse_admin_user_ids` non-positive regression pin.
     Total suite: 2117 tests passing (2106 + 11 new).
-17. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+17. **Stage-15-Step-E #6 follow-ups #2 + #3 OPENED** (PR-after-#146)
+    — optional GH Actions integration workflow + manual smoke
+    recipe doc. New `.github/workflows/integration.yml` runs the
+    Telethon-based integration suite on a manual
+    `workflow_dispatch` trigger ONLY (never push / pull_request /
+    schedule / release — every run sends real Telegram messages
+    and debits the test wallet). Operator stores the four secrets
+    in repo Settings → Secrets and variables → Actions, then
+    Actions tab → "Integration tests (live Telegram)" → "Run
+    workflow". Job-level 15-minute timeout, concurrency group with
+    cancel-in-progress so manual re-triggers don't pile up,
+    pre-step prints which secrets are present (without values) so
+    a missing binding surfaces in the run log instead of silently
+    skipping. README's "Telethon-driven live-bot integration test
+    suite" bullet now documents the manual smoke recipe as the
+    no-CI-setup path: export the four env vars locally and run
+    `pytest tests/integration/ -v`. **9 stdlib-only sanity tests**
+    in `tests/test_workflows.py` pin the workflow's shape (file
+    exists, has a `name`, is `workflow_dispatch`-only, has a 1-60
+    min `timeout-minutes`, binds all four `TG_*` secrets via
+    `${{ secrets.X }}`, declares a concurrency group with
+    `cancel-in-progress: true`, pins Python 3.11/3.12, installs
+    `requirements-dev.txt`, and `ci.yml` still exists). Stdlib-only
+    because the project has zero runtime YAML dependency — adding
+    PyYAML just to lint a CI file would bloat the production
+    image. Bundled real bug fix:
+    `vision.build_multimodal_user_message` now type-checks the
+    `prompt` argument against `str | None` before
+    `(prompt or "").strip()`. Pre-fix, a non-string truthy
+    `prompt` (dict / list / int / etc.) would slip past the
+    `or ""` short-circuit and crash with `AttributeError:
+    'dict' object has no attribute 'strip'` instead of the
+    documented `VisionError(reason="invalid_input")` contract.
+    The function's docstring promises every bad input shape
+    produces a clean VisionError; the fix closes the gap. 7 new
+    tests in `tests/test_vision.py` cover the type-guard
+    rejection (parametrized over dict / list / int / float /
+    bytes / `object()`) plus a regression pin that
+    `prompt=None` with a non-empty image list still works (the
+    documented "image-only" calling convention).
+18. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-18. **Read the §11 working agreement before doing anything.**
+19. **Read the §11 working agreement before doing anything.**
