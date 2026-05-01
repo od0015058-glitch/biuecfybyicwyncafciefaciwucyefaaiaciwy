@@ -302,25 +302,35 @@ NowPayments crypto invoices.
       reply (handles both the "edit the same message in place"
       callback-query path and the "post a new message" path).
   Stage-15-Step-E #6 first slice + follow-up #1.
-- **gettext `.po` round-trip for community translations (first
-  slice)** — `i18n_po.py` exports `strings._STRINGS` to
+- **gettext `.po` round-trip + runtime lookup for community
+  translations** — `i18n_po.py` exports `strings._STRINGS` to
   `locale/<lang>/LC_MESSAGES/messages.po` files (one per
   supported locale, two today: `fa`, `en`). Translators can
   open the `.po` files directly in Poedit / Crowdin / OmegaT
   and submit a PR with the diffed translation instead of
   hand-editing the 1146-line Python literal in `strings.py`.
-  The bot's runtime keeps reading `strings._STRINGS` for now —
-  the gettext-at-runtime path (replacing `t()` with
-  `gettext.gettext()` / `ngettext()` for plural support) is the
-  next slice. Workflow: edit `strings.py`, then
-  `python -m i18n_po export` to regenerate the `.po` files,
-  then commit both. CI gate `python -m i18n_po check`
-  (also exercised by `tests/test_i18n_po.py`) fails the build
-  if the on-disk `.po` files drift from the dict, so adding a
-  slug without re-exporting is impossible to merge. msgid is
-  the slug (Persian-as-msgid is awkward and length-explodes);
-  the source-locale text appears as a `#.` translator comment
-  for context. First slice of Stage-15-Step-E #7.
+  **`i18n_runtime.py` (Stage-15-Step-E #7 follow-up #1)** loads
+  every `messages.po` into an in-memory catalog at boot and
+  `strings.t()` consults it *between* the admin-override cache
+  (still highest priority) and the compiled-default `_STRINGS`
+  table — so a translator can drop an edited `messages.po`
+  into the locale directory and the bot picks up the new
+  strings on the next process restart **without a code
+  deploy**. Empty `msgstr` (gettext convention for
+  "untranslated") is treated as a miss so the lookup falls
+  through to the compiled default. Errors are isolated
+  per-locale: a malformed or missing `.po` file logs an
+  exception but doesn't crash the bot — the affected locale
+  just falls through to the compiled default. Workflow: edit
+  `strings.py`, then `python -m i18n_po export` to regenerate
+  the `.po` files, then commit both. CI gate
+  `python -m i18n_po check` (also exercised by
+  `tests/test_i18n_po.py`) fails the build if the on-disk
+  `.po` files drift from the dict, so adding a slug without
+  re-exporting is impossible to merge. msgid is the slug
+  (Persian-as-msgid is awkward and length-explodes); the
+  source-locale text appears as a `#.` translator comment for
+  context. Stage-15-Step-E #7 first slice + follow-up #1.
 - **Per-key 429 cooldown for OpenRouter** — when OpenRouter
   returns 429 for one of the configured pool keys (the upstream
   provider rate-limited it, or the key hit its OpenRouter plan

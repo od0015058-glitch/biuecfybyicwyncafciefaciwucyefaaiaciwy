@@ -8,6 +8,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp import web
 from dotenv import load_dotenv
 
+import i18n_runtime
 import strings
 from admin import parse_admin_user_ids, router as admin_router
 from admin_toggles import load_disabled_gateways, load_disabled_models
@@ -245,6 +246,25 @@ async def main():
         # so ops investigates (vs. silently shipping stale text).
         log.exception(
             "failed to load bot_strings overrides — using compiled defaults"
+        )
+
+    # Stage-15-Step-E #7 follow-up #1: load community translations
+    # from locale/<lang>/LC_MESSAGES/messages.po into the runtime
+    # cache. These sit BETWEEN the admin-override cache (still top
+    # priority) and the compiled-default _STRINGS table — so a
+    # translator can drop an edited messages.po into the locale
+    # directory and the bot picks up the new strings on the next
+    # process restart without a code deploy. init_translations
+    # never raises (per-locale errors are logged and the affected
+    # locale falls through to its compiled default), so a missing
+    # or malformed .po file can't take the bot down.
+    try:
+        counts = i18n_runtime.init_translations()
+        log.info("loaded community translations: %s", counts)
+    except Exception:
+        log.exception(
+            "i18n_runtime.init_translations failed — falling back "
+            "to compiled defaults for every locale"
         )
 
     # Stage-14: warm the admin-toggle caches so disabled models and

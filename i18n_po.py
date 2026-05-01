@@ -185,10 +185,27 @@ def dump_po(
     locale_table = strings_table[lang]
     default_table = strings_table.get(default_lang, {})
 
+    # Stage-15-Step-E #7 follow-up #1 bundled bug fix: escape the
+    # caller-supplied ``project_id_version`` and ``revision_date``
+    # before splicing them into the header literal. Pre-fix the
+    # function pasted those strings raw into the f-string, so a
+    # value containing ``"`` (quote) or ``\\`` (backslash) — both
+    # legal characters in real-world ``Project-Id-Version`` strings
+    # like ``"meowassist 1.0 \"beta\""`` — broke the surrounding
+    # quoted-string literal and produced an unparseable ``.po``
+    # file. ``load_po`` would then either raise ``unterminated
+    # quoted string`` or, worse, silently mis-parse later entries
+    # because the quote-balance was off. The drift-gate
+    # (``i18n_po check``) would catch the divergence on the next
+    # CI run, but only AFTER the broken file had been committed.
+    safe_project_id_version = _escape_po_string(project_id_version)
+    safe_revision_date = _escape_po_string(
+        revision_date or "YEAR-MO-DA HO:MI+ZONE"
+    )
     header_msgstr = (
-        f"Project-Id-Version: {project_id_version}\\n"
+        f"Project-Id-Version: {safe_project_id_version}\\n"
         f"Report-Msgid-Bugs-To: \\n"
-        f"PO-Revision-Date: {revision_date or 'YEAR-MO-DA HO:MI+ZONE'}\\n"
+        f"PO-Revision-Date: {safe_revision_date}\\n"
         f"Last-Translator: \\n"
         f"Language-Team: \\n"
         f"Language: {lang}\\n"
