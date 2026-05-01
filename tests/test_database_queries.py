@@ -2209,3 +2209,317 @@ async def test_get_gift_code_returns_none_when_missing():
     db.pool = _PoolStub(conn)
 
     assert await db.get_gift_code("GHOST") is None
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #5: admin role primitives
+# ---------------------------------------------------------------------
+
+
+async def test_get_admin_role_returns_role_when_present():
+    conn = _make_conn()
+    conn.fetchrow = AsyncMock(return_value={"role": "operator"})
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    assert await db.get_admin_role(777) == "operator"
+    sql = conn.fetchrow.await_args.args[0]
+    assert "SELECT role FROM admin_roles" in sql
+    assert "telegram_id = $1" in sql
+    assert conn.fetchrow.await_args.args[1] == 777
+
+
+async def test_get_admin_role_returns_none_when_missing():
+    conn = _make_conn()
+    conn.fetchrow = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    assert await db.get_admin_role(777) is None
+
+
+async def test_set_admin_role_normalizes_casing_and_whitespace():
+    conn = _make_conn()
+    conn.execute = AsyncMock(return_value="INSERT 0 1")
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    stored = await db.set_admin_role(
+        777, "  Operator ", granted_by=1, notes="trusted",
+    )
+    assert stored == "operator"
+    args = conn.execute.await_args.args[1:]
+    assert args == (777, "operator", 1, "trusted")
+
+
+@pytest.mark.parametrize("bad", ["", " ", None, "admin", "supr", "🛡"])
+async def test_set_admin_role_rejects_invalid_role(bad):
+    """Validate up-front so the caller sees a ``ValueError`` rather
+    than the asyncpg ``CheckViolationError`` from the SQL CHECK."""
+    conn = _make_conn()
+    conn.execute = AsyncMock()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    with pytest.raises(ValueError, match="role must be one of"):
+        await db.set_admin_role(777, bad)
+    # Crucially: NEVER hit the DB for an invalid role. A roundtrip
+    # would let a typo in the form parser pollute the connection
+    # pool's transaction state on the failure path.
+    conn.execute.assert_not_awaited()
+
+
+async def test_set_admin_role_passes_null_granted_by_when_unset():
+    conn = _make_conn()
+    conn.execute = AsyncMock(return_value="INSERT 0 1")
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.set_admin_role(777, "viewer")
+    args = conn.execute.await_args.args[1:]
+    assert args[2] is None  # granted_by
+    assert args[3] is None  # notes
+
+
+async def test_set_admin_role_uses_upsert():
+    conn = _make_conn()
+    conn.execute = AsyncMock(return_value="INSERT 0 1")
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.set_admin_role(777, "viewer")
+    sql = conn.execute.await_args.args[0]
+    assert "ON CONFLICT (telegram_id)" in sql
+    # NOW() refresh must be on the UPDATE branch so the
+    # `granted_at` column reflects the most-recent change rather
+    # than the original insert time.
+    assert "granted_at = NOW()" in sql
+
+
+async def test_delete_admin_role_returns_true_on_delete_one():
+    conn = _make_conn()
+    conn.execute = AsyncMock(return_value="DELETE 1")
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    assert await db.delete_admin_role(777) is True
+
+
+async def test_delete_admin_role_returns_false_on_delete_zero():
+    conn = _make_conn()
+    conn.execute = AsyncMock(return_value="DELETE 0")
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    assert await db.delete_admin_role(777) is False
+
+
+async def test_delete_admin_role_returns_false_on_unexpected_command_tag():
+    """Defence-in-depth: a future asyncpg release that returned a
+    different tag (or a buggy mock) shouldn't be interpreted as a
+    successful delete."""
+    conn = _make_conn()
+    conn.execute = AsyncMock(return_value="UPDATE 1")
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    assert await db.delete_admin_role(777) is False
+
+
+async def test_list_admin_roles_clamps_limit_into_safe_range():
+    """A buggy caller passing ``limit=10**6`` shouldn't OOM the
+    formatter. Clamp at 1000."""
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.list_admin_roles(limit=10**6)
+    assert conn.fetch.await_args.args[1] == 1000
+
+
+async def test_list_admin_roles_clamps_negative_limit_to_one():
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.list_admin_roles(limit=-5)
+    assert conn.fetch.await_args.args[1] == 1
+
+
+async def test_list_admin_roles_renders_rows():
+    from datetime import datetime, timezone
+
+    ts = datetime(2026, 4, 30, 12, 0, tzinfo=timezone.utc)
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[
+        {
+            "telegram_id": 777,
+            "role": "operator",
+            "granted_at": ts,
+            "granted_by": 1,
+            "notes": "trusted",
+        },
+        {
+            "telegram_id": 888,
+            "role": "viewer",
+            "granted_at": ts,
+            "granted_by": None,
+            "notes": None,
+        },
+    ])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    rows = await db.list_admin_roles()
+    assert rows == [
+        {
+            "telegram_id": 777,
+            "role": "operator",
+            "granted_at": ts.isoformat(),
+            "granted_by": 1,
+            "notes": "trusted",
+        },
+        {
+            "telegram_id": 888,
+            "role": "viewer",
+            "granted_at": ts.isoformat(),
+            "granted_by": None,
+            "notes": None,
+        },
+    ]
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #5 bundled bug fix:
+# ``list_admin_audit_log`` / ``list_payment_status_transitions`` no
+# longer crash on asyncpg's default ``str``-encoded JSONB meta.
+# ---------------------------------------------------------------------
+
+
+async def test_list_admin_audit_log_decodes_jsonb_string_meta():
+    """Pre-fix: ``dict("...JSON string...")`` raised ``ValueError``
+    because asyncpg returns JSONB columns as raw ``str`` by default
+    (no codec is registered on the pool). The audit page handler
+    swallowed the exception and rendered "Database query failed",
+    so the regression was silent in production. Pin the new
+    ``_decode_jsonb_meta`` path so a future revert reintroducing
+    ``dict(r["meta"])`` fails this test loudly."""
+    from datetime import datetime, timezone
+
+    ts = datetime(2026, 4, 30, 12, 0, tzinfo=timezone.utc)
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[
+        {
+            "id": 1,
+            "ts": ts,
+            "actor": "web",
+            "action": "user_adjust",
+            "target": "user:777",
+            "ip": "203.0.113.10",
+            "outcome": "ok",
+            "meta": '{"delta_usd": 5.0, "reason": "stuck_invoice"}',
+        },
+    ])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    rows = await db.list_admin_audit_log()
+    assert rows[0]["meta"] == {"delta_usd": 5.0, "reason": "stuck_invoice"}
+
+
+async def test_list_admin_audit_log_handles_dict_meta_for_codec_compat():
+    """When a future deploy registers a JSONB codec on the pool, the
+    column will already be a dict. The decoder must accept that
+    shape too — otherwise switching to a codec would break this read
+    path again the other way."""
+    from datetime import datetime, timezone
+
+    ts = datetime(2026, 4, 30, 12, 0, tzinfo=timezone.utc)
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[
+        {
+            "id": 1, "ts": ts, "actor": "web", "action": "login_ok",
+            "target": None, "ip": None, "outcome": "ok",
+            "meta": {"reason": "ok"},
+        },
+    ])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    rows = await db.list_admin_audit_log()
+    assert rows[0]["meta"] == {"reason": "ok"}
+
+
+async def test_list_admin_audit_log_demotes_unparseable_meta_to_none():
+    """A poisoned row (truncated JSON, a non-JSON insert from a
+    legacy SQL script) should not blank the entire feed. The
+    decoder logs a WARNING and demotes that row's meta to ``None``."""
+    from datetime import datetime, timezone
+
+    ts = datetime(2026, 4, 30, 12, 0, tzinfo=timezone.utc)
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[
+        {
+            "id": 1, "ts": ts, "actor": "web", "action": "x",
+            "target": None, "ip": None, "outcome": "ok",
+            "meta": "{not valid json",
+        },
+        {
+            "id": 2, "ts": ts, "actor": "web", "action": "x",
+            "target": None, "ip": None, "outcome": "ok",
+            "meta": '{"reason": "ok"}',
+        },
+    ])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    rows = await db.list_admin_audit_log()
+    # Row 1 was poisoned but doesn't kill the feed; row 2 still
+    # decodes cleanly.
+    assert rows[0]["meta"] is None
+    assert rows[1]["meta"] == {"reason": "ok"}
+
+
+async def test_list_admin_audit_log_keeps_null_meta_as_none():
+    """Sanity: an explicit NULL meta column round-trips cleanly."""
+    from datetime import datetime, timezone
+
+    ts = datetime(2026, 4, 30, 12, 0, tzinfo=timezone.utc)
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[
+        {
+            "id": 1, "ts": ts, "actor": "web", "action": "login_ok",
+            "target": None, "ip": None, "outcome": "ok", "meta": None,
+        },
+    ])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    rows = await db.list_admin_audit_log()
+    assert rows[0]["meta"] is None
+
+
+async def test_list_payment_status_transitions_decodes_jsonb_string_meta():
+    """Same fix applies to ``list_payment_status_transitions`` —
+    same shape, same decoder, same regression."""
+    from datetime import datetime, timezone
+
+    ts = datetime(2026, 4, 30, 12, 0, tzinfo=timezone.utc)
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[
+        {
+            "id": 1,
+            "gateway_invoice_id": "abc-123",
+            "payment_status": "partially_paid",
+            "recorded_at": ts,
+            "outcome": "credited",
+            "meta": '{"received_usd": 4.95}',
+        },
+    ])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    rows = await db.list_payment_status_transitions()
+    assert rows[0]["meta"] == {"received_usd": 4.95}

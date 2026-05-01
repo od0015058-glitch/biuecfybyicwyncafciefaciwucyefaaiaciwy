@@ -31,6 +31,7 @@ from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
+from admin_roles import VALID_ROLES, normalize_role
 from database import db
 from formatting import format_usd
 
@@ -145,7 +146,11 @@ _ADMIN_HUB_TEXT = (
     "• `/admin_promo_list` — list promo codes (newest 20)\n"
     "• `/admin_promo_revoke <CODE>` — soft-delete a promo code\n"
     "• `/admin_broadcast [--active=N] <text>` — send `<text>` to every "
-    "user (or only users active in the last `N` days)"
+    "user (or only users active in the last `N` days)\n"
+    "• `/admin_role_grant <user_id> <viewer|operator|super>` — record "
+    "a graduated role for a Telegram id\n"
+    "• `/admin_role_revoke <user_id>` — drop the DB-tracked role row\n"
+    "• `/admin_role_list` — list every DB-tracked admin role"
 )
 
 
@@ -1117,3 +1122,197 @@ async def admin_broadcast(message: Message) -> None:
         f"Total: *{stats['total']}*",
         parse_mode="Markdown",
     )
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #5: admin role grant / revoke / list
+# ---------------------------------------------------------------------
+#
+# First slice: env-list admins (the only admins today) can manage
+# DB-tracked roles via three new Telegram commands. The role hierarchy
+# itself is documented in ``admin_roles.py``; this module is just the
+# user-facing surface. Subsequent PRs will:
+#
+# * Wire ``role_at_least`` into the existing /admin_credit /
+#   /admin_broadcast / /admin_metrics handlers so a viewer/operator
+#   actually sees a reduced surface (right now they only get the
+#   role record, not the gating).
+# * Add a /admin/roles web page mirroring this CLI.
+#
+# We keep the gate on `is_admin` (env-list) for these commands so a
+# DB-tracked viewer can't promote themselves to super by virtue of
+# having a row in the table.
+
+_ROLE_GRANT_USAGE = (
+    "❌ Usage: `/admin_role_grant <user_id> <role> [notes…]`\n"
+    "Roles: `viewer` (read-only), `operator` (broadcasts, promo, gift), "
+    "`super` (full access, default for legacy env-list admins)."
+)
+
+
+def _format_role_row(r: dict) -> str:
+    """Render one ``Database.list_admin_roles`` row for the Telegram
+    list view. Markdown-formatted; user-supplied ``notes`` are escaped
+    via :func:`_escape_md` so a free-form ``stuck_invoice``-style
+    string can't break the message render the way PR #50 documented.
+    """
+    when = (r.get("granted_at") or "")[:19].replace("T", " ")
+    granted_by = r.get("granted_by")
+    by_label = f" by `{granted_by}`" if granted_by else ""
+    notes = r.get("notes") or ""
+    notes_label = f" — _{_escape_md(notes)}_" if notes else ""
+    return (
+        f"• `{r['telegram_id']}` → *{r['role']}*"
+        f" — granted {when}{by_label}{notes_label}"
+    )
+
+
+@router.message(Command("admin_role_grant"))
+async def admin_role_grant(message: Message) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return  # silent no-op for non-admins
+    parts = (message.text or "").split(maxsplit=3)
+    if len(parts) < 3:
+        await message.answer(_ROLE_GRANT_USAGE, parse_mode="Markdown")
+        return
+    raw_user_id = parts[1].strip()
+    raw_role = parts[2].strip()
+    notes = parts[3].strip() if len(parts) >= 4 else None
+
+    try:
+        user_id = int(raw_user_id)
+    except ValueError:
+        await message.answer(
+            f"❌ `{_escape_md(raw_user_id)}` is not a valid Telegram id.",
+            parse_mode="Markdown",
+        )
+        return
+
+    role = normalize_role(raw_role)
+    if role is None:
+        await message.answer(
+            f"❌ `{_escape_md(raw_role)}` is not a valid role. "
+            f"Choose one of: {', '.join(sorted(VALID_ROLES))}.",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        stored = await db.set_admin_role(
+            user_id,
+            role,
+            granted_by=message.from_user.id if message.from_user else None,
+            notes=notes,
+        )
+    except ValueError as exc:
+        # ``Database.set_admin_role`` validates again (defence in
+        # depth). Surface the validator's message verbatim so the
+        # admin sees the offending value.
+        await message.answer(f"❌ {exc}")
+        return
+    except Exception:
+        log.exception("admin_role_grant: DB write failed")
+        await message.answer("❌ DB write failed — see logs.")
+        return
+
+    # Best-effort audit. Don't block the success message on a write
+    # failure to ``admin_audit_log``.
+    try:
+        await db.record_admin_audit(
+            actor=str(message.from_user.id) if message.from_user else "tg",
+            action="role_grant",
+            target=f"user:{user_id}",
+            outcome="ok",
+            meta={"role": stored, "notes": notes},
+        )
+    except Exception:
+        log.exception("admin_role_grant: audit insert failed")
+
+    log.info(
+        "admin_role_grant: admin=%s target=%s role=%s",
+        message.from_user.id if message.from_user else None, user_id, stored,
+    )
+    await message.answer(
+        f"✅ Granted role *{stored}* to `{user_id}`.",
+        parse_mode="Markdown",
+    )
+
+
+@router.message(Command("admin_role_revoke"))
+async def admin_role_revoke(message: Message) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return  # silent no-op for non-admins
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer(
+            "❌ Usage: `/admin_role_revoke <user_id>`",
+            parse_mode="Markdown",
+        )
+        return
+    raw_user_id = parts[1].strip()
+    try:
+        user_id = int(raw_user_id)
+    except ValueError:
+        await message.answer(
+            f"❌ `{_escape_md(raw_user_id)}` is not a valid Telegram id.",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        deleted = await db.delete_admin_role(user_id)
+    except Exception:
+        log.exception("admin_role_revoke: DB write failed")
+        await message.answer("❌ DB write failed — see logs.")
+        return
+
+    try:
+        await db.record_admin_audit(
+            actor=str(message.from_user.id) if message.from_user else "tg",
+            action="role_revoke",
+            target=f"user:{user_id}",
+            outcome="ok" if deleted else "noop",
+            meta={"deleted": bool(deleted)},
+        )
+    except Exception:
+        log.exception("admin_role_revoke: audit insert failed")
+
+    if deleted:
+        log.info(
+            "admin_role_revoke: admin=%s target=%s",
+            message.from_user.id if message.from_user else None, user_id,
+        )
+        await message.answer(
+            f"✅ Revoked DB-tracked role for `{user_id}`. "
+            f"(If they remain in `ADMIN_USER_IDS`, they keep super "
+            f"access via the env list.)",
+            parse_mode="Markdown",
+        )
+    else:
+        await message.answer(
+            f"ℹ️ No DB-tracked role row for `{user_id}` — nothing to revoke.",
+            parse_mode="Markdown",
+        )
+
+
+@router.message(Command("admin_role_list"))
+async def admin_role_list(message: Message) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return  # silent no-op for non-admins
+    try:
+        rows = await db.list_admin_roles(limit=200)
+    except Exception:
+        log.exception("admin_role_list: DB read failed")
+        await message.answer("❌ DB query failed — see logs.")
+        return
+    if not rows:
+        await message.answer(
+            "_No DB-tracked admin roles yet. Legacy env-list admins "
+            "(`ADMIN_USER_IDS`) still have full access._",
+            parse_mode="Markdown",
+        )
+        return
+    lines = ["🛡 *Admin roles* (DB-tracked, newest first)", ""]
+    for r in rows:
+        lines.append(_format_role_row(r))
+    await message.answer("\n".join(lines), parse_mode="Markdown")

@@ -1,3 +1,4 @@
+import json
 import logging
 import math
 import os
@@ -9,6 +10,61 @@ from dotenv import load_dotenv
 load_dotenv()
 
 log = logging.getLogger("bot.database")
+
+
+def _decode_jsonb_meta(value: object) -> dict | None:
+    """Coerce an asyncpg-fetched JSONB column value into a ``dict``.
+
+    asyncpg returns JSONB columns as raw ``str`` by default (no codec
+    is registered on the pool — see the audit + payment-status
+    transitions writers, which all hand-cast ``$N::jsonb`` from a
+    ``json.dumps``-rendered string). On the read side, the historical
+    code path was ``dict(r["meta"]) if r["meta"] is not None else
+    None``, which works fine in tests (asyncpg-Record-like dict
+    fixtures) but raises ``ValueError`` in production for any
+    non-empty meta because ``dict("...JSON string...")`` interprets
+    the string as a sequence of 2-tuples. The audit page handler
+    swallowed the exception and rendered "Database query failed" so
+    the regression was silent in production.
+
+    This helper accepts the union of shapes asyncpg / future codecs
+    might return:
+
+    * ``None`` → ``None``.
+    * ``dict`` (a future ``set_type_codec`` registration would produce
+      this) → defensive shallow copy so the caller can mutate freely.
+    * ``str`` / ``bytes`` / ``bytearray`` (asyncpg's default) →
+      ``json.loads`` into a dict.
+    * Anything else (or a ``json.loads`` that returns a non-dict) →
+      ``None`` with a logged WARNING. Defense-in-depth: a buggy SQL
+      INSERT writing ``'"oops"'::jsonb`` shouldn't crash every
+      subsequent read of the table.
+
+    Decoding errors are logged and demoted to ``None``: a single
+    poisoned row should not blank the entire feed.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, (str, bytes, bytearray)):
+        try:
+            decoded = json.loads(value)
+        except (ValueError, TypeError) as exc:
+            log.warning("could not decode JSONB meta value: %s", exc)
+            return None
+        if isinstance(decoded, dict):
+            return decoded
+        log.warning(
+            "JSONB meta value decoded to non-dict (%s); treating as null",
+            type(decoded).__name__,
+        )
+        return None
+    log.warning(
+        "unexpected JSONB meta value type %s; treating as null",
+        type(value).__name__,
+    )
+    return None
 
 
 def _is_finite_amount(value) -> bool:
@@ -3502,7 +3558,7 @@ class Database:
                 "target": r["target"],
                 "ip": r["ip"],
                 "outcome": r["outcome"],
-                "meta": dict(r["meta"]) if r["meta"] is not None else None,
+                "meta": _decode_jsonb_meta(r["meta"]),
             }
             for r in rows
         ]
@@ -3592,7 +3648,143 @@ class Database:
                     else None
                 ),
                 "outcome": r["outcome"],
-                "meta": dict(r["meta"]) if r["meta"] is not None else None,
+                "meta": _decode_jsonb_meta(r["meta"]),
+            }
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------------
+    # Stage-15-Step-E #5: admin role primitives
+    # ------------------------------------------------------------------
+    #
+    # Schema lives in alembic ``0016_admin_roles.py``. The table has a
+    # CHECK constraint on the role column so a buggy caller that reaches
+    # past this allow-list still can't poison a row.
+
+    ADMIN_ROLE_VALUES: frozenset[str] = frozenset(
+        {"viewer", "operator", "super"}
+    )
+
+    async def get_admin_role(self, telegram_id: int) -> str | None:
+        """Return the DB-tracked role for *telegram_id* or ``None`` if
+        the user has no row in ``admin_roles``.
+
+        Does NOT consult ``ADMIN_USER_IDS``: backward-compat fallback
+        to env-list admins is the caller's job (see
+        :func:`admin_roles.effective_role`) so the helper stays
+        honest about what's in the DB vs what's inferred from env.
+        """
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                "SELECT role FROM admin_roles WHERE telegram_id = $1",
+                int(telegram_id),
+            )
+        return row["role"] if row is not None else None
+
+    async def set_admin_role(
+        self,
+        telegram_id: int,
+        role: str,
+        *,
+        granted_by: int | None = None,
+        notes: str | None = None,
+    ) -> str:
+        """UPSERT a role row. Returns the role string that was stored.
+
+        Validates *role* against :data:`ADMIN_ROLE_VALUES` *before*
+        hitting the DB so a typo gets a clean ``ValueError`` with the
+        offending value rather than the asyncpg
+        ``CheckViolationError`` that the SQL CHECK would raise on the
+        wire (which is harder for upstream callers to discriminate
+        from a transient DB error).
+
+        The ``granted_at`` column is reset to ``NOW()`` on every
+        UPSERT so the value always reflects the most recent change —
+        that keeps the audit trail / list view honest about when the
+        role last moved, which matters more than preserving the
+        first-grant timestamp.
+        """
+        normalized = role.strip().lower() if isinstance(role, str) else ""
+        if normalized not in self.ADMIN_ROLE_VALUES:
+            raise ValueError(
+                f"role must be one of {sorted(self.ADMIN_ROLE_VALUES)}; "
+                f"got {role!r}"
+            )
+        async with self.pool.acquire() as connection:
+            await connection.execute(
+                """
+                INSERT INTO admin_roles
+                    (telegram_id, role, granted_by, notes, granted_at)
+                VALUES ($1, $2, $3, $4, NOW())
+                ON CONFLICT (telegram_id) DO UPDATE
+                  SET role       = EXCLUDED.role,
+                      granted_by = EXCLUDED.granted_by,
+                      notes      = EXCLUDED.notes,
+                      granted_at = NOW()
+                """,
+                int(telegram_id),
+                normalized,
+                int(granted_by) if granted_by is not None else None,
+                notes,
+            )
+        return normalized
+
+    async def delete_admin_role(self, telegram_id: int) -> bool:
+        """Remove the DB-tracked role row for *telegram_id*.
+
+        Returns ``True`` iff a row was deleted. ``False`` for a
+        not-found target lets the caller distinguish "you revoked a
+        role" from "that user wasn't in the table" without a second
+        round-trip.
+        """
+        async with self.pool.acquire() as connection:
+            result = await connection.execute(
+                "DELETE FROM admin_roles WHERE telegram_id = $1",
+                int(telegram_id),
+            )
+        # asyncpg's `execute` returns the command tag, e.g. "DELETE 1".
+        try:
+            tag, _, count = result.partition(" ")
+            return tag == "DELETE" and int(count) >= 1
+        except (ValueError, AttributeError):
+            return False
+
+    async def list_admin_roles(
+        self, *, limit: int = 200,
+    ) -> list[dict]:
+        """Return every DB-tracked admin role, newest grants first.
+
+        Caller-side sort key: ``granted_at DESC`` so the freshest
+        changes float to the top of any /admin_role_list output.
+        Limited to *limit* rows (clamped [1..1000]) so a future
+        regression that floods the table can't OOM the formatter.
+        """
+        capped = max(1, min(int(limit), 1000))
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT telegram_id, role, granted_at, granted_by, notes
+                  FROM admin_roles
+                 ORDER BY granted_at DESC, telegram_id ASC
+                 LIMIT $1
+                """,
+                capped,
+            )
+        return [
+            {
+                "telegram_id": int(r["telegram_id"]),
+                "role": r["role"],
+                "granted_at": (
+                    r["granted_at"].isoformat()
+                    if r["granted_at"] is not None
+                    else None
+                ),
+                "granted_by": (
+                    int(r["granted_by"])
+                    if r["granted_by"] is not None
+                    else None
+                ),
+                "notes": r["notes"],
             }
             for r in rows
         ]

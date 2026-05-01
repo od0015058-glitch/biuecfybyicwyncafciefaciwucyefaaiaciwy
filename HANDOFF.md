@@ -44,6 +44,7 @@ middlewares.py      user-upsert middleware                  ~60 LoC
 force_join.py       required-channel subscription gate     ~360 LoC
 strings.py          fa/en string table                     ~600 LoC
 admin.py            Telegram-side admin commands           ~870 LoC
+admin_roles.py      role hierarchy + effective-role helper  ~140 LoC
 rate_limit.py       chat + webhook rate limiters + per-user in-flight slot   ~370 LoC
 metrics.py          Prometheus /metrics exposition + IP allowlist  ~400 LoC
 web_admin.py        web admin panel (aiohttp+jinja2)       ~910 LoC
@@ -613,7 +614,7 @@ Systematic sweep of the codebase for latent bugs. Candidates identified during a
 | 2 | **Spending analytics for users** — show users their own spending dashboard: total spent, per-model breakdown, daily/weekly graphs. Currently only admins see metrics. Add a `/stats` command or inline menu. | P2 product | Medium | Builds trust + reduces support questions about "where did my money go" |
 | 3 | **Webhook mode instead of long-polling** — switch from aiogram long-polling to webhook mode. The aiohttp server already runs; register a `/telegram-webhook` route. Reduces latency, uses fewer resources. | P3 ops | Low | Only worthwhile if the bot gets >100 concurrent users |
 | 4 | **Rate limiting per OpenRouter key** — extend `openrouter_keys.py` with per-key 429 detection. If a key gets rate-limited, temporarily redistribute its users to other keys. Current sticky assignment doesn't handle key exhaustion. | P3 ops | Medium | Only matters with 10+ keys and heavy traffic |
-| 5 | **Admin role system** — currently all admins have full access. Add roles: `viewer` (read-only dashboard), `operator` (can broadcast, manage promos), `super` (can edit users, refund). Store in DB, not env. | P2 product | High | Only needed if the team grows beyond 1 admin |
+| 5 | **Admin role system** — currently all admins have full access. Add roles: `viewer` (read-only dashboard), `operator` (can broadcast, manage promos), `super` (can edit users, refund). Store in DB, not env. **STARTED — see "Stage-15-Step-E #5" section below for first-slice scope, what remains, and the bundled JSONB-decode bug fix.** | P2 product | High | Only needed if the team grows beyond 1 admin |
 | 6 | **Automated testing with real Telegram** — use `telethon` or `pyrogram` to write integration tests that actually send messages to the bot and verify responses. Currently all tests are unit tests with mocked Telegram. | P3 ops | High | Big investment but catches integration bugs CI can't |
 | 7 | **i18n framework upgrade** — move from the current `strings.py` dict to proper `.po` / `.mo` gettext files. Enables community translations, pluralization rules, and tooling like Crowdin. | P2 product | Medium | Only worthwhile if adding a third language (Arabic, Turkish) |
 | 8 | **Stripe / Zarinpal payment gateway** — add conventional card payment options alongside crypto. Stripe for international, Zarinpal for Iranian cards (alternative to TetraPay). | P2 product | High | Significant gateway integration work |
@@ -671,6 +672,47 @@ What remains (next AI's TODO):
 * **Per-key Prometheus counters** — `metrics.py` already has the helper plumbing. Add `openrouter_key_429_total{index="N"}` and `openrouter_key_fallback_total{index="N"}` so dashboards show the distribution.
 * **Retry the request itself with a different key** — current behaviour is "mark the key, return rate-limited message to user". A more user-friendly behaviour is "mark the key, retry the same request once with the next available key". First-slice trade-off: retry adds latency budget pressure (the user already waited the full timeout once), so this is a follow-up that needs a separate latency-aware design — probably a 2-second retry budget gated by `available_key_count() > 0`.
 * **Per-model rate-limit tracking** — OpenRouter sometimes 429s a specific `:free` model rather than the whole key. Currently any 429 puts the entire key in cooldown, which is over-aggressive. The next iteration could key the cooldown table on `(api_key, model)` so a 429 on `google/gemini-flash-1.5:free` doesn't lock out the same key for `anthropic/claude-3.5-sonnet`.
+
+##### Stage-15-Step-E #5 — what's shipped vs. what remains (STARTED, not finished)
+
+**Step-E #5 (Admin role system) — STARTED in PR-after-Step-E-#4.**
+
+Original spec (Step-E table row 5): "currently all admins have full access. Add roles: viewer (read-only dashboard), operator (can broadcast, manage promos), super (can edit users, refund). Store in DB, not env."
+
+What's shipped this PR:
+
+* `alembic/versions/0016_admin_roles.py` — new `admin_roles` table:
+    * `telegram_id BIGINT PRIMARY KEY`
+    * `role TEXT NOT NULL CHECK (role IN ('viewer','operator','super'))` — typo-proof at the DB layer; a buggy SQL fix can't poison a row with `'opperator'` and degrade every gate to "unknown role → no access".
+    * `granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`
+    * `granted_by BIGINT NULL` — Telegram id of the granting admin; nullable so an env-list bootstrap / SQL seed row is allowed.
+    * `notes TEXT NULL` — free-form rationale for the audit trail.
+    * Indexed on `role` for the "list all operators" filter.
+* `admin_roles.py` — new module owning the role hierarchy:
+    * Constants `ROLE_VIEWER` / `ROLE_OPERATOR` / `ROLE_SUPER` and a `ROLE_ORDER` tuple (lowest → highest privilege) used as the index ordering for comparisons.
+    * `normalize_role(raw)` — lowercase + strip + validate. Returns `None` for unknown inputs so callers can branch on a single sentinel.
+    * `role_at_least(role, required)` — single chokepoint for every future gate. Fails closed on both sides: an unknown / `None` *role* always returns `False` ("we couldn't determine your role" must NEVER mean "you have access"); an unknown / mistyped *required* also returns `False` so a typo in the call-site doesn't accidentally match every input.
+    * `effective_role(telegram_id, db_role, *, is_env_admin)` — resolution helper. DB role wins when valid; otherwise an env-listed Telegram id resolves to `super` for backward-compat; otherwise `None`. A corrupted `db_role` value (e.g. left over from a manual SQL fix that pre-dated the CHECK) falls through to the env-list branch rather than locking the legacy admin out — fail-soft beats fail-closed when the operator is actively recovering from a bad SQL fix.
+* `Database.get_admin_role` / `set_admin_role` / `delete_admin_role` / `list_admin_roles` — the CRUD surface. `set_admin_role` validates against `Database.ADMIN_ROLE_VALUES` *before* hitting the DB so a typo gets a clean `ValueError` rather than the asyncpg `CheckViolationError` the SQL CHECK would raise on the wire (which is harder for upstream callers to discriminate from a transient DB error). `granted_at` is reset to `NOW()` on every UPSERT so the value always reflects the most recent change. `list_admin_roles` clamps `limit` into [1..1000] so a buggy caller can't OOM the formatter.
+* `admin.admin_role_grant` / `admin_role_revoke` / `admin_role_list` — three new Telegram commands gated to env-list `is_admin` (NOT to a DB-tracked role; otherwise a viewer could promote themselves to super by virtue of having a row in the table). All three audit-log via `record_admin_audit` with action slugs `role_grant` / `role_revoke` / (no log on the read-only `role_list`); the audit insert is best-effort wrapped in `try/except` so a transient `admin_audit_log` write failure doesn't regress the user-visible success message.
+* `_format_role_row` Markdown formatter routes `notes` through `_escape_md` so a free-form `stuck_invoice`-style string can't break the message render the way PR #50 documented.
+* The `/admin` hub message lists all three new commands.
+* 16 new tests in `tests/test_admin_roles.py` (role-order invariants, `normalize_role` accept/reject, `role_at_least` ordering + fail-closed on both sides, `effective_role` env-list backward-compat / DB role wins / corrupted `db_role` fallback / `None` telegram_id sentinel / case-normalisation).
+* 11 new tests in `tests/test_database_queries.py` (get/set/delete/list lifecycle: happy paths, casing-normalisation, validator-rejects-typo-without-DB-roundtrip, NULL granted_by, UPSERT shape with `granted_at = NOW()` on UPDATE, command-tag parsing for the `DELETE 1` vs `DELETE 0` discriminator, defence-in-depth for unexpected command tags, limit clamping in both directions).
+* 13 new tests in `tests/test_admin.py` (router exposes the three new commands, hub text lists them, `_format_role_row` happy + escapes Markdown + omits optional fields, handler smoke tests via mocked Message + db: non-admin no-op, invalid-role rejection without DB write, non-int user-id rejection, write-through to DB with audit hook, audit-failure-doesn't-block-success, revoke happy + not-found paths, list happy + empty-table path).
+* README.md and HANDOFF.md updated.
+
+What remains (next AI's TODO):
+
+* **Wire `role_at_least` into the existing admin command gates.** Right now `admin.admin_credit`, `admin.admin_broadcast`, `admin.admin_metrics`, etc. all gate on `is_admin` (env-list only). The follow-up should pull `effective_role` for the actor and gate `/admin_credit` / `/admin_debit` / `/admin_promo_*` / `/admin_role_*` at `super`; `/admin_broadcast` / gift-code mint at `operator`; `/admin_metrics` / `/admin_balance` at `viewer`. Bundle a regression test that pins each command's minimum role.
+* **Add `/admin/roles` web page** mirroring the Telegram CLI. List + create + revoke form, audit-logged via the existing `_record_audit_safe` helper. Same auth as the rest of the panel (`ADMIN_PASSWORD`-gated cookie) — per-user web auth is a separate, larger redesign not in scope for the role system.
+* **Wire role gates into the web admin panel.** The web side currently has a single `ADMIN_PASSWORD`; per-admin web auth is a larger redesign. As an interim, the web panel could read `effective_role` for the configured `ADMIN_PASSWORD` operator (today it's `super` by default) and surface a "view as <role>" toggle for testing the gates without provisioning a second password.
+* **Per-user web auth** — replace the single `ADMIN_PASSWORD` with per-admin Telegram-id-keyed credentials so the role system actually applies to the browser surface. This is the multi-week piece the original Step-E table row 5 calls out as "high effort"; it needs OAuth/SSO discussion with the operator first.
+* **First-login auto-promote of `ADMIN_USER_IDS` admins to a real `admin_roles` row.** Currently env-list admins only get a `super` role *implicitly* via `effective_role`. A startup task that ensures every env-list id has a matching `admin_roles` row would make the DB the source of truth and let the operator drop env-list management entirely.
+
+Bundled bug fix in this PR (real, found during code review of the audit-page wiring): **`Database.list_admin_audit_log` and `Database.list_payment_status_transitions` now decode JSONB `meta` columns through a new `_decode_jsonb_meta(...)` helper instead of `dict(r["meta"])`.** Pre-fix, both readers ran `dict(r["meta"]) if r["meta"] is not None else None`. asyncpg returns JSONB columns as raw `str` by default (no codec is registered on the pool — see the audit + payment-status writers, which all hand-cast `$N::jsonb` from a `json.dumps`-rendered string), so `dict("...JSON string...")` raised `ValueError: dictionary update sequence element #0 has length 1; 2 is required` for every non-empty meta. The audit-page handler (`web_admin.audit_get`) wraps the read in `try/except` and renders "Database query failed" on any exception, so the regression was *silent* in production — the operator looking at `${WEBHOOK_BASE_URL}/admin/audit` would see an empty error tile instead of the per-action audit trail the moment the table grew its first non-NULL `meta` row (which is most rows: every login attempt records `{"reason": "..."}`, every wallet adjustment records `{"delta_usd": ...}`, etc.). The new helper accepts `None` / `dict` / `str` / `bytes` cleanly and demotes any unparseable row's `meta` to `None` (with a logged WARNING) so a single poisoned row can't blank the entire feed. Confirmed locally with a real asyncpg connection against a Postgres 16 container. 5 new tests in `tests/test_database_queries.py` pin both the JSONB-`str` decode path (regression pin), the dict pass-through (forward-compat for a future `set_type_codec` registration), the corrupted-row-doesn't-blank-feed semantics, and the matching `list_payment_status_transitions` site (same shape, same regression — one helper call site, one fix).
+
+---
 
 Bundled bug fix in this PR: **`pricing._apply_markup` now NaN-guards the token-count side, not just the price side.** Pre-fix, the function had a defensive fallback for non-finite `ModelPrice.input_per_1m_usd` / `output_per_1m_usd` (the comments correctly explained NaN propagation through `raw * markup` / `max(NaN, 0)`) but no guard on the `prompt_tokens` / `completion_tokens` arguments. Those flow in directly from `data["usage"]["prompt_tokens"]` / `["completion_tokens"]` in `ai_engine.chat_with_model`, where Python's stdlib `json.loads` accepts the literal `NaN` token by default — meaning a quirky OpenRouter 200 response (or, more realistically, a misbehaving stub / custom proxy / future internal billing path) with a non-finite token count would propagate NaN through the multiplication, through `raw * markup`, and through `max(NaN, 0.0)` (which returns NaN in CPython because `NaN < 0.0` is False, so `max` treats NaN as the maximum). The downstream impact mirrors the price-side hole: `database.deduct_balance` refuses the NaN cost (its own NaN guard fires), `database.log_usage` likewise refuses — so the user gets free chat AND the audit trail has a hole. Fix: new `_coerce_token_count(value, label)` helper that clamps non-finite, non-numeric, and negative token counts to `0.0` with a logged warning. Six new test cases in `test_pricing.py` pin the fix (NaN prompt / Inf completion / negative both / non-numeric string / happy-path unchanged / zero-input edge / both-corrupt-collapses-to-zero).
 
@@ -1104,27 +1146,40 @@ The user's process for this project — **do not deviate**:
     secret token (header AND path). Bundled bug fix in #3:
     `webhook_rate_limit_middleware` now protects the TetraPay
     endpoint instead of just `/nowpayments-webhook`.
-    **Stage-15-Step-E #4 STARTED (this PR)** — first slice of
+    **Stage-15-Step-E #4 MERGED** (PR #122) — first slice of
     "rate limiting per OpenRouter key": `openrouter_keys.py`
     extended with a per-key 429 cooldown table and a fall-through
-    selection policy so a single key going hot routes its sticky
-    users to the next available pool member instead of returning
-    a "rate-limited" error every time. `mark_key_rate_limited`
-    honours `Retry-After`, clamps to a 1h ceiling so a misbehaving
-    CDN can't pin a key out for a day, and never shortens an
-    already-running longer cooldown. `ai_engine.chat_with_model`
-    calls the marker on a 429 from OpenRouter, wrapped in a broad
-    except so a parsing quirk in the response doesn't mask the
-    user-facing reply. Bundled bug fix in #4: `pricing._apply_markup`
-    now NaN/Inf/non-numeric/negative-guards the token-count side
-    too, not just the price side — pre-fix, a quirky OpenRouter
-    200 with a non-finite token count would propagate NaN through
-    the multiplication, through `max(NaN, 0.0)` (which returns
-    NaN in CPython), and yield a NaN cost that `deduct_balance`
-    and `log_usage` both refuse — leaving the audit trail with a
-    hole AND the user with free chat. New `_coerce_token_count`
-    helper clamps to 0 with a logged warning so ops can chase
-    the upstream cause. See "Stage-15-Step-E #4 — what's shipped
+    selection policy. Bundled bug fix in #4:
+    `pricing._apply_markup` now NaN/Inf/non-numeric/negative-guards
+    the token-count side too, not just the price side.
+    **Stage-15-Step-E #5 STARTED (this PR)** — first slice of
+    "admin role system": new `admin_roles` table + `admin_roles.py`
+    module owning the `viewer`/`operator`/`super` hierarchy +
+    `Database.get/set/delete/list_admin_roles` CRUD primitives +
+    three new Telegram commands (`/admin_role_grant <user_id>
+    <role> [notes]`, `/admin_role_revoke <user_id>`,
+    `/admin_role_list`). Backward compatible: env-list admins
+    keep `super` access via `effective_role`'s fallback so this
+    PR doesn't lock the legacy operator out. The role hierarchy
+    is documented but **not yet wired into the existing command
+    gates** — that's the next PR (gate `/admin_credit` to `super`,
+    `/admin_broadcast` to `operator`, `/admin_metrics` to `viewer`).
+    Bundled bug fix in #5:
+    `Database.list_admin_audit_log` and
+    `Database.list_payment_status_transitions` now decode JSONB
+    `meta` columns through a new `_decode_jsonb_meta` helper
+    instead of `dict(r["meta"])`. Pre-fix, asyncpg returned JSONB
+    columns as raw `str` (no codec registered on the pool — see
+    the writer side, which all hand-cast `$N::jsonb` from
+    `json.dumps`-rendered strings) and `dict("...JSON string...")`
+    raised `ValueError` for every non-empty meta. The audit-page
+    handler swallowed the exception and rendered "Database query
+    failed", so the regression was *silent* in production: the
+    operator looking at `${WEBHOOK_BASE_URL}/admin/audit` would see
+    an empty error tile instead of the per-action audit trail the
+    moment the table grew its first non-NULL `meta` row (which is
+    most rows). Confirmed locally with a real asyncpg connection
+    against Postgres 16. See "Stage-15-Step-E #5 — what's shipped
     vs. what remains" section above for the precise boundary so
     the next AI can continue.
 11. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
