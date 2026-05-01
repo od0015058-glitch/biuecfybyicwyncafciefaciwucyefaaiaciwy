@@ -445,9 +445,21 @@ NowPayments crypto invoices.
   — keyed by 0-based pool index, never by api_key, so a leaked
   scrape doesn't carry the keys themselves. Counters reset on
   every deliberate `load_keys()` reload so a key rotation
-  doesn't carry stale per-index meaning forward. Cross-replica
-  cooldown coordination (Redis-backed) and per-model 429
-  tracking remain follow-ups.
+  doesn't carry stale per-index meaning forward. **Stage-15-
+  Step-E #4 follow-up #2:** the same `/admin/openrouter-keys`
+  page is now an editable surface — operators can add new keys
+  (label + plaintext stored in the `openrouter_api_keys` DB
+  table), disable / re-enable keys without restarting the bot,
+  and hard-delete rows. Each row shows a 4-char tail
+  (`…3a4b`) instead of the plaintext key so the operator can
+  identify each entry without leaking it into browser history.
+  Each pool slot also surfaces a per-process **request count**
+  (sticky picks + fallback picks combined) so the panel answers
+  "is this key actually being used?" without needing access to
+  OpenRouter's dashboard. All mutations are CSRF-protected and
+  audit-logged via `record_admin_audit`. Cross-replica cooldown
+  coordination (Redis-backed) and per-model 429 tracking remain
+  follow-ups.
 - **Bot health & emergency control panel** — new `/admin/control`
   page surfaces a traffic-light status tile (idle / healthy /
   busy / degraded / under-attack / down) classified by

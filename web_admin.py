@@ -1139,6 +1139,15 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     # labels so a future PR can't drop them again.
     "transactions_export_csv": "Transactions CSV exported",
     "monetization_export_csv": "Monetization CSV exported",
+    # Stage-15-Step-E #4 follow-up #2: DB-backed OpenRouter key
+    # registry. These slugs are recorded by the new POST handlers
+    # in this module; surfacing them in the dropdown lets an
+    # operator audit "what changed in the key pool today" without
+    # scrolling the full feed.
+    "openrouter_key_add": "OpenRouter key added",
+    "openrouter_key_disable": "OpenRouter key disabled",
+    "openrouter_key_enable": "OpenRouter key re-enabled",
+    "openrouter_key_delete": "OpenRouter key deleted",
 }
 
 
@@ -5078,45 +5087,95 @@ async def openrouter_keys_get(request: web.Request) -> web.StreamResponse:
       slot since process start.
     * ``count_fallback`` — number of times this slot absorbed a
       fallback after another slot's sticky key went hot.
+    * ``count_request`` — number of times :func:`key_for_user`
+      picked this slot (Stage-15-Step-E #4 follow-up #2). Lets
+      the operator answer "is this key actually being used?".
+    * ``label`` / ``source`` / DB metadata — DB-loaded keys carry
+      a human-readable label and the DB row id; env-loaded keys
+      get ``source="env"`` and a generic "Env slot N" display name.
 
-    Counters are reset on a deliberate ``load_keys()`` reload (so
-    a key rotation doesn't carry stale meaning forward) and on
-    every process restart. Key material itself is **not** rendered;
-    rows are keyed by 0-based pool index — same discipline the
-    Prometheus exposition follows. Render is read-only; mutations
-    (force-clear cooldowns) live on ``/admin/control`` so the
-    "panic button" surface stays in one place.
+    Stage-15-Step-E #4 follow-up #2 wires this page to the
+    ``openrouter_api_keys`` registry: the page now also lists
+    every DB-stored key (enabled or disabled) below the live
+    pool table so the operator can add / disable / re-enable /
+    delete keys without leaving the panel. The list is
+    read-only on this GET; the matching POST handlers
+    (``openrouter_keys_add_post`` / ``..._toggle_post`` /
+    ``..._delete_post``) handle mutation.
+
+    Render reads ``request.app[APP_KEY_DB]`` for the DB list and
+    refreshes the in-process pool from the DB on every page
+    load (best-effort — a transient DB error keeps the existing
+    pool in place). Key material itself is NEVER rendered; rows
+    show only a 4-char tail (``sk-or-…3a4b``) so the operator
+    can identify each key without leaking it into browser
+    history / DOM dumps.
     """
     from openrouter_keys import (
         get_key_429_counters,
         get_key_fallback_counters,
+        get_key_meta_snapshot,
+        get_key_request_counters,
         key_status_snapshot,
+        refresh_from_db,
     )
+
+    db = request.app[APP_KEY_DB]
+
+    # Refresh the in-process pool on every page load so a tweak
+    # made on a different replica is reflected here. Best-effort —
+    # a transient DB blip leaves the previous pool in place.
+    try:
+        await refresh_from_db(db)
+    except Exception:
+        log.exception("openrouter_keys: refresh_from_db failed on render")
 
     snapshot = key_status_snapshot()
     counts_429 = get_key_429_counters()
     counts_fallback = get_key_fallback_counters()
+    counts_request = get_key_request_counters()
+    meta = get_key_meta_snapshot()
 
     rows: list[dict[str, object]] = []
     for entry in snapshot:
         idx = int(entry.get("index", -1))
+        m = meta[idx] if 0 <= idx < len(meta) else {"source": "env"}
+        source = m.get("source", "env")
+        if source == "db":
+            display_name = m.get("label") or f"DB key #{m.get('db_id')}"
+        else:
+            display_name = f"Env slot {idx + 1}"
         rows.append(
             {
                 "index": idx,
+                "display_name": display_name,
+                "source": source,
+                "db_id": m.get("db_id"),
                 "rate_limited": bool(entry.get("rate_limited", False)),
                 "cooldown_remaining_secs": entry.get(
                     "cooldown_remaining_secs"
                 ),
                 "count_429": int(counts_429.get(idx, 0)),
                 "count_fallback": int(counts_fallback.get(idx, 0)),
+                "count_request": int(counts_request.get(idx, 0)),
             }
         )
+
+    # Pull the full DB-side registry so the operator can manage
+    # disabled rows too (the in-process pool only has enabled
+    # rows because the loader filters them out).
+    try:
+        db_rows = await db.list_openrouter_keys(include_disabled=True)
+    except Exception:
+        log.exception("openrouter_keys: list_openrouter_keys failed")
+        db_rows = []
 
     ctx = {
         "active_page": "openrouter_keys",
         "csrf_token": csrf_token_for(request),
         "flash": None,
         "rows": rows,
+        "db_rows": db_rows,
     }
     response = aiohttp_jinja2.render_template(
         "openrouter_keys.html", request, ctx,
@@ -5127,6 +5186,261 @@ async def openrouter_keys_get(request: web.Request) -> web.StreamResponse:
         response = aiohttp_jinja2.render_template(
             "openrouter_keys.html", request, ctx,
         )
+    return response
+
+
+async def openrouter_keys_add_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/openrouter-keys/add`` — register a new DB-backed
+    OpenRouter API key.
+
+    Form fields:
+        * ``label`` — required, 1..64 chars, trimmed.
+        * ``api_key`` — required, 1..200 chars, trimmed.
+        * ``notes`` — optional, 0..500 chars.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+
+    form = await request.post()
+    csrf = str(form.get("csrf_token") or "")
+    if not verify_csrf_token(request, csrf):
+        response = web.HTTPFound(location="/admin/openrouter-keys")
+        set_flash(
+            response, kind="error",
+            message="CSRF token missing or invalid. Please retry.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    label = str(form.get("label") or "").strip()
+    api_key = str(form.get("api_key") or "").strip()
+    notes_raw = str(form.get("notes") or "").strip()
+    notes = notes_raw or None
+
+    db = request.app[APP_KEY_DB]
+    response = web.HTTPFound(location="/admin/openrouter-keys")
+    try:
+        new_id = await db.add_openrouter_key(
+            label=label, api_key=api_key, notes=notes,
+        )
+    except ValueError as exc:
+        set_flash(
+            response, kind="error",
+            message=f"Failed to add key: {exc}",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+    except Exception:
+        log.exception("openrouter_keys_add_post: DB write failed")
+        set_flash(
+            response, kind="error",
+            message="Database write failed. The key was NOT added.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    # Refresh the in-process pool so the new key is live without
+    # waiting for the next page load.
+    try:
+        from openrouter_keys import refresh_from_db
+        await refresh_from_db(db)
+    except Exception:
+        log.exception(
+            "openrouter_keys_add_post: refresh_from_db failed",
+        )
+
+    try:
+        await db.record_admin_audit(
+            actor="web",
+            action="openrouter_key_add",
+            target=str(new_id),
+            ip=client_ip_for_rate_limit(request),
+            meta={"label": label, "api_key_len": len(api_key)},
+        )
+    except Exception:
+        log.exception(
+            "openrouter_keys_add_post: record_admin_audit failed",
+        )
+
+    set_flash(
+        response, kind="success",
+        message=f"Added OpenRouter key '{label}' (id={new_id}).",
+        secret=secret, cookie_secure=cookie_secure,
+    )
+    return response
+
+
+async def openrouter_keys_toggle_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/openrouter-keys/{id}/{action}`` where
+    ``{action}`` ∈ ``"disable" | "enable"``.
+
+    Soft-disables / re-enables the key. The row stays in the
+    table (so audit history + per-key counters survive); the
+    loader's next refresh skips disabled rows so a disabled key
+    is no longer in rotation.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+
+    action = request.match_info.get("action", "")
+    if action not in ("disable", "enable"):
+        raise web.HTTPNotFound(reason=f"unknown action {action}")
+    enabled = action == "enable"
+
+    try:
+        key_id = int(request.match_info.get("key_id", "0"))
+    except (TypeError, ValueError):
+        raise web.HTTPBadRequest(reason="invalid key id")
+    if key_id <= 0:
+        raise web.HTTPBadRequest(reason="invalid key id")
+
+    form = await request.post()
+    csrf = str(form.get("csrf_token") or "")
+    response = web.HTTPFound(location="/admin/openrouter-keys")
+    if not verify_csrf_token(request, csrf):
+        set_flash(
+            response, kind="error",
+            message="CSRF token missing or invalid. Please retry.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    db = request.app[APP_KEY_DB]
+    try:
+        ok = await db.set_openrouter_key_enabled(key_id, enabled=enabled)
+    except Exception:
+        log.exception(
+            "openrouter_keys_toggle_post: DB write failed",
+        )
+        set_flash(
+            response, kind="error",
+            message="Database write failed. State unchanged.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    if not ok:
+        set_flash(
+            response, kind="error",
+            message=f"Key id={key_id} not found.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        from openrouter_keys import refresh_from_db
+        await refresh_from_db(db)
+    except Exception:
+        log.exception(
+            "openrouter_keys_toggle_post: refresh_from_db failed",
+        )
+
+    try:
+        await db.record_admin_audit(
+            actor="web",
+            action=f"openrouter_key_{action}",
+            target=str(key_id),
+            ip=client_ip_for_rate_limit(request),
+            meta={"enabled": enabled},
+        )
+    except Exception:
+        log.exception(
+            "openrouter_keys_toggle_post: record_admin_audit failed",
+        )
+
+    word = "enabled" if enabled else "disabled"
+    set_flash(
+        response, kind="success",
+        message=f"OpenRouter key id={key_id} {word}.",
+        secret=secret, cookie_secure=cookie_secure,
+    )
+    return response
+
+
+async def openrouter_keys_delete_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/openrouter-keys/{id}/delete`` — hard-delete a
+    DB-backed OpenRouter API key.
+
+    Hard-delete is intentional: the loader's next refresh removes
+    the key from rotation, and the audit row in
+    ``admin_audit_log`` preserves the "operator deleted X at Y"
+    trail. The row itself doesn't need to live forever.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+
+    try:
+        key_id = int(request.match_info.get("key_id", "0"))
+    except (TypeError, ValueError):
+        raise web.HTTPBadRequest(reason="invalid key id")
+    if key_id <= 0:
+        raise web.HTTPBadRequest(reason="invalid key id")
+
+    form = await request.post()
+    csrf = str(form.get("csrf_token") or "")
+    response = web.HTTPFound(location="/admin/openrouter-keys")
+    if not verify_csrf_token(request, csrf):
+        set_flash(
+            response, kind="error",
+            message="CSRF token missing or invalid. Please retry.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    db = request.app[APP_KEY_DB]
+    try:
+        ok = await db.delete_openrouter_key(key_id)
+    except Exception:
+        log.exception(
+            "openrouter_keys_delete_post: DB delete failed",
+        )
+        set_flash(
+            response, kind="error",
+            message="Database delete failed. Key was NOT removed.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    if not ok:
+        set_flash(
+            response, kind="error",
+            message=f"Key id={key_id} not found.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        from openrouter_keys import refresh_from_db
+        await refresh_from_db(db)
+    except Exception:
+        log.exception(
+            "openrouter_keys_delete_post: refresh_from_db failed",
+        )
+
+    try:
+        await db.record_admin_audit(
+            actor="web",
+            action="openrouter_key_delete",
+            target=str(key_id),
+            ip=client_ip_for_rate_limit(request),
+            meta={},
+        )
+    except Exception:
+        log.exception(
+            "openrouter_keys_delete_post: record_admin_audit failed",
+        )
+
+    set_flash(
+        response, kind="success",
+        message=f"OpenRouter key id={key_id} deleted.",
+        secret=secret, cookie_secure=cookie_secure,
+    )
     return response
 
 
@@ -6407,6 +6721,19 @@ def setup_admin_routes(
     # Stage-15-Step-E #4 follow-up: per-key OpenRouter ops view.
     app.router.add_get(
         "/admin/openrouter-keys", _require_auth(openrouter_keys_get),
+    )
+    # Stage-15-Step-E #4 follow-up #2: DB-backed key registry CRUD.
+    app.router.add_post(
+        "/admin/openrouter-keys/add",
+        _require_auth(openrouter_keys_add_post),
+    )
+    app.router.add_post(
+        "/admin/openrouter-keys/{key_id}/{action:disable|enable}",
+        _require_auth(openrouter_keys_toggle_post),
+    )
+    app.router.add_post(
+        "/admin/openrouter-keys/{key_id}/delete",
+        _require_auth(openrouter_keys_delete_post),
     )
 
     # Stage-15-Step-E #5 follow-up #2: admin-roles web page.

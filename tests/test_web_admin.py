@@ -454,6 +454,15 @@ def _stub_db(
     db.REFUND_REFUSAL_INSUFFICIENT_BALANCE = (
         database_module.Database.REFUND_REFUSAL_INSUFFICIENT_BALANCE
     )
+    # Stage-15-Step-E #4 follow-up #2: DB-backed OpenRouter key
+    # registry. Default mocks ensure the new ``/admin/openrouter-keys``
+    # render path has a benign empty list / no-op pool.
+    db.list_openrouter_keys = AsyncMock(return_value=[])
+    db.list_enabled_openrouter_keys_with_secret = AsyncMock(return_value=[])
+    db.add_openrouter_key = AsyncMock(return_value=1)
+    db.set_openrouter_key_enabled = AsyncMock(return_value=True)
+    db.delete_openrouter_key = AsyncMock(return_value=True)
+    db.mark_openrouter_key_used = AsyncMock(return_value=None)
     return db
 
 
@@ -10070,3 +10079,216 @@ async def test_roles_revoke_db_error(aiohttp_client, make_admin_app):
     resp2 = await client.get("/admin/roles")
     body = await resp2.text()
     assert "Database write failed" in body
+
+
+# ── Stage-15-Step-E #4 follow-up #2: DB-backed OpenRouter key CRUD ──
+
+
+async def test_openrouter_keys_get_renders_db_management_table(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """The page renders one row per DB-stored key in the
+    management table — including disabled rows."""
+    _setup_or_keys_pool(monkeypatch)
+    db = _stub_db()
+    db.list_openrouter_keys = AsyncMock(
+        return_value=[
+            {
+                "id": 7, "label": "main", "api_key_tail": "abcd",
+                "api_key_len": 48, "enabled": True,
+                "created_at": "2026-04-01T00:00:00+00:00",
+                "last_used_at": None, "notes": "primary",
+            },
+            {
+                "id": 8, "label": "old", "api_key_tail": "9999",
+                "api_key_len": 48, "enabled": False,
+                "created_at": "2026-03-01T00:00:00+00:00",
+                "last_used_at": "2026-04-01T12:34:56+00:00",
+                "notes": None,
+            },
+        ]
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/openrouter-keys")
+    body = await resp.text()
+    assert "main" in body
+    assert "abcd" in body
+    assert "primary" in body
+    assert "old" in body
+    assert "9999" in body
+
+
+async def test_openrouter_keys_add_post_writes_and_redirects(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """A valid POST inserts the key and redirects to the list."""
+    _setup_or_keys_pool(monkeypatch)
+    db = _stub_db()
+    db.add_openrouter_key = AsyncMock(return_value=42)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+
+    # Need to fetch a CSRF token from the GET first.
+    resp_get = await client.get("/admin/openrouter-keys")
+    body_get = await resp_get.text()
+    import re
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body_get)
+    assert m, "csrf_token absent from rendered page"
+    csrf = m.group(1)
+
+    resp = await client.post(
+        "/admin/openrouter-keys/add",
+        data={
+            "csrf_token": csrf,
+            "label": "main-key",
+            "api_key": "sk-or-v1-abcdef0123456789",
+            "notes": "primary",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/openrouter-keys"
+    db.add_openrouter_key.assert_awaited_once()
+    call_kwargs = db.add_openrouter_key.await_args.kwargs
+    assert call_kwargs["label"] == "main-key"
+    assert call_kwargs["api_key"] == "sk-or-v1-abcdef0123456789"
+    assert call_kwargs["notes"] == "primary"
+
+
+async def test_openrouter_keys_add_post_rejects_invalid_csrf(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """A POST with a missing CSRF token must NOT call the DB
+    method."""
+    _setup_or_keys_pool(monkeypatch)
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+
+    resp = await client.post(
+        "/admin/openrouter-keys/add",
+        data={
+            "csrf_token": "wrong",
+            "label": "main", "api_key": "sk-or-v1-x",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.add_openrouter_key.assert_not_called()
+
+
+async def test_openrouter_keys_add_post_surfaces_validation_error(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """A ValueError from the DB layer surfaces as a flash banner —
+    not a 500."""
+    _setup_or_keys_pool(monkeypatch)
+    db = _stub_db()
+    db.add_openrouter_key = AsyncMock(
+        side_effect=ValueError("api_key is already registered")
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+
+    resp_get = await client.get("/admin/openrouter-keys")
+    body_get = await resp_get.text()
+    import re
+    csrf = re.search(
+        r'name="csrf_token" value="([^"]+)"', body_get
+    ).group(1)
+    resp = await client.post(
+        "/admin/openrouter-keys/add",
+        data={
+            "csrf_token": csrf,
+            "label": "dup", "api_key": "sk-or-v1-x",
+        },
+        allow_redirects=True,
+    )
+    body = await resp.text()
+    assert "already registered" in body
+
+
+async def test_openrouter_keys_disable_post_marks_disabled(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """A disable POST flips the enabled flag and refreshes the
+    pool."""
+    _setup_or_keys_pool(monkeypatch)
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp_get = await client.get("/admin/openrouter-keys")
+    import re
+    csrf = re.search(
+        r'name="csrf_token" value="([^"]+)"', await resp_get.text()
+    ).group(1)
+    resp = await client.post(
+        "/admin/openrouter-keys/42/disable",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.set_openrouter_key_enabled.assert_awaited_once_with(42, enabled=False)
+
+
+async def test_openrouter_keys_enable_post_marks_enabled(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """An enable POST flips the enabled flag the other direction."""
+    _setup_or_keys_pool(monkeypatch)
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp_get = await client.get("/admin/openrouter-keys")
+    import re
+    csrf = re.search(
+        r'name="csrf_token" value="([^"]+)"', await resp_get.text()
+    ).group(1)
+    resp = await client.post(
+        "/admin/openrouter-keys/42/enable",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.set_openrouter_key_enabled.assert_awaited_once_with(42, enabled=True)
+
+
+async def test_openrouter_keys_delete_post_removes_row(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """A delete POST hard-removes the row."""
+    _setup_or_keys_pool(monkeypatch)
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp_get = await client.get("/admin/openrouter-keys")
+    import re
+    csrf = re.search(
+        r'name="csrf_token" value="([^"]+)"', await resp_get.text()
+    ).group(1)
+    resp = await client.post(
+        "/admin/openrouter-keys/42/delete",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.delete_openrouter_key.assert_awaited_once_with(42)
+
+
+async def test_openrouter_keys_delete_post_requires_auth(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """Unauthenticated POSTs must redirect to /admin/login —
+    they must NOT touch the DB."""
+    _setup_or_keys_pool(monkeypatch)
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    resp = await client.post(
+        "/admin/openrouter-keys/1/delete",
+        data={"csrf_token": "anything"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+    db.delete_openrouter_key.assert_not_called()

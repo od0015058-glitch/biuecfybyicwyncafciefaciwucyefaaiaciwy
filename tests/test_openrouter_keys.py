@@ -646,3 +646,194 @@ def test_load_keys_preserves_cooldowns_for_keys_still_in_pool():
     openrouter_keys.load_keys()
     assert "k1" in openrouter_keys._cooldowns
     _reset_env()
+
+
+# ---- Stage-15-Step-E #4 follow-up #2: DB-backed key registry --------
+
+
+class _StubDB:
+    """Minimal duck-typed DB stub for ``refresh_from_db`` tests."""
+
+    def __init__(self, rows):
+        self._rows = rows
+        self.calls = 0
+
+    async def list_enabled_openrouter_keys_with_secret(self):
+        self.calls += 1
+        if isinstance(self._rows, Exception):
+            raise self._rows
+        return self._rows
+
+
+@pytest.mark.asyncio
+async def test_refresh_from_db_appends_db_keys_to_env_pool():
+    """Env keys load first; DB-backed enabled rows append after."""
+    _reset_env()
+    os.environ["OPENROUTER_API_KEY_1"] = "env-1"
+    db = _StubDB([
+        {"id": 11, "label": "main", "api_key": "db-1"},
+        {"id": 12, "label": "backup", "api_key": "db-2"},
+    ])
+    pool_size = await openrouter_keys.refresh_from_db(db)
+    assert pool_size == 3
+    assert openrouter_keys.key_count() == 3
+    meta = openrouter_keys.get_key_meta_snapshot()
+    assert meta[0]["source"] == "env"
+    assert meta[1] == {"source": "db", "label": "main", "db_id": 11}
+    assert meta[2] == {"source": "db", "label": "backup", "db_id": 12}
+    _reset_env()
+
+
+@pytest.mark.asyncio
+async def test_refresh_from_db_idempotent_preserves_counters():
+    """Calling refresh twice with the same DB rows must NOT reset
+    per-key counters — that's what lets the admin GET path refresh
+    on every page load without nuking the request/429 numbers."""
+    _reset_env()
+    os.environ["OPENROUTER_API_KEY_1"] = "env-1"
+    db = _StubDB([{"id": 11, "label": "main", "api_key": "db-1"}])
+    await openrouter_keys.refresh_from_db(db)
+    # Simulate a 429 on env-1 + a few requests on db-1 (idx 1). We
+    # use telegram_id=1 to stick to idx 1 so the request counter
+    # for idx 1 bumps directly.
+    openrouter_keys.mark_key_rate_limited("env-1", retry_after_secs=42.0)
+    openrouter_keys.key_for_user(1)  # sticks to idx 1
+    openrouter_keys.key_for_user(1)
+    counters_before_429 = openrouter_keys.get_key_429_counters()
+    counters_before_req = openrouter_keys.get_key_request_counters()
+    assert counters_before_429.get(0, 0) >= 1
+    assert counters_before_req.get(1, 0) >= 2
+    # Second refresh with identical rows is a no-op.
+    await openrouter_keys.refresh_from_db(db)
+    assert openrouter_keys.get_key_429_counters() == counters_before_429
+    assert openrouter_keys.get_key_request_counters() == counters_before_req
+    _reset_env()
+
+
+@pytest.mark.asyncio
+async def test_refresh_from_db_rebuilds_when_pool_changes():
+    """Adding a new DB key must trigger a rebuild — counters can
+    legitimately reset because the pool composition changed."""
+    _reset_env()
+    os.environ["OPENROUTER_API_KEY_1"] = "env-1"
+    db = _StubDB([{"id": 11, "label": "a", "api_key": "db-1"}])
+    await openrouter_keys.refresh_from_db(db)
+    assert openrouter_keys.key_count() == 2
+    # Add a 2nd db key.
+    db._rows = [
+        {"id": 11, "label": "a", "api_key": "db-1"},
+        {"id": 12, "label": "b", "api_key": "db-2"},
+    ]
+    await openrouter_keys.refresh_from_db(db)
+    assert openrouter_keys.key_count() == 3
+    meta = openrouter_keys.get_key_meta_snapshot()
+    assert meta[2] == {"source": "db", "label": "b", "db_id": 12}
+    _reset_env()
+
+
+@pytest.mark.asyncio
+async def test_refresh_from_db_skips_duplicate_against_env():
+    """A DB row whose api_key already lives in env is skipped (not
+    inserted twice). Defends against an operator who copy-pasted a
+    key into both surfaces."""
+    _reset_env()
+    os.environ["OPENROUTER_API_KEY_1"] = "shared-key"
+    db = _StubDB([
+        {"id": 99, "label": "dup", "api_key": "shared-key"},
+        {"id": 100, "label": "fresh", "api_key": "fresh-key"},
+    ])
+    await openrouter_keys.refresh_from_db(db)
+    assert openrouter_keys.key_count() == 2
+    assert openrouter_keys._keys == ["shared-key", "fresh-key"]
+    _reset_env()
+
+
+@pytest.mark.asyncio
+async def test_refresh_from_db_handles_db_error_gracefully():
+    """A transient DB error must keep the env pool in place rather
+    than blanking it."""
+    _reset_env()
+    os.environ["OPENROUTER_API_KEY_1"] = "env-1"
+    openrouter_keys.load_keys()
+    db = _StubDB(RuntimeError("boom"))
+    pool_size = await openrouter_keys.refresh_from_db(db)
+    assert pool_size == 1
+    assert openrouter_keys._keys == ["env-1"]
+    _reset_env()
+
+
+@pytest.mark.asyncio
+async def test_refresh_from_db_handles_non_list_return():
+    """A buggy stub that returns AsyncMock / None / anything-not-a-list
+    must be tolerated — same fail-safe shape as the threshold-overrides
+    path."""
+    _reset_env()
+    os.environ["OPENROUTER_API_KEY_1"] = "env-1"
+
+    class _BadDB:
+        async def list_enabled_openrouter_keys_with_secret(self):
+            return "not a list"
+
+    pool_size = await openrouter_keys.refresh_from_db(_BadDB())
+    assert pool_size == 1
+    _reset_env()
+
+
+@pytest.mark.asyncio
+async def test_refresh_from_db_with_none_db_falls_through_to_env():
+    """Passing ``None`` for the DB falls back to a pure env load."""
+    _reset_env()
+    os.environ["OPENROUTER_API_KEY_1"] = "env-only"
+    pool_size = await openrouter_keys.refresh_from_db(None)
+    assert pool_size == 1
+    assert openrouter_keys._keys == ["env-only"]
+    _reset_env()
+
+
+def test_key_for_user_bumps_request_counter():
+    """Each ``key_for_user`` call must bump the request counter for
+    the picked slot."""
+    _reset_env()
+    os.environ["OPENROUTER_API_KEY_1"] = "k0"
+    os.environ["OPENROUTER_API_KEY_2"] = "k1"
+    openrouter_keys.load_keys()
+    openrouter_keys.reset_key_counters_for_tests()
+    openrouter_keys.key_for_user(0)
+    openrouter_keys.key_for_user(0)
+    openrouter_keys.key_for_user(1)
+    counts = openrouter_keys.get_key_request_counters()
+    assert counts.get(0, 0) == 2
+    assert counts.get(1, 0) == 1
+    _reset_env()
+
+
+def test_key_for_user_request_counter_bumps_on_fallback():
+    """When the sticky pick is hot, the fallback slot's request
+    counter must bump — not the sticky slot's."""
+    _reset_env()
+    os.environ["OPENROUTER_API_KEY_1"] = "k0"
+    os.environ["OPENROUTER_API_KEY_2"] = "k1"
+    openrouter_keys.load_keys()
+    openrouter_keys.reset_key_counters_for_tests()
+    openrouter_keys.mark_key_rate_limited("k0", retry_after_secs=60.0)
+    # User 0 sticks to idx 0 (k0) but it's hot → fallback to idx 1.
+    picked = openrouter_keys.key_for_user(0)
+    assert picked == "k1"
+    counts = openrouter_keys.get_key_request_counters()
+    assert counts.get(0, 0) == 0
+    assert counts.get(1, 0) == 1
+    _reset_env()
+
+
+def test_load_keys_marks_env_source_in_meta():
+    """``load_keys()`` populates ``_KEY_META`` with ``source='env'``
+    for every env-loaded slot so the panel can render the source
+    column even on env-only deploys."""
+    _reset_env()
+    os.environ["OPENROUTER_API_KEY_1"] = "k1"
+    os.environ["OPENROUTER_API_KEY_2"] = "k2"
+    openrouter_keys.load_keys()
+    meta = openrouter_keys.get_key_meta_snapshot()
+    assert len(meta) == 2
+    assert all(m == {"source": "env"} for m in meta)
+    _reset_env()
