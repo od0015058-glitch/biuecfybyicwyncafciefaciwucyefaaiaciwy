@@ -15,6 +15,19 @@ NowPayments crypto invoices.
   promos, gifts, users — search by id/username and credit/debit from
   the browser — broadcast with a live progress bar, and a paginated
   transactions browser with gateway / status / user filters).
+- **Monetization dashboard** at `${WEBHOOK_BASE_URL}/admin/monetization`
+  surfaces the bot's revenue (gateway top-ups, with the same
+  admin/gift filter as the main dashboard's "Total revenue" tile),
+  wallet charges (`SUM(cost_deducted_usd)` from `usage_logs`), the
+  *implied* OpenRouter cost (charges divided by the current
+  `COST_MARKUP`), gross margin (charges − OpenRouter cost), and net
+  profit (revenue − OpenRouter cost) — both lifetime and over a
+  trailing 30-day window. Includes a per-model breakdown over the
+  same window sorted by charged USD descending so the biggest
+  margin contributors are at the top. Footnotes on the page spell
+  out the assumptions (implied OR cost drifts when `COST_MARKUP`
+  changes; net profit is forward-looking — assumes every credited
+  dollar will eventually burn).
 - Telegram-side admin commands (`/admin`, `/admin_metrics`,
   `/admin_credit`, `/admin_broadcast`, …) for ops via DMs.
 - **Canonical slash-command menu** — on every startup the bot
@@ -139,8 +152,10 @@ NowPayments crypto invoices.
   `prometheus_client` dependency in the bot itself). Output covers
   per-loop heartbeat epochs (FX refresh, model discovery, catalog
   refresh, NowPayments min-amount refresh, pending alert / reaper
-  loops), IPN drop counters (NowPayments + TetraPay) broken down by
-  reason, the in-flight chat-slot gauge, the count of
+  loops), IPN drop counters (NowPayments + TetraPay + Zarinpal —
+  exposed as `meowassist_ipn_drops_total`,
+  `meowassist_tetrapay_drops_total`, `meowassist_zarinpal_drops_total`)
+  broken down by reason, the in-flight chat-slot gauge, the count of
   admin-disabled models / gateways, and the size of the OpenRouter
   key pool. The endpoint is gated by `METRICS_IP_ALLOWLIST`
   (comma-separated IPs / CIDRs, default `127.0.0.1,::1`); an empty
@@ -160,13 +175,13 @@ NowPayments crypto invoices.
     for: 5m
   ```
 - **IPN-health dashboard tile** — `/admin/` shows a per-process
-  drop-counter table for both NowPayments and TetraPay so an
+  drop-counter table for NowPayments, TetraPay, and Zarinpal so an
   operator can spot a misconfigured webhook (signature mismatch,
   unknown invoice, transient verify failures) at a glance without
   shelling into the Prometheus scrape. Counters reset on every
   bot restart; for long-running history, pull `/metrics` into
   Prometheus. Gateway tiles are independently fault-isolated — a
-  future regression in one accessor cannot blank the other half.
+  future regression in one accessor cannot blank the other two.
 - **Conversation history export** — the memory screen now has a
   "📥 Export conversation" button that ships the user's full
   persisted buffer back as a `.txt` document (role labels +

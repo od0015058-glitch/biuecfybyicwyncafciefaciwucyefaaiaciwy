@@ -525,16 +525,29 @@ async def logout(request: web.Request) -> web.StreamResponse:
 def _collect_ipn_health() -> dict:
     """Snapshot the per-process IPN drop counters for the dashboard tile.
 
-    Stage-15-Step-D #5. ``payments.get_ipn_drop_counters()`` and
-    ``tetrapay.get_tetrapay_drop_counters()`` are both
-    process-local and reset to zero on every restart, so the tile
-    is labelled "since last restart" in the template. Each gateway
-    is collected behind its own ``try`` so a future regression in
-    one accessor (or a missing-import edge case in tests) cannot
-    blank out the other half of the panel.
+    Stage-15-Step-D #5. ``payments.get_ipn_drop_counters()``,
+    ``tetrapay.get_tetrapay_drop_counters()`` and
+    ``zarinpal.get_zarinpal_drop_counters()`` are all process-local
+    and reset to zero on every restart, so the tile is labelled
+    "since last restart" in the template. Each gateway is collected
+    behind its own ``try`` so a future regression in one accessor
+    (or a missing-import edge case in tests) cannot blank out the
+    other panels.
+
+    Stage-15-Step-E #9 bundled fix: Zarinpal shipped its own
+    ``_ZARINPAL_DROP_COUNTERS`` registry in
+    Stage-15-Step-E #8 (PR #126) but the dashboard tile and the
+    Prometheus exposition both forgot to consume it, so an operator
+    debugging a Zarinpal verify-failure spike had to grep the bot
+    logs to count drops. The dashboard now surfaces Zarinpal
+    counters alongside NowPayments and TetraPay, and ``metrics.py``
+    exposes ``meowassist_zarinpal_drops_total{reason="..."}`` as a
+    Prometheus counter so the alerting rules already targeting the
+    other two gateways auto-extend to the third.
     """
     nowpayments: dict[str, int]
     tetrapay: dict[str, int]
+    zarinpal: dict[str, int]
     try:
         from payments import get_ipn_drop_counters
 
@@ -549,11 +562,20 @@ def _collect_ipn_health() -> dict:
     except Exception:
         log.exception("dashboard: get_tetrapay_drop_counters failed")
         tetrapay = {}
+    try:
+        from zarinpal import get_zarinpal_drop_counters
+
+        zarinpal = dict(get_zarinpal_drop_counters())
+    except Exception:
+        log.exception("dashboard: get_zarinpal_drop_counters failed")
+        zarinpal = {}
     return {
         "nowpayments": nowpayments,
         "tetrapay": tetrapay,
+        "zarinpal": zarinpal,
         "nowpayments_total": sum(nowpayments.values()),
         "tetrapay_total": sum(tetrapay.values()),
+        "zarinpal_total": sum(zarinpal.values()),
     }
 
 
@@ -609,6 +631,106 @@ async def dashboard(request: web.Request) -> web.StreamResponse:
             "db_error": db_error,
             "ipn_health": ipn_health,
             "active_page": "dashboard",
+        },
+    )
+
+
+# ---------------------------------------------------------------------
+# Monetization (Stage-15-Step-E #9)
+# ---------------------------------------------------------------------
+
+
+# 30 days mirrors ``Database.get_monetization_summary``'s default and
+# the ``get_system_metrics`` top-models horizon — keeping the two
+# admin surfaces aligned ("the same 30 days") avoids confusion when
+# the operator cross-references the dashboard's "Top models" tile
+# against the monetization table.
+_MONETIZATION_DEFAULT_WINDOW_DAYS: int = 30
+_MONETIZATION_TOP_MODELS_LIMIT: int = 10
+
+
+def _empty_monetization_summary(
+    *, window_days: int, markup: float = 0.0,
+) -> dict:
+    """Return a zero-everything monetization summary in the shape the
+    template expects. Used as the dev-mode and DB-error fallback so
+    the page renders cleanly even when the DB is unreachable.
+
+    The shape MUST stay aligned with ``Database.get_monetization_summary``
+    — Devin Review caught a similar mismatch on PR #54 where the
+    template wanted ``user_count`` but the real DB returned
+    ``users_total``, which 500'd every dashboard load.
+    """
+    zero_block = {
+        "revenue_usd": 0.0,
+        "charged_usd": 0.0,
+        "openrouter_cost_usd": 0.0,
+        "gross_margin_usd": 0.0,
+        "gross_margin_pct": 0.0,
+        "net_profit_usd": 0.0,
+    }
+    return {
+        "markup": float(markup),
+        "lifetime": dict(zero_block),
+        "window": {"days": int(window_days), **zero_block},
+        "by_model": [],
+    }
+
+
+async def monetization(request: web.Request) -> web.StreamResponse:
+    """``/admin/monetization`` — first slice of Stage-15-Step-E #9.
+
+    Renders the bot's revenue / OpenRouter cost / gross margin
+    breakdown over a fixed 30-day window plus lifetime totals. The
+    per-model table sorts by *charged USD descending* so the biggest
+    margin contributors are at the top.
+
+    DB unreachable / query failure → render the empty-zero shape
+    plus an inline error banner. Same fail-soft pattern the
+    ``dashboard`` handler uses; a flaky DB shouldn't 500 the
+    operator's home view.
+    """
+    db = request.app.get(APP_KEY_DB)
+    summary: dict
+    db_error: str | None = None
+
+    # Read the markup once for the empty-fallback path so the page
+    # still shows the operator their current pricing config even
+    # when the DB is out. Cheap and stable.
+    try:
+        from pricing import get_markup
+        markup_for_fallback = float(get_markup())
+    except Exception:
+        log.exception("monetization: get_markup failed")
+        markup_for_fallback = 1.0
+
+    if db is None:
+        summary = _empty_monetization_summary(
+            window_days=_MONETIZATION_DEFAULT_WINDOW_DAYS,
+            markup=markup_for_fallback,
+        )
+        db_error = "No database wired up (development mode)."
+    else:
+        try:
+            summary = await db.get_monetization_summary(
+                window_days=_MONETIZATION_DEFAULT_WINDOW_DAYS,
+                top_models_limit=_MONETIZATION_TOP_MODELS_LIMIT,
+            )
+        except Exception:
+            log.exception("monetization: get_monetization_summary failed")
+            summary = _empty_monetization_summary(
+                window_days=_MONETIZATION_DEFAULT_WINDOW_DAYS,
+                markup=markup_for_fallback,
+            )
+            db_error = "Database query failed — see logs."
+
+    return aiohttp_jinja2.render_template(
+        "monetization.html",
+        request,
+        {
+            "summary": summary,
+            "db_error": db_error,
+            "active_page": "monetization",
         },
     )
 
@@ -4817,6 +4939,12 @@ def setup_admin_routes(
     app.router.add_get(
         "/admin",
         lambda r: web.HTTPFound(location="/admin/"),
+    )
+
+    # Stage-15-Step-E #9: bot monetization rollup.
+    app.router.add_get(
+        "/admin/monetization",
+        _require_auth(monetization),
     )
 
     # Stage-8-Part-2: promo codes.

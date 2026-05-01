@@ -108,6 +108,35 @@
     TetraPay counters unavailable (module import failed — see logs).
   </p>
   {% endif %}
+
+  <h4 style="margin: 1em 0 0.25em 0;">Zarinpal</h4>
+  {% if ipn_health.zarinpal %}
+  <table>
+    <thead>
+      <tr>
+        <th>Reason</th>
+        <th>Count</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for reason, count in ipn_health.zarinpal.items()|sort %}
+      <tr>
+        <td><code>{{ reason }}</code></td>
+        <td>{{ "{:,}".format(count) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if ipn_health.zarinpal_total == 0 %}
+  <p style="color: var(--text-muted); margin: 0.25em 0; font-size: 0.85em;">
+    All zero — no Zarinpal callback drops recorded since startup.
+  </p>
+  {% endif %}
+  {% else %}
+  <p style="color: var(--text-muted); margin: 0;">
+    Zarinpal counters unavailable (module import failed — see logs).
+  </p>
+  {% endif %}
 </div>
 
 <div class="panel">

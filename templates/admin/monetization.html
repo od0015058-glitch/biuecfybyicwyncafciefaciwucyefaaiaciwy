@@ -1,0 +1,145 @@
+{% extends "_layout.html" %}
+
+{% block title %}Monetization{% endblock %}
+
+{% block main %}
+<h2>Monetization</h2>
+
+<p style="color: var(--text-muted); margin: 0 0 1em 0; font-size: 0.9em;">
+  Revenue (gateway top-ups), wallet charges (per-token spend), implied
+  OpenRouter cost (charges ÷ markup) and the resulting gross margin.
+  Configurable via <code>COST_MARKUP</code> in the bot environment.
+</p>
+
+{% if db_error %}
+<div class="alert alert-warn">{{ db_error }}</div>
+{% endif %}
+
+<div class="panel">
+  <h3>Pricing</h3>
+  <p style="margin: 0;">
+    Current markup multiplier: <strong>{{ "{:,.4f}".format(summary.markup) }}×</strong>
+    {% if summary.markup > 1.0 %}
+      &nbsp;(gross margin pinned at {{ "{:.2f}".format(summary["lifetime"].gross_margin_pct) }}% of every charged dollar)
+    {% else %}
+      &nbsp;(operating at-cost — no markup applied)
+    {% endif %}
+  </p>
+</div>
+
+<div class="panel">
+  <h3>Last {{ summary["window"].days }} days</h3>
+  <div class="stat-grid">
+    <div class="stat">
+      <div class="label">Gateway revenue</div>
+      <div class="value">${{ "{:,.2f}".format(summary["window"].revenue_usd) }}</div>
+    </div>
+    <div class="stat">
+      <div class="label">Wallet charges</div>
+      <div class="value">${{ "{:,.2f}".format(summary["window"].charged_usd) }}</div>
+    </div>
+    <div class="stat">
+      <div class="label">Implied OpenRouter cost</div>
+      <div class="value">${{ "{:,.2f}".format(summary["window"].openrouter_cost_usd) }}</div>
+    </div>
+    <div class="stat">
+      <div class="label">Gross margin</div>
+      <div class="value">${{ "{:,.2f}".format(summary["window"].gross_margin_usd) }}</div>
+    </div>
+    <div class="stat">
+      <div class="label">Net (revenue − OR cost)</div>
+      <div class="value">${{ "{:,.2f}".format(summary["window"].net_profit_usd) }}</div>
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <h3>Lifetime</h3>
+  <div class="stat-grid">
+    <div class="stat">
+      <div class="label">Gateway revenue</div>
+      <div class="value">${{ "{:,.2f}".format(summary["lifetime"].revenue_usd) }}</div>
+    </div>
+    <div class="stat">
+      <div class="label">Wallet charges</div>
+      <div class="value">${{ "{:,.2f}".format(summary["lifetime"].charged_usd) }}</div>
+    </div>
+    <div class="stat">
+      <div class="label">Implied OpenRouter cost</div>
+      <div class="value">${{ "{:,.2f}".format(summary["lifetime"].openrouter_cost_usd) }}</div>
+    </div>
+    <div class="stat">
+      <div class="label">Gross margin</div>
+      <div class="value">${{ "{:,.2f}".format(summary["lifetime"].gross_margin_usd) }}</div>
+    </div>
+    <div class="stat">
+      <div class="label">Net (revenue − OR cost)</div>
+      <div class="value">${{ "{:,.2f}".format(summary["lifetime"].net_profit_usd) }}</div>
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <h3>By model — last {{ summary["window"].days }} days</h3>
+  {% if summary.by_model %}
+  <table>
+    <thead>
+      <tr>
+        <th>Model</th>
+        <th>Requests</th>
+        <th>Charged (USD)</th>
+        <th>Implied OR cost (USD)</th>
+        <th>Gross margin (USD)</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in summary.by_model %}
+      <tr>
+        <td>{{ row.model }}</td>
+        <td>{{ "{:,}".format(row.requests) }}</td>
+        <td>${{ "{:,.4f}".format(row.charged_usd) }}</td>
+        <td>${{ "{:,.4f}".format(row.openrouter_cost_usd) }}</td>
+        <td>${{ "{:,.4f}".format(row.gross_margin_usd) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p style="color: var(--text-muted); margin: 0;">
+    No model usage logged in the last {{ summary["window"].days }} days.
+  </p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <h3>How to read these numbers</h3>
+  <ul style="margin: 0.5em 0; padding-left: 1.25em; color: var(--text-muted); font-size: 0.9em;">
+    <li>
+      <strong>Gateway revenue</strong> excludes <code>admin</code> and
+      <code>gift</code> top-ups (manual credits and gift-code
+      redemptions are free credit, not earnings). Same filter the
+      dashboard "Total revenue" tile uses.
+    </li>
+    <li>
+      <strong>Wallet charges</strong> is the sum of
+      <code>cost_deducted_usd</code> from <code>usage_logs</code> —
+      i.e. what we charged users per token, with the markup baked in.
+    </li>
+    <li>
+      <strong>Implied OpenRouter cost</strong> is
+      <code>wallet_charges ÷ markup</code>. We don't store per-call
+      OpenRouter cost, so this is a derived figure that assumes the
+      historical rows were charged at today's markup. If you've
+      changed <code>COST_MARKUP</code> recently the lifetime number
+      drifts; the rolling-window numbers are more reliable.
+    </li>
+    <li>
+      <strong>Net profit</strong> assumes every dollar credited will
+      eventually be consumed at today's markup. A user who topped up
+      $20 and never sent a prompt counts as $20 of revenue and $0 of
+      OpenRouter cost. Treat net as "what would be left if every
+      wallet drained tomorrow", not as realised profit.
+    </li>
+  </ul>
+</div>
+{% endblock %}
