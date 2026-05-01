@@ -1569,29 +1569,150 @@ async def receipts_more_handler(callback: CallbackQuery, state: FSMContext):
 
 
 # ==========================================
-# Stage-15-Step-E #2: wallet → my usage stats (first slice).
+# Stage-15-Step-E #2: wallet → my usage stats.
 # Per-user spending dashboard. Pulls a snapshot from the dedicated
 # DB method (which hard-codes the ``WHERE telegram_id = …`` filter
 # so a future caller can't accidentally leak someone else's totals)
 # and renders it via the pure ``user_stats.format_stats_summary``.
 # Empty-data case (a user with zero usage_logs rows) renders the
 # ``stats_empty`` placeholder rather than a wall of zeroes.
+#
+# Stage-15-Step-E #2 follow-up:
+# * ``/stats`` slash-command alias — ``cmd_stats``. Same render
+#   pipeline as ``hub_stats_handler``, but ``message.answer``
+#   instead of ``edit_text`` so a typed ``/stats`` lands as a
+#   fresh message.
+# * Window selector buttons — 7d / 30d / 90d / 365d. Click
+#   re-renders the same screen with the new window. Default 30d
+#   (matches ``Database.USER_STATS_WINDOW_DAYS_DEFAULT``).
+# * The selected window is highlighted with a ``✓`` prefix on
+#   the button label so a user can tell which one they're on
+#   without reading the section header.
 # ==========================================
 
+# Allowed window-day choices for the inline keyboard. Any value not
+# in this set falls back to ``USER_STATS_WINDOW_DAYS_DEFAULT`` —
+# defense against a stale callback payload from a deploy that used
+# a different option set, or a hand-crafted callback string from a
+# misbehaving client.
+_STATS_WINDOW_CHOICES: tuple[int, ...] = (7, 30, 90, 365)
 
-def _build_stats_keyboard(lang: str) -> InlineKeyboardBuilder:
-    """Two-row keyboard for the stats screen: back-to-wallet + home.
 
-    Mirrors the receipts-screen tail keyboard (no "Show more" — the
-    stats screen is a single-page snapshot, not a paginated feed).
+def _coerce_stats_window(value: object) -> int:
+    """Return ``value`` if it's a recognised window choice, else 30."""
+    try:
+        n = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 30
+    if n in _STATS_WINDOW_CHOICES:
+        return n
+    return 30
+
+
+def _build_stats_keyboard(
+    lang: str, *, window_days: int
+) -> InlineKeyboardBuilder:
+    """Window-selector + back-to-wallet keyboard for the stats screen.
+
+    Top row: four window buttons (7d / 30d / 90d / 365d). The
+    button matching ``window_days`` is prefixed with ``✓`` so the
+    selected window is visually obvious without scrolling to the
+    section header. Bottom row: back-to-wallet + home, matching
+    the receipts-screen tail keyboard.
+
+    Callback shape ``stats_window:<days>`` — parsed by
+    :func:`stats_window_select_handler`. A click on the
+    already-selected button is still emitted (Telegram doesn't
+    suppress repeats), and we swallow the resulting "message is
+    not modified" race the same way the wallet / receipts screens
+    do.
     """
     builder = InlineKeyboardBuilder()
+    selected = _coerce_stats_window(window_days)
+    for choice in _STATS_WINDOW_CHOICES:
+        prefix = "✓ " if choice == selected else ""
+        builder.button(
+            text=f"{prefix}{t(lang, 'stats_window_btn', days=choice)}",
+            callback_data=f"stats_window:{choice}",
+        )
     builder.button(
         text=t(lang, "btn_back_to_wallet"), callback_data="back_to_wallet"
     )
     builder.button(text=t(lang, "btn_home"), callback_data="close_menu")
-    builder.adjust(2)
+    # 4 window buttons on top, back+home on bottom.
+    builder.adjust(4, 2)
     return builder
+
+
+# Empty fallback shape returned to ``_render_stats_screen`` when
+# ``Database.get_user_spending_summary`` raises. Keeps the formatter
+# happy (every key present, every value finite) without a 500 to
+# the user. Mirrors the empty shape inlined into ``hub_stats_handler``
+# pre-refactor — extracted so the slash-command path can re-use it.
+def _empty_stats_snapshot(window_days: int) -> dict:
+    return {
+        "lifetime": {
+            "total_calls": 0, "total_tokens": 0, "total_cost_usd": 0.0,
+        },
+        "window_days": window_days,
+        "window": {
+            "total_calls": 0, "total_tokens": 0, "total_cost_usd": 0.0,
+        },
+        "top_models": [],
+    }
+
+
+async def _build_stats_render(
+    user_id: int, lang: str, *, window_days: int
+) -> tuple[str, InlineKeyboardBuilder]:
+    """Fetch the snapshot + balance and return ``(text, keyboard)``.
+
+    Pure-ish helper shared by every entry point that renders the
+    stats screen: the wallet-menu callback (``hub_stats_handler``),
+    the slash-command alias (``cmd_stats``), and the window
+    selector (``stats_window_select_handler``).
+
+    ``window_days`` is forwarded straight to
+    :meth:`Database.get_user_spending_summary` (which clamps it to
+    ``[1, 365]`` of its own accord, but we additionally constrain
+    callers to :data:`_STATS_WINDOW_CHOICES` upstream so the
+    button-press path never sends anything weird).
+
+    Defensive against ``ValueError`` from the DB layer (renders
+    the empty snapshot instead of 500-ing); against a NaN
+    ``balance_usd`` (clamped to 0, then dropped by the formatter's
+    own ``balance_usd >= 0 + isfinite`` guard); and against a
+    missing ``user_data`` row (treated as a fresh / zero-balance
+    user).
+    """
+    try:
+        snapshot = await db.get_user_spending_summary(
+            user_id, window_days=window_days
+        )
+    except ValueError:
+        # Defensive — get_user_spending_summary raises on a missing
+        # / zero / negative ``telegram_id`` to keep a future buggy
+        # caller from leaking other users' totals.
+        log.exception(
+            "get_user_spending_summary refused for user %r", user_id
+        )
+        snapshot = _empty_stats_snapshot(window_days)
+    user_data = await db.get_user(user_id)
+    raw_balance = float(user_data["balance_usd"]) if user_data else 0.0
+    balance = raw_balance if math.isfinite(raw_balance) else 0.0
+
+    # Imported lazily to keep the module-import graph thin — the
+    # full ``handlers`` module already pulls in everything else;
+    # ``user_stats`` is a pure-function module so the import is
+    # cheap, but localising it makes the dependency obvious in
+    # code review.
+    from user_stats import format_stats_summary
+
+    text = format_stats_summary(snapshot, lang, balance_usd=balance)
+    builder = _build_stats_keyboard(
+        lang, window_days=snapshot.get("window_days", window_days)
+    )
+    return text, builder
 
 
 @router.callback_query(F.data == "hub_stats")
@@ -1616,39 +1737,9 @@ async def hub_stats_handler(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     user_id = callback.from_user.id
     lang = await _get_user_language(user_id)
-    try:
-        snapshot = await db.get_user_spending_summary(user_id)
-    except ValueError:
-        # Defensive — get_user_spending_summary raises on a missing
-        # / zero / negative ``telegram_id`` to keep a future buggy
-        # caller from leaking other users' totals. Same fallback
-        # shape as ``_render_receipts_page``.
-        log.exception(
-            "get_user_spending_summary refused for user %r", user_id
-        )
-        snapshot = {
-            "lifetime": {
-                "total_calls": 0, "total_tokens": 0, "total_cost_usd": 0.0,
-            },
-            "window_days": 30,
-            "window": {
-                "total_calls": 0, "total_tokens": 0, "total_cost_usd": 0.0,
-            },
-            "top_models": [],
-        }
-    user_data = await db.get_user(user_id)
-    raw_balance = float(user_data["balance_usd"]) if user_data else 0.0
-    balance = raw_balance if math.isfinite(raw_balance) else 0.0
-
-    # Imported lazily to keep the module-import graph thin — the
-    # full ``handlers`` module already pulls in everything else;
-    # ``user_stats`` is a pure-function module so the import is
-    # cheap, but localising it makes the dependency obvious in
-    # code review.
-    from user_stats import format_stats_summary
-
-    text = format_stats_summary(snapshot, lang, balance_usd=balance)
-    builder = _build_stats_keyboard(lang)
+    text, builder = await _build_stats_render(
+        user_id, lang, window_days=30
+    )
     try:
         await callback.message.edit_text(
             text,
@@ -1663,6 +1754,87 @@ async def hub_stats_handler(callback: CallbackQuery, state: FSMContext):
         # just swallow the no-op.
         log.debug("hub_stats edit was a no-op", exc_info=True)
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("stats_window:"))
+async def stats_window_select_handler(
+    callback: CallbackQuery, state: FSMContext
+):
+    """Re-render the stats screen with a different rolling window.
+
+    Callback payload shape: ``stats_window:<days>``. ``<days>``
+    must be one of :data:`_STATS_WINDOW_CHOICES`; anything else
+    falls back to the default (``30``) — mirrors the receipts
+    cursor parser's "garbage in → start over" stance.
+
+    Same FSM clear + identical edit-back-to-screen semantics as
+    :func:`hub_stats_handler`. The "message is not modified"
+    race fires here too when the user mashes the same button
+    twice; swallow it.
+    """
+    await state.clear()
+    user_id = callback.from_user.id
+    lang = await _get_user_language(user_id)
+    raw = (callback.data or "").split(":", 1)[1] if callback.data else ""
+    window_days = _coerce_stats_window(raw)
+    text, builder = await _build_stats_render(
+        user_id, lang, window_days=window_days
+    )
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=builder.as_markup(),
+            parse_mode="Markdown",
+        )
+    except TelegramBadRequest:
+        log.debug("stats_window edit was a no-op", exc_info=True)
+    await callback.answer()
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message, state: FSMContext):
+    """Slash-command alias for the wallet-menu stats screen.
+
+    Mirrors the wallet-menu button (``hub_stats``) but lands as a
+    fresh message instead of an in-place edit, which is the
+    natural shape for a typed slash command. Re-uses the same
+    render pipeline (:func:`_build_stats_render`) so the two
+    surfaces can never drift on copy or layout.
+
+    Optional positional arg picks a non-default window:
+    ``/stats 7`` / ``/stats 90`` / ``/stats 365``. Anything else
+    is silently coerced to the default (``30`` days) so a
+    fat-fingered ``/stats abc`` doesn't 500 — same forgiveness
+    policy as the receipts pagination cursor.
+
+    FSM clear matches the wallet-menu callback: the slash command
+    is a hard exit from any in-flight charge / promo / gift code
+    flow, so we drop the partial state before rendering.
+    """
+    await state.clear()
+    if message.from_user is None:
+        # Same defensive guard pattern used in cmd_start /
+        # cmd_redeem — anonymous group admins / channel-bot edge
+        # cases have no ``from_user``.
+        return
+    user_id = message.from_user.id
+    lang = await _get_user_language(user_id)
+
+    # Parse the optional ``<days>`` arg. ``aiogram``'s Command
+    # filter doesn't auto-split, so split here. Accept both
+    # ``/stats 7`` and ``/stats@bot 7``.
+    text_raw = (message.text or "").strip()
+    parts = text_raw.split(maxsplit=1)
+    window_days = 30
+    if len(parts) >= 2 and parts[1].strip():
+        window_days = _coerce_stats_window(parts[1].strip())
+
+    text, builder = await _build_stats_render(
+        user_id, lang, window_days=window_days
+    )
+    await message.answer(
+        text, reply_markup=builder.as_markup(), parse_mode="Markdown"
+    )
 
 
 @router.message(F.text.in_(_WALLET_LABELS))

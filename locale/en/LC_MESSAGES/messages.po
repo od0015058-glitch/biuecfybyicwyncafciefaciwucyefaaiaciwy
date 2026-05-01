@@ -1073,6 +1073,11 @@ msgstr "🔝 *Top models (last {days} days)*"
 msgid "stats_top_models_line"
 msgstr "  {rank}. `{model}` — {calls:,} calls, ${cost:.4f}"
 
+#. {days} روزه
+#: strings.py:stats_window_btn
+msgid "stats_window_btn"
+msgstr "{days}d"
+
 #. 🕒 *{days} روز اخیر*
 #: strings.py:stats_window_header
 msgid "stats_window_header"
