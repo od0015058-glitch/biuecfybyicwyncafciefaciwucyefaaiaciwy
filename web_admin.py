@@ -823,6 +823,19 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     # the alert-loop incidents.
     "bot_health_alert": "Bot-health alert DM sent",
     "bot_health_recovery": "Bot-health recovery DM sent",
+    # Stage-15-Step-E #5 (follow-up to PR #123): admin-role CRUD
+    # was already recording these slugs at the
+    # ``/admin_role_grant`` / ``/admin_role_revoke`` Telegram
+    # handlers, but they were missed by the original Step-E #5 PR
+    # *and* by the audit-dropdown sweep in Stage-15-Step-F follow-up
+    # #3. The rows were stored correctly, but an operator filtering
+    # the audit feed to "role changes only" while reviewing who got
+    # promoted couldn't pick those slugs out of the dropdown — they
+    # had to scroll the full unfiltered feed. Bundled fix in this
+    # PR. A regression test in ``tests/test_web_admin.py`` pins both
+    # labels so a future PR can't drop them again.
+    "role_grant": "Admin role granted",
+    "role_revoke": "Admin role revoked",
 }
 
 

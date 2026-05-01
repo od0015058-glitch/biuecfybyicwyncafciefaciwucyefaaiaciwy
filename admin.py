@@ -31,7 +31,15 @@ from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
-from admin_roles import VALID_ROLES, normalize_role
+from admin_roles import (
+    ROLE_OPERATOR,
+    ROLE_SUPER,
+    ROLE_VIEWER,
+    VALID_ROLES,
+    effective_role,
+    normalize_role,
+    role_at_least,
+)
 from database import db
 from formatting import format_usd
 
@@ -131,38 +139,169 @@ def get_admin_user_ids() -> frozenset[int]:
 
 
 # ---------------------------------------------------------------------
+# Stage-15-Step-E #5 follow-up — role-aware command gating.
+#
+# The first slice of Step-E #5 (PR #123) shipped the role *table* +
+# the role-CRUD commands but kept every other ``/admin_*`` handler
+# gated on the flat env-list ``is_admin`` predicate. That meant a
+# DB-tracked ``viewer`` actually had no surface — they could be granted
+# the role, but :func:`is_admin` wouldn't match them, so every
+# ``/admin_metrics`` / ``/admin_balance`` / etc. silently no-oped.
+#
+# This helper resolves the actor's *effective* role (DB row first,
+# then env-list fallback) once per handler call so each handler can
+# branch on a single, typed, async-safe value. Resolution is the
+# same primitive the future ``/admin/roles`` web page will use, so
+# the Telegram-side and web-side agree on what "viewer means here".
+#
+# Why DB-fetch on every call rather than caching: the role table is
+# tiny (one row per admin), the lookup is a single primary-key SELECT
+# on an indexed integer column, and an admin's role can be revoked
+# in real-time. A stale-by-five-minutes cache would let a just-revoked
+# operator credit a wallet during their grace period — too dangerous
+# for the leverage saved.
+# ---------------------------------------------------------------------
+
+
+async def _resolve_actor_role(message: Message) -> str | None:
+    """Return the effective admin role for the actor of *message*.
+
+    Walks the same resolution order as :func:`admin_roles.effective_role`:
+
+    1. ``Database.get_admin_role`` — DB-tracked role wins when set.
+    2. Env-list ``ADMIN_USER_IDS`` — backward-compat fallback; legacy
+       admins keep ``super`` access without forcing an op-by-op DB seed.
+    3. ``None`` — not an admin in either layer.
+
+    Returns ``None`` for messages without a ``from_user`` (a service
+    message we somehow received as an admin command — defence in
+    depth, the dispatcher shouldn't deliver these here).
+
+    DB-fetch failures fall through to the env-list result. We'd
+    rather a transient pool error keep the legacy admin's surface
+    working than silently downgrade them to ``None`` mid-incident.
+    """
+    if message.from_user is None:
+        return None
+    telegram_id = message.from_user.id
+    is_env_admin = is_admin(telegram_id)
+    db_role: str | None = None
+    try:
+        db_role = await db.get_admin_role(telegram_id)
+    except Exception:
+        log.exception(
+            "admin: get_admin_role failed for telegram_id=%s; "
+            "falling through to env-list",
+            telegram_id,
+        )
+    return effective_role(
+        telegram_id, db_role, is_env_admin=is_env_admin
+    )
+
+
+async def _require_role(message: Message, required: str) -> bool:
+    """Return ``True`` iff the actor of *message* has at least the
+    *required* role; otherwise silent no-op + ``False``.
+
+    Same fail-closed contract :func:`is_admin` enforces: a non-admin,
+    a viewer querying a super-only command, or a malformed message
+    all return ``False`` and produce no user-visible output. The
+    handler is expected to short-circuit on a ``False`` return so we
+    don't leak the existence of the admin namespace to a curious
+    user poking at the bot.
+    """
+    role = await _resolve_actor_role(message)
+    if role_at_least(role, required):
+        return True
+    log.info(
+        "admin: %s denied — telegram_id=%s effective_role=%s "
+        "required=%s",
+        getattr(message, "text", "<no text>")[:40],
+        getattr(message.from_user, "id", None),
+        role,
+        required,
+    )
+    return False
+
+
+# ---------------------------------------------------------------------
 # /admin   →  hub message
 # ---------------------------------------------------------------------
 
-_ADMIN_HUB_TEXT = (
-    "🛠 *Admin hub*\n\n"
-    "Available commands:\n"
-    "• `/admin` — this menu\n"
-    "• `/admin_metrics` — system stats (users, revenue, top models)\n"
-    "• `/admin_balance <user_id>` — view a user's wallet + last 5 txs\n"
-    "• `/admin_credit <user_id> <usd> <reason>` — add USD to wallet\n"
-    "• `/admin_debit <user_id> <usd> <reason>` — subtract USD from wallet\n"
-    "• `/admin_promo_create <CODE> <pct%|$amt> [max_uses] [days]` — new promo\n"
-    "• `/admin_promo_list` — list promo codes (newest 20)\n"
-    "• `/admin_promo_revoke <CODE>` — soft-delete a promo code\n"
-    "• `/admin_broadcast [--active=N] <text>` — send `<text>` to every "
-    "user (or only users active in the last `N` days)\n"
-    "• `/admin_role_grant <user_id> <viewer|operator|super>` — record "
-    "a graduated role for a Telegram id\n"
-    "• `/admin_role_revoke <user_id>` — drop the DB-tracked role row\n"
-    "• `/admin_role_list` — list every DB-tracked admin role"
+# Hub-message lines, grouped by minimum role required to use the
+# command. The hub is rendered with only the rows the actor's
+# effective role can actually drive; surfacing a command in the menu
+# that the gate would silently deny is exactly the discoverability
+# trap Step-E #5 was meant to close.
+_HUB_LINES_VIEWER: tuple[str, ...] = (
+    "• `/admin` — this menu",
+    "• `/admin_metrics` — system stats (users, revenue, top models)",
+    "• `/admin_balance <user_id>` — view a user's wallet + last 5 txs",
 )
+_HUB_LINES_OPERATOR: tuple[str, ...] = (
+    "• `/admin_broadcast [--active=N] <text>` — send `<text>` to every "
+    "user (or only users active in the last `N` days)",
+)
+_HUB_LINES_SUPER: tuple[str, ...] = (
+    "• `/admin_credit <user_id> <usd> <reason>` — add USD to wallet",
+    "• `/admin_debit <user_id> <usd> <reason>` — subtract USD from wallet",
+    "• `/admin_promo_create <CODE> <pct%|$amt> [max_uses] [days]` — new promo",
+    "• `/admin_promo_list` — list promo codes (newest 20)",
+    "• `/admin_promo_revoke <CODE>` — soft-delete a promo code",
+)
+# Role-CRUD commands stay env-list-only — surface them in the hub
+# only for an env-list admin so a DB-tracked super (who can't promote
+# themselves out of super) doesn't see commands they can't run.
+_HUB_LINES_ENV_ONLY: tuple[str, ...] = (
+    "• `/admin_role_grant <user_id> <viewer|operator|super>` — record "
+    "a graduated role for a Telegram id",
+    "• `/admin_role_revoke <user_id>` — drop the DB-tracked role row",
+    "• `/admin_role_list` — list every DB-tracked admin role",
+)
+
+
+def _render_admin_hub(role: str | None, *, is_env_admin: bool) -> str:
+    """Render the role-filtered admin hub message.
+
+    Each section is included only if the actor's *role* satisfies the
+    section's minimum. The role-CRUD section is gated on
+    *is_env_admin* (not *role*) because the role table itself is the
+    source of truth those commands manage — letting a DB-tracked super
+    promote themselves out of the role table would defeat the gate.
+    """
+    lines: list[str] = ["🛠 *Admin hub*", "", "Available commands:"]
+    if role_at_least(role, ROLE_VIEWER):
+        lines.extend(_HUB_LINES_VIEWER)
+    if role_at_least(role, ROLE_OPERATOR):
+        lines.extend(_HUB_LINES_OPERATOR)
+    if role_at_least(role, ROLE_SUPER):
+        lines.extend(_HUB_LINES_SUPER)
+    if is_env_admin:
+        lines.extend(_HUB_LINES_ENV_ONLY)
+    return "\n".join(lines)
+
+
+# Kept for backward-compat with any external import; the live hub
+# now uses :func:`_render_admin_hub` to filter by role.
+_ADMIN_HUB_TEXT = _render_admin_hub(ROLE_SUPER, is_env_admin=True)
 
 
 @router.message(Command("admin"))
 async def admin_hub(message: Message) -> None:
-    if not is_admin(message.from_user.id if message.from_user else None):
+    role = await _resolve_actor_role(message)
+    if not role_at_least(role, ROLE_VIEWER):
         log.info(
             "non-admin /admin attempt by telegram_id=%s",
             getattr(message.from_user, "id", None),
         )
         return  # silent no-op
-    await message.answer(_ADMIN_HUB_TEXT, parse_mode="Markdown")
+    is_env = is_admin(
+        message.from_user.id if message.from_user else None
+    )
+    await message.answer(
+        _render_admin_hub(role, is_env_admin=is_env),
+        parse_mode="Markdown",
+    )
 
 
 # ---------------------------------------------------------------------
@@ -229,7 +368,8 @@ def format_metrics(rows: dict) -> str:
 
 @router.message(Command("admin_metrics"))
 async def admin_metrics(message: Message) -> None:
-    if not is_admin(message.from_user.id if message.from_user else None):
+    # Read-only digest — viewer is the floor.
+    if not await _require_role(message, ROLE_VIEWER):
         return  # silent no-op
     try:
         metrics = await db.get_system_metrics()
@@ -341,7 +481,9 @@ def _format_balance_summary(summary: dict) -> str:
 
 @router.message(Command("admin_balance"))
 async def admin_balance(message: Message) -> None:
-    if not is_admin(message.from_user.id if message.from_user else None):
+    # Read-only wallet snapshot — viewer is the floor (the actual
+    # credit/debit handlers below escalate to super).
+    if not await _require_role(message, ROLE_VIEWER):
         return  # silent no-op
     parts = (message.text or "").strip().split(None, 1)
     if len(parts) < 2:
@@ -430,14 +572,18 @@ async def _handle_balance_op(
 
 @router.message(Command("admin_credit"))
 async def admin_credit(message: Message) -> None:
-    if not is_admin(message.from_user.id if message.from_user else None):
+    # Wallet writes — super only. A viewer/operator runs against this
+    # gate and the silent no-op kicks in (same surface every other
+    # denied admin command produces).
+    if not await _require_role(message, ROLE_SUPER):
         return
     await _handle_balance_op(message, sign=+1)
 
 
 @router.message(Command("admin_debit"))
 async def admin_debit(message: Message) -> None:
-    if not is_admin(message.from_user.id if message.from_user else None):
+    # Wallet writes — super only.
+    if not await _require_role(message, ROLE_SUPER):
         return
     await _handle_balance_op(message, sign=-1)
 
@@ -611,7 +757,9 @@ def _format_promo_row(r: dict) -> str:
 
 @router.message(Command("admin_promo_create"))
 async def admin_promo_create(message: Message) -> None:
-    if not is_admin(message.from_user.id if message.from_user else None):
+    # Promo CRUD touches the live discount table — super only,
+    # matching the wallet credit/debit gates.
+    if not await _require_role(message, ROLE_SUPER):
         return
     parsed = parse_promo_create_args(message.text or "")
     if isinstance(parsed, str):
@@ -674,7 +822,10 @@ async def admin_promo_create(message: Message) -> None:
 
 @router.message(Command("admin_promo_list"))
 async def admin_promo_list(message: Message) -> None:
-    if not is_admin(message.from_user.id if message.from_user else None):
+    # Promo data is sensitive (revenue calc + active discounts the
+    # bot honours) — super only, matching the rest of the
+    # ``/admin_promo_*`` family per the role-gate contract.
+    if not await _require_role(message, ROLE_SUPER):
         return
     try:
         rows = await db.list_promo_codes(limit=20)
@@ -693,7 +844,8 @@ async def admin_promo_list(message: Message) -> None:
 
 @router.message(Command("admin_promo_revoke"))
 async def admin_promo_revoke(message: Message) -> None:
-    if not is_admin(message.from_user.id if message.from_user else None):
+    # Soft-deletes a promo code — super only.
+    if not await _require_role(message, ROLE_SUPER):
         return
     parts = (message.text or "").strip().split(None, 1)
     if len(parts) < 2:
@@ -1068,7 +1220,10 @@ async def _do_broadcast(
 
 @router.message(Command("admin_broadcast"))
 async def admin_broadcast(message: Message) -> None:
-    if not is_admin(message.from_user.id if message.from_user else None):
+    # Broadcast doesn't touch the wallet table or the role table —
+    # operator suffices. Lets the team scale support broadcasts to
+    # someone other than the wallet super-admin.
+    if not await _require_role(message, ROLE_OPERATOR):
         return  # silent no-op
     parsed = parse_broadcast_args(message.text or "")
     if isinstance(parsed, str):
@@ -1128,16 +1283,19 @@ async def admin_broadcast(message: Message) -> None:
 # Stage-15-Step-E #5: admin role grant / revoke / list
 # ---------------------------------------------------------------------
 #
-# First slice: env-list admins (the only admins today) can manage
-# DB-tracked roles via three new Telegram commands. The role hierarchy
-# itself is documented in ``admin_roles.py``; this module is just the
-# user-facing surface. Subsequent PRs will:
+# Env-list admins (the only admins today, plus any DB-tracked admins
+# graduated via the commands below) manage DB-tracked roles via three
+# new Telegram commands. The role hierarchy itself is documented in
+# ``admin_roles.py``; this module is just the user-facing surface.
+# The Stage-15-Step-E #5 *follow-up* PR (this one) wired
+# ``role_at_least`` into every other ``/admin_*`` handler so a
+# DB-tracked viewer/operator now sees a real reduced surface — the
+# role record finally drives the gate, not just the audit log.
 #
-# * Wire ``role_at_least`` into the existing /admin_credit /
-#   /admin_broadcast / /admin_metrics handlers so a viewer/operator
-#   actually sees a reduced surface (right now they only get the
-#   role record, not the gating).
+# Still on the wishlist for a future PR:
 # * Add a /admin/roles web page mirroring this CLI.
+# * Wire role gates into the web admin panel (currently
+#   single-password access — every web operator is a de-facto super).
 #
 # We keep the gate on `is_admin` (env-list) for these commands so a
 # DB-tracked viewer can't promote themselves to super by virtue of

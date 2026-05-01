@@ -212,21 +212,27 @@ NowPayments crypto invoices.
   the bot continues to use long-polling exactly as before. See
   `.env.example` (Stage-15-Step-E #3 block) for the recovery
   procedure if you flip back.
-- **DB-tracked admin roles (first slice)** — `viewer`, `operator`,
-  and `super` roles live in the new `admin_roles` table. The
-  hierarchy lives in `admin_roles.py` (`role_at_least`,
-  `effective_role`); three new Telegram commands manage the rows:
-  `/admin_role_grant <user_id> <role> [notes]`,
+- **DB-tracked admin roles wired into every Telegram-side handler**
+  — `viewer`, `operator`, and `super` roles live in the
+  `admin_roles` table; the hierarchy lives in `admin_roles.py`
+  (`role_at_least`, `effective_role`). Three new commands manage
+  the rows: `/admin_role_grant <user_id> <role> [notes]`,
   `/admin_role_revoke <user_id>`, `/admin_role_list`. Role grants
   are audit-logged with `action=role_grant`/`role_revoke` so the
-  trail surfaces in `${WEBHOOK_BASE_URL}/admin/audit`. Backward
-  compatible: any Telegram id in `ADMIN_USER_IDS` keeps `super`
-  access through `admin_roles.effective_role`'s env-list fallback,
-  so this PR doesn't lock the legacy operator out. The role
-  hierarchy is documented but **not yet wired into the existing
-  command gates** — that's the follow-up PR (gate `/admin_credit` to
-  `super`, `/admin_broadcast` to `operator`, `/admin_metrics` to
-  `viewer`). First slice of Stage-15-Step-E #5.
+  trail surfaces in `${WEBHOOK_BASE_URL}/admin/audit`. Per-handler
+  floors (Stage-15-Step-E #5 follow-up): `/admin_metrics` and
+  `/admin_balance` at `viewer`; `/admin_broadcast` at `operator`;
+  `/admin_credit`, `/admin_debit`, and `/admin_promo_*` at
+  `super`. The `/admin_role_*` handlers stay env-list-only — a
+  DB-tracked super must NOT be able to self-promote out of the
+  role table. The `/admin` hub message is rendered per-actor and
+  only lists rows the caller can drive (so a `viewer` typing
+  `/admin` sees just `/admin_metrics` + `/admin_balance`, not
+  `/admin_credit`). Backward compatible: any Telegram id in
+  `ADMIN_USER_IDS` keeps `super` access through
+  `admin_roles.effective_role`'s env-list fallback so legacy
+  deploys don't change behaviour. Web-side role gating + a
+  `/admin/roles` web page are the remaining follow-ups.
 - **Telethon-driven live-bot integration test scaffold (first
   slice)** — `tests/integration/` ships a Telethon-based scaffold
   that drives a *live* test bot via a real Telegram user account
