@@ -437,3 +437,212 @@ def test_cooldown_state_is_independent_of_pool_size():
     openrouter_keys.mark_key_rate_limited("only-key")
     assert openrouter_keys.key_for_user(99) == "only-key"
     _reset_env()
+
+
+# ---- per-key 429 / fallback counters (Stage-15-Step-E #4 follow-up) -
+
+
+def test_get_key_429_counters_returns_empty_initially():
+    """A fresh pool has no recorded 429s."""
+    _setup_three_keys()
+    assert openrouter_keys.get_key_429_counters() == {}
+    _reset_env()
+
+
+def test_get_key_fallback_counters_returns_empty_initially():
+    """A fresh pool has no recorded fallbacks."""
+    _setup_three_keys()
+    assert openrouter_keys.get_key_fallback_counters() == {}
+    _reset_env()
+
+
+def test_mark_key_rate_limited_increments_per_key_429_counter():
+    """Each ``mark_key_rate_limited`` call bumps the 429 counter for
+    the matching pool index."""
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited("k1")
+    counters = openrouter_keys.get_key_429_counters()
+    # ``k1`` is at pool idx 1 (declaration order in _setup_three_keys).
+    assert counters == {1: 1}
+    # Re-marking the same already-cooled key still counts the second
+    # 429 event — the operator wants to see every event in the rate
+    # plot, even if the second one didn't change the cooldown
+    # deadline.
+    openrouter_keys.mark_key_rate_limited("k1")
+    counters = openrouter_keys.get_key_429_counters()
+    assert counters == {1: 2}
+    _reset_env()
+
+
+def test_429_counter_is_per_index_not_per_key_string():
+    """The counter family is keyed by 0-based pool index so the
+    rendered ``/metrics`` body never carries the api_key string.
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited("k0")
+    openrouter_keys.mark_key_rate_limited("k2")
+    counters = openrouter_keys.get_key_429_counters()
+    assert counters == {0: 1, 2: 1}
+    # No string-keyed entry leaked into the dict.
+    for key in counters:
+        assert isinstance(key, int)
+    _reset_env()
+
+
+def test_mark_unknown_key_does_not_increment_counter():
+    """``mark_key_rate_limited`` for a key not in the pool no-ops the
+    cooldown table AND skips the 429 counter — otherwise a stale
+    reference would inflate a slot that no longer exists."""
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited("not-in-pool")
+    assert openrouter_keys.get_key_429_counters() == {}
+    _reset_env()
+
+
+def test_fallback_counter_increments_against_absorbing_index():
+    """``key_for_user`` records the fallback count against the
+    *absorbing* pool slot, not the sticky source slot — so a
+    "fallback rate per key" plot answers 'which key is taking the
+    load when others go hot'."""
+    _setup_three_keys()
+    # User id 1 → sticky idx 1 → "k1"
+    openrouter_keys.mark_key_rate_limited("k1")
+    fallback = openrouter_keys.key_for_user(1)
+    counters = openrouter_keys.get_key_fallback_counters()
+    # Walk-forward order is sticky+1, sticky+2, ... so the next
+    # available slot is idx 2 ("k2").
+    assert fallback == "k2"
+    assert counters == {2: 1}
+    _reset_env()
+
+
+def test_fallback_counter_not_incremented_when_sticky_available():
+    """The user's sticky key was available — no fallback occurred,
+    so the counter stays at zero. Defends against a future refactor
+    that drops the early-return branch."""
+    _setup_three_keys()
+    # User id 0 → sticky idx 0 → "k0" (not in cooldown)
+    openrouter_keys.key_for_user(0)
+    assert openrouter_keys.get_key_fallback_counters() == {}
+    _reset_env()
+
+
+def test_fallback_counter_not_incremented_when_all_keys_cooled():
+    """When every key is in cooldown, the picker falls back to the
+    sticky pick (best-effort) — that's NOT a fallback to a different
+    slot, so the counter stays at zero. The sticky-pick log is
+    enough; the counter is reserved for genuine cross-slot routes."""
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited("k0")
+    openrouter_keys.mark_key_rate_limited("k1")
+    openrouter_keys.mark_key_rate_limited("k2")
+    # User id 1 → sticky idx 1 → "k1" — but k1 is hot AND every other
+    # slot is hot too, so we get the sticky pick back.
+    assert openrouter_keys.key_for_user(1) == "k1"
+    assert openrouter_keys.get_key_fallback_counters() == {}
+    _reset_env()
+
+
+def test_reset_key_counters_for_tests_clears_both_dicts():
+    """The tests-only reset wipes both counter dicts so each case
+    starts from a known-zero state."""
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited("k1")
+    openrouter_keys._increment_key_fallback(2)
+    assert openrouter_keys.get_key_429_counters()
+    assert openrouter_keys.get_key_fallback_counters()
+    openrouter_keys.reset_key_counters_for_tests()
+    assert openrouter_keys.get_key_429_counters() == {}
+    assert openrouter_keys.get_key_fallback_counters() == {}
+    _reset_env()
+
+
+def test_load_keys_resets_per_key_counters():
+    """Hot reload must reset the per-index counters — otherwise idx 0
+    in the new pool inherits idx 0's count from the old pool, even
+    though the underlying api_key is a completely different
+    deployment slot. Tested here to pin the contract."""
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited("k0")
+    openrouter_keys.mark_key_rate_limited("k1")
+    assert openrouter_keys.get_key_429_counters() == {0: 1, 1: 1}
+    # Reload with a different pool — counters must reset.
+    os.environ.pop("OPENROUTER_API_KEY_1", None)
+    os.environ.pop("OPENROUTER_API_KEY_2", None)
+    os.environ.pop("OPENROUTER_API_KEY_3", None)
+    os.environ["OPENROUTER_API_KEY_1"] = "new-k0"
+    os.environ["OPENROUTER_API_KEY_2"] = "new-k1"
+    openrouter_keys.load_keys()
+    assert openrouter_keys.get_key_429_counters() == {}
+    assert openrouter_keys.get_key_fallback_counters() == {}
+    _reset_env()
+
+
+def test_increment_key_429_negative_index_is_noop():
+    """Defence in depth: a future caller resolving an index from a
+    stale snapshot must not be able to poison the counter dict
+    with a negative slot."""
+    openrouter_keys.reset_key_counters_for_tests()
+    openrouter_keys._increment_key_429(-1)
+    openrouter_keys._increment_key_fallback(-1)
+    assert openrouter_keys.get_key_429_counters() == {}
+    assert openrouter_keys.get_key_fallback_counters() == {}
+
+
+# ---- bundled bug fix: load_keys evicts stale cooldown entries -----
+
+
+def test_load_keys_evicts_stale_cooldown_entries():
+    """Bundled bug fix (Stage-15-Step-E #4 follow-up #2):
+    ``load_keys`` must drop cooldown entries whose api_key isn't in
+    the freshly-loaded pool. Pre-fix, a hot key rotation
+    (operator script that swaps keys to dodge upstream throttling)
+    left dangling entries in ``_cooldowns`` for up to
+    ``MAX_COOLDOWN_SECS`` (1 hour), violating the comment-asserted
+    invariant that the cooldown table size is bounded by
+    ``len(_keys)``.
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited("k0")
+    openrouter_keys.mark_key_rate_limited("k1")
+    assert "k0" in openrouter_keys._cooldowns
+    assert "k1" in openrouter_keys._cooldowns
+
+    # Hot rotation: keep "k1" in the new pool but drop "k0" and
+    # add a brand-new "kX". Post-load, the cooldown for "k0"
+    # must be gone (its key no longer exists); the cooldown for
+    # "k1" must also be gone because load_keys resets on a
+    # composition change.
+    for k in ("OPENROUTER_API_KEY_1", "OPENROUTER_API_KEY_2",
+              "OPENROUTER_API_KEY_3"):
+        os.environ.pop(k, None)
+    os.environ["OPENROUTER_API_KEY_1"] = "k1"
+    os.environ["OPENROUTER_API_KEY_2"] = "kX"
+    openrouter_keys.load_keys()
+
+    assert "k0" not in openrouter_keys._cooldowns
+    # Sanity: pool size bound holds again.
+    assert len(openrouter_keys._cooldowns) <= len(openrouter_keys._keys)
+    _reset_env()
+
+
+def test_load_keys_preserves_cooldowns_for_keys_still_in_pool():
+    """The eviction rule must NOT drop cooldowns for keys that
+    survived the rotation. (Bug-fix would over-eagerly clear
+    everything, defeating the purpose of the cooldown table.)
+
+    NOTE: load_keys() *does* clear cooldowns whose api_key is no
+    longer in the pool. A key that IS still in the pool but
+    whose deadline is still active should still be in cooldown
+    after the reload, even though we've rotated the env around
+    it. This pins that invariant so a future "always clear all"
+    refactor doesn't slip through.
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited("k1")
+    assert "k1" in openrouter_keys._cooldowns
+
+    # Reload with the SAME pool composition — k1 stays.
+    openrouter_keys.load_keys()
+    assert "k1" in openrouter_keys._cooldowns
+    _reset_env()

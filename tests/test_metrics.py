@@ -536,3 +536,146 @@ def test_install_metrics_route_stashes_parsed_allowlist():
     parsed = app[metrics.APP_KEY_ALLOWLIST]
     assert ipaddress.ip_network("10.0.0.0/8") in parsed
     assert ipaddress.ip_network("192.168.0.0/16") in parsed
+
+
+# ── Stage-15-Step-E #4 follow-up: per-key OpenRouter exposition ────
+
+
+def _setup_three_key_pool(monkeypatch):
+    """Set up a deterministic 3-key pool for the per-key tests.
+
+    Mirrors ``tests/test_openrouter_keys._setup_three_keys`` but
+    keeps the test helper local so a future split between unit and
+    integration metric tests doesn't break across modules.
+    """
+    import openrouter_keys
+
+    monkeypatch.setenv("OPENROUTER_API_KEY_1", "km0")
+    monkeypatch.setenv("OPENROUTER_API_KEY_2", "km1")
+    monkeypatch.setenv("OPENROUTER_API_KEY_3", "km2")
+    # Force a clean reload so the env vars take effect.
+    openrouter_keys._keys = []
+    openrouter_keys._loaded = False
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys.reset_key_counters_for_tests()
+    openrouter_keys.load_keys()
+
+
+def test_render_metrics_emits_per_key_429_counter(monkeypatch):
+    """The per-key 429 counter family appears in the rendered body
+    with one row per pool slot that recorded a 429."""
+    import openrouter_keys
+
+    metrics.reset_loop_ticks_for_tests()
+    _patch_collectors(monkeypatch)
+    _setup_three_key_pool(monkeypatch)
+    openrouter_keys.mark_key_rate_limited("km0")
+    openrouter_keys.mark_key_rate_limited("km2")
+    openrouter_keys.mark_key_rate_limited("km2")
+
+    body = metrics.render_metrics()
+    assert "# HELP meowassist_openrouter_key_429_total" in body
+    assert "# TYPE meowassist_openrouter_key_429_total counter" in body
+    assert 'meowassist_openrouter_key_429_total{index="0"} 1' in body
+    assert 'meowassist_openrouter_key_429_total{index="2"} 2' in body
+
+
+def test_render_metrics_emits_per_key_fallback_counter(monkeypatch):
+    """The per-key fallback counter family appears in the rendered body
+    with one row per pool slot that absorbed a fallback."""
+    import openrouter_keys
+
+    metrics.reset_loop_ticks_for_tests()
+    _patch_collectors(monkeypatch)
+    _setup_three_key_pool(monkeypatch)
+    # User id 1 → sticky idx 1 → "km1"; mark "km1" hot, then call
+    # key_for_user(1) — picker walks forward to idx 2 ("km2").
+    openrouter_keys.mark_key_rate_limited("km1")
+    openrouter_keys.key_for_user(1)
+
+    body = metrics.render_metrics()
+    assert "# HELP meowassist_openrouter_key_fallback_total" in body
+    assert "# TYPE meowassist_openrouter_key_fallback_total counter" in body
+    assert 'meowassist_openrouter_key_fallback_total{index="2"} 1' in body
+
+
+def test_render_metrics_emits_per_key_cooldown_remaining_gauge(monkeypatch):
+    """The cooldown-remaining gauge family renders one row per pool key.
+
+    Available slots render as 0 so a PromQL ``> 0`` filter cleanly
+    catches the cooled keys; the cooled slot renders the
+    remaining seconds (close to the configured Retry-After).
+    """
+    import openrouter_keys
+
+    metrics.reset_loop_ticks_for_tests()
+    _patch_collectors(monkeypatch)
+    _setup_three_key_pool(monkeypatch)
+    openrouter_keys.mark_key_rate_limited("km1", retry_after_secs=42.0)
+
+    body = metrics.render_metrics()
+    assert (
+        "# HELP meowassist_openrouter_key_cooldown_remaining_seconds"
+        in body
+    )
+    assert (
+        "# TYPE meowassist_openrouter_key_cooldown_remaining_seconds gauge"
+        in body
+    )
+    assert (
+        'meowassist_openrouter_key_cooldown_remaining_seconds'
+        '{index="0"} 0\n'
+        in body
+    )
+    assert (
+        'meowassist_openrouter_key_cooldown_remaining_seconds'
+        '{index="2"} 0\n'
+        in body
+    )
+    # The cooled slot must render a finite seconds value > 0
+    # (the test runs in microseconds, so the deadline barely
+    # decremented from 42 — assert it's in the (0, 42] range).
+    for line in body.splitlines():
+        if (
+            line.startswith(
+                "meowassist_openrouter_key_cooldown_remaining_seconds"
+            )
+            and 'index="1"' in line
+        ):
+            value = float(line.rsplit(" ", 1)[-1])
+            assert 0.0 < value <= 42.0
+            break
+    else:
+        pytest.fail(
+            "no cooldown_remaining_seconds row for index=1 found"
+        )
+
+
+def test_render_metrics_per_key_counters_zero_when_pool_empty(monkeypatch):
+    """No keys configured → the labelled counter families still emit
+    the HELP/TYPE preamble (Prometheus rate(...) queries shouldn't
+    blow up against an absent counter) but no data rows."""
+    import openrouter_keys
+
+    metrics.reset_loop_ticks_for_tests()
+    _patch_collectors(monkeypatch)
+    # Wipe the pool so there are no keys at all.
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    for i in range(1, 11):
+        monkeypatch.delenv(f"OPENROUTER_API_KEY_{i}", raising=False)
+    openrouter_keys._keys = []
+    openrouter_keys._loaded = False
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys.reset_key_counters_for_tests()
+
+    body = metrics.render_metrics()
+    assert "# HELP meowassist_openrouter_key_429_total" in body
+    assert "# TYPE meowassist_openrouter_key_429_total counter" in body
+    # No data rows for an empty pool.
+    assert "meowassist_openrouter_key_429_total{" not in body
+    assert "meowassist_openrouter_key_fallback_total{" not in body
+    # No cooldown gauge rows either.
+    assert (
+        'meowassist_openrouter_key_cooldown_remaining_seconds{'
+        not in body
+    )
