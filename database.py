@@ -3731,7 +3731,35 @@ class Database:
     ) -> None:
         """Insert-or-replace a single override. The ``updated_by``
         field is freeform text — typically the admin's telegram id
-        for /admin_* slash commands or ``"web"`` for browser edits."""
+        for /admin_* slash commands or ``"web"`` for browser edits.
+
+        Bug fix bundle (Stage-15-Step-E #7 follow-up #2): strip
+        NUL bytes from *value* and *updated_by* before insertion.
+        Postgres ``TEXT`` rejects NUL with
+        ``invalid byte sequence for encoding "UTF8": 0x00`` which
+        crashes the upsert and bubbles up to the caller. Pre-fix,
+        the new ``i18n_po import`` CLI would crash mid-batch on a
+        translator's ``.po`` containing a stray NUL (some Crowdin
+        export pipelines emit them inside multi-line msgstrs); the
+        web admin editor would 500 on the same input. The
+        defensive strip is consistent with
+        :meth:`set_admin_role`'s NUL-byte handling for the
+        ``notes`` column.
+        """
+        if "\x00" in value:
+            log.warning(
+                "upsert_string_override: stripped NUL byte from value "
+                "for %s:%s (likely artifact from translator's editor)",
+                lang, key,
+            )
+            value = value.replace("\x00", "")
+        if updated_by is not None and "\x00" in updated_by:
+            log.warning(
+                "upsert_string_override: stripped NUL byte from "
+                "updated_by tag for %s:%s",
+                lang, key,
+            )
+            updated_by = updated_by.replace("\x00", "")
         async with self.pool.acquire() as connection:
             await connection.execute(
                 """

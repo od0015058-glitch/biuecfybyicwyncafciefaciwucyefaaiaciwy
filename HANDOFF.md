@@ -783,7 +783,7 @@ What remains (next AI's TODO):
 
 * ~~**Replace runtime lookup with stdlib gettext.**~~ ✅ **shipped (Stage-15-Step-E #7 follow-up #1 PR).** New `i18n_runtime.py` module (~210 LoC, no third-party deps) loads every `locale/<lang>/LC_MESSAGES/messages.po` into an in-memory catalog at boot via `init_translations(locale_dir)`. `strings.t()` consults `i18n_runtime.gettext_lookup(lang, key)` *between* the admin-override cache (still highest priority) and the compiled-default `_STRINGS` table — so a translator can drop an edited `messages.po` into the locale directory and the bot picks up the new strings on the next process restart **without a code deploy**. Empty `msgstr` is treated as a miss (returns `None` so the caller falls through to the compiled default) per the gettext convention for "untranslated". Errors are isolated per-locale: a malformed or missing `.po` file logs an exception but doesn't crash the bot — the affected locale just falls through to its compiled default. Wired into `main.py` boot directly after the `set_overrides` seeding step. Why parse `.po` directly instead of compiling to `.mo` and using `gettext.GNUTranslations`? Zero deploy-time deps (`msgfmt` isn't in stdlib), the parser already exists (`i18n_po.load_po`), loading is one-time at startup so the lookup is a `dict.get` afterwards, and the dict-based catalog gives us a clean "translation missing" signal that `gettext.GNUTranslations.gettext()` doesn't (which conflates "no translation" with "translation == msgid"). 22 new tests pin the runtime layer (lookup semantics, error paths, empty-msgstr handling, default-locale fallback through `.po`, admin-override-wins-over-`.po`, format-kwargs through `.po`, debug snapshot, idempotent re-init, reset).
 * **Add ngettext-style pluralization.** Once the gettext path is live, slugs like `receipts_count` ("1 receipt" vs. "N receipts") can move to a `t_plural(lang, key_one, key_other, n, **kwargs)` helper. Persian's plural rules are simpler than English's (one form for every count); the gettext `Plural-Forms` header expresses that. Today the bot has zero pluralized strings — adopting them is a quality lift, not a bug fix, so it's a follow-up rather than blocker.
-* **Ship the importer side of the round-trip.** Currently `load_po` is exposed only for tests. A `python -m i18n_po import <lang> <path>` CLI that bulk-creates `database.bot_strings` overrides from a translator's `.po` would close the loop: a community translator submits `messages.po`, the operator runs the import, and overrides go live without a code deploy. Validation gate: every imported `msgstr` must pass `strings.validate_override` before being written.
+* ~~**Ship the importer side of the round-trip.**~~ ✅ **shipped (Stage-15-Step-E #7 follow-up #2 PR).** New `python -m i18n_po import <lang> <path>` CLI bulk-loads a translator's `.po` into the runtime `bot_strings` table. Every `msgstr` is validated against `strings.validate_override` before being written; entries that fail (unknown slug, bad placeholder, malformed format syntax) are reported and skipped — the rest are upserted. `--dry-run` validates without writing. `--updated-by NAME` tags the `bot_strings.updated_by` audit column with a translator name or PR number. The CLI prints a five-bucket summary (`upserted` / `unchanged` / `skipped_empty` / `skipped_unknown_slug` / `invalid` / `errors`) and exits non-zero if any `invalid` or `errors` were observed so CI / cron-driven imports can fail fast on bad input. Implementation also exposes `import_po_into_db(db, lang, po_text, *, dry_run, updated_by, existing_overrides)` and `ImportReport` for callers (admin web UI, future operator tooling) that want to drive the importer programmatically without reaching for argparse. Bundled real bug fix: `Database.upsert_string_override` now strips NUL bytes from both `value` and `updated_by` before insertion (Postgres `TEXT` rejects NUL with `invalid byte sequence for encoding "UTF8": 0x00`). Pre-fix, a translator's `.po` containing a stray NUL (some Crowdin export pipelines emit them inside multi-line msgstrs) would crash the upsert mid-batch and bubble up to the importer; the web admin editor had the same crash mode. Defensive strip pattern is consistent with the prior `set_admin_role` NUL-byte handling for the `notes` column. 21 new tests in `tests/test_i18n_po_import.py` covering: happy path / dry-run / empty-msgstr skip / unknown-slug skip / unchanged-bucket idempotence / pre-loaded existing-overrides / `updated_by` plumbing / unsupported-lang rejection / invalid-placeholder bucketing (no abort) / unparseable .po surfaced as single error / per-key DB upsert error reported (no abort) / DB snapshot error aborts cleanly / `ImportReport.render` covers all buckets / `has_failures` only on invalid+errors / `total_seen` sums correctly / CLI `--help` lists every arg / CLI missing args exits non-zero / CLI nonexistent path returns 2 / NUL-byte strip in `value` / NUL-byte strip in `updated_by` / clean-input passthrough.
 * **Add a .po-format Crowdin / Poedit walkthrough to README.md.** Shipped this PR mentions the file location but doesn't enumerate the translator workflow. The next pass should include a screenshot or two and a step-by-step "edit, save, submit PR" recipe.
 * **Optional: extract pluralization-aware string formatting from `strings.py:t()` into a dedicated `i18n.py` module.** The current `t()` is 80 lines and growing; once gettext + ngettext + pluralization land, splitting will make it easier to reason about. Not required for first slice.
 
@@ -2119,7 +2119,49 @@ The user's process for this project — **do not deviate**:
     pin) + 3 in `tests/test_database_queries.py` (NUL strip + log
     warn / non-NUL passthrough / `notes=None` early-out). Total
     suite: 1994 tests passing (1970 + 24 new).
-16. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+16. **Stage-15-Step-E #7 follow-up #2 OPENED** (PR-after-#145) —
+    importer side of the .po round-trip. New
+    `python -m i18n_po import <lang> <path>` CLI bulk-loads a
+    translator's .po into the runtime `bot_strings` override
+    table. Every msgstr is validated through
+    `strings.validate_override` before being written; entries
+    that fail (unknown slug, bad placeholder, malformed format
+    syntax) are reported and skipped — the rest are upserted.
+    `--dry-run` validates without writing. `--updated-by NAME`
+    tags `bot_strings.updated_by` with a translator name or PR
+    number for traceability. Five-bucket summary
+    (`upserted` / `unchanged` / `skipped_empty` /
+    `skipped_unknown_slug` / `invalid` / `errors`); exits
+    non-zero if any entry hit `invalid` or `errors` so
+    CI / cron-driven imports can fail fast. Closes the .po
+    round-trip: a community translator submits messages.po, the
+    operator runs the import, and overrides go live without a
+    code deploy. Implementation also exposes
+    `import_po_into_db(db, lang, po_text, *, dry_run,
+    updated_by, existing_overrides)` and `ImportReport` for
+    callers (future admin web UI) that want to drive the
+    importer programmatically without argparse. Bundled real
+    bug fix: `Database.upsert_string_override` now strips NUL
+    bytes from both `value` and `updated_by` before insertion
+    (Postgres TEXT rejects NUL with `invalid byte sequence for
+    encoding "UTF8": 0x00`). Pre-fix, a translator's .po
+    containing a stray NUL (some Crowdin export pipelines emit
+    them inside multi-line msgstrs) would crash the upsert
+    mid-batch and bubble up to the importer; the web admin
+    editor had the same 500 crash mode. Defensive strip pattern
+    is consistent with the prior `set_admin_role` NUL-byte
+    handling for the `notes` column. 21 new tests in
+    `tests/test_i18n_po_import.py` covering happy path /
+    dry-run / every skip-bucket / pre-loaded existing-overrides
+    optimisation / `updated_by` plumbing / unknown lang
+    rejection / invalid-placeholder bucketing without abort /
+    unparseable .po surfaced as single error / per-key DB
+    upsert error reported without abort / DB snapshot error
+    aborts cleanly / report rendering / has_failures semantics
+    / `total_seen` arithmetic / CLI argparse coverage / NUL
+    byte strip in value / NUL byte strip in updated_by / clean
+    input passthrough. Suite: 2106 → 2127 passing (+21 new).
+17. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-17. **Read the §11 working agreement before doing anything.**
+18. **Read the §11 working agreement before doing anything.**
