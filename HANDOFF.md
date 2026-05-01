@@ -707,7 +707,7 @@ What's shipped this PR:
 
 What remains (next AI's TODO):
 
-* **Wire `role_at_least` into the existing admin command gates.** Right now `admin.admin_credit`, `admin.admin_broadcast`, `admin.admin_metrics`, etc. all gate on `is_admin` (env-list only). The follow-up should pull `effective_role` for the actor and gate `/admin_credit` / `/admin_debit` / `/admin_promo_*` / `/admin_role_*` at `super`; `/admin_broadcast` / gift-code mint at `operator`; `/admin_metrics` / `/admin_balance` at `viewer`. Bundle a regression test that pins each command's minimum role.
+* ~~**Wire `role_at_least` into the existing admin command gates.**~~ ✅ **shipped in Stage-15-Step-E #5 follow-up #1 (role-gates wiring PR).** `admin._resolve_actor_role` (DB lookup → env-list fallback) + `admin._require_role(message, required)` now gate every Telegram-side admin handler. Per-handler floors: `/admin_metrics` and `/admin_balance` at `viewer`; `/admin_broadcast` at `operator`; `/admin_credit`, `/admin_debit`, and the entire `/admin_promo_*` family at `super`. The `/admin_role_*` handlers stay env-list-only (a DB-tracked super must NOT be able to self-promote out of the role table). The `/admin` hub message is rendered by `_render_admin_hub(role, is_env_admin=...)` and only lists rows the actor can actually drive — so a viewer typing `/admin` sees `/admin_metrics` and `/admin_balance` only, not `/admin_credit`. 17 new regression tests in `tests/test_admin.py`: the parametrised `test_admin_handlers_respect_role_floor` walks every (role × handler) cell of the matrix and pins both directions (the floor-and-above runs, every strictly-lower role silent-no-ops). Plus dedicated tests for the env-list backward-compat fallback when the DB pool fails (a transient pool error must NOT downgrade a legacy admin from super → None mid-incident), DB-role-wins-over-env-list, no-from-user defence in depth, and the role-CRUD-stays-env-list invariant.
 * **Add `/admin/roles` web page** mirroring the Telegram CLI. List + create + revoke form, audit-logged via the existing `_record_audit_safe` helper. Same auth as the rest of the panel (`ADMIN_PASSWORD`-gated cookie) — per-user web auth is a separate, larger redesign not in scope for the role system.
 * **Wire role gates into the web admin panel.** The web side currently has a single `ADMIN_PASSWORD`; per-admin web auth is a larger redesign. As an interim, the web panel could read `effective_role` for the configured `ADMIN_PASSWORD` operator (today it's `super` by default) and surface a "view as <role>" toggle for testing the gates without provisioning a second password.
 * **Per-user web auth** — replace the single `ADMIN_PASSWORD` with per-admin Telegram-id-keyed credentials so the role system actually applies to the browser surface. This is the multi-week piece the original Step-E table row 5 calls out as "high effort"; it needs OAuth/SSO discussion with the operator first.
@@ -1832,6 +1832,44 @@ The user's process for this project — **do not deviate**:
     tests pin the cases. See "Stage-15-Step-E #7 — what's
     shipped vs. what remains" section above for the precise
     boundary so the next AI can continue.
+    **Stage-15-Step-E #5 follow-up #1 STARTED (this PR)** —
+    "wire `role_at_least` into the existing admin command gates".
+    The first slice of #5 (PR #123) shipped the role table + the
+    role-CRUD commands but kept every other `/admin_*` handler
+    gated on the flat env-list `is_admin` predicate, so a
+    DB-tracked viewer/operator had no real reduced surface — the
+    role record only showed up in the audit log. This PR adds
+    `admin._resolve_actor_role` (DB lookup → env-list fallback;
+    fail-soft on DB pool errors so a transient flake doesn't
+    downgrade a legacy admin mid-incident) + `_require_role(
+    message, required)` and wires them into every gated handler:
+    `/admin_metrics` and `/admin_balance` at `viewer`,
+    `/admin_broadcast` at `operator`, `/admin_credit` /
+    `/admin_debit` / `/admin_promo_create` / `/admin_promo_list`
+    / `/admin_promo_revoke` at `super`. The `/admin_role_*`
+    handlers stay env-list-only — a DB-tracked super must NOT be
+    able to self-promote out of the role table. The `/admin` hub
+    message is rendered by `_render_admin_hub(role, is_env_admin=...)`
+    and only lists rows the actor can actually drive (a viewer
+    sees just `/admin_metrics` + `/admin_balance`). 17 new
+    regression tests pin the gate matrix per (role × handler),
+    plus the env-list backward-compat fallback, the
+    DB-role-wins-over-env-list contract, the no-from-user
+    defence-in-depth path, and the role-CRUD-stays-env-list
+    invariant. Bundled bug fix: `web_admin.AUDIT_ACTION_LABELS`
+    was missing the `role_grant` and `role_revoke` slugs (which
+    `Database.record_admin_audit` was already storing at the
+    `/admin_role_grant` / `/admin_role_revoke` Telegram handlers
+    since PR #123). The audit rows themselves were stored
+    correctly, but an operator filtering the `/admin/audit` feed
+    to "role changes only" while reviewing who got promoted /
+    demoted couldn't pick those slugs out of the dropdown — they
+    had to scroll the full unfiltered feed. Same regression
+    pattern as the bundled fix in Stage-15-Step-F follow-up #3
+    (PR #134) for the five `control_*` slugs; that sweep missed
+    the role slugs because they pre-date Step-F. New regression
+    test `test_audit_filter_dropdown_includes_role_crud_actions`
+    pins both labels so a future PR can't drop them again.
 11. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.

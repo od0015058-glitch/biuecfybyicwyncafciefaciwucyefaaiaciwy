@@ -1072,3 +1072,268 @@ def _failing_assert_not_called():
         side_effect=AssertionError("DB was called for an invalid input"),
     )
     return mock
+
+
+# ---- Stage-15-Step-E #5 follow-up: role gating on every admin handler
+
+
+def _patch_actor_role(monkeypatch, role: str | None):
+    """Make every ``_resolve_actor_role`` call return *role* in this
+    test. Avoids the per-test boilerplate of mocking
+    ``admin.db.get_admin_role``."""
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(
+        admin, "_resolve_actor_role", AsyncMock(return_value=role),
+    )
+
+
+def test_admin_role_gating_helpers_are_exposed():
+    """The follow-up PR introduces ``_resolve_actor_role`` +
+    ``_require_role``. Pin their existence so a future refactor
+    that moves them out can't silently un-gate the surface."""
+    assert hasattr(admin, "_resolve_actor_role")
+    assert hasattr(admin, "_require_role")
+
+
+def test_admin_hub_text_filters_by_role():
+    """A viewer should not see ``/admin_credit`` advertised in the
+    hub message; a super should see everything."""
+    from admin import (
+        _render_admin_hub,
+        ROLE_VIEWER,
+        ROLE_OPERATOR,
+        ROLE_SUPER,
+    )
+
+    viewer_hub = _render_admin_hub(ROLE_VIEWER, is_env_admin=False)
+    assert "/admin_metrics" in viewer_hub
+    assert "/admin_balance" in viewer_hub
+    # viewer can't broadcast / credit / promo / role-CRUD
+    assert "/admin_credit" not in viewer_hub
+    assert "/admin_debit" not in viewer_hub
+    assert "/admin_promo_create" not in viewer_hub
+    assert "/admin_broadcast" not in viewer_hub
+    assert "/admin_role_grant" not in viewer_hub
+
+    operator_hub = _render_admin_hub(ROLE_OPERATOR, is_env_admin=False)
+    assert "/admin_metrics" in operator_hub
+    assert "/admin_broadcast" in operator_hub
+    # operator still can't credit/debit or manage roles
+    assert "/admin_credit" not in operator_hub
+    assert "/admin_role_grant" not in operator_hub
+
+    super_db_hub = _render_admin_hub(ROLE_SUPER, is_env_admin=False)
+    assert "/admin_metrics" in super_db_hub
+    assert "/admin_broadcast" in super_db_hub
+    assert "/admin_credit" in super_db_hub
+    assert "/admin_promo_create" in super_db_hub
+    # DB-tracked super (not in env list) must NOT see role-CRUD —
+    # those commands stay env-only so the role table itself can't
+    # be self-promoted.
+    assert "/admin_role_grant" not in super_db_hub
+
+    super_env_hub = _render_admin_hub(ROLE_SUPER, is_env_admin=True)
+    assert "/admin_role_grant" in super_env_hub
+    assert "/admin_role_revoke" in super_env_hub
+    assert "/admin_role_list" in super_env_hub
+
+
+def test_admin_hub_text_constant_still_lists_every_section():
+    """The legacy ``_ADMIN_HUB_TEXT`` constant is still imported by
+    out-of-tree tooling that hasn't migrated to the renderer; rebuild
+    it with super + env-admin so it stays the union of every section."""
+    text = admin._ADMIN_HUB_TEXT
+    for slug in (
+        "/admin_metrics", "/admin_balance",
+        "/admin_credit", "/admin_debit",
+        "/admin_promo_create", "/admin_promo_list", "/admin_promo_revoke",
+        "/admin_broadcast",
+        "/admin_role_grant", "/admin_role_revoke", "/admin_role_list",
+    ):
+        assert slug in text, f"{slug} missing from _ADMIN_HUB_TEXT"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "handler_name,required_role,sample_text",
+    [
+        ("admin_hub", "viewer", "/admin"),
+        ("admin_metrics", "viewer", "/admin_metrics"),
+        ("admin_balance", "viewer", "/admin_balance 12345"),
+        ("admin_broadcast", "operator", "/admin_broadcast hello"),
+        ("admin_credit", "super", "/admin_credit 12345 1.0 reason"),
+        ("admin_debit", "super", "/admin_debit 12345 1.0 reason"),
+        ("admin_promo_create", "super", "/admin_promo_create FOO 10%"),
+        ("admin_promo_list", "super", "/admin_promo_list"),
+        ("admin_promo_revoke", "super", "/admin_promo_revoke FOO"),
+    ],
+)
+async def test_admin_handlers_respect_role_floor(
+    monkeypatch, handler_name, required_role, sample_text,
+):
+    """Drive the gate boundary: the handler at *required_role* runs,
+    but every strictly-lower role silent-no-ops. We mock the DB
+    side-effect so only the gate behaviour is observable.
+
+    Failure mode this pins: a future refactor that wires the wrong
+    role into a handler — e.g. ``ROLE_VIEWER`` on
+    ``/admin_credit`` — would let any role with a viewer DB row
+    credit a wallet. The parametrised matrix would catch that the
+    moment the boundary moves."""
+    from admin_roles import ROLE_ORDER
+
+    # Stub every DB primitive the handler might touch so we stop
+    # at the gate, not the DB pool.
+    from unittest.mock import AsyncMock
+    for attr in (
+        "get_system_metrics", "get_user_admin_summary",
+        "admin_adjust_balance", "create_promo_code", "list_promo_codes",
+        "revoke_promo_code", "iter_broadcast_recipients",
+        "record_admin_audit",
+    ):
+        monkeypatch.setattr(
+            admin.db, attr, AsyncMock(return_value=None),
+        )
+    monkeypatch.setattr(
+        admin.db, "get_system_metrics",
+        AsyncMock(return_value={
+            "users_total": 0, "users_active_7d": 0,
+            "revenue_usd": 0.0, "spend_usd": 0.0, "top_models": [],
+        }),
+    )
+    monkeypatch.setattr(
+        admin.db, "list_promo_codes", AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        admin.db, "iter_broadcast_recipients", AsyncMock(return_value=[]),
+    )
+
+    handler = getattr(admin, handler_name)
+    required_index = ROLE_ORDER.index(required_role)
+    for i, role in enumerate(ROLE_ORDER):
+        msg = _FakeMessage(sample_text, user_id=1)
+        _patch_actor_role(monkeypatch, role)
+        await handler(msg)
+        if i < required_index:
+            assert msg.replies == [], (
+                f"{handler_name}: role={role} below {required_role} "
+                f"must silent-no-op, got: {msg.replies}"
+            )
+        # else: role meets/exceeds the floor — either a happy reply
+        # or a usage-error reply is fine, what matters is it didn't
+        # silent-no-op. (Some handlers like admin_balance error on
+        # missing user; that's still observable activity.)
+    # Also pin the unauthenticated path — role None means "not an
+    # admin in any layer". Must silent-no-op even at the lowest gate.
+    msg = _FakeMessage(sample_text, user_id=999)
+    _patch_actor_role(monkeypatch, None)
+    await handler(msg)
+    assert msg.replies == [], (
+        f"{handler_name}: role=None must silent-no-op, "
+        f"got: {msg.replies}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_actor_role_falls_through_to_env_on_db_failure(
+    monkeypatch,
+):
+    """A transient ``Database.get_admin_role`` failure must NOT
+    downgrade an env-list admin from super → None mid-incident.
+    The fail-soft fallback is the only thing keeping the legacy
+    admin's surface alive when the pool flakes."""
+    from unittest.mock import AsyncMock
+
+    set_admin_user_ids({1})
+    monkeypatch.setattr(
+        admin.db, "get_admin_role",
+        AsyncMock(side_effect=RuntimeError("pool unavailable")),
+    )
+    msg = _FakeMessage("/admin", user_id=1)
+    role = await admin._resolve_actor_role(msg)
+    assert role == "super"
+
+
+@pytest.mark.asyncio
+async def test_resolve_actor_role_db_role_wins_over_env_list(monkeypatch):
+    """A DB-tracked role overrides the env-list fallback so an
+    operator can downgrade a legacy admin to viewer without dropping
+    them from ``ADMIN_USER_IDS`` (which is a deploy-time concern)."""
+    from unittest.mock import AsyncMock
+
+    set_admin_user_ids({1})
+    monkeypatch.setattr(
+        admin.db, "get_admin_role", AsyncMock(return_value="viewer"),
+    )
+    msg = _FakeMessage("/admin", user_id=1)
+    role = await admin._resolve_actor_role(msg)
+    assert role == "viewer"
+
+
+@pytest.mark.asyncio
+async def test_resolve_actor_role_returns_none_for_service_message():
+    """A message with no ``from_user`` (channel post / forwarded
+    service event) must never resolve to an admin role — defence
+    in depth on top of the dispatcher's filters."""
+    msg = _FakeMessage("/admin", user_id=None)
+    role = await admin._resolve_actor_role(msg)
+    assert role is None
+
+
+@pytest.mark.asyncio
+async def test_admin_role_crud_stays_env_list_only(monkeypatch):
+    """Even after wiring ``role_at_least`` into the rest of the
+    surface, the role-CRUD handlers themselves remain gated on
+    ``is_admin`` (env-list). A DB-tracked super is NOT allowed to
+    touch the role table — otherwise a viewer who got promoted to
+    super by accident could hop right over to ``/admin_role_grant``
+    and lock the legitimate operator out. The role table is a
+    deploy-time concern; only env-list admins (who control the
+    deploy) get to manage it."""
+    from unittest.mock import AsyncMock
+
+    # User 1 is NOT in env-list. We give them a DB-tracked super
+    # role and make sure the role-CRUD handlers still silent-no-op.
+    set_admin_user_ids(set())
+    monkeypatch.setattr(
+        admin.db, "get_admin_role", AsyncMock(return_value="super"),
+    )
+    set_role_mock = _failing_assert_not_called()
+    delete_role_mock = _failing_assert_not_called()
+    list_roles_mock = _failing_assert_not_called()
+    monkeypatch.setattr(admin.db, "set_admin_role", set_role_mock)
+    monkeypatch.setattr(admin.db, "delete_admin_role", delete_role_mock)
+    monkeypatch.setattr(admin.db, "list_admin_roles", list_roles_mock)
+
+    msg_grant = _FakeMessage(
+        "/admin_role_grant 999 viewer", user_id=1,
+    )
+    await admin.admin_role_grant(msg_grant)
+    assert msg_grant.replies == []
+
+    msg_revoke = _FakeMessage("/admin_role_revoke 999", user_id=1)
+    await admin.admin_role_revoke(msg_revoke)
+    assert msg_revoke.replies == []
+
+    msg_list = _FakeMessage("/admin_role_list", user_id=1)
+    await admin.admin_role_list(msg_list)
+    assert msg_list.replies == []
+
+
+@pytest.mark.asyncio
+async def test_admin_hub_filters_role_crud_for_db_super_not_in_env_list(
+    monkeypatch,
+):
+    """A DB-tracked super who is *not* in the env-list sees the
+    super hub but without the role-CRUD section — there's no point
+    advertising commands the env-only gate would silently deny."""
+    set_admin_user_ids(set())
+    _patch_actor_role(monkeypatch, "super")
+
+    msg = _FakeMessage("/admin", user_id=1)
+    await admin.admin_hub(msg)
+    assert len(msg.replies) == 1
+    body = msg.replies[0][0]
+    assert "/admin_credit" in body
+    assert "/admin_role_grant" not in body

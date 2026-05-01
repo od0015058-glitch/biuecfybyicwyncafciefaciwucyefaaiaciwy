@@ -6162,6 +6162,27 @@ async def test_audit_filter_dropdown_includes_control_panel_actions(
     assert "Bot-health recovery DM sent" in body
 
 
+async def test_audit_filter_dropdown_includes_role_crud_actions(
+    aiohttp_client, make_admin_app,
+):
+    """Bug-fix regression (Stage-15-Step-E #5 follow-up): the
+    ``role_grant`` / ``role_revoke`` slugs were already being
+    recorded by ``Database.record_admin_audit`` at the
+    ``/admin_role_grant`` / ``/admin_role_revoke`` Telegram-side
+    handlers (since PR #123), but they had been omitted from
+    ``AUDIT_ACTION_LABELS`` so the filter dropdown on
+    ``/admin/audit`` couldn't narrow the feed to "role changes
+    only". The dropdown must now list both."""
+    db = _stub_db(audit_log_result=[])
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/audit")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Admin role granted" in body
+    assert "Admin role revoked" in body
+
+
 async def test_user_edit_route_requires_auth(
     aiohttp_client, make_admin_app
 ):
