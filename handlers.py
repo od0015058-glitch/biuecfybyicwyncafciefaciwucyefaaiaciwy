@@ -3293,7 +3293,21 @@ async def _download_photo_to_bytes(message: Message) -> bytes | None:
     photo = message.photo[-1]
     try:
         file = await message.bot.get_file(photo.file_id)
-    except TelegramAPIError:
+    except Exception:  # noqa: BLE001
+        # Bundled bug fix (Stage-15-Step-E #10 follow-up #1): the
+        # docstring promises this helper "stays loud-but-recoverable
+        # so the photo handler can keep running" — but the previous
+        # ``except TelegramAPIError`` only caught aiogram-wrapped
+        # errors. A plain ``asyncio.TimeoutError`` (aiogram's request
+        # timeout fires before the API call returns; no wrapping) or
+        # an unwrapped ``aiohttp.ClientError`` from the underlying
+        # session would propagate out, crash the photo handler before
+        # the ``finally`` block could surface ``ai_image_download_failed``,
+        # and the user would see no reply at all. Broaden to
+        # ``Exception`` so any transport-layer failure produces the
+        # documented ``None`` return + localised error path. The
+        # ``log.exception`` keeps the failure visible in ops logs so
+        # a flaky network is still triagable.
         log.exception(
             "vision: get_file failed for file_id=%r (chat_id=%s)",
             photo.file_id, message.chat.id,
@@ -3309,7 +3323,13 @@ async def _download_photo_to_bytes(message: Message) -> bytes | None:
     try:
         buf: io.BytesIO = io.BytesIO()
         await message.bot.download_file(file_path, destination=buf)
-    except TelegramAPIError:
+    except Exception:  # noqa: BLE001
+        # Same broadening as the get_file branch above — see the
+        # comment there for the bundled-fix rationale. The CDN
+        # download is the more common failure surface (Telegram's
+        # photo CDN occasionally returns 5xx during incidents) so
+        # narrowing the catch here was the higher-impact half of
+        # the regression.
         log.exception(
             "vision: download_file failed for file_path=%r (chat_id=%s)",
             file_path, message.chat.id,
@@ -3456,3 +3476,77 @@ async def process_photo(message: Message):
 
     for chunk in _split_for_telegram(reply, _TELEGRAM_MAX_MSG_CHARS):
         await message.answer(chunk)
+
+
+@router.message(F.document)
+async def process_image_document(message: Message):
+    """Image-as-document → "please re-send as photo" instruction.
+
+    Stage-15-Step-E #10 follow-up. iPhone users send photos as HEIC
+    by default and many Android galleries also let you "send as
+    file" instead of compressing through Telegram's photo channel.
+    Both arrive as ``message.document`` (NOT ``message.photo``) so
+    :func:`process_photo` never sees them — pre-fix the bot
+    silently ignored the upload and the user saw nothing happen.
+
+    This handler intercepts only documents whose ``mime_type``
+    starts with ``image/`` (HEIC / HEIF / PNG / WEBP / TIFF / SVG /
+    AVIF / BMP / etc.) and replies with a localised "send as a
+    photo, not a file" instruction. Non-image documents (PDFs,
+    archives, audio) are passed through silently — there is no
+    other handler for them today, but a future "PDF summariser"
+    feature could add one without colliding with this filter.
+
+    Why HEIC isn't auto-converted server-side: the conversion
+    needs Pillow + the ``pillow-heif`` plugin (a CPU-bound, memory-
+    heavy operation on a hot path), and Telegram's "Photo" attach
+    mode already converts client-side to JPEG for free. Telling
+    the user to flip the attach mode is a one-tap fix; spending
+    operator-side memory + CPU re-encoding every iPhone photo
+    isn't.
+
+    Per-user chat-token bucket gates the reply so a malicious
+    client spamming the document upload doesn't burn our outbound
+    Telegram-API budget. When the bucket is exhausted the handler
+    silently drops — sending another "please re-send as photo"
+    reply on top of the chat's already-rate-limited state would
+    just be noise, and the user already knows their session is
+    throttled.
+    """
+    if message.from_user is None:
+        log.info(
+            "process_image_document: dropping document with no "
+            "from_user (chat_id=%s)",
+            message.chat.id,
+        )
+        return
+    document = message.document
+    if document is None:
+        # ``F.document`` should already exclude this case but
+        # defence-in-depth — if a future aiogram-filter regression
+        # changes the matching semantics, we don't want to trip
+        # on ``getattr(None, "mime_type", ...)``.
+        return
+    mime_type = (getattr(document, "mime_type", None) or "").strip().lower()
+    # Pass-through for non-image documents (PDFs, archives, audio):
+    # the bot has no other document handler today, but if one is
+    # added later it should be reached. Returning silently is the
+    # explicit "I do not handle this" signal.
+    if not mime_type.startswith("image/"):
+        return
+    user_id = message.from_user.id
+    if not await consume_chat_token(user_id):
+        log.info(
+            "process_image_document: rate-limited telegram_id=%s "
+            "(mime=%s); dropping silently",
+            user_id, mime_type,
+        )
+        return
+    lang = await _get_user_language(user_id)
+    log.info(
+        "process_image_document: rejecting image-as-document for "
+        "user %d (mime=%s, file_name=%r); instructing user to "
+        "send as photo",
+        user_id, mime_type, getattr(document, "file_name", None),
+    )
+    await message.answer(t(lang, "ai_image_document_instruction"))

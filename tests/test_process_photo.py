@@ -501,6 +501,88 @@ async def test_download_photo_to_bytes_returns_none_on_telegram_api_error():
     assert out is None
 
 
+@pytest.mark.parametrize(
+    "exc_factory",
+    [
+        # ``asyncio.TimeoutError`` is the most common non-aiogram
+        # failure on the photo CDN — aiogram applies its 30s
+        # request timeout via ``asyncio.wait_for`` and the
+        # resulting TimeoutError is NOT wrapped into a
+        # ``TelegramAPIError`` by every aiogram version.
+        lambda: __import__("asyncio").TimeoutError("download took too long"),
+        # ``aiohttp.ClientConnectionError`` is the canonical
+        # transport-layer failure during the streaming download
+        # (TCP reset, DNS hiccup, TLS handshake timeout). aiogram
+        # passes the underlying session through to ``download_file``
+        # so this can leak out unwrapped.
+        lambda: __import__(
+            "aiohttp"
+        ).ClientConnectionError("connection reset"),
+        # A generic ``Exception`` covers any other unforeseen
+        # crash mode — defensive contract is "loud-but-recoverable",
+        # so anything that surfaces here should produce ``None``
+        # and a logged exception, not a poller-level crash.
+        lambda: RuntimeError("unexpected failure inside session"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_download_photo_to_bytes_returns_none_on_non_telegram_error(
+    exc_factory,
+):
+    """Stage-15-Step-E #10 follow-up #1 bundled bug fix regression
+    pin. The helper's docstring promises "loud-but-recoverable" —
+    return None on any download failure so the photo handler can
+    surface the localised ``ai_image_download_failed`` message.
+
+    Pre-fix the catch was ``except TelegramAPIError`` only, so a
+    non-aiogram-wrapped transport error (``asyncio.TimeoutError``
+    from aiogram's request-timeout budget firing,
+    ``aiohttp.ClientConnectionError`` from the streaming download)
+    propagated past this helper, past the photo handler's outer
+    try/finally, and the user saw nothing — no reply, no error,
+    just silence — while ops triage was harder than necessary
+    because the unhandled stack reached the poller.
+
+    Post-fix the broadened ``except Exception`` catches every
+    crash mode, returns None, and logs at exception level so
+    operations can spot a flaky network without losing the user's
+    UX.
+    """
+    import handlers
+
+    msg = _make_photo_message()
+    msg.bot.get_file = AsyncMock(side_effect=exc_factory())
+    out = await handlers._download_photo_to_bytes(msg)
+    assert out is None
+
+
+@pytest.mark.parametrize(
+    "exc_factory",
+    [
+        lambda: __import__("asyncio").TimeoutError("stream timed out"),
+        lambda: __import__(
+            "aiohttp"
+        ).ClientPayloadError("malformed chunk"),
+        lambda: ConnectionResetError("peer reset mid-download"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_download_photo_to_bytes_returns_none_on_download_file_error(
+    exc_factory,
+):
+    """Bundled bug fix regression pin (mirror of the get_file
+    branch above) — the streaming ``download_file`` call is the
+    other half of the broadened catch. CDN-side failures during
+    the actual byte transfer must produce None, not a stack
+    trace at poller level."""
+    import handlers
+
+    msg = _make_photo_message()
+    msg.bot.download_file = AsyncMock(side_effect=exc_factory())
+    out = await handlers._download_photo_to_bytes(msg)
+    assert out is None
+
+
 @pytest.mark.asyncio
 async def test_download_photo_to_bytes_returns_none_on_no_file_path():
     """Telegram occasionally returns a ``File`` with no

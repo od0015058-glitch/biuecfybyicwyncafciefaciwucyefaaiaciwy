@@ -426,6 +426,13 @@ _STRINGS: dict[str, dict[str, str]] = {
             "🖼️ دریافت تصویر از تلگرام ممکن نشد. "
             "لطفاً دوباره تلاش کنید."
         ),
+        "ai_image_document_instruction": (
+            "🖼️ این تصویر به‌صورت «فایل» ارسال شده است و من نمی‌توانم آن را تحلیل کنم. "
+            "لطفاً همان تصویر را به‌صورت «عکس» (در تلگرام هنگام ارسال، گزینهٔ «Photo» نه «File») "
+            "دوباره بفرستید تا یک مدل بینایی بتواند آن را ببیند. "
+            "فرمت‌های HEIC / HEIF (پیش‌فرض آیفون) پشتیبانی نمی‌شوند؛ "
+            "تلگرام هنگام ارسال به‌صورت «Photo» تصویر را به JPEG تبدیل می‌کند."
+        ),
         # ---- Payment notifications ----
         "pay_credited_full": "✅ پرداخت تایید شد! مبلغ ${delta:.4f} به حساب شما اضافه شد.",
         "pay_credited_total_only": (
@@ -896,6 +903,13 @@ _STRINGS: dict[str, dict[str, str]] = {
         "ai_image_download_failed": (
             "🖼️ Couldn't fetch your image from Telegram. "
             "Please try again."
+        ),
+        "ai_image_document_instruction": (
+            "🖼️ You sent this image as a file attachment, which I can't analyze. "
+            "Please re-send the same image as a photo (in Telegram's attach menu pick "
+            "\"Photo\", not \"File\") so a vision-capable model can see it. "
+            "HEIC / HEIF (the iPhone default) isn't supported either; sending as a "
+            "Photo automatically converts the image to JPEG, which is."
         ),
         # ---- Payment notifications ----
         "pay_credited_full": "✅ Payment confirmed! ${delta:.4f} has been added to your wallet.",

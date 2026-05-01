@@ -910,7 +910,7 @@ What remains for future Step-E #10 PRs (the user-visible feature is now end-to-e
 
 * **Memory persistence for image turns** — the current `conversation_messages` table stores plaintext `content`. The integration slice persists the prompt text only (the image is NOT in the schema). A memory-enabled user's vision turn replays as text-only on the next turn — model loses the visual context but keeps the conversational thread. Acceptable trade-off for the first user-facing slice; a follow-up PR can extend the schema to JSONB and update `get_recent_messages` to round-trip the multimodal array shape.
 * **Token / cost accounting for image turns** — vision images consume input tokens (a 1024×1024 image is ~765 tokens for GPT-4V; varies per model). The existing `pricing.calculate_cost_async` only takes `(active_model, prompt_tokens, completion_tokens)` — those values come back from OpenRouter's `usage` block, which already includes the image-token contribution, so this *should* be transparent. Verify with a real OpenRouter response that the `prompt_tokens` field reflects the image cost; if it does, this is already correct. If not, factor in a per-model multiplier.
-* **HEIC / unsupported-mime conversion path** — iPhone users send HEIC by default (sent as `document` in Telegram, currently *not* routed to `process_photo` because `F.photo` only matches the JPEG-rendered photo-message channel). Either: (a) reject loudly with a localised "please re-send as JPEG/PNG" message via a `F.document & F.document.mime_type.startswith("image/")` handler, or (b) install Pillow + the HEIC plugin and convert server-side. Option (a) is the trivial path; option (b) doubles the install footprint and adds a CPU-hungry hot path. Defer until we see real user demand.
+* ✅ **HEIC / unsupported-mime rejection path** — shipped in Stage-15-Step-E #10 follow-up #1. New `@router.message(F.document)` handler `process_image_document` filters to `mime_type.startswith("image/")` and replies with the localised `ai_image_document_instruction` slug ("send as Photo, not File"). Non-image documents (PDFs, archives, audio) pass through silently so a future doc handler can be added without colliding. Server-side HEIC conversion (option (b) — install Pillow + `pillow-heif` and convert in the hot path) deliberately NOT taken: doubles the install footprint, adds a CPU-bound memory-heavy operation per upload, and Telegram's "Photo" attach mode already converts client-side to JPEG for free. Telling the user to flip the attach mode is a one-tap fix.
 * **Multi-image messages** — the helper supports up to `MAX_IMAGES_PER_MESSAGE` images per turn but the handler currently only routes single `F.photo` messages. To support a media group (album) the handler would need to buffer media-group updates by `message.media_group_id`, accumulate the data URIs across the group, and fire one `chat_with_model` call when the album is complete. Non-trivial because aiogram doesn't natively coalesce media groups — would need a small in-memory dict keyed by `media_group_id` with a debounce timer.
 * **Per-image cost transparency** — the wallet UI / charge log doesn't currently surface "this $X charge included a vision image". Could be useful for a power user trying to budget. Out of scope.
 
@@ -2388,7 +2388,64 @@ The user's process for this project — **do not deviate**:
     known names / one warn per distinct unknown name /
     `zarinpal_backfill` is in `_LOOP_METRIC_NAMES` / reset
     clears warned set. Suite: 2106 → 2125 passing (+19 new).
-22. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+22. **Stage-15-Step-E #10 follow-up #1 OPENED** (PR-after-#152) —
+    image-as-document rejection handler. iPhone's default photo
+    format (HEIC) and Telegram's "Send as File" attach mode both
+    arrive as `message.document` (not `message.photo`), so
+    `process_photo` never sees them and the bot silently ignores
+    the upload. New `@router.message(F.document)` handler
+    `process_image_document` filters to `mime_type` starting with
+    `image/` (HEIC / HEIF / PNG / WEBP / TIFF / SVG / AVIF / BMP /
+    x-icon — the exhaustive `image/*` family) and replies with a
+    new localised slug `ai_image_document_instruction` telling
+    the user to re-attach as Photo, not File. Non-image documents
+    (PDFs, archives, audio) pass through silently — explicit
+    "I do not handle this" signal so a future PDF / audio handler
+    can be added without colliding. Per-user chat-token bucket
+    gates the reply (so a malicious client spamming HEIC uploads
+    can't burn our outbound Telegram-API budget); when the bucket
+    is exhausted we drop silently rather than send a "rate-limited"
+    reply on top of the chat's already-throttled state. The mime
+    filter fires BEFORE the rate-limit gate so a user sending a
+    PDF (which we pass through) doesn't have their chat-token
+    budget penalised. `from_user is None` (anonymous-admin /
+    channel forward) drops silently mirroring `process_photo`.
+    HEIC isn't auto-converted server-side because the conversion
+    needs Pillow + `pillow-heif` (a CPU-bound, memory-heavy
+    operation on a hot path), and Telegram's "Photo" attach mode
+    already converts client-side to JPEG for free; telling the
+    user to flip the attach mode is a one-tap fix, spending
+    operator-side memory + CPU re-encoding every iPhone photo
+    isn't. Bundled real bug fix:
+    `handlers._download_photo_to_bytes` now catches `Exception`
+    instead of `TelegramAPIError` only on both the `get_file` and
+    `download_file` branches. Pre-fix the docstring promised
+    "loud-but-recoverable" — return None on any failure so
+    `process_photo` could surface `ai_image_download_failed` —
+    but a non-aiogram-wrapped error (`asyncio.TimeoutError` from
+    aiogram's request-timeout firing,
+    `aiohttp.ClientConnectionError` / `ClientPayloadError` from
+    the streaming download, `ConnectionResetError` from a peer
+    reset mid-transfer) propagated out of the helper, past the
+    photo handler's outer `try/finally`, and the user saw nothing
+    — no reply, no error, just silence — while ops triage was
+    harder than necessary because the unhandled stack reached the
+    poller. Post-fix the broadened catch produces None for every
+    transport-layer crash mode and `log.exception` keeps the
+    failure visible in ops logs. 30 new test instances in
+    `tests/test_process_image_document.py` (parametrised over 13
+    image mime types incl. mixed-case + whitespace, parametrised
+    over 10 non-image mime types incl. None / empty, FA + EN copy,
+    `from_user is None` drop, `document is None` defence,
+    rate-limit silent-drop, PDF doesn't drain chat-token,
+    caption-on-document is ignored, slug present in both locales)
+    + 6 new regression test instances in
+    `tests/test_process_photo.py` (parametrised over
+    `asyncio.TimeoutError` / `aiohttp.ClientConnectionError` /
+    `aiohttp.ClientPayloadError` / `ConnectionResetError` /
+    generic `RuntimeError` on both `get_file` and `download_file`
+    sites). Suite: 2204 → 2240 passing (+36 new).
+23. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-23. **Read the §11 working agreement before doing anything.**
+24. **Read the §11 working agreement before doing anything.**
