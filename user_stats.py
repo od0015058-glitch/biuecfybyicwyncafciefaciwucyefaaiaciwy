@@ -46,6 +46,7 @@ the docstring on
 from __future__ import annotations
 
 import math
+from datetime import date, timedelta
 from typing import Iterable
 
 from strings import t
@@ -223,7 +224,172 @@ def format_stats_summary(
                     cost=row["cost_usd"],
                 )
             )
+
+    # Stage-15-Step-E #2 follow-up #3: per-day spending breakdown.
+    # Rendered as ASCII bars in a fenced code block so the date /
+    # bar / cost columns line up under Telegram's variable-width
+    # font. Skipped when there's no daily data — same "no row is
+    # better than a misleading empty bar chart" policy as the
+    # balance line at the top of the screen.
+    daily = snapshot.get("daily") or []
+    daily_block = _format_daily_bars(daily, lang, window_days=window_days)
+    if daily_block:
+        lines.append("")
+        lines.append(daily_block)
     return "\n".join(lines)
+
+
+# Width of the bar in characters. Picked so the longest line
+# ("YYYY-MM-DD ████…████ $XX.XXXX") stays under ~40 cols on a
+# narrow phone — Telegram's monospace fits ~32 chars before the
+# code block starts wrapping on iPhone SE-class screens. 16 is
+# the widest bar that keeps the whole line readable.
+_DAILY_BAR_WIDTH = 16
+_DAILY_BAR_FILLED_CHAR = "█"
+_DAILY_BAR_EMPTY_CHAR = "░"
+
+
+def _format_daily_bars(
+    daily: Iterable[dict],
+    lang: str | None,
+    *,
+    window_days: int,
+) -> str:
+    """Render the per-day spending series as an ASCII bar chart.
+
+    Returns ``""`` when *daily* is empty so the caller can decide
+    whether to emit a header. Otherwise returns a Markdown
+    code-block string with one row per day (newest last).
+
+    The bar width is proportional to ``cost_usd / max(cost_usd)``
+    over the visible window. Days with zero cost render as an
+    all-empty bar (``░░░░░░░░░░░░░░░░``) so the user can see the
+    continuity of dates rather than a sparse "every-other-day"
+    chart. Days that aren't present in *daily* but fall inside
+    ``[max_date - window_days + 1, max_date]`` are filled with
+    zero rows for the same reason.
+
+    Defensive against legacy / corrupted rows: any row missing
+    ``date`` / ``cost_usd``, with a non-string date, with a
+    non-finite cost, or with a date that doesn't ISO-parse, is
+    skipped. ``window_days`` is clamped to the same range as
+    ``Database.get_user_daily_spending``'s server-side clamp so a
+    buggy caller can't blow the bar count up.
+    """
+    rows = list(_iter_daily_rows(daily))
+    if not rows:
+        return ""
+
+    # Pad missing days so the bars form a continuous date axis.
+    rows = _pad_missing_days(rows, window_days=window_days)
+    max_cost = max((r["cost_usd"] for r in rows), default=0.0)
+
+    body_lines: list[str] = []
+    for row in rows:
+        cost = row["cost_usd"]
+        if max_cost > 0:
+            ratio = cost / max_cost
+        else:
+            ratio = 0.0
+        # Round half-up via int(ratio*W + 0.5). At ratio=1 this is
+        # exactly W; at ratio=0 it's 0; at ratio=0.5 it's W/2 +
+        # rounding. Bounded to [0, W] defensively against a NaN
+        # ratio (which can't actually happen here — _iter_daily_rows
+        # already drops NaN cost — but bounded math is clearer).
+        filled = max(0, min(_DAILY_BAR_WIDTH, int(ratio * _DAILY_BAR_WIDTH + 0.5)))
+        bar = (
+            _DAILY_BAR_FILLED_CHAR * filled
+            + _DAILY_BAR_EMPTY_CHAR * (_DAILY_BAR_WIDTH - filled)
+        )
+        body_lines.append(
+            f"{row['date']}  {bar}  ${cost:.4f}"
+        )
+
+    header = t(lang, "stats_daily_header", days=window_days)
+    body = "\n".join(body_lines)
+    # Triple-backtick fence keeps the columns monospaced. Trailing
+    # newline before the closing fence avoids Telegram swallowing
+    # the last data row on some clients.
+    return f"{header}\n```\n{body}\n```"
+
+
+def _iter_daily_rows(rows: Iterable[dict]) -> Iterable[dict]:
+    """Yield only well-formed rows from *rows*.
+
+    Same defensive shape as :func:`_iter_top_models`. A row whose
+    ``date`` doesn't parse, or whose ``cost_usd`` is non-finite /
+    non-numeric, is dropped rather than rendered as a broken bar.
+    """
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        raw_date = r.get("date")
+        if not isinstance(raw_date, str) or not raw_date:
+            continue
+        try:
+            parsed_date = date.fromisoformat(raw_date)
+        except ValueError:
+            continue
+        cost = _safe_float(r.get("cost_usd"))
+        calls = _safe_int(r.get("calls"))
+        yield {
+            "date": parsed_date.isoformat(),
+            "_date_obj": parsed_date,
+            "cost_usd": cost,
+            "calls": calls,
+        }
+
+
+def _pad_missing_days(
+    rows: list[dict],
+    *,
+    window_days: int,
+) -> list[dict]:
+    """Fill any gap days inside the rendered window with zero rows.
+
+    The DB query in :meth:`Database.get_user_daily_spending`
+    intentionally omits days with no usage to keep the row count
+    bounded; the renderer then has to put them back so the date
+    axis on the bar chart looks continuous. Spans more than
+    *window_days* are truncated to the most-recent *window_days*
+    days, defensive against a future caller passing rows older
+    than the requested window.
+    """
+    if not rows:
+        return rows
+    # Clamp window_days defensively. The DB layer already clamps,
+    # but the formatter must not blow up if a hand-built snapshot
+    # passes an unreasonable value.
+    window_days = max(1, min(int(window_days), 365))
+
+    # Walk the window from oldest -> newest based on the LATEST
+    # row's date, NOT today's date. This keeps the chart anchored
+    # on the user's most recent activity even if the latest row
+    # is several days behind the wall clock — otherwise a user
+    # who hasn't chatted in a week would see a chart of all
+    # zero-bars with their actual usage scrolled off the bottom.
+    latest = rows[-1]["_date_obj"]
+    earliest = latest - timedelta(days=window_days - 1)
+    by_date = {r["_date_obj"]: r for r in rows if r["_date_obj"] >= earliest}
+
+    padded: list[dict] = []
+    cursor = earliest
+    while cursor <= latest:
+        if cursor in by_date:
+            row = by_date[cursor]
+            padded.append({
+                "date": row["date"],
+                "cost_usd": row["cost_usd"],
+                "calls": row["calls"],
+            })
+        else:
+            padded.append({
+                "date": cursor.isoformat(),
+                "cost_usd": 0.0,
+                "calls": 0,
+            })
+        cursor = cursor + timedelta(days=1)
+    return padded
 
 
 def _iter_top_models(rows: Iterable[dict]) -> Iterable[dict]:

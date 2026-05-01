@@ -12,6 +12,30 @@ import database as database_module
 from user_stats import format_stats_summary
 
 
+@pytest.fixture(autouse=True)
+def _stub_handler_daily_spending(monkeypatch):
+    """Stage-15-Step-E #2 follow-up #3: the new
+    ``_build_stats_render`` helper now also calls
+    ``db.get_user_daily_spending`` to populate the per-day bar
+    chart. Pre-existing handler tests didn't mock that method, so
+    a leaky DB-pool from another test module (e.g.
+    ``test_model_discovery._FailingPool``) would surface as a
+    ``pytest.fail`` exception that bypasses the handler's
+    defensive ``except Exception``.
+
+    Default to an empty list so existing tests continue to work.
+    Tests that need a populated daily series can override this
+    with their own ``patch`` context — the most-recent stack
+    entry wins."""
+    import handlers as _h
+    monkeypatch.setattr(
+        _h.db,
+        "get_user_daily_spending",
+        AsyncMock(return_value=[]),
+        raising=False,
+    )
+
+
 # ---------------------------------------------------------------------
 # Database helpers (mirrors test_database_queries.py)
 # ---------------------------------------------------------------------
@@ -1025,3 +1049,327 @@ def test_hub_stats_keyboard_default_window_highlighted():
             assert b.text.startswith("✓ ")
         elif (b.callback_data or "").startswith("stats_window:"):
             assert not b.text.startswith("✓")
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #2 follow-up #3: per-day spending breakdown bars
+# ---------------------------------------------------------------------
+
+
+async def test_daily_spending_query_filters_user_and_window():
+    """SQL-shape pin for the new ``get_user_daily_spending`` method.
+
+    The query MUST hard-code the ``WHERE telegram_id = $1`` filter
+    (same defense as ``get_user_spending_summary``) and cover the
+    requested rolling window via the ``$2 || ' days'``::interval
+    pattern. ``date_trunc('day', created_at)`` must group rows
+    into per-day buckets and ORDER BY 1 (oldest first) so the
+    renderer can emit bars left-to-right.
+    """
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_user_daily_spending(telegram_id=42, days=30)
+
+    sql = conn.fetch.await_args.args[0]
+    assert "WHERE telegram_id = $1" in sql
+    assert "($2 || ' days')::interval" in sql
+    assert "date_trunc('day', created_at)" in sql
+    assert "GROUP BY 1" in sql
+    assert "ORDER BY 1" in sql
+    # The bind args carry through.
+    assert conn.fetch.await_args.args[1] == 42
+    assert conn.fetch.await_args.args[2] == "30"
+
+
+async def test_daily_spending_returns_iso_dates_and_finite_floats():
+    import datetime as dt
+    conn = _make_conn()
+    conn.fetch = AsyncMock(
+        return_value=[
+            {"day": dt.date(2026, 4, 25), "calls": 3, "cost": 0.1500},
+            {"day": dt.date(2026, 4, 26), "calls": 5, "cost": 0.2500},
+        ]
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    out = await db.get_user_daily_spending(telegram_id=42, days=30)
+
+    assert out == [
+        {"date": "2026-04-25", "calls": 3, "cost_usd": pytest.approx(0.15)},
+        {"date": "2026-04-26", "calls": 5, "cost_usd": pytest.approx(0.25)},
+    ]
+
+
+async def test_daily_spending_scrubs_nan_inf_cost():
+    """Bundled bug fix: a corrupted aggregate that returns ``nan``
+    or ``inf`` from ``SUM(cost_deducted_usd)`` (legacy rows pre-PR
+    #75) MUST be coerced to ``0.0`` at the DB boundary so the
+    snapshot dict only contains finite floats. Pre-fix, the
+    formatter's ``_safe_float`` clamped at render time but the
+    snapshot itself leaked NaN to other potential callers."""
+    import datetime as dt
+    import math
+    conn = _make_conn()
+    conn.fetch = AsyncMock(
+        return_value=[
+            {"day": dt.date(2026, 4, 25), "calls": 1, "cost": float("nan")},
+            {"day": dt.date(2026, 4, 26), "calls": 2, "cost": float("inf")},
+            {"day": dt.date(2026, 4, 27), "calls": 3, "cost": 0.5},
+        ]
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    out = await db.get_user_daily_spending(telegram_id=42, days=30)
+
+    assert len(out) == 3
+    assert all(math.isfinite(r["cost_usd"]) for r in out)
+    assert out[0]["cost_usd"] == 0.0
+    assert out[1]["cost_usd"] == 0.0
+    assert out[2]["cost_usd"] == pytest.approx(0.5)
+
+
+async def test_daily_spending_skips_null_day_rows():
+    """A row with ``day=None`` (shouldn't happen because
+    ``date_trunc`` over a NOT NULL column never returns NULL, but
+    defense-in-depth) must be dropped, not rendered as the empty
+    string."""
+    import datetime as dt
+    conn = _make_conn()
+    conn.fetch = AsyncMock(
+        return_value=[
+            {"day": None, "calls": 1, "cost": 0.10},
+            {"day": dt.date(2026, 4, 25), "calls": 3, "cost": 0.15},
+        ]
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    out = await db.get_user_daily_spending(telegram_id=42, days=30)
+
+    assert len(out) == 1
+    assert out[0]["date"] == "2026-04-25"
+
+
+async def test_daily_spending_clamps_days():
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_user_daily_spending(telegram_id=1, days=99999)
+    assert conn.fetch.await_args.args[2] == str(
+        database_module.Database.USER_STATS_WINDOW_DAYS_MAX
+    )
+
+    await db.get_user_daily_spending(telegram_id=1, days=0)
+    assert conn.fetch.await_args.args[2] == "1"
+
+    await db.get_user_daily_spending(telegram_id=1, days=-5)
+    assert conn.fetch.await_args.args[2] == "1"
+
+
+async def test_daily_spending_refuses_non_positive_telegram_id():
+    db = database_module.Database()
+    db.pool = _PoolStub(_make_conn())
+    with pytest.raises(ValueError):
+        await db.get_user_daily_spending(telegram_id=0, days=30)
+    with pytest.raises(ValueError):
+        await db.get_user_daily_spending(telegram_id=-1, days=30)
+
+
+async def test_summary_finite_float_scrub_for_nan_top_models_cost():
+    """Bundled bug fix: ``Decimal('NaN') or 0`` is truthy, so the
+    pre-fix code returned the NaN through to the snapshot dict.
+    Asserting the dict contains finite floats only."""
+    import math
+    conn = _make_conn()
+    _attach_summary_fetches(
+        conn,
+        lifetime={"calls": 10, "tokens": 5_000, "cost": float("nan")},
+        window={"calls": 3, "tokens": 1_500, "cost": float("inf")},
+        top_models=[
+            {"model": "openai/gpt-4o", "calls": 12, "cost": float("nan")},
+            {"model": "anthropic/claude-3-opus", "calls": 8, "cost": 0.10},
+        ],
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    out = await db.get_user_spending_summary(telegram_id=42)
+
+    assert math.isfinite(out["lifetime"]["total_cost_usd"])
+    assert out["lifetime"]["total_cost_usd"] == 0.0
+    assert math.isfinite(out["window"]["total_cost_usd"])
+    assert out["window"]["total_cost_usd"] == 0.0
+    for row in out["top_models"]:
+        assert math.isfinite(row["cost_usd"])
+    # Sane row passes through.
+    sane = next(r for r in out["top_models"] if r["model"] == "anthropic/claude-3-opus")
+    assert sane["cost_usd"] == pytest.approx(0.10)
+
+
+async def test_summary_finite_int_scrub_for_nan_tokens():
+    """Bundled bug fix: ``int(Decimal('NaN'))`` raises
+    ``ValueError`` and crashed the whole summary query. The new
+    ``_finite_int`` helper coerces NaN → 0."""
+    conn = _make_conn()
+    _attach_summary_fetches(
+        conn,
+        lifetime={"calls": 1, "tokens": float("nan"), "cost": 0.10},
+        window={"calls": 1, "tokens": float("inf"), "cost": 0.05},
+        top_models=[],
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    out = await db.get_user_spending_summary(telegram_id=42)
+
+    assert out["lifetime"]["total_tokens"] == 0
+    assert out["window"]["total_tokens"] == 0
+
+
+# ---------------------------------------------------------------------
+# user_stats._format_daily_bars — pure-function renderer
+# ---------------------------------------------------------------------
+
+
+def test_formatter_emits_no_daily_block_when_empty():
+    snapshot = _populated_snapshot()
+    snapshot["daily"] = []
+    out = format_stats_summary(snapshot, "en")
+    # Title still renders, but the daily header is skipped.
+    assert "Daily breakdown" not in out
+
+
+def test_formatter_renders_daily_bars_in_code_block():
+    snapshot = _populated_snapshot()
+    snapshot["daily"] = [
+        {"date": "2026-04-25", "calls": 1, "cost_usd": 0.10},
+        {"date": "2026-04-26", "calls": 3, "cost_usd": 0.30},
+        {"date": "2026-04-27", "calls": 2, "cost_usd": 0.20},
+    ]
+    out = format_stats_summary(snapshot, "en")
+    assert "Daily breakdown (last 30 days)" in out
+    # Code-block fences for monospace columns.
+    assert "```" in out
+    # Each ISO date appears in the rendered output.
+    assert "2026-04-25" in out
+    assert "2026-04-26" in out
+    assert "2026-04-27" in out
+    # The day with the highest cost gets the widest bar (16 chars).
+    assert "█" * 16 in out
+    # The lowest non-zero day's bar is shorter than the maximum.
+    bar_filled_chars = "█" * 16
+    assert out.count(bar_filled_chars) == 1
+
+
+def test_formatter_pads_missing_days_in_window():
+    """A user who chatted on day-1 and day-3 of a 3-day window
+    should see THREE rows, not two. The middle day renders as an
+    all-empty bar."""
+    snapshot = _populated_snapshot()
+    snapshot["window_days"] = 3
+    snapshot["daily"] = [
+        {"date": "2026-04-25", "calls": 1, "cost_usd": 0.10},
+        {"date": "2026-04-27", "calls": 2, "cost_usd": 0.20},
+    ]
+    out = format_stats_summary(snapshot, "en", balance_usd=None)
+    assert "2026-04-25" in out
+    assert "2026-04-26" in out  # filled-in zero day
+    assert "2026-04-27" in out
+    # The zero day must be the all-empty bar (no filled blocks).
+    lines = out.splitlines()
+    zero_line = next(l for l in lines if l.startswith("2026-04-26"))
+    assert "█" not in zero_line
+    assert "░" * 16 in zero_line
+
+
+def test_formatter_renders_zero_height_bar_for_zero_cost_day():
+    """A day with zero cost (but at least one zero-cost call —
+    e.g. a free model) renders as the all-empty bar."""
+    snapshot = _populated_snapshot()
+    snapshot["daily"] = [
+        {"date": "2026-04-25", "calls": 5, "cost_usd": 0.0},
+        {"date": "2026-04-26", "calls": 5, "cost_usd": 0.10},
+    ]
+    out = format_stats_summary(snapshot, "en")
+    lines = out.splitlines()
+    zero_line = next(l for l in lines if l.startswith("2026-04-25"))
+    assert "█" not in zero_line
+
+
+def test_formatter_drops_rows_with_invalid_date():
+    """Defense-in-depth: a row with a non-string / non-ISO date
+    must be skipped, not crash the renderer."""
+    snapshot = _populated_snapshot()
+    snapshot["daily"] = [
+        {"date": "2026-04-25", "calls": 1, "cost_usd": 0.10},
+        {"date": "not-a-date", "calls": 1, "cost_usd": 0.10},
+        {"date": None, "calls": 1, "cost_usd": 0.10},
+        {"date": 42, "calls": 1, "cost_usd": 0.10},
+    ]
+    out = format_stats_summary(snapshot, "en")
+    assert "2026-04-25" in out
+    assert "not-a-date" not in out
+
+
+def test_formatter_drops_rows_with_nan_cost():
+    """NaN/Inf cost must not render as ``$nan`` — drop the row.
+
+    (The DB-layer scrub already prevents NaN from reaching the
+    formatter, but a hand-built snapshot — eg. unit tests — must
+    not produce a malformed bar.)"""
+    snapshot = _populated_snapshot()
+    snapshot["daily"] = [
+        {"date": "2026-04-25", "calls": 1, "cost_usd": float("nan")},
+        {"date": "2026-04-26", "calls": 1, "cost_usd": 0.20},
+    ]
+    out = format_stats_summary(snapshot, "en")
+    assert "$nan" not in out.lower()
+    assert "2026-04-26" in out
+
+
+def test_formatter_renders_daily_with_persian_locale():
+    snapshot = _populated_snapshot()
+    snapshot["daily"] = [
+        {"date": "2026-04-25", "calls": 1, "cost_usd": 0.10},
+    ]
+    out = format_stats_summary(snapshot, "fa")
+    assert "روند روزانه" in out
+    assert "2026-04-25" in out
+
+
+def test_formatter_truncates_to_recent_window_days():
+    """A daily series longer than ``window_days`` (a stale
+    snapshot, or a hand-built test row) is truncated to the most
+    recent ``window_days`` days, anchored on the latest data
+    point."""
+    snapshot = _populated_snapshot()
+    snapshot["window_days"] = 3
+    snapshot["daily"] = [
+        {"date": "2026-04-20", "calls": 1, "cost_usd": 0.05},  # outside window
+        {"date": "2026-04-25", "calls": 1, "cost_usd": 0.10},
+        {"date": "2026-04-26", "calls": 2, "cost_usd": 0.20},
+        {"date": "2026-04-27", "calls": 3, "cost_usd": 0.30},
+    ]
+    out = format_stats_summary(snapshot, "en")
+    assert "2026-04-20" not in out
+    assert "2026-04-25" in out
+    assert "2026-04-27" in out
+
+
+def test_handler_empty_stats_snapshot_includes_daily_key():
+    """The empty-snapshot fallback (used when
+    ``get_user_spending_summary`` raises ``ValueError``) must
+    include the ``daily`` key the formatter now expects, otherwise
+    a slash-command call with a bad ``user_id`` would crash the
+    formatter on ``snapshot.get('daily')``."""
+    from handlers import _empty_stats_snapshot
+
+    snapshot = _empty_stats_snapshot(window_days=30)
+    assert snapshot["daily"] == []

@@ -770,6 +770,10 @@ msgstr ""
 msgid "stats_balance_line"
 msgstr "💰 موجودی فعلی: *${balance:.2f}*"
 
+#: strings.py:stats_daily_header
+msgid "stats_daily_header"
+msgstr "📅 *روند روزانه ({days} روز اخیر)*"
+
 #: strings.py:stats_empty
 msgid "stats_empty"
 msgstr ""

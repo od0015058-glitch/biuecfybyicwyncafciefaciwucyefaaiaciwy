@@ -122,6 +122,10 @@ _STRINGS: dict[str, dict[str, str]] = {
         "stats_top_models_line": (
             "  {rank}. `{model}` — {calls:,} درخواست، ${cost:.4f}"
         ),
+        # Stage-15-Step-E #2 follow-up #3: per-day spending breakdown.
+        # Rendered as ASCII bars in a fenced code block; the days
+        # placeholder is the rolling window the bars cover.
+        "stats_daily_header": "📅 *روند روزانه ({days} روز اخیر)*",
         # Stage-15-Step-E #2 follow-up: window selector buttons.
         # ``{days}روزه`` = "<days>-day" — short enough to keep the
         # four buttons on one row in a Telegram message.
@@ -600,6 +604,8 @@ _STRINGS: dict[str, dict[str, str]] = {
         "stats_top_models_line": (
             "  {rank}. `{model}` — {calls:,} calls, ${cost:.4f}"
         ),
+        # Stage-15-Step-E #2 follow-up #3: per-day spending breakdown.
+        "stats_daily_header": "📅 *Daily breakdown (last {days} days)*",
         # Stage-15-Step-E #2 follow-up: window selector buttons.
         "stats_window_btn": "{days}d",
         # ---- Wallet redeem button (Stage-8-Part-3.5) ----

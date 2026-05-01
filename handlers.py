@@ -1738,6 +1738,7 @@ def _empty_stats_snapshot(window_days: int) -> dict:
             "total_calls": 0, "total_tokens": 0, "total_cost_usd": 0.0,
         },
         "top_models": [],
+        "daily": [],
     }
 
 
@@ -1776,6 +1777,27 @@ async def _build_stats_render(
             "get_user_spending_summary refused for user %r", user_id
         )
         snapshot = _empty_stats_snapshot(window_days)
+
+    # Stage-15-Step-E #2 follow-up #3: per-day breakdown for the
+    # ASCII bar chart. Best-effort — a transient DB error here
+    # MUST NOT crash the whole stats screen (the user still sees
+    # lifetime + window totals + top models without the chart).
+    try:
+        snapshot["daily"] = await db.get_user_daily_spending(
+            user_id, days=window_days
+        )
+    except ValueError:
+        log.exception(
+            "get_user_daily_spending refused for user %r", user_id
+        )
+        snapshot["daily"] = []
+    except Exception:
+        log.exception(
+            "get_user_daily_spending crashed for user %r; "
+            "rendering stats without the daily chart",
+            user_id,
+        )
+        snapshot["daily"] = []
     user_data = await db.get_user(user_id)
     raw_balance = float(user_data["balance_usd"]) if user_data else 0.0
     balance = raw_balance if math.isfinite(raw_balance) else 0.0

@@ -1035,6 +1035,11 @@ msgstr ""
 msgid "stats_balance_line"
 msgstr "💰 Current balance: *${balance:.2f}*"
 
+#. 📅 *روند روزانه ({days} روز اخیر)*
+#: strings.py:stats_daily_header
+msgid "stats_daily_header"
+msgstr "📅 *Daily breakdown (last {days} days)*"
+
 #. _هنوز هیچ مصرفی ثبت نشده است._
 #. بعد از اولین گفتگو با مدل، آمار اینجا نمایش داده می‌شود.
 #: strings.py:stats_empty
