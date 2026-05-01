@@ -569,3 +569,99 @@ def test_bot_status_is_immutable():
     )
     with pytest.raises((AttributeError, Exception)):
         s.level = bh.BotStatusLevel.DOWN  # type: ignore[misc]
+
+
+# ── Cadence introspection accessors (Stage-15-Step-F follow-up #4) ─
+
+
+def test_loop_cadence_seconds_returns_published_value():
+    """Every entry in ``LOOP_CADENCES`` is reachable via the public
+    accessor; unknown names round-trip to ``None`` (vs raising) so
+    the panel's snapshot loop can ask about *every* loop in
+    ``_LOOP_METRIC_NAMES`` without a try/except per name."""
+    for name, expected in bh.LOOP_CADENCES.items():
+        assert bh.loop_cadence_seconds(name) == expected
+    assert bh.loop_cadence_seconds("nope") is None
+    assert bh.loop_cadence_seconds("") is None
+
+
+def test_loop_stale_threshold_seconds_uses_cadence_derived_default():
+    """For known loops the public threshold is ``2 × cadence + 60``
+    — same formula the classifier uses internally. Pinned per-loop
+    so a refactor of ``_stale_threshold_seconds`` can't silently
+    drift the panel away from the classifier."""
+    margin = bh._STALE_THRESHOLD_MARGIN_SECONDS  # noqa: SLF001
+    for name, cadence in bh.LOOP_CADENCES.items():
+        assert (
+            bh.loop_stale_threshold_seconds(name)
+            == cadence * 2 + margin
+        ), f"loop_stale_threshold_seconds({name!r}) drifted"
+
+
+def test_loop_stale_threshold_seconds_unknown_falls_back_to_legacy(
+    monkeypatch,
+):
+    """An unknown loop name falls back to the legacy single
+    ``BOT_HEALTH_LOOP_STALE_SECONDS`` knob — important so a brand-new
+    loop that opts in to ``_LOOP_METRIC_NAMES`` *before* its cadence
+    is registered here doesn't crash the panel."""
+    monkeypatch.setenv("BOT_HEALTH_LOOP_STALE_SECONDS", "777")
+    assert bh.loop_stale_threshold_seconds("brand_new_loop") == 777
+
+
+def test_loop_stale_threshold_seconds_legacy_default_when_env_unset(
+    monkeypatch,
+):
+    """Unknown loop with no env override → ``DEFAULT_LOOP_STALE_SECONDS``."""
+    monkeypatch.delenv("BOT_HEALTH_LOOP_STALE_SECONDS", raising=False)
+    assert (
+        bh.loop_stale_threshold_seconds("brand_new_loop")
+        == bh.DEFAULT_LOOP_STALE_SECONDS
+    )
+
+
+def test_loop_stale_threshold_seconds_explicit_override_wins(
+    monkeypatch,
+):
+    """A per-loop env override takes precedence over the cadence-
+    derived default — same fail-safe contract as the private
+    ``_stale_threshold_seconds`` (operators can pin a tighter or
+    looser threshold for their deploy without redeploying code)."""
+    monkeypatch.setenv("BOT_HEALTH_LOOP_STALE_FX_REFRESH_SECONDS", "111")
+    assert bh.loop_stale_threshold_seconds("fx_refresh") == 111
+
+
+def test_zarinpal_backfill_has_registered_cadence():
+    """Bug-fix regression (Stage-15-Step-F follow-up #4): pre-fix
+    ``zarinpal_backfill`` was in ``_LOOP_METRIC_NAMES`` (so it
+    got a heartbeat gauge) but missing from ``LOOP_CADENCES``, so
+    its 5-min-cadence loop fell back to the legacy 30-min stale
+    threshold — six missed ticks before the panel even hinted at
+    a problem. Pinning the cadence here means a future regression
+    that drops the entry will fail this test loud-and-once."""
+    from metrics import _LOOP_METRIC_NAMES  # noqa: SLF001
+
+    assert "zarinpal_backfill" in _LOOP_METRIC_NAMES
+    assert "zarinpal_backfill" in bh.LOOP_CADENCES
+    assert bh.LOOP_CADENCES["zarinpal_backfill"] == 300
+    # Threshold is the cadence-derived 2×300+60 = 660, NOT the
+    # legacy 1800 the bug exposed.
+    assert bh.loop_stale_threshold_seconds("zarinpal_backfill") == 660
+
+
+def test_every_loop_in_metric_names_has_cadence_or_falls_back_safely():
+    """A loop that's in ``_LOOP_METRIC_NAMES`` but not in
+    ``LOOP_CADENCES`` falls back to the legacy single-knob default.
+    That's intentional (forward-compat) but it means a fresh entry
+    in ``_LOOP_METRIC_NAMES`` quietly inherits a 30-min threshold
+    even if its real cadence is very different. This test pins the
+    invariant that today every metric-named loop has an explicit
+    cadence — flag at PR-review time if a follow-up adds a new loop
+    without also adding a ``LOOP_CADENCES`` entry."""
+    from metrics import _LOOP_METRIC_NAMES  # noqa: SLF001
+
+    missing = sorted(set(_LOOP_METRIC_NAMES) - set(bh.LOOP_CADENCES))
+    assert missing == [], (
+        f"loops in _LOOP_METRIC_NAMES but missing LOOP_CADENCES "
+        f"entries: {missing}"
+    )

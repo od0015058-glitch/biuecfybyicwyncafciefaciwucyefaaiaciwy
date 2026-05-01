@@ -5985,7 +5985,16 @@ def _collect_control_signals(
         disabled_models_count = 0
         disabled_gateways_count = 0
 
-    # Background-loop heartbeats.
+    # Background-loop heartbeats. The panel surfaces each loop's
+    # published cadence + per-loop stale threshold + overdue /
+    # grace-period status next to the last-tick age so an operator
+    # can tell at a glance which loops are actually overdue (a
+    # 6h-cadence loop that ticked 5 min ago is fine; a 60s-cadence
+    # loop that ticked 5 min ago is six missed ticks past
+    # threshold). The cadence + threshold accessors live on
+    # ``bot_health`` so the panel and the classifier agree by
+    # construction — no risk of the panel showing "fresh" while
+    # the classifier shows DEGRADED on the same loop.
     try:
         from metrics import _LOOP_METRIC_NAMES, get_loop_last_tick
     except Exception:
@@ -5996,16 +6005,64 @@ def _collect_control_signals(
         loop_names = _LOOP_METRIC_NAMES
         get_last = get_loop_last_tick
 
+    try:
+        from bot_health import (
+            get_process_start_epoch,
+            loop_cadence_seconds,
+            loop_stale_threshold_seconds,
+        )
+
+        boot_epoch = get_process_start_epoch()
+        cadence_lookup = loop_cadence_seconds
+        threshold_lookup = loop_stale_threshold_seconds
+    except Exception:
+        log.exception("control: bot_health accessors failed")
+        boot_epoch = _BOT_PROCESS_START_EPOCH
+        cadence_lookup = lambda _name: None  # noqa: E731
+        threshold_lookup = lambda _name: 0  # noqa: E731
+
     now = time.time()
+    uptime_s = max(0.0, now - boot_epoch)
     loops: list[dict] = []
     loop_ticks_for_classifier: dict[str, float] = {}
     for name in loop_names:
+        cadence = cadence_lookup(name)
+        threshold = threshold_lookup(name)
         last = get_last(name)
         if last is None or last == 0.0:
-            loops.append({"name": name, "last_tick_age_s": None})
+            # Never ticked. Mirror the classifier's grace-period
+            # contract — a fresh deploy whose long-cadence loop
+            # hasn't fired yet is "warming up", not "alarm". Once
+            # uptime exceeds the per-loop threshold we flip to
+            # "overdue" (the same condition the classifier uses
+            # to escalate to DEGRADED).
+            past_grace = threshold > 0 and uptime_s > threshold
+            loops.append({
+                "name": name,
+                "last_tick_age_s": None,
+                "cadence_s": cadence,
+                "stale_threshold_s": threshold,
+                "next_tick_in_s": None,
+                "is_overdue": past_grace,
+                "grace_pending": not past_grace,
+            })
             continue
         age = max(0, int(now - float(last)))
-        loops.append({"name": name, "last_tick_age_s": age})
+        # ``next_tick_in_s`` is informational — the published
+        # cadence minus the current age. Negative means the loop is
+        # past due. ``None`` for loops without a registered cadence
+        # (where we genuinely don't know when the next tick should
+        # land).
+        next_in = (cadence - age) if cadence is not None else None
+        loops.append({
+            "name": name,
+            "last_tick_age_s": age,
+            "cadence_s": cadence,
+            "stale_threshold_s": threshold,
+            "next_tick_in_s": next_in,
+            "is_overdue": threshold > 0 and age > threshold,
+            "grace_pending": False,
+        })
         loop_ticks_for_classifier[name] = float(last)
 
     # Total catalog sizes for the kill-switch summary.

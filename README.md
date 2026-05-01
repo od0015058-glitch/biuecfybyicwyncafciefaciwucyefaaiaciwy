@@ -512,6 +512,23 @@ NowPayments crypto invoices.
   for its first 24h. The classifier now grace-periods a never-
   ticked loop until `uptime > stale_threshold`. Stage-15-Step-F
   follow-up #2.
+- **Cadence introspection on `/admin/control`** — the panel's
+  "Background loop heartbeats" section now shows each loop's
+  published cadence + per-loop stale threshold + colour-coded
+  status (`fresh` / `warming up` / `overdue` / `no tick`)
+  alongside the live last-tick age. Operators no longer have to
+  memorise each loop's expected interval to answer "is this loop
+  overdue?" — the panel reads
+  `bot_health.loop_cadence_seconds(name)` and
+  `bot_health.loop_stale_threshold_seconds(name)` so the panel
+  and the classifier agree by construction. Bundled bug fix:
+  `zarinpal_backfill` (5 min cadence) was in the heartbeat metric
+  registry but missing from `LOOP_CADENCES`, so it was inheriting
+  the legacy 30 min stale threshold — six missed ticks before the
+  panel hinted at a problem. Now registered at its true 5 min
+  cadence with a 660 s threshold; pinned by a regression test
+  that asserts every name in `metrics._LOOP_METRIC_NAMES` has a
+  matching `LOOP_CADENCES` entry. Stage-15-Step-F follow-up #4.
 - **Proactive bot-health Telegram DMs** — new `bot_health_alert.py`
   background loop wakes every `BOT_HEALTH_ALERT_INTERVAL_SECONDS`
   (default 60), runs the same `bot_health.compute_bot_status`
