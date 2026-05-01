@@ -360,7 +360,18 @@ def test_formatter_skips_malformed_top_model_rows():
 def test_formatter_handles_corrupt_aggregate_values():
     """A NaN cost or non-numeric token count from a buggy DB
     column must not crash the formatter — coerce to 0 / empty
-    instead so the screen still renders."""
+    on the lifetime + window aggregates so the screen still
+    renders.
+
+    For the **top-models** list the policy is different (per the
+    Stage-15-Step-E #2 follow-up): a row with non-finite cost is
+    DROPPED rather than rendered as ``$0.0000`` next to a real
+    model name, since silently coercing corruption to zero would
+    misattribute the user's spend ("you spent $0 on model X" when
+    in fact the value is just unrepresentable). The lifetime /
+    window aggregates are still coerced because there's no row to
+    drop — the alternative would be a 500 to the user.
+    """
     snap = {
         "lifetime": {
             "total_calls": 5,
@@ -380,10 +391,65 @@ def test_formatter_handles_corrupt_aggregate_values():
     # type-ignored keys above mimic a corrupted DB row; the
     # formatter must not raise.
     out = format_stats_summary(snap, "en")
-    assert "$0.0000" in out  # NaN cost rendered as $0.0000
+    assert "$0.0000" in out  # lifetime / window NaN cost coerced to $0.0000
     assert "nan" not in out.lower()
     assert "inf" not in out.lower()
-    assert "x/y" in out  # row still renders, calls coerced to 0
+    # Stage-15-Step-E #2 follow-up bundled bug fix: the top-models
+    # row with a non-finite cost is now dropped (was: silently
+    # rendered as "$0.0000" next to the model name, lying about
+    # which model the spend went to).
+    assert "x/y" not in out
+
+
+def test_top_models_drops_non_finite_cost_rows():
+    """Stage-15-Step-E #2 follow-up bundled bug fix.
+
+    Pre-fix, ``_iter_top_models`` silently coerced a row's
+    non-finite ``cost_usd`` to ``0.0`` via :func:`_safe_float`, so
+    a corrupted aggregate (operator-injected bogus
+    ``cost_deducted_usd`` values landing as ``Decimal('Infinity')``
+    in ``SUM`` → asyncpg → ``float`` cast → ``inf``) showed up in
+    the user-facing screen as "you spent $0.0000 on model X" — a
+    confident lie.
+
+    Post-fix the row is dropped entirely so the "top models" list
+    shrinks rather than misattributes spend. Same policy applies
+    to ``calls`` (a non-finite call count gets the row dropped
+    too — it's also corruption).
+    """
+    snap = {
+        "lifetime": {
+            "total_calls": 100, "total_tokens": 1000,
+            "total_cost_usd": 1.0,
+        },
+        "window_days": 30,
+        "window": {
+            "total_calls": 10, "total_tokens": 100,
+            "total_cost_usd": 0.5,
+        },
+        "top_models": [
+            {"model": "good/model", "calls": 5, "cost_usd": 0.10},
+            # Corruption — must be skipped.
+            {"model": "corrupt/cost", "calls": 7, "cost_usd": float("inf")},
+            {"model": "corrupt/nan", "calls": 7, "cost_usd": float("nan")},
+            {"model": "corrupt/calls", "calls": float("inf"), "cost_usd": 0.05},
+            # Boolean cost / calls — also corruption (bool is a
+            # subclass of int but rendering ``True`` as ``$1`` was
+            # never the intent).
+            {"model": "corrupt/bool", "calls": True, "cost_usd": False},
+        ],
+    }
+    out = format_stats_summary(snap, "en")
+    assert "good/model" in out
+    assert "corrupt/cost" not in out
+    assert "corrupt/nan" not in out
+    assert "corrupt/calls" not in out
+    assert "corrupt/bool" not in out
+    # Only one row rendered → exactly one rank line in the top-models
+    # block.
+    import re
+    rank_lines = re.findall(r"^\s+\d+\.", out, flags=re.MULTILINE)
+    assert len(rank_lines) == 1
 
 
 def test_formatter_does_not_render_negative_balance():
@@ -581,9 +647,381 @@ def test_strings_keys_present_in_both_languages():
         "stats_window_line",
         "stats_top_models_header",
         "stats_top_models_line",
+        # Stage-15-Step-E #2 follow-up: new window-selector button.
+        "stats_window_btn",
     ]
     fa = _STRINGS["fa"]
     en = _STRINGS["en"]
     for k in new_keys:
         assert k in fa, f"missing fa: {k}"
         assert k in en, f"missing en: {k}"
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #2 follow-up: /stats slash command + window selector
+# ---------------------------------------------------------------------
+
+
+def _make_message(user_id: int = 12345, text: str = "/stats"):
+    """Mock ``Message`` for the slash-command handler tests.
+
+    Mirrors ``_make_callback`` but for the message-side path.
+    ``answer`` is the AsyncMock the handler is expected to call.
+    """
+    return SimpleNamespace(
+        from_user=SimpleNamespace(id=user_id, username="alice"),
+        text=text,
+        chat=SimpleNamespace(id=user_id),
+        answer=AsyncMock(),
+    )
+
+
+async def test_cmd_stats_renders_fresh_message():
+    """``/stats`` must call ``message.answer`` (fresh message)
+    instead of the wallet-menu's ``edit_text`` (in-place edit) —
+    typing a slash command into chat should land as its own
+    bubble, not silently replace some scrolled-up older
+    message."""
+    from handlers import cmd_stats
+
+    msg = _make_message()
+    state = _make_state()
+    snap = _populated_snapshot()
+    user_row = {"balance_usd": 5.00}
+    with patch(
+        "handlers._get_user_language", new=AsyncMock(return_value="en")
+    ), patch(
+        "handlers.db.get_user_spending_summary",
+        new=AsyncMock(return_value=snap),
+    ), patch(
+        "handlers.db.get_user", new=AsyncMock(return_value=user_row)
+    ):
+        await cmd_stats(msg, state)
+
+    msg.answer.assert_awaited_once()
+    text = msg.answer.await_args.args[0]
+    assert "Your usage stats" in text
+    assert "openai/gpt-4o" in text
+    state.clear.assert_awaited()
+
+
+async def test_cmd_stats_default_window_is_30_days():
+    """Plain ``/stats`` (no arg) requests the 30-day window."""
+    from handlers import cmd_stats
+
+    msg = _make_message(text="/stats")
+    state = _make_state()
+    snap = _populated_snapshot()
+    snap["window_days"] = 30
+    user_row = {"balance_usd": 0.0}
+    summary_mock = AsyncMock(return_value=snap)
+    with patch(
+        "handlers._get_user_language", new=AsyncMock(return_value="en")
+    ), patch(
+        "handlers.db.get_user_spending_summary", new=summary_mock,
+    ), patch(
+        "handlers.db.get_user", new=AsyncMock(return_value=user_row)
+    ):
+        await cmd_stats(msg, state)
+
+    summary_mock.assert_awaited_once()
+    kwargs = summary_mock.await_args.kwargs
+    assert kwargs.get("window_days") == 30
+
+
+async def test_cmd_stats_accepts_window_arg():
+    """``/stats 7`` requests the 7-day window. Other recognised
+    choices (90 / 365) work the same way."""
+    from handlers import cmd_stats
+
+    for arg in (7, 90, 365):
+        msg = _make_message(text=f"/stats {arg}")
+        state = _make_state()
+        snap = _populated_snapshot()
+        snap["window_days"] = arg
+        user_row = {"balance_usd": 0.0}
+        summary_mock = AsyncMock(return_value=snap)
+        with patch(
+            "handlers._get_user_language", new=AsyncMock(return_value="en")
+        ), patch(
+            "handlers.db.get_user_spending_summary", new=summary_mock,
+        ), patch(
+            "handlers.db.get_user", new=AsyncMock(return_value=user_row)
+        ):
+            await cmd_stats(msg, state)
+        kwargs = summary_mock.await_args.kwargs
+        assert kwargs.get("window_days") == arg, (
+            f"expected window_days={arg} for arg {arg!r}, got {kwargs!r}"
+        )
+
+
+async def test_cmd_stats_silently_coerces_garbage_arg_to_default():
+    """``/stats abc`` / ``/stats -7`` / ``/stats 99999`` all fall
+    back to the 30-day default rather than 500-ing the user.
+
+    Same forgiveness policy as the receipts pagination cursor —
+    a fat-fingered arg should never break the screen.
+    """
+    from handlers import cmd_stats
+
+    for bad in ("abc", "-7", "99999", "0"):
+        msg = _make_message(text=f"/stats {bad}")
+        state = _make_state()
+        snap = _populated_snapshot()
+        user_row = {"balance_usd": 0.0}
+        summary_mock = AsyncMock(return_value=snap)
+        with patch(
+            "handlers._get_user_language", new=AsyncMock(return_value="en")
+        ), patch(
+            "handlers.db.get_user_spending_summary", new=summary_mock,
+        ), patch(
+            "handlers.db.get_user", new=AsyncMock(return_value=user_row)
+        ):
+            await cmd_stats(msg, state)
+        kwargs = summary_mock.await_args.kwargs
+        assert kwargs.get("window_days") == 30, (
+            f"expected coerce-to-30 for {bad!r}, got {kwargs!r}"
+        )
+
+
+async def test_cmd_stats_skips_when_no_from_user():
+    """``message.from_user is None`` (anonymous group admin /
+    channel-bot edge case) must early-return — same defensive
+    guard as ``cmd_start`` / ``cmd_redeem``."""
+    from handlers import cmd_stats
+
+    msg = _make_message()
+    msg.from_user = None
+    state = _make_state()
+    summary_mock = AsyncMock()
+    with patch(
+        "handlers.db.get_user_spending_summary", new=summary_mock,
+    ):
+        await cmd_stats(msg, state)
+    msg.answer.assert_not_awaited()
+    summary_mock.assert_not_awaited()
+
+
+async def test_cmd_stats_supports_at_bot_suffix():
+    """``/stats@MyBot 7`` (the suffixed shape Telegram uses in
+    group chats) parses as ``/stats 7`` — same shape support as
+    ``cmd_redeem``."""
+    from handlers import cmd_stats
+
+    msg = _make_message(text="/stats@meowbot 7")
+    state = _make_state()
+    snap = _populated_snapshot()
+    snap["window_days"] = 7
+    user_row = {"balance_usd": 0.0}
+    summary_mock = AsyncMock(return_value=snap)
+    with patch(
+        "handlers._get_user_language", new=AsyncMock(return_value="en")
+    ), patch(
+        "handlers.db.get_user_spending_summary", new=summary_mock,
+    ), patch(
+        "handlers.db.get_user", new=AsyncMock(return_value=user_row)
+    ):
+        await cmd_stats(msg, state)
+    kwargs = summary_mock.await_args.kwargs
+    assert kwargs.get("window_days") == 7
+
+
+def test_stats_keyboard_includes_window_selector_buttons():
+    """The stats screen must surface a 4-button window selector
+    (7 / 30 / 90 / 365) so users can pivot to other windows
+    without typing the slash command."""
+    from handlers import _build_stats_keyboard
+
+    builder = _build_stats_keyboard("en", window_days=30)
+    markup = builder.as_markup()
+    flat = [b for row in markup.inline_keyboard for b in row]
+    callbacks = [b.callback_data for b in flat]
+    assert "stats_window:7" in callbacks
+    assert "stats_window:30" in callbacks
+    assert "stats_window:90" in callbacks
+    assert "stats_window:365" in callbacks
+    # Plus the existing back-to-wallet + home buttons.
+    assert "back_to_wallet" in callbacks
+    assert "close_menu" in callbacks
+
+
+def test_stats_keyboard_marks_selected_window_with_check():
+    """The currently-selected window button is prefixed with
+    ``✓`` so a user can read which window they're on without
+    scrolling to the section header."""
+    from handlers import _build_stats_keyboard
+
+    for selected in (7, 30, 90, 365):
+        builder = _build_stats_keyboard("en", window_days=selected)
+        markup = builder.as_markup()
+        flat = [b for row in markup.inline_keyboard for b in row]
+        for b in flat:
+            if b.callback_data == f"stats_window:{selected}":
+                assert b.text.startswith("✓ "), (
+                    f"selected={selected} button text {b.text!r} "
+                    f"missing checkmark"
+                )
+            elif (b.callback_data or "").startswith("stats_window:"):
+                assert not b.text.startswith("✓"), (
+                    f"non-selected button text {b.text!r} "
+                    f"has checkmark"
+                )
+
+
+def test_stats_keyboard_unknown_window_falls_back_to_30():
+    """A stale callback-payload window value (e.g. an old client
+    sending ``stats_window:14`` from a deploy that supported 14d
+    but the current deploy doesn't) renders the keyboard with
+    ``30d`` highlighted as the safe default."""
+    from handlers import _build_stats_keyboard
+
+    builder = _build_stats_keyboard("en", window_days=14)
+    markup = builder.as_markup()
+    flat = [b for row in markup.inline_keyboard for b in row]
+    for b in flat:
+        if b.callback_data == "stats_window:30":
+            assert b.text.startswith("✓ ")
+
+
+async def test_stats_window_select_handler_re_renders_with_new_window():
+    """Clicking ``stats_window:7`` re-fetches the snapshot with
+    ``window_days=7`` and edits the message in place — no fresh
+    message bubble."""
+    from handlers import stats_window_select_handler
+
+    cb = _make_callback()
+    cb.data = "stats_window:7"
+    state = _make_state()
+    snap = _populated_snapshot()
+    snap["window_days"] = 7
+    user_row = {"balance_usd": 5.00}
+    summary_mock = AsyncMock(return_value=snap)
+    with patch(
+        "handlers._get_user_language", new=AsyncMock(return_value="en")
+    ), patch(
+        "handlers.db.get_user_spending_summary", new=summary_mock,
+    ), patch(
+        "handlers.db.get_user", new=AsyncMock(return_value=user_row)
+    ):
+        await stats_window_select_handler(cb, state)
+
+    cb.message.edit_text.assert_awaited_once()
+    cb.answer.assert_awaited_once()
+    kwargs = summary_mock.await_args.kwargs
+    assert kwargs.get("window_days") == 7
+
+
+async def test_stats_window_select_handler_silently_recovers_from_garbage():
+    """A malformed ``stats_window:abc`` payload (stale client /
+    crafted callback) falls back to the 30d default rather than
+    500-ing."""
+    from handlers import stats_window_select_handler
+
+    cb = _make_callback()
+    cb.data = "stats_window:abc"
+    state = _make_state()
+    snap = _populated_snapshot()
+    user_row = {"balance_usd": 0.0}
+    summary_mock = AsyncMock(return_value=snap)
+    with patch(
+        "handlers._get_user_language", new=AsyncMock(return_value="en")
+    ), patch(
+        "handlers.db.get_user_spending_summary", new=summary_mock,
+    ), patch(
+        "handlers.db.get_user", new=AsyncMock(return_value=user_row)
+    ):
+        await stats_window_select_handler(cb, state)
+
+    kwargs = summary_mock.await_args.kwargs
+    assert kwargs.get("window_days") == 30
+    cb.answer.assert_awaited_once()
+
+
+async def test_stats_window_select_handler_swallows_message_not_modified():
+    """Double-tap on the already-selected window button renders
+    identical text + keyboard, which Telegram refuses to edit
+    with ``message is not modified``. The handler must swallow
+    that error rather than 500-ing the user."""
+    from aiogram.exceptions import TelegramBadRequest
+    from handlers import stats_window_select_handler
+
+    cb = _make_callback()
+    cb.data = "stats_window:30"
+    cb.message.edit_text = AsyncMock(
+        side_effect=TelegramBadRequest(
+            method=MagicMock(), message="message is not modified"
+        )
+    )
+    state = _make_state()
+    snap = _populated_snapshot()
+    user_row = {"balance_usd": 0.0}
+    with patch(
+        "handlers._get_user_language", new=AsyncMock(return_value="en")
+    ), patch(
+        "handlers.db.get_user_spending_summary",
+        new=AsyncMock(return_value=snap),
+    ), patch(
+        "handlers.db.get_user", new=AsyncMock(return_value=user_row)
+    ):
+        await stats_window_select_handler(cb, state)
+
+    cb.answer.assert_awaited_once()
+
+
+async def test_stats_window_select_handler_clears_fsm_state():
+    """Same defensive FSM clear as ``hub_stats_handler``: the
+    wallet menu is reachable from inside charge / promo / gift
+    flows."""
+    from handlers import stats_window_select_handler
+
+    cb = _make_callback()
+    cb.data = "stats_window:30"
+    state = _make_state()
+    snap = _populated_snapshot()
+    user_row = {"balance_usd": 0.0}
+    with patch(
+        "handlers._get_user_language", new=AsyncMock(return_value="en")
+    ), patch(
+        "handlers.db.get_user_spending_summary",
+        new=AsyncMock(return_value=snap),
+    ), patch(
+        "handlers.db.get_user", new=AsyncMock(return_value=user_row)
+    ):
+        await stats_window_select_handler(cb, state)
+    state.clear.assert_awaited()
+
+
+def test_coerce_stats_window_accepts_recognised_choices():
+    """Every value in :data:`_STATS_WINDOW_CHOICES` round-trips."""
+    from handlers import _coerce_stats_window, _STATS_WINDOW_CHOICES
+
+    for choice in _STATS_WINDOW_CHOICES:
+        assert _coerce_stats_window(choice) == choice
+        assert _coerce_stats_window(str(choice)) == choice
+
+
+def test_coerce_stats_window_falls_back_to_30():
+    """Anything else (garbage str, negative, unknown int, None,
+    bool) falls back to ``30``."""
+    from handlers import _coerce_stats_window
+
+    for bad in ("abc", "-7", "99999", "", "0", None, [], {}, "14"):
+        assert _coerce_stats_window(bad) == 30, (
+            f"expected 30 for {bad!r}"
+        )
+
+
+def test_hub_stats_keyboard_default_window_highlighted():
+    """The wallet-menu entry-point (``hub_stats_handler``) lands
+    on the 30d default — so the rendered keyboard must show 30d
+    as the selected window."""
+    from handlers import _build_stats_keyboard
+
+    builder = _build_stats_keyboard("en", window_days=30)
+    markup = builder.as_markup()
+    flat = [b for row in markup.inline_keyboard for b in row]
+    for b in flat:
+        if b.callback_data == "stats_window:30":
+            assert b.text.startswith("✓ ")
+        elif (b.callback_data or "").startswith("stats_window:"):
+            assert not b.text.startswith("✓")

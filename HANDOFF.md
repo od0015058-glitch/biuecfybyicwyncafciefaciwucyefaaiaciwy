@@ -947,10 +947,10 @@ What's shipped this PR:
 
 What remains (next AI's TODO):
 
-* **`/stats` slash-command alias** — currently the only entry point is the wallet-menu button. Add a `Command("stats")` handler that calls into `hub_stats_handler`'s body (~5 lines, factor the body into a private `_render_stats_screen` helper first). Gate behind the same chat-token bucket as `cmd_chat` to prevent spam.
-* **Per-day / per-week breakdowns** — the original spec mentioned "daily/weekly graphs". This PR ships rolling 30-day totals + lifetime totals. A real day-over-day series would need a new query: `SELECT date_trunc('day', created_at), SUM(cost_deducted_usd) FROM usage_logs WHERE telegram_id = $1 AND created_at >= NOW() - INTERVAL '30 days' GROUP BY 1 ORDER BY 1`. Render as ASCII bars (one row per day) in Telegram — image-based graphs would need a separate dependency surface (`matplotlib` / `Pillow`) which is **explicitly out of scope for the first slice** until the operator approves the new dep.
+* ✅ **`/stats` slash-command alias** — shipped in the Stage-15-Step-E #2 follow-up. `cmd_stats` (`@router.message(Command("stats"))`) renders the same screen as the wallet-menu button but as a fresh message bubble (`message.answer`) instead of an in-place edit. Optional positional arg picks a non-default window: `/stats 7` / `/stats 90` / `/stats 365`. Garbage args (`/stats abc`) silently coerce to the default — same forgiveness policy as the receipts-pagination cursor. Both the slash and the wallet-menu paths route through `_build_stats_render`, so the two surfaces can never drift on copy or layout.
+* ✅ **Window selector buttons (7d / 30d / 90d / 365d)** — shipped in the same follow-up. Top-row inline keyboard on the stats screen; the currently-selected window is prefixed with `✓` so the user can tell which one they're on without scrolling. Callback shape `stats_window:<days>` — parsed by `stats_window_select_handler`; an unrecognised value (stale-deploy callback, hand-crafted client) falls back to the 30d default rather than 500-ing. Re-uses `_build_stats_render` so the entire pipeline is one definition.
+* **Per-day / per-week breakdowns** — the original spec mentioned "daily/weekly graphs". The first slice + this follow-up ship lifetime totals + an operator-selectable rolling window (7 / 30 / 90 / 365 days). A real day-over-day series would need a new query: `SELECT date_trunc('day', created_at), SUM(cost_deducted_usd) FROM usage_logs WHERE telegram_id = $1 AND created_at >= NOW() - INTERVAL '30 days' GROUP BY 1 ORDER BY 1`. Render as ASCII bars (one row per day) in Telegram — image-based graphs would need a separate dependency surface (`matplotlib` / `Pillow`) which is **explicitly out of scope** until the operator approves the new dep.
 * **CSV export of full `usage_logs`** — pairs nicely with the conversation export from Step-E #1. The admin panel already has a JSON view at `/admin/users/<id>/usage`; a user-facing CSV button on the stats screen would close the loop.
-* **Window selector buttons (7d / 30d / 90d / lifetime)** — the DB method already accepts a `window_days` parameter; just wire up an inline keyboard with rotating options. Re-uses the same render pipeline.
 * **Schema-rotation hook** — if the operator ever needs to "reset" a user's stats without deleting their wallet history, document that this is `DELETE FROM usage_logs WHERE telegram_id = $1`. Currently the only data-deletion surfaces are `mem_reset` (conversation buffer) and the admin panel's user-deletion flow.
 
 Bundled bug fix in this PR (real, found during code review of the Step-E #1 export module): **`conversation_export.format_history_as_text` now returns `(text, kept_count)` instead of just `text`.** Pre-fix, the handler called `t(lang, "memory_export_caption", count=len(rows))` and `t(lang, "memory_export_done", count=len(rows))` — but `format_history_as_text` may have trimmed older messages to stay under the 1 MB `EXPORT_MAX_BYTES` cap. The in-file header reflected the truth (`Messages: 10 (trimmed 10 oldest)`) but the caption + toast both lied (`Conversation history (20 messages)`) for any user heavy enough to trigger the trim. Fix returns the actually-kept count alongside the rendered text and the handler now uses that. Test `test_memory_export_handler_caption_uses_kept_count_after_trim` pins the regression with a 2 MB simulated buffer.
@@ -1979,22 +1979,68 @@ The user's process for this project — **do not deviate**:
     required, not in rate-limited path set). Total suite:
     1944 tests passing (was 1917 + 27 new).
 13. **Stage-15-Step-E #2 follow-up #1 MERGED** (PR-after-#138) —
-    `/stats` slash-command alias + window selector buttons +
-    `_build_stats_render` shared helper between
-    `hub_stats_handler` (wallet-menu callback) and
-    `cmd_stats`. Selector callback shape `stats_window:<days>`
-    with 7 / 30 / 90 / 365 day choices, selected window
-    prefixed with `✓`, garbage values silently coerce to 30d.
-    Bundled real bug fix: `user_stats._iter_top_models` now
-    drops top-models rows whose `cost_usd` or `calls` are
-    non-finite (NaN, ±Inf, bool) instead of misattributing the
-    user's spend as `$0.0000` next to the model name. New
-    `_is_finite_number` helper enforces strict checks (rejects
-    `bool`, which is an `int` subclass that would otherwise
-    sneak through).  Total suite: 1961 tests passing (was 1944
-    + 17 new — entry-point tests, window-selector behaviour,
-    keyboard shape, callback parsing, garbage-arg coercion,
-    plus the bundled-fix regression-pin).
+    closes two of the four remaining Step-E #2 TODOs in one PR:
+    `/stats` slash-command alias + window selector buttons.
+    `cmd_stats` (`Command("stats")`) renders the same per-user
+    spending dashboard as the wallet-menu button, but as a fresh
+    `message.answer` bubble instead of an in-place `edit_text` —
+    typing a slash command should land as its own bubble, not
+    silently rewrite some scrolled-up older message. Optional
+    positional arg picks a non-default window: `/stats 7` /
+    `/stats 90` / `/stats 365` (recognised choices: 7, 30, 90,
+    365). Garbage args (`/stats abc`, `/stats -7`, `/stats 99999`)
+    silently coerce to the 30d default — same forgiveness policy
+    as the receipts-pagination cursor. The `/stats@bot` suffix
+    shape that Telegram uses in group chats parses identically to
+    the bare slash. Window selector lives on the stats screen
+    itself: 4 inline buttons (`7d` / `30d` / `90d` / `365d`),
+    callback shape `stats_window:<days>`, the currently-selected
+    button is prefixed with `✓` so the user can tell which one
+    they're on without scrolling to the section header. Click
+    re-renders the same screen with the new window via
+    `stats_window_select_handler`. An unrecognised callback value
+    (stale-deploy callback, hand-crafted client) falls back to
+    30d rather than 500-ing — same fail-soft posture as the
+    healthz / IP-allowlist work in PR-#138. Refactor: both the
+    slash-command path and the wallet-menu callback now route
+    through `_build_stats_render(user_id, lang, window_days=…)`
+    so the two surfaces can never drift on copy, layout, or
+    keyboard shape. New i18n string `stats_window_btn` (FA: "X
+    روزه", EN: "Xd"). Bundled bug fix:
+    `user_stats._iter_top_models` now honours its docstring and
+    drops `top_models` rows whose `cost_usd` / `calls` is
+    non-finite, instead of silently coercing them to `0.0` /
+    `0` via `_safe_float` / `_safe_int`. Pre-fix, a corrupted
+    aggregate (operator-injected bogus `cost_deducted_usd` rows
+    landing as `Decimal('Infinity')` in `SUM` → asyncpg → `float`
+    cast → `inf`) showed up in the user-facing screen as "you
+    spent $0.0000 on model X" — a confident lie about which
+    model the spend went to. Post-fix the row is dropped entirely
+    so the "top models" list shrinks rather than misattributes
+    spend. `bool` values (which silently subclassed off `int` and
+    rendered `True` as `$1.00`) are now also rejected. Same
+    explicit `bool` rejection that `_safe_float` / `_safe_int`
+    already do, just lifted out into a shared
+    `_is_finite_number` predicate so the cost / calls checks stay
+    in lock-step. 17 new tests in `tests/test_user_stats.py`
+    covering: the bundled fix (corrupt cost / NaN / Inf / bool
+    rejection, plus a regression-pin showing the row is dropped
+    rather than rendered as $0); the slash command (fresh
+    message bubble, default 30d window, accept 7/90/365 args,
+    coerce garbage to 30d, skip when from_user is None,
+    `@bot` suffix parses identically); the keyboard (4 window
+    buttons + back-to-wallet + home, ✓ on the selected window,
+    no-✓ on the others, unknown window value falls back to 30d);
+    the window-select callback (re-renders with new window,
+    silently recovers from garbage payload, swallows
+    `message is not modified`, clears FSM); and `_coerce_stats_window`
+    (round-trips recognised choices, coerces everything else to
+    30). Existing test
+    `test_formatter_handles_corrupt_aggregate_values` updated to
+    pin the new contract (the lifetime/window aggregates still
+    coerce to $0 — there's no row to drop — but the top-models
+    row with corrupt cost is now dropped). Total suite: 1961
+    passing (was 1944 + 17 new).
 14. **Stage-15-Step-E #1 follow-up #1 OPENED** (PR-after-#139) —
     `/history` slash-command alias + chat-token rate-limit
     gate + `_build_history_export_document(user_id, username)`
@@ -2022,9 +2068,8 @@ The user's process for this project — **do not deviate**:
     caption-count regression-pin, `/history@bot` group-chat
     suffix, plus the perf-fix behaviour-pin (drops only oldest,
     most recent always survives, single-second timing budget
-    catches an O(n²) regression). Total suite: 1953 tests
-    passing (was 1944 + 9 new — measured against `main`,
-    will be 1961 + 9 = 1970 once #139 lands).
+    catches an O(n²) regression). Total suite: 1970 tests
+    passing (1961 from `main` after #139 + 9 new).
 15. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.

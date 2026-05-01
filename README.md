@@ -205,8 +205,14 @@ NowPayments crypto invoices.
   models by call count. Same SQL shape as the admin-side
   dashboard; the DB method (`Database.get_user_spending_summary`)
   hard-codes `WHERE telegram_id = $1` on every sub-query so a
-  buggy caller can't leak someone else's totals. First slice of
-  Stage-15-Step-E #2.
+  buggy caller can't leak someone else's totals. Stage-15-Step-E
+  #2 follow-up: typed `/stats` slash command (with optional
+  `/stats 7` / `/stats 90` / `/stats 365` window arg) lands as a
+  fresh message bubble; an inline window selector (`7d` / `30d`
+  / `90d` / `365d`) on the stats screen pivots between rolling
+  windows in-place — the currently-selected window is prefixed
+  with `✓` so the user can read which one they're on without
+  scrolling.
 - **Opt-in Telegram webhook mode** — set `TELEGRAM_WEBHOOK_SECRET`
   to switch from long-polling to webhook delivery. The bot mounts
   a `POST /telegram-webhook/<secret>` route on the same aiohttp
