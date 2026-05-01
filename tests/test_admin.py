@@ -814,3 +814,261 @@ def test_promo_create_err_text_has_new_keys():
     assert "days_too_large" in _PROMO_CREATE_ERR_TEXT
     assert "1,000,000" in _PROMO_CREATE_ERR_TEXT["max_uses_too_large"]
     assert "36,500" in _PROMO_CREATE_ERR_TEXT["days_too_large"]
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #5: admin role grant / revoke / list
+# ---------------------------------------------------------------------
+
+
+def test_admin_router_has_role_commands():
+    """Same guard as the credit/promo handlers — a refactor that moves
+    these decorators must not silently drop them from the router."""
+    import inspect
+
+    src = inspect.getsource(admin)
+    assert '@router.message(Command("admin_role_grant"))' in src
+    assert '@router.message(Command("admin_role_revoke"))' in src
+    assert '@router.message(Command("admin_role_list"))' in src
+
+
+def test_admin_hub_text_lists_role_commands():
+    """The /admin hub message advertises every command the router
+    exposes; out-of-sync entries make the surface invisible to a
+    new admin reading the hub."""
+    text = admin._ADMIN_HUB_TEXT
+    assert "/admin_role_grant" in text
+    assert "/admin_role_revoke" in text
+    assert "/admin_role_list" in text
+
+
+def test_format_role_row_renders_full_metadata():
+    rendered = admin._format_role_row({
+        "telegram_id": 777,
+        "role": "operator",
+        "granted_at": "2026-04-30T12:34:56",
+        "granted_by": 1,
+        "notes": "trusted",
+    })
+    assert "`777`" in rendered
+    assert "*operator*" in rendered
+    assert "2026-04-30 12:34:56" in rendered
+    assert "by `1`" in rendered
+    assert "_trusted_" in rendered
+
+
+def test_format_role_row_omits_optional_fields_when_missing():
+    rendered = admin._format_role_row({
+        "telegram_id": 888,
+        "role": "viewer",
+        "granted_at": "2026-04-30T12:34:56",
+        "granted_by": None,
+        "notes": None,
+    })
+    assert "*viewer*" in rendered
+    assert "by `" not in rendered
+    assert "_" not in rendered.split("granted")[1]
+
+
+def test_format_role_row_escapes_markdown_in_notes():
+    """A free-form ``notes`` value containing reserved Markdown
+    characters (``_ * ` [``) must round-trip through ``_escape_md``
+    so the message render doesn't 400 on Telegram's parser."""
+    rendered = admin._format_role_row({
+        "telegram_id": 1,
+        "role": "viewer",
+        "granted_at": "2026-04-30T00:00:00",
+        "granted_by": None,
+        "notes": "stuck_invoice *VIP*",
+    })
+    assert r"stuck\_invoice" in rendered
+    assert r"\*VIP\*" in rendered
+
+
+# ---- handler smoke tests via mocked Message + db ------------------
+
+
+class _FakeMessage:
+    """Minimal aiogram-Message-lookalike covering the surface our
+    new handlers actually use (``message.text``, ``message.from_user.id``,
+    ``message.answer``)."""
+
+    def __init__(self, text: str, user_id: int | None = 1):
+        self.text = text
+        self.from_user = type("_U", (), {"id": user_id})() if user_id is not None else None
+        self.replies: list[tuple[str, dict]] = []
+
+    async def answer(self, text, **kwargs):
+        self.replies.append((text, kwargs))
+
+
+@pytest.mark.asyncio
+async def test_admin_role_grant_no_op_for_non_admins(monkeypatch):
+    """Non-admins (env-list miss) get the same silent no-op every other
+    admin command does — consistent surface, no leak of the admin
+    namespace existence."""
+    set_admin_user_ids(set())
+    msg = _FakeMessage("/admin_role_grant 777 viewer", user_id=999)
+    await admin.admin_role_grant(msg)
+    assert msg.replies == []
+
+
+@pytest.mark.asyncio
+async def test_admin_role_grant_rejects_invalid_role(monkeypatch):
+    set_admin_user_ids({1})
+    monkeypatch.setattr(
+        admin.db, "set_admin_role", _failing_assert_not_called(),
+    )
+    msg = _FakeMessage("/admin_role_grant 777 admin", user_id=1)
+    await admin.admin_role_grant(msg)
+    assert any("not a valid role" in r[0] for r in msg.replies)
+
+
+@pytest.mark.asyncio
+async def test_admin_role_grant_rejects_non_int_user_id(monkeypatch):
+    set_admin_user_ids({1})
+    monkeypatch.setattr(
+        admin.db, "set_admin_role", _failing_assert_not_called(),
+    )
+    msg = _FakeMessage("/admin_role_grant abc viewer", user_id=1)
+    await admin.admin_role_grant(msg)
+    assert any("not a valid Telegram id" in r[0] for r in msg.replies)
+
+
+@pytest.mark.asyncio
+async def test_admin_role_grant_writes_through_to_db(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    set_admin_user_ids({1})
+    set_role = AsyncMock(return_value="viewer")
+    record_audit = AsyncMock(return_value=1)
+    monkeypatch.setattr(admin.db, "set_admin_role", set_role)
+    monkeypatch.setattr(admin.db, "record_admin_audit", record_audit)
+
+    msg = _FakeMessage(
+        "/admin_role_grant 777 viewer trusted op",
+        user_id=1,
+    )
+    await admin.admin_role_grant(msg)
+
+    set_role.assert_awaited_once_with(
+        777, "viewer", granted_by=1, notes="trusted op",
+    )
+    record_audit.assert_awaited()
+    assert any("Granted role *viewer*" in r[0] for r in msg.replies)
+
+
+@pytest.mark.asyncio
+async def test_admin_role_grant_db_audit_failure_does_not_block_success(
+    monkeypatch,
+):
+    """The audit insert is best-effort. A transient ``admin_audit_log``
+    write failure must not regress the user-visible success message
+    (otherwise the operator retries and double-grants)."""
+    from unittest.mock import AsyncMock
+
+    set_admin_user_ids({1})
+    set_role = AsyncMock(return_value="viewer")
+    record_audit = AsyncMock(side_effect=RuntimeError("audit blip"))
+    monkeypatch.setattr(admin.db, "set_admin_role", set_role)
+    monkeypatch.setattr(admin.db, "record_admin_audit", record_audit)
+
+    msg = _FakeMessage("/admin_role_grant 777 viewer", user_id=1)
+    await admin.admin_role_grant(msg)
+
+    set_role.assert_awaited_once()
+    assert any("Granted role *viewer*" in r[0] for r in msg.replies)
+
+
+@pytest.mark.asyncio
+async def test_admin_role_revoke_no_op_for_non_admins():
+    set_admin_user_ids(set())
+    msg = _FakeMessage("/admin_role_revoke 777", user_id=999)
+    await admin.admin_role_revoke(msg)
+    assert msg.replies == []
+
+
+@pytest.mark.asyncio
+async def test_admin_role_revoke_reports_no_row_when_not_found(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    set_admin_user_ids({1})
+    monkeypatch.setattr(
+        admin.db, "delete_admin_role", AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        admin.db, "record_admin_audit", AsyncMock(return_value=1),
+    )
+
+    msg = _FakeMessage("/admin_role_revoke 777", user_id=1)
+    await admin.admin_role_revoke(msg)
+    assert any("nothing to revoke" in r[0] for r in msg.replies)
+
+
+@pytest.mark.asyncio
+async def test_admin_role_revoke_reports_success_when_deleted(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    set_admin_user_ids({1})
+    monkeypatch.setattr(
+        admin.db, "delete_admin_role", AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        admin.db, "record_admin_audit", AsyncMock(return_value=1),
+    )
+
+    msg = _FakeMessage("/admin_role_revoke 777", user_id=1)
+    await admin.admin_role_revoke(msg)
+    assert any("Revoked DB-tracked role" in r[0] for r in msg.replies)
+
+
+@pytest.mark.asyncio
+async def test_admin_role_list_renders_rows(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    set_admin_user_ids({1})
+    monkeypatch.setattr(
+        admin.db, "list_admin_roles",
+        AsyncMock(return_value=[
+            {
+                "telegram_id": 777, "role": "operator",
+                "granted_at": "2026-04-30T12:00:00",
+                "granted_by": 1, "notes": "trusted",
+            },
+        ]),
+    )
+
+    msg = _FakeMessage("/admin_role_list", user_id=1)
+    await admin.admin_role_list(msg)
+    body = msg.replies[0][0]
+    assert "Admin roles" in body
+    assert "`777`" in body
+    assert "*operator*" in body
+
+
+@pytest.mark.asyncio
+async def test_admin_role_list_handles_empty_table(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    set_admin_user_ids({1})
+    monkeypatch.setattr(
+        admin.db, "list_admin_roles", AsyncMock(return_value=[]),
+    )
+
+    msg = _FakeMessage("/admin_role_list", user_id=1)
+    await admin.admin_role_list(msg)
+    assert any("No DB-tracked admin roles" in r[0] for r in msg.replies)
+
+
+def _failing_assert_not_called():
+    """Helper: an AsyncMock that fails the test if it gets awaited.
+
+    Used to pin "validation rejects the input *before* hitting the DB"
+    so a future regression that flips the order of checks fails this
+    test loudly rather than silently writing a poisoned row."""
+    from unittest.mock import AsyncMock
+
+    mock = AsyncMock(
+        side_effect=AssertionError("DB was called for an invalid input"),
+    )
+    return mock

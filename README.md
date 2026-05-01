@@ -192,6 +192,21 @@ NowPayments crypto invoices.
   the bot continues to use long-polling exactly as before. See
   `.env.example` (Stage-15-Step-E #3 block) for the recovery
   procedure if you flip back.
+- **DB-tracked admin roles (first slice)** — `viewer`, `operator`,
+  and `super` roles live in the new `admin_roles` table. The
+  hierarchy lives in `admin_roles.py` (`role_at_least`,
+  `effective_role`); three new Telegram commands manage the rows:
+  `/admin_role_grant <user_id> <role> [notes]`,
+  `/admin_role_revoke <user_id>`, `/admin_role_list`. Role grants
+  are audit-logged with `action=role_grant`/`role_revoke` so the
+  trail surfaces in `${WEBHOOK_BASE_URL}/admin/audit`. Backward
+  compatible: any Telegram id in `ADMIN_USER_IDS` keeps `super`
+  access through `admin_roles.effective_role`'s env-list fallback,
+  so this PR doesn't lock the legacy operator out. The role
+  hierarchy is documented but **not yet wired into the existing
+  command gates** — that's the follow-up PR (gate `/admin_credit` to
+  `super`, `/admin_broadcast` to `operator`, `/admin_metrics` to
+  `viewer`). First slice of Stage-15-Step-E #5.
 - **Per-key 429 cooldown for OpenRouter** — when OpenRouter
   returns 429 for one of the configured pool keys (the upstream
   provider rate-limited it, or the key hit its OpenRouter plan
