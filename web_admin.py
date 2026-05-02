@@ -2754,6 +2754,433 @@ async def wallet_config_free_messages_post(
 
 
 # ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 8: /admin/memory-config
+# (MEMORY_CONTEXT_LIMIT + MEMORY_CONTENT_MAX_CHARS editors)
+# ---------------------------------------------------------------------
+
+
+def _build_memory_context_limit_view() -> dict:
+    """Snapshot of the resolved MEMORY_CONTEXT_LIMIT + per-source values."""
+    import memory_config as mc
+
+    override_value = mc.get_memory_context_limit_override()
+    env_raw = os.getenv("MEMORY_CONTEXT_LIMIT", "").strip()
+    env_value: int | None = None
+    if env_raw:
+        env_value = mc._coerce_memory_context_limit(env_raw)
+    return {
+        "effective": mc.get_memory_context_limit(),
+        "source": mc.get_memory_context_limit_source(),
+        "default_value": mc.DEFAULT_MEMORY_CONTEXT_LIMIT,
+        "env_value": env_value,
+        "env_raw": env_raw,
+        "override_value": override_value,
+        "minimum": mc.MEMORY_CONTEXT_LIMIT_MINIMUM,
+        "maximum": mc.MEMORY_CONTEXT_LIMIT_MAXIMUM,
+    }
+
+
+def _build_memory_content_max_chars_view() -> dict:
+    """Snapshot of the resolved MEMORY_CONTENT_MAX_CHARS + per-source values."""
+    import memory_config as mc
+
+    override_value = mc.get_memory_content_max_chars_override()
+    env_raw = os.getenv("MEMORY_CONTENT_MAX_CHARS", "").strip()
+    env_value: int | None = None
+    if env_raw:
+        env_value = mc._coerce_memory_content_max_chars(env_raw)
+    return {
+        "effective": mc.get_memory_content_max_chars(),
+        "source": mc.get_memory_content_max_chars_source(),
+        "default_value": mc.DEFAULT_MEMORY_CONTENT_MAX_CHARS,
+        "env_value": env_value,
+        "env_raw": env_raw,
+        "override_value": override_value,
+        "minimum": mc.MEMORY_CONTENT_MAX_CHARS_MINIMUM,
+        "maximum": mc.MEMORY_CONTENT_MAX_CHARS_MAXIMUM,
+    }
+
+
+async def memory_config_get(request: web.Request) -> web.StreamResponse:
+    """``GET /admin/memory-config`` — render the memory-caps editors."""
+    db = request.app.get(APP_KEY_DB)
+    db_error: str | None = None
+
+    import memory_config as mc
+
+    if db is not None:
+        try:
+            await mc.refresh_memory_context_limit_override_from_db(db)
+        except Exception:
+            log.exception(
+                "memory_config_get: "
+                "refresh_memory_context_limit_override_from_db failed"
+            )
+            db_error = "Database query failed — see logs."
+        try:
+            await mc.refresh_memory_content_max_chars_override_from_db(db)
+        except Exception:
+            log.exception(
+                "memory_config_get: "
+                "refresh_memory_content_max_chars_override_from_db failed"
+            )
+            db_error = "Database query failed — see logs."
+
+    ctx = {
+        "context_limit_view": _build_memory_context_limit_view(),
+        "content_max_view": _build_memory_content_max_chars_view(),
+        "db_error": db_error,
+        "active_page": "memory_config",
+        "csrf_token": csrf_token_for(request),
+        "flash": None,
+    }
+    response = aiohttp_jinja2.render_template(
+        "memory_config.html", request, ctx,
+    )
+    flash = get_flash(request)
+    if flash:
+        ctx["flash"] = flash
+        response = aiohttp_jinja2.render_template(
+            "memory_config.html", request, ctx,
+        )
+    return response
+
+
+def _memory_config_csrf_guard(
+    request: web.Request, form,
+) -> web.StreamResponse | None:
+    """CSRF guard redirecting to ``/admin/memory-config`` on failure."""
+    if verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        return None
+    log.warning(
+        "memory_config: CSRF token mismatch from %s (path=%s)",
+        request.remote, request.path,
+    )
+    response = web.HTTPFound(location="/admin/memory-config")
+    set_flash(
+        response, kind="error",
+        message="CSRF token mismatch — please reload and try again.",
+        secret=request.app.get(APP_KEY_SESSION_SECRET, ""),
+        cookie_secure=request.app.get(APP_KEY_COOKIE_SECURE, True),
+    )
+    return response
+
+
+async def memory_config_context_limit_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/memory-config/context-limit`` — update
+    ``MEMORY_CONTEXT_LIMIT``."""
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app.get(APP_KEY_DB)
+    form = await request.post()
+
+    guard = _memory_config_csrf_guard(request, form)
+    if guard is not None:
+        return guard
+
+    if db is None:
+        response = web.HTTPFound(location="/admin/memory-config")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Database is not configured — memory-config edits "
+                "require a live DB connection."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    import memory_config as mc
+
+    raw_value = str(form.get("memory_context_limit", "")).strip()
+    previous_effective = mc.get_memory_context_limit()
+    previous_source = mc.get_memory_context_limit_source()
+
+    if not raw_value:
+        try:
+            await db.delete_setting(mc.MEMORY_CONTEXT_LIMIT_SETTING_KEY)
+        except Exception:
+            log.exception(
+                "memory_config_context_limit_post: delete_setting failed"
+            )
+            response = web.HTTPFound(location="/admin/memory-config")
+            set_flash(
+                response, kind="error",
+                message=(
+                    "Failed to clear the override — see logs. "
+                    "The previous value is still in effect."
+                ),
+                secret=secret, cookie_secure=cookie_secure,
+            )
+            return response
+        mc.clear_memory_context_limit_override()
+        try:
+            await mc.refresh_memory_context_limit_override_from_db(db)
+        except Exception:
+            log.exception(
+                "memory_config_context_limit_post: "
+                "refresh after clear failed"
+            )
+        new_effective = mc.get_memory_context_limit()
+        await _record_audit_safe(
+            request, "memory_config_context_limit_update",
+            target="memory_context_limit",
+            meta={
+                "action": "clear",
+                "before": previous_effective,
+                "before_source": previous_source,
+                "after": new_effective,
+                "after_source": mc.get_memory_context_limit_source(),
+            },
+        )
+        response = web.HTTPFound(location="/admin/memory-config")
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Context-limit override cleared. Effective limit "
+                f"is now {new_effective} "
+                f"(source: {mc.get_memory_context_limit_source()})."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    parsed = mc._coerce_memory_context_limit(raw_value)
+    if parsed is None:
+        response = web.HTTPFound(location="/admin/memory-config")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Context limit must be an integer in "
+                f"[{mc.MEMORY_CONTEXT_LIMIT_MINIMUM}, "
+                f"{mc.MEMORY_CONTEXT_LIMIT_MAXIMUM}]. "
+                f"Got: {raw_value!r}. No changes were made."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        await db.upsert_setting(
+            mc.MEMORY_CONTEXT_LIMIT_SETTING_KEY, str(parsed),
+        )
+    except Exception:
+        log.exception(
+            "memory_config_context_limit_post: upsert_setting failed "
+            "value=%r", parsed,
+        )
+        response = web.HTTPFound(location="/admin/memory-config")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Failed to persist the new limit — see logs. "
+                "The previous value is still in effect."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        mc.set_memory_context_limit_override(parsed)
+    except ValueError:
+        log.exception(
+            "memory_config_context_limit_post: "
+            "set_memory_context_limit_override rejected %r",
+            parsed,
+        )
+
+    try:
+        await mc.refresh_memory_context_limit_override_from_db(db)
+    except Exception:
+        log.exception(
+            "memory_config_context_limit_post: refresh after upsert failed"
+        )
+
+    new_effective = mc.get_memory_context_limit()
+    await _record_audit_safe(
+        request, "memory_config_context_limit_update",
+        target="memory_context_limit",
+        meta={
+            "action": "set",
+            "before": previous_effective,
+            "before_source": previous_source,
+            "after": new_effective,
+            "after_source": mc.get_memory_context_limit_source(),
+        },
+    )
+    response = web.HTTPFound(location="/admin/memory-config")
+    set_flash(
+        response, kind="success",
+        message=(
+            f"Context limit updated: {previous_effective} → "
+            f"{new_effective}."
+        ),
+        secret=secret, cookie_secure=cookie_secure,
+    )
+    return response
+
+
+async def memory_config_content_max_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/memory-config/content-max`` — update
+    ``MEMORY_CONTENT_MAX_CHARS``."""
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app.get(APP_KEY_DB)
+    form = await request.post()
+
+    guard = _memory_config_csrf_guard(request, form)
+    if guard is not None:
+        return guard
+
+    if db is None:
+        response = web.HTTPFound(location="/admin/memory-config")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Database is not configured — memory-config edits "
+                "require a live DB connection."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    import memory_config as mc
+
+    raw_value = str(form.get("memory_content_max_chars", "")).strip()
+    previous_effective = mc.get_memory_content_max_chars()
+    previous_source = mc.get_memory_content_max_chars_source()
+
+    if not raw_value:
+        try:
+            await db.delete_setting(
+                mc.MEMORY_CONTENT_MAX_CHARS_SETTING_KEY,
+            )
+        except Exception:
+            log.exception(
+                "memory_config_content_max_post: delete_setting failed"
+            )
+            response = web.HTTPFound(location="/admin/memory-config")
+            set_flash(
+                response, kind="error",
+                message=(
+                    "Failed to clear the override — see logs. "
+                    "The previous value is still in effect."
+                ),
+                secret=secret, cookie_secure=cookie_secure,
+            )
+            return response
+        mc.clear_memory_content_max_chars_override()
+        try:
+            await mc.refresh_memory_content_max_chars_override_from_db(db)
+        except Exception:
+            log.exception(
+                "memory_config_content_max_post: "
+                "refresh after clear failed"
+            )
+        new_effective = mc.get_memory_content_max_chars()
+        await _record_audit_safe(
+            request, "memory_config_content_max_update",
+            target="memory_content_max_chars",
+            meta={
+                "action": "clear",
+                "before": previous_effective,
+                "before_source": previous_source,
+                "after": new_effective,
+                "after_source": mc.get_memory_content_max_chars_source(),
+            },
+        )
+        response = web.HTTPFound(location="/admin/memory-config")
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Content-max override cleared. Effective cap "
+                f"is now {new_effective:,} chars "
+                f"(source: {mc.get_memory_content_max_chars_source()})."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    parsed = mc._coerce_memory_content_max_chars(raw_value)
+    if parsed is None:
+        response = web.HTTPFound(location="/admin/memory-config")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Content max chars must be an integer in "
+                f"[{mc.MEMORY_CONTENT_MAX_CHARS_MINIMUM:,}, "
+                f"{mc.MEMORY_CONTENT_MAX_CHARS_MAXIMUM:,}]. "
+                f"Got: {raw_value!r}. No changes were made."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        await db.upsert_setting(
+            mc.MEMORY_CONTENT_MAX_CHARS_SETTING_KEY, str(parsed),
+        )
+    except Exception:
+        log.exception(
+            "memory_config_content_max_post: upsert_setting failed "
+            "value=%r", parsed,
+        )
+        response = web.HTTPFound(location="/admin/memory-config")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Failed to persist the new cap — see logs. "
+                "The previous value is still in effect."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        mc.set_memory_content_max_chars_override(parsed)
+    except ValueError:
+        log.exception(
+            "memory_config_content_max_post: "
+            "set_memory_content_max_chars_override rejected %r",
+            parsed,
+        )
+
+    try:
+        await mc.refresh_memory_content_max_chars_override_from_db(db)
+    except Exception:
+        log.exception(
+            "memory_config_content_max_post: refresh after upsert failed"
+        )
+
+    new_effective = mc.get_memory_content_max_chars()
+    await _record_audit_safe(
+        request, "memory_config_content_max_update",
+        target="memory_content_max_chars",
+        meta={
+            "action": "set",
+            "before": previous_effective,
+            "before_source": previous_source,
+            "after": new_effective,
+            "after_source": mc.get_memory_content_max_chars_source(),
+        },
+    )
+    response = web.HTTPFound(location="/admin/memory-config")
+    set_flash(
+        response, kind="success",
+        message=(
+            f"Content max chars updated: {previous_effective:,} → "
+            f"{new_effective:,}."
+        ),
+        secret=secret, cookie_secure=cookie_secure,
+    )
+    return response
+
+
+# ---------------------------------------------------------------------
 # Admin audit helper (Stage-9-Step-2)
 # ---------------------------------------------------------------------
 
@@ -2916,6 +3343,10 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     # cause to a knob tweak vs. a real change in the loop's actual
     # ticking cadence.
     "control_loop_stale_update": "Per-loop stale threshold updated",
+    # Stage-15-Step-E #10b row 8: memory-config editors on
+    # ``/admin/memory-config``.
+    "memory_config_context_limit_update": "Memory context limit updated",
+    "memory_config_content_max_update": "Memory content max chars updated",
     # Stage-15-Step-E #10b row 20: audit retention policy editor.
     "audit_retention_update": "Audit retention policy updated",
 }
@@ -10905,6 +11336,23 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/wallet-config/free-messages",
         _require_role(ROLE_OPERATOR)(wallet_config_free_messages_post),
+    )
+
+    # Stage-15-Step-E #10b row 8: MEMORY_CONTEXT_LIMIT +
+    # MEMORY_CONTENT_MAX_CHARS editors on ``/admin/memory-config``.
+    # Operator-floored because the caps directly affect context quality
+    # and per-request token spend.
+    app.router.add_get(
+        "/admin/memory-config",
+        _require_auth(memory_config_get),
+    )
+    app.router.add_post(
+        "/admin/memory-config/context-limit",
+        _require_role(ROLE_OPERATOR)(memory_config_context_limit_post),
+    )
+    app.router.add_post(
+        "/admin/memory-config/content-max",
+        _require_role(ROLE_OPERATOR)(memory_config_content_max_post),
     )
 
     # Stage-8-Part-2: promo codes. Stage-15-Step-E #5 follow-up #4:
