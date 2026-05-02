@@ -356,6 +356,47 @@ async def main():
             "falling through to env / compile-time default"
         )
 
+    # Stage-15-Step-E #10b row 7: warm the REFERRAL_BONUS_PERCENT and
+    # REFERRAL_BONUS_MAX_USD override caches so the first paid top-up
+    # after boot calls ``grant_referral_after_credit`` with the
+    # operator's configured payouts rather than the env / compile-time
+    # default. Two separate try-blocks so a malformed row in one knob
+    # doesn't poison the other.
+    try:
+        import referral
+        loaded_pct = await (
+            referral.refresh_referral_bonus_percent_override_from_db(db)
+        )
+        log.info(
+            "loaded REFERRAL_BONUS_PERCENT override from system_settings: "
+            "%s (source=%s, effective=%.2f%%)",
+            loaded_pct,
+            referral.get_referral_bonus_percent_source(),
+            referral.get_referral_bonus_percent(),
+        )
+    except Exception:
+        log.exception(
+            "failed to load REFERRAL_BONUS_PERCENT override from DB — "
+            "falling through to env / compile-time default"
+        )
+    try:
+        import referral
+        loaded_max = await (
+            referral.refresh_referral_bonus_max_usd_override_from_db(db)
+        )
+        log.info(
+            "loaded REFERRAL_BONUS_MAX_USD override from system_settings: "
+            "%s (source=%s, effective=$%.2f)",
+            loaded_max,
+            referral.get_referral_bonus_max_usd_source(),
+            referral.get_referral_bonus_max_usd(),
+        )
+    except Exception:
+        log.exception(
+            "failed to load REFERRAL_BONUS_MAX_USD override from DB — "
+            "falling through to env / compile-time default"
+        )
+
     # Overwrite BotFather's cached slash-command list with the
     # canonical one. Without this, Telegram shows whatever was last
     # typed into the BotFather "Edit Commands" panel — including

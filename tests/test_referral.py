@@ -36,6 +36,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import referral as _referral
 from database import Database
 
 
@@ -711,3 +712,387 @@ def test_wallet_keyboard_has_invite_button():
             if hasattr(btn, "callback_data") and btn.callback_data:
                 callback_data.append(btn.callback_data)
     assert "hub_invite" in callback_data
+
+
+# =====================================================================
+# Stage-15-Step-E #10b row 7: REFERRAL_BONUS_* DB-backed override layer.
+#
+# Mirrors the COST_MARKUP / MIN_TOPUP_USD / REQUIRED_CHANNEL test
+# matrix: validator parametrize cases, set / clear / get cache,
+# refresh-from-db happy / missing / error / malformed, and the
+# resolution-order pin (override → env → default).
+# =====================================================================
+
+
+@pytest.fixture
+def _reset_referral_overrides(monkeypatch):
+    """Auto-clear both override caches + scrub the env vars between
+    tests so every test starts from a known "no override, no env" state.
+    """
+    _referral.clear_referral_bonus_percent_override()
+    _referral.clear_referral_bonus_max_usd_override()
+    monkeypatch.delenv("REFERRAL_BONUS_PERCENT", raising=False)
+    monkeypatch.delenv("REFERRAL_BONUS_MAX_USD", raising=False)
+    yield
+    _referral.clear_referral_bonus_percent_override()
+    _referral.clear_referral_bonus_max_usd_override()
+
+
+# ---------- _coerce_referral_bonus_percent ----------
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (10.0, 10.0),
+        (1, 1.0),
+        ("12.5", 12.5),
+        (99.99, 99.99),
+        # rejections
+        (0, None),
+        (-1, None),
+        (100.0, None),  # cap is exclusive
+        (200, None),
+        (float("nan"), None),
+        (float("inf"), None),
+        (float("-inf"), None),
+        (None, None),
+        ("", None),
+        ("nan", None),
+        ("abc", None),
+        (True, None),  # bool is rejected before float()
+        (False, None),
+    ],
+)
+def test_coerce_referral_bonus_percent(value, expected):
+    assert _referral._coerce_referral_bonus_percent(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (5.0, 5.0),
+        (0.5, 0.5),
+        ("3.5", 3.5),
+        (999.99, 999.99),
+        # rejections
+        (0, None),
+        (-0.01, None),
+        (1000.0, None),  # cap is exclusive
+        (1_000_000, None),
+        (float("nan"), None),
+        (float("inf"), None),
+        (None, None),
+        (True, None),
+    ],
+)
+def test_coerce_referral_bonus_max_usd(value, expected):
+    assert _referral._coerce_referral_bonus_max_usd(value) == expected
+
+
+# ---------- override: percent ----------
+
+
+def test_set_referral_bonus_percent_override_changes_lookup(
+    _reset_referral_overrides, monkeypatch,
+):
+    monkeypatch.setenv("REFERRAL_BONUS_PERCENT", "20")
+    assert _referral.get_referral_bonus_percent() == 20.0
+    _referral.set_referral_bonus_percent_override(15)
+    assert _referral.get_referral_bonus_percent() == 15.0
+    assert _referral.get_referral_bonus_percent_source() == "db"
+
+
+def test_set_referral_bonus_percent_override_rejects_bad_values(
+    _reset_referral_overrides,
+):
+    with pytest.raises(ValueError):
+        _referral.set_referral_bonus_percent_override(0)
+    with pytest.raises(ValueError):
+        _referral.set_referral_bonus_percent_override(-1)
+    with pytest.raises(ValueError):
+        _referral.set_referral_bonus_percent_override(100)
+    with pytest.raises(ValueError):
+        _referral.set_referral_bonus_percent_override(float("nan"))
+    with pytest.raises(ValueError):
+        _referral.set_referral_bonus_percent_override(True)
+
+
+def test_clear_referral_bonus_percent_override_returns_had_value(
+    _reset_referral_overrides,
+):
+    assert _referral.clear_referral_bonus_percent_override() is False
+    _referral.set_referral_bonus_percent_override(15)
+    assert _referral.clear_referral_bonus_percent_override() is True
+    assert _referral.clear_referral_bonus_percent_override() is False
+
+
+def test_clear_referral_bonus_percent_override_falls_through_to_env(
+    _reset_referral_overrides, monkeypatch,
+):
+    monkeypatch.setenv("REFERRAL_BONUS_PERCENT", "25")
+    _referral.set_referral_bonus_percent_override(50)
+    assert _referral.get_referral_bonus_percent() == 50.0
+    _referral.clear_referral_bonus_percent_override()
+    assert _referral.get_referral_bonus_percent() == 25.0
+    assert _referral.get_referral_bonus_percent_source() == "env"
+
+
+# ---------- override: max-USD ----------
+
+
+def test_set_referral_bonus_max_usd_override_changes_lookup(
+    _reset_referral_overrides, monkeypatch,
+):
+    monkeypatch.setenv("REFERRAL_BONUS_MAX_USD", "10")
+    assert _referral.get_referral_bonus_max_usd() == 10.0
+    _referral.set_referral_bonus_max_usd_override(7.5)
+    assert _referral.get_referral_bonus_max_usd() == 7.5
+    assert _referral.get_referral_bonus_max_usd_source() == "db"
+
+
+def test_set_referral_bonus_max_usd_override_rejects_bad_values(
+    _reset_referral_overrides,
+):
+    with pytest.raises(ValueError):
+        _referral.set_referral_bonus_max_usd_override(0)
+    with pytest.raises(ValueError):
+        _referral.set_referral_bonus_max_usd_override(-1)
+    with pytest.raises(ValueError):
+        _referral.set_referral_bonus_max_usd_override(1000)
+    with pytest.raises(ValueError):
+        _referral.set_referral_bonus_max_usd_override(float("inf"))
+    with pytest.raises(ValueError):
+        _referral.set_referral_bonus_max_usd_override(False)
+
+
+def test_clear_referral_bonus_max_usd_override_returns_had_value(
+    _reset_referral_overrides,
+):
+    assert _referral.clear_referral_bonus_max_usd_override() is False
+    _referral.set_referral_bonus_max_usd_override(8)
+    assert _referral.clear_referral_bonus_max_usd_override() is True
+
+
+# ---------- get_*_source ----------
+
+
+def test_get_referral_bonus_percent_source_default(
+    _reset_referral_overrides,
+):
+    assert _referral.get_referral_bonus_percent_source() == "default"
+
+
+def test_get_referral_bonus_percent_source_env(
+    _reset_referral_overrides, monkeypatch,
+):
+    monkeypatch.setenv("REFERRAL_BONUS_PERCENT", "25")
+    assert _referral.get_referral_bonus_percent_source() == "env"
+
+
+def test_get_referral_bonus_percent_source_env_rejects_malformed(
+    _reset_referral_overrides, monkeypatch,
+):
+    """Malformed env value reads as "default" because the validator
+    rejects it, which is the same shape as the lookup itself."""
+    monkeypatch.setenv("REFERRAL_BONUS_PERCENT", "nan")
+    assert _referral.get_referral_bonus_percent_source() == "default"
+
+
+def test_get_referral_bonus_max_usd_source_default(
+    _reset_referral_overrides,
+):
+    assert _referral.get_referral_bonus_max_usd_source() == "default"
+
+
+def test_get_referral_bonus_max_usd_source_env(
+    _reset_referral_overrides, monkeypatch,
+):
+    monkeypatch.setenv("REFERRAL_BONUS_MAX_USD", "8")
+    assert _referral.get_referral_bonus_max_usd_source() == "env"
+
+
+def test_get_referral_bonus_max_usd_source_db(
+    _reset_referral_overrides,
+):
+    _referral.set_referral_bonus_max_usd_override(7)
+    assert _referral.get_referral_bonus_max_usd_source() == "db"
+
+
+# ---------- refresh_*_from_db ----------
+
+
+@pytest.mark.asyncio
+async def test_refresh_referral_bonus_percent_loads_value(
+    _reset_referral_overrides,
+):
+    db = MagicMock()
+    db.get_setting = AsyncMock(return_value="22.5")
+    loaded = await _referral.refresh_referral_bonus_percent_override_from_db(
+        db,
+    )
+    assert loaded == 22.5
+    assert _referral.get_referral_bonus_percent_override() == 22.5
+    db.get_setting.assert_awaited_once_with(
+        _referral.REFERRAL_BONUS_PERCENT_SETTING_KEY,
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_referral_bonus_percent_clears_when_missing(
+    _reset_referral_overrides,
+):
+    _referral.set_referral_bonus_percent_override(50)
+    db = MagicMock()
+    db.get_setting = AsyncMock(return_value=None)
+    loaded = await _referral.refresh_referral_bonus_percent_override_from_db(
+        db,
+    )
+    assert loaded is None
+    assert _referral.get_referral_bonus_percent_override() is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_referral_bonus_percent_keeps_cache_on_error(
+    _reset_referral_overrides,
+):
+    _referral.set_referral_bonus_percent_override(50)
+    db = MagicMock()
+    db.get_setting = AsyncMock(side_effect=RuntimeError("boom"))
+    loaded = await _referral.refresh_referral_bonus_percent_override_from_db(
+        db,
+    )
+    # Fail-soft: keeps the previously-set cache.
+    assert loaded == 50.0
+    assert _referral.get_referral_bonus_percent_override() == 50.0
+
+
+@pytest.mark.asyncio
+async def test_refresh_referral_bonus_percent_handles_none_db(
+    _reset_referral_overrides,
+):
+    _referral.set_referral_bonus_percent_override(50)
+    loaded = await _referral.refresh_referral_bonus_percent_override_from_db(
+        None,
+    )
+    assert loaded == 50.0
+
+
+@pytest.mark.asyncio
+async def test_refresh_referral_bonus_percent_rejects_above_cap(
+    _reset_referral_overrides,
+):
+    db = MagicMock()
+    db.get_setting = AsyncMock(return_value="999")
+    loaded = await _referral.refresh_referral_bonus_percent_override_from_db(
+        db,
+    )
+    assert loaded is None
+    assert _referral.get_referral_bonus_percent_override() is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_referral_bonus_percent_rejects_malformed(
+    _reset_referral_overrides,
+):
+    db = MagicMock()
+    db.get_setting = AsyncMock(return_value="not-a-number")
+    loaded = await _referral.refresh_referral_bonus_percent_override_from_db(
+        db,
+    )
+    assert loaded is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_referral_bonus_max_usd_loads_value(
+    _reset_referral_overrides,
+):
+    db = MagicMock()
+    db.get_setting = AsyncMock(return_value="3.25")
+    loaded = await (
+        _referral.refresh_referral_bonus_max_usd_override_from_db(db)
+    )
+    assert loaded == 3.25
+    db.get_setting.assert_awaited_once_with(
+        _referral.REFERRAL_BONUS_MAX_USD_SETTING_KEY,
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_referral_bonus_max_usd_clears_when_missing(
+    _reset_referral_overrides,
+):
+    _referral.set_referral_bonus_max_usd_override(7)
+    db = MagicMock()
+    db.get_setting = AsyncMock(return_value=None)
+    loaded = await (
+        _referral.refresh_referral_bonus_max_usd_override_from_db(db)
+    )
+    assert loaded is None
+    assert _referral.get_referral_bonus_max_usd_override() is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_referral_bonus_max_usd_keeps_cache_on_error(
+    _reset_referral_overrides,
+):
+    _referral.set_referral_bonus_max_usd_override(7)
+    db = MagicMock()
+    db.get_setting = AsyncMock(side_effect=RuntimeError("boom"))
+    loaded = await (
+        _referral.refresh_referral_bonus_max_usd_override_from_db(db)
+    )
+    assert loaded == 7.0
+
+
+@pytest.mark.asyncio
+async def test_refresh_referral_bonus_max_usd_rejects_above_cap(
+    _reset_referral_overrides,
+):
+    db = MagicMock()
+    db.get_setting = AsyncMock(return_value="9999")
+    loaded = await (
+        _referral.refresh_referral_bonus_max_usd_override_from_db(db)
+    )
+    assert loaded is None
+
+
+# ---------- resolution order ----------
+
+
+def test_resolution_order_override_beats_env_beats_default(
+    _reset_referral_overrides, monkeypatch,
+):
+    """Pin: override > env > default for both knobs."""
+    # default
+    assert _referral.get_referral_bonus_percent() == 10.0
+    assert _referral.get_referral_bonus_max_usd() == 5.0
+
+    # env
+    monkeypatch.setenv("REFERRAL_BONUS_PERCENT", "30")
+    monkeypatch.setenv("REFERRAL_BONUS_MAX_USD", "2.5")
+    assert _referral.get_referral_bonus_percent() == 30.0
+    assert _referral.get_referral_bonus_max_usd() == 2.5
+
+    # override
+    _referral.set_referral_bonus_percent_override(50)
+    _referral.set_referral_bonus_max_usd_override(8)
+    assert _referral.get_referral_bonus_percent() == 50.0
+    assert _referral.get_referral_bonus_max_usd() == 8.0
+
+
+def test_resolution_order_independent_clears(
+    _reset_referral_overrides, monkeypatch,
+):
+    """Pin: clearing one knob's override doesn't affect the other."""
+    monkeypatch.setenv("REFERRAL_BONUS_PERCENT", "30")
+    monkeypatch.setenv("REFERRAL_BONUS_MAX_USD", "2.5")
+    _referral.set_referral_bonus_percent_override(50)
+    _referral.set_referral_bonus_max_usd_override(8)
+
+    _referral.clear_referral_bonus_percent_override()
+    # Percent fell back to env; max stayed on the override.
+    assert _referral.get_referral_bonus_percent() == 30.0
+    assert _referral.get_referral_bonus_max_usd() == 8.0
+    assert _referral.get_referral_bonus_percent_source() == "env"
+    assert _referral.get_referral_bonus_max_usd_source() == "db"

@@ -101,4 +101,154 @@
     </form>
   </details>
 </div>
+
+{# Stage-15-Step-E #10b row 7: REFERRAL_BONUS_* editor.
+   Two knobs share one card because they're a coupled product
+   decision: a percent change typically goes hand-in-hand with a
+   cap re-check. The form has two text inputs (either / both can be
+   filled) and TWO submit buttons — Save (action=set, persists what
+   was typed) and Clear (action=clear, drops the override row(s)
+   listed in the ``targets`` checkboxes). #}
+<div class="panel" style="margin-top: 1em;">
+  <h3>🎁 Referral payouts</h3>
+  <p style="margin: 0 0 0.75em 0;">
+    Effective:
+    <strong>{{ "{:.2f}".format(referral_view.percent.effective) }}%</strong>
+    of every paid top-up, capped at
+    <strong>${{ "{:.2f}".format(referral_view.max_usd.effective) }}</strong>
+    per side (inviter and invitee each get this much when an invitee's
+    first paid top-up settles).
+  </p>
+  <p style="color: var(--text-muted); margin: 0 0 0.75em 0; font-size: 0.9em;">
+    A referral grant is only created on the FIRST paid top-up after a
+    ``/start ref_<code>`` deep link. Tweaks land live for the next paid
+    settlement — no redeploy required.
+  </p>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-muted); font-size: 0.9em;">
+      Edit referral payouts (operator+)
+    </summary>
+    <table style="margin: 0.75em 0; font-size: 0.9em; max-width: 48em;">
+      <thead>
+        <tr>
+          <th style="text-align: left;">&nbsp;</th>
+          <th style="text-align: left;">Percent</th>
+          <th style="text-align: left;">Cap (USD)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;">DB override</td>
+          <td>
+            {% if referral_view.percent.override_value is not none %}
+              <strong>{{ "{:.2f}".format(referral_view.percent.override_value) }}%</strong>
+            {% else %}
+              <span style="color: var(--text-muted);">(none)</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if referral_view.max_usd.override_value is not none %}
+              <strong>${{ "{:.2f}".format(referral_view.max_usd.override_value) }}</strong>
+            {% else %}
+              <span style="color: var(--text-muted);">(none)</span>
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;">Env</td>
+          <td>
+            <code>REFERRAL_BONUS_PERCENT</code>:
+            {% if referral_view.percent.env_value is not none %}
+              {{ "{:.2f}".format(referral_view.percent.env_value) }}%
+            {% elif referral_view.percent.env_raw %}
+              <span style="color: var(--text-warn);">{{ referral_view.percent.env_raw }} (rejected)</span>
+            {% else %}
+              <span style="color: var(--text-muted);">(unset)</span>
+            {% endif %}
+          </td>
+          <td>
+            <code>REFERRAL_BONUS_MAX_USD</code>:
+            {% if referral_view.max_usd.env_value is not none %}
+              ${{ "{:.2f}".format(referral_view.max_usd.env_value) }}
+            {% elif referral_view.max_usd.env_raw %}
+              <span style="color: var(--text-warn);">{{ referral_view.max_usd.env_raw }} (rejected)</span>
+            {% else %}
+              <span style="color: var(--text-muted);">(unset)</span>
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;">Compile-time default</td>
+          <td>{{ "{:.2f}".format(referral_view.percent.default_value) }}%</td>
+          <td>${{ "{:.2f}".format(referral_view.max_usd.default_value) }}</td>
+        </tr>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;"><strong>Effective</strong></td>
+          <td>
+            <strong>{{ "{:.2f}".format(referral_view.percent.effective) }}%</strong>
+            <span class="badge badge-{{ referral_view.percent.source }}">{{ referral_view.percent.source }}</span>
+          </td>
+          <td>
+            <strong>${{ "{:.2f}".format(referral_view.max_usd.effective) }}</strong>
+            <span class="badge badge-{{ referral_view.max_usd.source }}">{{ referral_view.max_usd.source }}</span>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <form method="post"
+          action="/admin/wallet-config/referral"
+          style="display: flex; gap: 0.75em; align-items: baseline; flex-wrap: wrap; margin-bottom: 0.75em;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>
+        New percent
+        <input type="number"
+               name="referral_bonus_percent"
+               step="0.01"
+               min="0"
+               max="{{ referral_view.percent.maximum_exclusive }}"
+               value="{% if referral_view.percent.override_value is not none %}{{ referral_view.percent.override_value }}{% endif %}"
+               placeholder="leave blank to keep"
+               style="width: 9em;">
+      </label>
+      <label>
+        New cap (USD)
+        <input type="number"
+               name="referral_bonus_max_usd"
+               step="0.01"
+               min="0"
+               max="{{ referral_view.max_usd.maximum_exclusive }}"
+               value="{% if referral_view.max_usd.override_value is not none %}{{ referral_view.max_usd.override_value }}{% endif %}"
+               placeholder="leave blank to keep"
+               style="width: 9em;">
+      </label>
+      <button type="submit" name="action" value="set">Save</button>
+      <span style="color: var(--text-muted); font-size: 0.85em;">
+        Percent: 0 &lt; n &lt; {{ "{:.0f}".format(referral_view.percent.maximum_exclusive) }}.
+        Cap: 0 &lt; n &lt; {{ "{:.0f}".format(referral_view.max_usd.maximum_exclusive) }}.
+        Empty fields are not touched.
+      </span>
+    </form>
+
+    <form method="post"
+          action="/admin/wallet-config/referral"
+          style="display: flex; gap: 0.75em; align-items: baseline; flex-wrap: wrap;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="action" value="clear">
+      <label style="display: inline-flex; align-items: center; gap: 0.25em;">
+        <input type="checkbox" name="targets" value="percent">
+        Clear percent override
+      </label>
+      <label style="display: inline-flex; align-items: center; gap: 0.25em;">
+        <input type="checkbox" name="targets" value="max_usd">
+        Clear cap override
+      </label>
+      <button type="submit">Clear selected</button>
+      <span style="color: var(--text-muted); font-size: 0.85em;">
+        Drops the DB row so the knob falls through to env / default.
+      </span>
+    </form>
+  </details>
+</div>
 {% endblock %}
