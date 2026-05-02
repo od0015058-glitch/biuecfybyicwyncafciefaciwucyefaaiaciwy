@@ -2592,6 +2592,13 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     # window was set too aggressively?" investigation can pin the
     # cause to a knob tweak vs. unrelated invoice-creation traffic.
     "control_expiration_hours_update": "Pending-expiration window updated",
+    # Stage-15-Step-E #10b row 10: PENDING_ALERT_THRESHOLD_HOURS
+    # editor on ``/admin/control``. Recorded by
+    # :func:`control_alert_threshold_post`; the dropdown entry lets
+    # an operator filter the audit feed to "alert-threshold changes
+    # only" so a "why did the alert DM stop firing for 4-hour-stuck
+    # invoices?" investigation can pin the cause to a knob tweak.
+    "control_alert_threshold_update": "Pending-alert threshold updated",
 }
 
 
@@ -7776,6 +7783,21 @@ async def control_get(request: web.Request) -> web.StreamResponse:
                 "control: refresh_expiration_hours_override_from_db failed"
             )
 
+    # Stage-15-Step-E #10b row 10: refresh the pending-PENDING alert
+    # threshold override so the panel + the alert loop agree on the
+    # live threshold. Best-effort — a transient DB blip leaves the
+    # previous cache in place.
+    if db is not None:
+        try:
+            import pending_alert
+            await (
+                pending_alert.refresh_alert_threshold_override_from_db(db)
+            )
+        except Exception:
+            log.exception(
+                "control: refresh_alert_threshold_override_from_db failed"
+            )
+
     # Read the bot-health alert loop's most-recent rate-windowed drop
     # count so the panel + the loop + Prometheus all classify
     # identically. The panel can't observe a rate-of-drops on its own
@@ -7804,6 +7826,7 @@ async def control_get(request: web.Request) -> web.StreamResponse:
     required_channel_view = _build_required_channel_view()
     alert_interval_view = _build_alert_interval_view()
     expiration_hours_view = _build_expiration_hours_view()
+    alert_threshold_view = _build_alert_threshold_view()
 
     ctx = {
         "active_page": "control",
@@ -7815,6 +7838,7 @@ async def control_get(request: web.Request) -> web.StreamResponse:
         "required_channel": required_channel_view,
         "alert_interval": alert_interval_view,
         "expiration_hours": expiration_hours_view,
+        "alert_threshold": alert_threshold_view,
     }
     response = aiohttp_jinja2.render_template("control.html", request, ctx)
     flash = pop_flash(request, response)
@@ -8030,6 +8054,58 @@ def _build_expiration_hours_view() -> dict:
         "default_value": pending_expiration.EXPIRATION_HOURS_DEFAULT,
         "minimum": pending_expiration.EXPIRATION_HOURS_MINIMUM,
         "maximum": pending_expiration.EXPIRATION_HOURS_OVERRIDE_MAXIMUM,
+    }
+
+
+def _build_alert_threshold_view() -> dict:
+    """Snapshot of the pending-PENDING alert threshold for the panel.
+
+    Mirrors :func:`_build_expiration_hours_view` (single dict, single
+    knob) so ``control.html`` can re-use the
+    effective / source / override / env badge pattern.
+
+    Stage-15-Step-E #10b row 10. The alert threshold (default 2h) is
+    the much-earlier "something is wrong" line — operators sometimes
+    raise it for slow-chain gateways that legitimately keep invoices
+    PENDING for 4+h, or lower it for high-priority deployments where
+    even 1h of stuck PENDING is unacceptable. The override slot is
+    bounded by :data:`pending_alert.ALERT_THRESHOLD_OVERRIDE_MAXIMUM`
+    (1 year cap; the threshold is logically smaller than the reaper's
+    cap but the slot is bounded by the reaper's cap to stay
+    consistent with the Row-#9 layer).
+    """
+    import pending_alert
+
+    override_value = pending_alert.get_alert_threshold_override()
+    env_raw = os.getenv("PENDING_ALERT_THRESHOLD_HOURS", "").strip()
+    env_value: int | None = None
+    if env_raw:
+        try:
+            parsed = int(env_raw)
+        except ValueError:
+            env_value = None
+        else:
+            if parsed >= pending_alert.ALERT_THRESHOLD_MINIMUM:
+                env_value = parsed
+            elif parsed >= 1:
+                # ``_read_int_env`` clamps below the minimum; surface
+                # the *clamped* value so the panel doesn't lie about
+                # what's live. Defensive parity with the Row-#9 view.
+                env_value = pending_alert.ALERT_THRESHOLD_MINIMUM
+            # else: env_raw was 0 / negative → falls back to default;
+            # leave env_value None so the source resolver returns
+            # "default".
+    effective = pending_alert.get_pending_alert_threshold_hours()
+    source = pending_alert.get_pending_alert_threshold_source()
+    return {
+        "effective": effective,
+        "source": source,
+        "override_value": override_value,
+        "env_value": env_value,
+        "env_raw": env_raw,
+        "default_value": pending_alert.ALERT_THRESHOLD_DEFAULT,
+        "minimum": pending_alert.ALERT_THRESHOLD_MINIMUM,
+        "maximum": pending_alert.ALERT_THRESHOLD_OVERRIDE_MAXIMUM,
     }
 
 
@@ -9429,6 +9505,231 @@ async def control_expiration_hours_post(
     return response
 
 
+async def control_alert_threshold_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/control/alert-threshold`` — update the alert threshold.
+
+    Stage-15-Step-E #10b row 10. ``PENDING_ALERT_THRESHOLD_HOURS`` was
+    env-only, so an operator who wanted to retune the "stuck-PENDING"
+    alert line had to redeploy. This handler writes the override to
+    the ``system_settings`` overlay (DB-backed), refreshes the
+    in-process cache so :func:`pending_alert._alert_loop` picks up
+    the change on its next iteration without a restart, and
+    audit-logs a row whose ``meta`` carries the diff.
+
+    Form keys + validation order mirror
+    :func:`control_expiration_hours_post` exactly so the two cards on
+    the panel behave identically from an operator's POV.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app.get(APP_KEY_DB)
+    form = await request.post()
+
+    guard = _control_csrf_guard(request, form)
+    if guard is not None:
+        return guard
+
+    if db is None:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Database is not configured — "
+                "PENDING_ALERT_THRESHOLD_HOURS edits require a "
+                "live DB connection."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    import pending_alert
+
+    action = str(form.get("action", "set")).strip().lower()
+    if action not in {"set", "clear"}:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Unknown alert-threshold action {action!r}. "
+                "Expected 'set' or 'clear'. No changes were made."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    raw_value = str(form.get("alert_threshold_hours", "")).strip()
+    previous_effective = (
+        pending_alert.get_pending_alert_threshold_hours()
+    )
+    previous_source = (
+        pending_alert.get_pending_alert_threshold_source()
+    )
+
+    if action == "clear":
+        try:
+            await db.delete_setting(
+                pending_alert.ALERT_THRESHOLD_SETTING_KEY
+            )
+        except Exception:
+            log.exception(
+                "control_alert_threshold_post: delete_setting failed"
+            )
+            response = web.HTTPFound(location="/admin/control")
+            set_flash(
+                response, kind="error",
+                message=(
+                    "Failed to clear the PENDING_ALERT_THRESHOLD_HOURS "
+                    "override — see logs. The previous value is still "
+                    "in effect."
+                ),
+                secret=secret, cookie_secure=cookie_secure,
+            )
+            return response
+        pending_alert.clear_alert_threshold_override()
+        try:
+            await (
+                pending_alert.refresh_alert_threshold_override_from_db(db)
+            )
+        except Exception:
+            log.exception(
+                "control_alert_threshold_post: refresh after clear failed"
+            )
+        new_effective = (
+            pending_alert.get_pending_alert_threshold_hours()
+        )
+        new_source = (
+            pending_alert.get_pending_alert_threshold_source()
+        )
+        await _record_audit_safe(
+            request, "control_alert_threshold_update",
+            target="pending_alert_threshold_hours",
+            meta={
+                "action": "clear",
+                "before": previous_effective,
+                "before_source": previous_source,
+                "after": new_effective,
+                "after_source": new_source,
+            },
+        )
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Alert-threshold override cleared. The pending-alert "
+                f"threshold is now {new_effective}h "
+                f"(source: {new_source})."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    # action == "set". Validate + persist + apply.
+    if not raw_value:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Alert threshold cannot be blank when applying a "
+                "'set'. Use 'Clear DB override' to drop the override."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    coerced = pending_alert._coerce_alert_threshold_hours(raw_value)
+    if coerced is None:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"PENDING_ALERT_THRESHOLD_HOURS must be an integer in "
+                f"[{pending_alert.ALERT_THRESHOLD_MINIMUM}, "
+                f"{pending_alert.ALERT_THRESHOLD_OVERRIDE_MAXIMUM}] "
+                f"(got {raw_value!r}). No changes were made."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        await db.upsert_setting(
+            pending_alert.ALERT_THRESHOLD_SETTING_KEY, str(coerced),
+        )
+    except Exception:
+        log.exception(
+            "control_alert_threshold_post: upsert_setting failed value=%r",
+            coerced,
+        )
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Failed to persist the new alert threshold — see logs. "
+                "The previous value is still in effect."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        pending_alert.set_alert_threshold_override(coerced)
+    except ValueError:
+        log.exception(
+            "control_alert_threshold_post: set_alert_threshold_override "
+            "rejected %r after upsert succeeded — refreshing from DB",
+            coerced,
+        )
+
+    # Re-read whatever ended up in the DB so the cache reflects the
+    # truth.
+    try:
+        await pending_alert.refresh_alert_threshold_override_from_db(db)
+    except Exception:
+        log.exception(
+            "control_alert_threshold_post: refresh after upsert failed"
+        )
+
+    new_effective = (
+        pending_alert.get_pending_alert_threshold_hours()
+    )
+    new_source = pending_alert.get_pending_alert_threshold_source()
+    await _record_audit_safe(
+        request, "control_alert_threshold_update",
+        target="pending_alert_threshold_hours",
+        meta={
+            "action": "set",
+            "before": previous_effective,
+            "before_source": previous_source,
+            "after": new_effective,
+            "after_source": new_source,
+        },
+    )
+
+    response = web.HTTPFound(location="/admin/control")
+    if new_effective == previous_effective:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Alert threshold unchanged ({new_effective}h). "
+                "The override is now persisted in the DB."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    else:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Alert threshold updated: {previous_effective}h → "
+                f"{new_effective}h. The new threshold is live for "
+                f"the next tick of the pending-alert loop."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    return response
+
+
 # ---------------------------------------------------------------------
 # Stage-15-Step-E #5 follow-up #4: per-template globals.
 # ---------------------------------------------------------------------
@@ -9945,6 +10246,15 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/control/expiration-hours",
         _require_role(ROLE_SUPER)(control_expiration_hours_post),
+    )
+    # Stage-15-Step-E #10b row 10: PENDING_ALERT_THRESHOLD_HOURS
+    # editor on /admin/control. Lets an operator retune the
+    # "stuck-PENDING" alert line without a redeploy. The pending-
+    # alert loop re-reads the resolved threshold on every iteration
+    # so the new value takes effect on the next tick.
+    app.router.add_post(
+        "/admin/control/alert-threshold",
+        _require_role(ROLE_SUPER)(control_alert_threshold_post),
     )
     # Stage-15-Step-F follow-up #6: per-loop manual "tick now" button.
     app.router.add_post(

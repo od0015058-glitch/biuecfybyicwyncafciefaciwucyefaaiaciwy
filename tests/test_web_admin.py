@@ -13223,6 +13223,323 @@ async def test_control_get_renders_expiration_hours_card(
 
 
 # =====================================================================
+# Stage-15-Step-E #10b row 10: PENDING_ALERT_THRESHOLD_HOURS editor
+# =====================================================================
+
+
+async def test_control_alert_threshold_post_requires_auth(
+    aiohttp_client, make_admin_app
+):
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    resp = await client.post(
+        "/admin/control/alert-threshold",
+        data={
+            "alert_threshold_hours": "2",
+            "action": "set",
+            "csrf_token": "x",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303), resp.status
+    assert resp.headers.get("Location", "").startswith("/admin/login")
+
+
+async def test_control_alert_threshold_post_csrf_required(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False,
+    )
+    db.upsert_setting.reset_mock()
+    resp = await client.post(
+        "/admin/control/alert-threshold",
+        data={"alert_threshold_hours": "2", "action": "set"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/control"
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+
+
+async def test_control_alert_threshold_post_persists_value_and_refreshes(
+    aiohttp_client, make_admin_app
+):
+    """Happy path: a valid integer is upserted to system_settings AND
+    pushed into the in-process override cache."""
+    import pending_alert
+
+    pending_alert.clear_alert_threshold_override()
+    saved: dict[str, str | None] = {"value": None}
+
+    async def _upsert(key: str, value: str) -> None:
+        if key == pending_alert.ALERT_THRESHOLD_SETTING_KEY:
+            saved["value"] = value
+
+    async def _get(key: str):
+        if key == pending_alert.ALERT_THRESHOLD_SETTING_KEY:
+            return saved["value"]
+        return None
+
+    db = _stub_toggle_db()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/alert-threshold",
+        data={
+            "alert_threshold_hours": "4",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302, await resp.text()
+    assert resp.headers["Location"] == "/admin/control"
+
+    db.upsert_setting.assert_awaited_once_with(
+        pending_alert.ALERT_THRESHOLD_SETTING_KEY, "4",
+    )
+    # In-process cache reflects the new value (no restart needed).
+    assert pending_alert.get_alert_threshold_override() == 4
+    assert pending_alert.get_pending_alert_threshold_hours() == 4
+    matching = [
+        c for c in db.record_admin_audit.await_args_list
+        if c.kwargs.get("action") == "control_alert_threshold_update"
+    ]
+    assert matching, db.record_admin_audit.await_args_list
+    pending_alert.clear_alert_threshold_override()
+
+
+async def test_control_alert_threshold_post_clear_drops_db_row(
+    aiohttp_client, make_admin_app
+):
+    """``action=clear`` deletes the DB row and clears the in-process
+    override so the env var (or default) takes effect again."""
+    import pending_alert
+
+    pending_alert.set_alert_threshold_override(4)
+
+    async def _get(key: str):
+        return None  # row already deleted
+
+    db = _stub_toggle_db()
+    db.delete_setting = AsyncMock(return_value=True)
+    db.get_setting = AsyncMock(side_effect=_get)
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    pending_alert.set_alert_threshold_override(4)
+    db.delete_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/alert-threshold",
+        data={
+            "alert_threshold_hours": "",
+            "action": "clear",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302, await resp.text()
+    db.delete_setting.assert_awaited_once_with(
+        pending_alert.ALERT_THRESHOLD_SETTING_KEY,
+    )
+    assert pending_alert.get_alert_threshold_override() is None
+
+
+async def test_control_alert_threshold_post_rejects_below_minimum(
+    aiohttp_client, make_admin_app
+):
+    import pending_alert
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/alert-threshold",
+        data={
+            "alert_threshold_hours": "0",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+    assert pending_alert.get_alert_threshold_override() is None
+
+
+async def test_control_alert_threshold_post_rejects_above_max(
+    aiohttp_client, make_admin_app
+):
+    import pending_alert
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/alert-threshold",
+        data={
+            "alert_threshold_hours": str(
+                pending_alert.ALERT_THRESHOLD_OVERRIDE_MAXIMUM + 1
+            ),
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+    assert pending_alert.get_alert_threshold_override() is None
+
+
+async def test_control_alert_threshold_post_rejects_non_int(
+    aiohttp_client, make_admin_app
+):
+    import pending_alert
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/alert-threshold",
+        data={
+            "alert_threshold_hours": "abc",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+    assert pending_alert.get_alert_threshold_override() is None
+
+
+async def test_control_alert_threshold_post_rejects_blank_set(
+    aiohttp_client, make_admin_app
+):
+    """A 'set' with no value is rejected — operator must use 'clear'
+    explicitly to drop the override."""
+    import pending_alert
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/alert-threshold",
+        data={
+            "alert_threshold_hours": "",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+    assert pending_alert.get_alert_threshold_override() is None
+
+
+async def test_control_alert_threshold_post_rejects_unknown_action(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/alert-threshold",
+        data={
+            "alert_threshold_hours": "2",
+            "action": "delete_everything",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+
+
+async def test_control_alert_threshold_post_db_failure_keeps_previous(
+    aiohttp_client, make_admin_app
+):
+    """A transient DB blip on upsert keeps the previous override in
+    place."""
+    import pending_alert
+
+    pending_alert.clear_alert_threshold_override()
+
+    db = _stub_toggle_db()
+    db.upsert_setting = AsyncMock(side_effect=RuntimeError("DB down"))
+    db.get_setting = AsyncMock(return_value="6")
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    # GET-render refresh loaded "6" into the cache.
+    assert pending_alert.get_alert_threshold_override() == 6
+
+    resp = await client.post(
+        "/admin/control/alert-threshold",
+        data={
+            "alert_threshold_hours": "8",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    # Override unchanged after a failed write.
+    assert pending_alert.get_alert_threshold_override() == 6
+    pending_alert.clear_alert_threshold_override()
+
+
+def test_audit_action_labels_includes_alert_threshold_update():
+    """Regression: ``control_alert_threshold_update`` must be listed
+    in ``AUDIT_ACTION_LABELS`` so the ``/admin/audit`` filter
+    dropdown surfaces alert-threshold changes."""
+    from web_admin import AUDIT_ACTION_LABELS
+
+    assert "control_alert_threshold_update" in AUDIT_ACTION_LABELS
+    assert AUDIT_ACTION_LABELS["control_alert_threshold_update"] == (
+        "Pending-alert threshold updated"
+    )
+
+
+async def test_control_get_renders_alert_threshold_card(
+    aiohttp_client, make_admin_app
+):
+    """The /admin/control panel renders the new pending-alert
+    threshold card with the current effective value, source badge,
+    and the form."""
+    import pending_alert
+
+    pending_alert.clear_alert_threshold_override()
+
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/control")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Pending-PENDING alert threshold" in body
+    assert "/admin/control/alert-threshold" in body
+    assert 'name="alert_threshold_hours"' in body
+
+
+# =====================================================================
 # Stage-15-Step-F follow-up #6: per-loop manual "tick now" button
 # =====================================================================
 

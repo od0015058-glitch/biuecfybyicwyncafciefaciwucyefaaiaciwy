@@ -791,6 +791,21 @@ NowPayments crypto invoices.
   reading the env var directly, so it respects saved DB overrides
   and agrees with the loop's iteration-time behaviour.
   Stage-15-Step-E #10b row 9.
+- **Tunable stuck-PENDING alert threshold** — the
+  `PENDING_ALERT_THRESHOLD_HOURS` knob (default 2h) is now editable
+  from `/admin/control` instead of being env-only. The pending-alert
+  loop re-reads its resolved threshold every iteration so a saved
+  override takes effect on the next tick (no restart). The dashboard
+  tile, the panel, and the alert DM body all pull from the same
+  resolver, so they cannot disagree about "what counts as overdue".
+  Override range is bounded to `[1, 8_760]` hours; an explicit `bool`
+  rejection in the coercer prevents a stored `"true"` row from
+  coercing to `1` and shrinking the threshold to "anything PENDING
+  for an hour is suspicious", paging admins constantly. Bundled
+  defensive measure: `_alert_loop` wraps the iteration-time re-read
+  in a `try/except` that falls back to the previous threshold (logged
+  at ERROR) rather than letting a transient resolver blip propagate
+  up and starve the loop. Stage-15-Step-E #10b row 10.
 
 For the full project history, file map, and roadmap **read [HANDOFF.md](./HANDOFF.md)**.
 

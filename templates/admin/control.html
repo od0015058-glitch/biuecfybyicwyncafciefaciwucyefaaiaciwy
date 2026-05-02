@@ -679,6 +679,96 @@
   </form>
 </div>
 
+<div class="control-card">
+  <h3>🚨 Pending-PENDING alert threshold</h3>
+  <p>
+    How old a <code>PENDING</code> transaction has to get before the
+    pending-alert loop DMs every admin a "<code>N pending payment(s)
+    stuck over Xh</code>" warning. The default is 2h — slow chains
+    can legitimately keep an invoice PENDING for 30+ minutes during
+    confirmation, so anything younger is just normal latency. Save
+    here to override the
+    <code>PENDING_ALERT_THRESHOLD_HOURS</code> env var without a
+    redeploy; the new threshold takes effect on the alert loop's
+    next tick.
+  </p>
+  <p style="margin-top: 4px; color: var(--text-muted); font-size: 12px;">
+    The "source" badge below shows where the currently-applied
+    threshold comes from. <code>db</code> = saved here,
+    <code>env</code> = process env var, <code>default</code> =
+    {{ alert_threshold.default_value }}h. Override range:
+    <code>{{ alert_threshold.minimum }}</code>–<code>{{ alert_threshold.maximum }}</code>
+    hours. The alert loop re-reads the threshold on every iteration
+    so a saved override is live within at most one tick — no
+    restart required. The dashboard tile and the admin DM both
+    pull from the same resolver, so they cannot disagree about
+    "what counts as overdue".
+  </p>
+  <table class="signals-table" style="margin-top: 12px;">
+    <thead>
+      <tr>
+        <td class="label">Field</td>
+        <td class="label">Value</td>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="label">Effective</td>
+        <td class="value">{{ "{:,}".format(alert_threshold.effective) }}h</td>
+      </tr>
+      <tr>
+        <td class="label">Source</td>
+        <td class="value">
+          {% if alert_threshold.source == 'db' %}
+            <span style="color: var(--success);">db</span>
+          {% elif alert_threshold.source == 'env' %}
+            <span style="color: var(--warn, #f9e2af);">env</span>
+          {% else %}
+            <span style="color: var(--text-muted);">default</span>
+          {% endif %}
+        </td>
+      </tr>
+      <tr>
+        <td class="label">DB override</td>
+        <td class="value">
+          {% if alert_threshold.override_value is none %}
+            <span style="color: var(--text-muted);">(not set)</span>
+          {% else %}
+            <code>{{ "{:,}".format(alert_threshold.override_value) }}h</code>
+          {% endif %}
+        </td>
+      </tr>
+      <tr>
+        <td class="label">Env value</td>
+        <td class="value">
+          {% if alert_threshold.env_value is not none %}
+            <code>{{ "{:,}".format(alert_threshold.env_value) }}h</code>
+          {% else %}
+            <span style="color: var(--text-muted);">(unset)</span>
+          {% endif %}
+        </td>
+      </tr>
+    </tbody>
+  </table>
+  <form method="post" action="/admin/control/alert-threshold"
+        style="margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="number" name="alert_threshold_hours"
+           min="{{ alert_threshold.minimum }}"
+           max="{{ alert_threshold.maximum }}"
+           value="{% if alert_threshold.override_value is not none %}{{ alert_threshold.override_value }}{% endif %}"
+           placeholder="hours (e.g. 2)"
+           style="width: 160px;">
+    <button type="submit" name="action" value="set" class="btn-confirm">
+      Save threshold
+    </button>
+    <button type="submit" name="action" value="clear" class="btn-secondary"
+            style="background: transparent; border: 1px solid var(--border, #444); color: var(--text);">
+      Clear DB override
+    </button>
+  </form>
+</div>
+
 <div class="control-card danger-zone">
   <h3>🛑 Force-stop bot</h3>
   <p>
