@@ -2155,7 +2155,7 @@ or unblock other work.
 | 22 | **`I18N_LOCK`** — gate live string overrides during deploy. | Not implemented. | Toggle on `/admin/strings` that blocks the upsert form. | P3 | Pending |
 | 23 | **`MODEL_DISCOVERY_INTERVAL_SECONDS`** — catalog refresh cadence. | Env-only. | Editor on a new `/admin/models-config` page. | P3 | **Shipped** (this PR — new `model_discovery_config.py` module with DB-backed override for `DISCOVERY_INTERVAL_SECONDS`. New `/admin/models-config` page with sidebar link + discovery interval editor (breakdown table + set/clear form). Boot warm-up in `main.py`. Discovery loop re-reads DB-backed interval every tick. Audit slug `models_config_discovery_interval_update`. Bundled bug fix: `delete_setting` now strips NUL bytes from the key, mirroring `upsert_setting`.) |
 | 24 | **`FX_REFRESH_INTERVAL_SECONDS`** — USD→Toman refresh cadence. | Env-only. | Editor on `/admin/wallet-config`. | P3 | Pending |
-| 25 | **`ADMIN_PASSWORD`** rotation — currently env-only. | Env-only. | "Rotate password" form on `/admin` profile page. | P2 | Pending |
+| 25 | **`ADMIN_PASSWORD`** rotation — currently env-only. | Env-only. | "Rotate password" form on `/admin` profile page. | P2 | **Shipped** (this PR — new `admin_password.py` module: scrypt-hashed password (n=2^15, r=8, p=1) stored in `system_settings.ADMIN_PASSWORD_HASH`, DB-backed override slot mirroring rows 4/6/8/20/21/23/24, login flow prefers DB hash → env back-compat → "deploy is misconfigured" refusal. New `/admin/profile` page with sidebar link, "current credential" provenance breakdown (db / env / unset), and password-rotation form (current + new + confirm) gated to `ROLE_SUPER`. Strength gate: ≥12 chars, must include letter + digit/symbol, refuses whitespace-only / unchanged. Boot warm-up in `main.py`; per-request refresh on login + on /admin/profile render. Audit slugs `profile_view`, `admin_password_rotated`, `admin_password_rotation_failed`. Bundled bug fix: `/admin/logout` now sweeps `meow_admin_view_as` AND `meow_flash` cookies in addition to the session cookie — previously a shared workstation leaked the prior operator's "viewing as <role>" preview into the next person's session.) |
 | 26 | **`ADMIN_2FA_ENROLLMENT_TIMEOUT`** — TOTP enrollment window. | Env-only. | Editor on the existing `/admin/enroll_2fa` page. | P3 | Pending |
 | 27 | **CSV export bulk download** — full transactions / usage history. | Per-user only. | Top-level `/admin/exports` page that streams big CSVs. | P3 | Pending |
 | 28 | **Refund presets** — predefined refund reasons / amounts. | Free-form text only. | Dropdown of presets + amount on `/admin/users/<id>/refund`. | P3 | Pending |
@@ -4232,7 +4232,32 @@ The user's process for this project — **do not deviate**:
     Audit slug `models_config_discovery_interval_update`. Bundled bug fix:
     `delete_setting` now strips NUL bytes, mirroring `upsert_setting`.
     47 new tests. Total suite: 3119 passing.
-29. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+29. **Stage-15-Step-E #10b row 24 OPENED** — FX_REFRESH_INTERVAL_SECONDS
+    editor on `/admin/wallet-config`. New `fx_refresh_config.py` module
+    (DB-backed override, range [60, 86400]). FX refresher loop re-reads
+    interval from DB every tick. Audit slug `wallet_config_fx_refresh_update`.
+    Bundled bug fix: cadence sync helper pushes resolved cadence to
+    `bot_health.LOOP_CADENCES` so the `/admin/control` panel's stale-
+    threshold matches the loop's actual sleep duration. 95 new tests.
+    Total suite: 3336 passing.
+30. **Stage-15-Step-E #10b row 25 OPENED** — ADMIN_PASSWORD rotation form
+    on `/admin/profile`. New `admin_password.py` module: scrypt-hashed
+    (n=2^15, r=8, p=1) password stored in
+    `system_settings.ADMIN_PASSWORD_HASH`, DB-backed override mirroring
+    rows 4/6/8/20/21/23/24. Login flow prefers DB hash → env back-compat
+    → "deploy is misconfigured" refusal. New `/admin/profile` page
+    (sidebar link 👤 Profile) with current-credential provenance
+    breakdown + rotation form (current + new + confirm), gated to
+    `ROLE_SUPER`. Strength gate: ≥12 chars, letter + digit/symbol,
+    refuses whitespace-only / unchanged / current-equals-new. Boot
+    warm-up in `main.py`. Audit slugs `profile_view`,
+    `admin_password_rotated`, `admin_password_rotation_failed`.
+    Bundled bug fix: `/admin/logout` now sweeps `meow_admin_view_as`
+    + `meow_flash` cookies in addition to the session cookie —
+    previously a shared workstation leaked the prior operator's
+    "viewing as <role>" preview into the next person's session. 116
+    new tests. Total suite: 3356 passing.
+31. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-30. **Read the §11 working agreement before doing anything.**
+32. **Read the §11 working agreement before doing anything.**

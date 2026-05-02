@@ -15400,3 +15400,470 @@ async def test_role_gates_on_routes_module_definition():
             f"route {route} has no _require_role(ROLE_OPERATOR) "
             f"registration"
         )
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 25: /admin/profile (password rotation)
+# Plus the bundled bug fix on /admin/logout (extra cookie cleanup).
+# ---------------------------------------------------------------------
+
+
+import admin_password as _ap  # noqa: E402  (module imported for tests)
+
+
+def _stub_db_for_profile(
+    *,
+    upsert_setting_result: object | Exception = None,
+    get_setting_result: str | None | Exception = None,
+):
+    """Stub DB pre-wired with the system_settings CRUD needed by the
+    profile-page password rotation handler."""
+    db = _stub_db()
+    if isinstance(upsert_setting_result, Exception):
+        db.upsert_setting = AsyncMock(side_effect=upsert_setting_result)
+    else:
+        db.upsert_setting = AsyncMock(return_value=upsert_setting_result)
+    if isinstance(get_setting_result, Exception):
+        db.get_setting = AsyncMock(side_effect=get_setting_result)
+    else:
+        db.get_setting = AsyncMock(return_value=get_setting_result)
+    return db
+
+
+@pytest.fixture(autouse=False)
+def _reset_admin_password_cache():
+    """Each profile-handler test starts with a clean module cache so
+    the resolution chain (DB hash → env) is deterministic."""
+    _ap.clear_admin_password_hash_override()
+    yield
+    _ap.clear_admin_password_hash_override()
+
+
+async def _login_and_get_profile_csrf(
+    client, password: str = "letmein-1234",
+) -> str:
+    """Log in, fetch /admin/profile, scrape its CSRF token."""
+    await client.post(
+        "/admin/login", data={"password": password}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/profile")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    import re
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+    assert m, "Expected CSRF token on /admin/profile rotation form"
+    return m.group(1)
+
+
+async def test_profile_get_renders_form(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    db = _stub_db_for_profile()
+    client = await aiohttp_client(
+        make_admin_app(password="letmein-1234", db=db)
+    )
+    await client.post(
+        "/admin/login",
+        data={"password": "letmein-1234"},
+        allow_redirects=False,
+    )
+    resp = await client.get("/admin/profile")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert 'action="/admin/profile/rotate-password"' in body
+    assert 'name="csrf_token"' in body
+    assert 'name="current_password"' in body
+    assert 'name="new_password"' in body
+    assert 'name="confirm_password"' in body
+    # Source badge surfaces "Environment variable" since we're using
+    # the back-compat env path (no DB rotation yet).
+    assert "Environment variable" in body
+    # Profile sidebar link active.
+    assert 'class="active"' in body and 'href="/admin/profile"' in body
+
+
+async def test_profile_get_requires_auth(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    client = await aiohttp_client(make_admin_app(password="letmein-1234"))
+    resp = await client.get("/admin/profile", allow_redirects=False)
+    assert resp.status in (302, 303)
+    assert resp.headers.get("Location", "").startswith("/admin/login")
+
+
+async def test_profile_rotate_password_post_requires_auth(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    client = await aiohttp_client(make_admin_app(password="letmein-1234"))
+    resp = await client.post(
+        "/admin/profile/rotate-password",
+        data={
+            "current_password": "letmein-1234",
+            "new_password": "NewPassword99!",
+            "confirm_password": "NewPassword99!",
+            "csrf_token": "x",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303), resp.status
+    assert resp.headers.get("Location", "").startswith("/admin/login")
+
+
+async def test_profile_rotate_password_rejects_csrf_mismatch(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    db = _stub_db_for_profile()
+    client = await aiohttp_client(
+        make_admin_app(password="letmein-1234", db=db)
+    )
+    await _login_and_get_profile_csrf(client, password="letmein-1234")
+    resp = await client.post(
+        "/admin/profile/rotate-password",
+        data={
+            "current_password": "letmein-1234",
+            "new_password": "NewPassword99!",
+            "confirm_password": "NewPassword99!",
+            "csrf_token": "wrong-csrf-token",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303)
+    assert resp.headers.get("Location", "").endswith("/admin/profile")
+    db.upsert_setting.assert_not_awaited()
+
+
+async def test_profile_rotate_password_persists_and_caches(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    """The rotation persists into upsert_setting AND lands the new
+    hash into the in-process cache via refresh-from-DB so subsequent
+    logins prefer the new password over the env back-compat."""
+    saved: dict = {}
+
+    async def _upsert(key, value):
+        saved[key] = value
+        return None
+
+    async def _get(key):
+        return saved.get(key)
+
+    db = _stub_db_for_profile()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+
+    client = await aiohttp_client(
+        make_admin_app(password="letmein-1234", db=db)
+    )
+    csrf = await _login_and_get_profile_csrf(client, password="letmein-1234")
+
+    resp = await client.post(
+        "/admin/profile/rotate-password",
+        data={
+            "current_password": "letmein-1234",
+            "new_password": "NewPasswordRotated2024",
+            "confirm_password": "NewPasswordRotated2024",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303), await resp.text()
+    assert resp.headers.get("Location", "").endswith("/admin/profile")
+    db.upsert_setting.assert_awaited_once()
+    args, _ = db.upsert_setting.call_args
+    assert args[0] == _ap.ADMIN_PASSWORD_HASH_SETTING_KEY
+    assert args[1].startswith("scrypt$")
+    # Cache now carries the rotated hash.
+    cached = _ap.get_admin_password_hash_override()
+    assert cached is not None
+    assert _ap.verify_password("NewPasswordRotated2024", cached)
+    # Old env plaintext is NO longer accepted.
+    assert not _ap.verify_admin_password(
+        "letmein-1234", env_expected="letmein-1234",
+    )
+
+
+async def test_profile_rotate_password_rejects_wrong_current(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    db = _stub_db_for_profile()
+    client = await aiohttp_client(
+        make_admin_app(password="letmein-1234", db=db)
+    )
+    csrf = await _login_and_get_profile_csrf(client, password="letmein-1234")
+    resp = await client.post(
+        "/admin/profile/rotate-password",
+        data={
+            "current_password": "wrong-current-1234",
+            "new_password": "NewPasswordRotated2024",
+            "confirm_password": "NewPasswordRotated2024",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303)
+    db.upsert_setting.assert_not_awaited()
+    assert _ap.get_admin_password_hash_override() is None
+
+
+async def test_profile_rotate_password_rejects_confirm_mismatch(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    db = _stub_db_for_profile()
+    client = await aiohttp_client(
+        make_admin_app(password="letmein-1234", db=db)
+    )
+    csrf = await _login_and_get_profile_csrf(client, password="letmein-1234")
+    resp = await client.post(
+        "/admin/profile/rotate-password",
+        data={
+            "current_password": "letmein-1234",
+            "new_password": "NewPasswordRotated2024",
+            "confirm_password": "DIFFERENT-confirm-99",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303)
+    db.upsert_setting.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "weak_password",
+    [
+        "",                       # empty
+        "short1!",                # below 12
+        "abcdefghijkl",           # alpha-only
+        "123456789012",           # digit-only
+        "             ",          # whitespace-only (12 chars)
+    ],
+)
+async def test_profile_rotate_password_rejects_weak(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+    weak_password,
+):
+    db = _stub_db_for_profile()
+    client = await aiohttp_client(
+        make_admin_app(password="letmein-1234", db=db)
+    )
+    csrf = await _login_and_get_profile_csrf(client, password="letmein-1234")
+    resp = await client.post(
+        "/admin/profile/rotate-password",
+        data={
+            "current_password": "letmein-1234",
+            "new_password": weak_password,
+            "confirm_password": weak_password,
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303)
+    db.upsert_setting.assert_not_awaited()
+
+
+async def test_profile_rotate_password_rejects_unchanged(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    """An operator can't rotate to the same password — refuses with
+    a flash, audits the failure."""
+    db = _stub_db_for_profile()
+    client = await aiohttp_client(
+        make_admin_app(password="letmein-1234", db=db)
+    )
+    csrf = await _login_and_get_profile_csrf(client, password="letmein-1234")
+    resp = await client.post(
+        "/admin/profile/rotate-password",
+        data={
+            "current_password": "letmein-1234",
+            "new_password": "letmein-1234",
+            "confirm_password": "letmein-1234",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303)
+    db.upsert_setting.assert_not_awaited()
+
+
+async def test_profile_rotate_password_db_error_flashes(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    """upsert_setting raising → flash an error, leave cache as-is."""
+    db = _stub_db_for_profile(
+        upsert_setting_result=RuntimeError("db down"),
+    )
+    client = await aiohttp_client(
+        make_admin_app(password="letmein-1234", db=db)
+    )
+    csrf = await _login_and_get_profile_csrf(client, password="letmein-1234")
+    resp = await client.post(
+        "/admin/profile/rotate-password",
+        data={
+            "current_password": "letmein-1234",
+            "new_password": "NewPasswordRotated2024",
+            "confirm_password": "NewPasswordRotated2024",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303)
+    # Cache stays as-is — rotation failed at the persistence step.
+    assert _ap.get_admin_password_hash_override() is None
+
+
+async def test_login_post_uses_db_hash_after_rotation(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    """End-to-end: rotate via /admin/profile, then sign in with the
+    NEW password (not the env back-compat) on a fresh login flow."""
+    saved: dict = {}
+
+    async def _upsert(key, value):
+        saved[key] = value
+        return None
+
+    async def _get(key):
+        return saved.get(key)
+
+    db = _stub_db_for_profile()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+
+    client = await aiohttp_client(
+        make_admin_app(password="letmein-1234", db=db)
+    )
+    csrf = await _login_and_get_profile_csrf(client, password="letmein-1234")
+    await client.post(
+        "/admin/profile/rotate-password",
+        data={
+            "current_password": "letmein-1234",
+            "new_password": "NewPasswordRotated2024",
+            "confirm_password": "NewPasswordRotated2024",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+
+    # Sign out, then sign in with the NEW password — should succeed.
+    await client.get("/admin/logout")
+    resp_new = await client.post(
+        "/admin/login",
+        data={"password": "NewPasswordRotated2024"},
+        allow_redirects=False,
+    )
+    assert resp_new.status == 302
+    assert resp_new.headers["Location"] == "/admin/"
+
+
+async def test_login_post_rejects_old_env_after_rotation(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    """End-to-end: after rotation the OLD env plaintext is rejected
+    even if it stays in app config (the canonical "rotated" flow)."""
+    saved: dict = {}
+
+    async def _upsert(key, value):
+        saved[key] = value
+        return None
+
+    async def _get(key):
+        return saved.get(key)
+
+    db = _stub_db_for_profile()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+
+    client = await aiohttp_client(
+        make_admin_app(password="letmein-1234", db=db)
+    )
+    csrf = await _login_and_get_profile_csrf(client, password="letmein-1234")
+    await client.post(
+        "/admin/profile/rotate-password",
+        data={
+            "current_password": "letmein-1234",
+            "new_password": "NewPasswordRotated2024",
+            "confirm_password": "NewPasswordRotated2024",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    await client.get("/admin/logout")
+    resp_old = await client.post(
+        "/admin/login",
+        data={"password": "letmein-1234"},
+        allow_redirects=False,
+    )
+    # Old env value NO longer signs in — DB hash wins.
+    assert resp_old.status == 401
+
+
+# ---------------------------------------------------------------------
+# Bundled bug fix: /admin/logout clears every cookie the panel sets
+# ---------------------------------------------------------------------
+
+
+async def test_logout_clears_view_as_cookie(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    """The previous logout impl only cleared the session cookie,
+    leaving the signed view-as cookie behind. Verify the rotation-
+    PR bug fix sweeps it too."""
+    client = await aiohttp_client(make_admin_app(password="letmein-1234"))
+    await client.post(
+        "/admin/login",
+        data={"password": "letmein-1234"},
+        allow_redirects=False,
+    )
+    # Set a view-as cookie via the toggle endpoint.
+    body = await (await client.get("/admin/")).text()
+    import re
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+    csrf = m.group(1) if m else ""
+    await client.post(
+        "/admin/view-as",
+        data={"role": "viewer", "csrf_token": csrf, "next": "/admin/"},
+        allow_redirects=False,
+    )
+    # Confirm the cookie is set on the client.
+    cookie_jar = client.session.cookie_jar
+    cookies_pre = {c.key: c.value for c in cookie_jar}
+    assert "meow_admin_view_as" in cookies_pre, cookies_pre
+
+    resp = await client.get("/admin/logout", allow_redirects=False)
+    assert resp.status == 302
+    # Logout must emit a Set-Cookie that clears the view-as cookie.
+    set_cookie_headers = resp.headers.getall("Set-Cookie", [])
+    assert any(
+        "meow_admin_view_as=" in h
+        and ("Max-Age=0" in h or "expires=" in h.lower())
+        for h in set_cookie_headers
+    ), set_cookie_headers
+
+
+async def test_logout_clears_flash_cookie(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    """Logout sweeps the flash cookie too, even if no flash is
+    currently set — defensive cleanup is cheap and keeps the post-
+    logout state pristine."""
+    client = await aiohttp_client(make_admin_app(password="letmein-1234"))
+    await client.post(
+        "/admin/login",
+        data={"password": "letmein-1234"},
+        allow_redirects=False,
+    )
+    resp = await client.get("/admin/logout", allow_redirects=False)
+    assert resp.status == 302
+    set_cookie_headers = resp.headers.getall("Set-Cookie", [])
+    # Three cleanup cookies in total: session, view-as, flash.
+    cleared = {
+        "meow_admin": False,
+        "meow_admin_view_as": False,
+        "meow_flash": False,
+    }
+    for h in set_cookie_headers:
+        for key in cleared:
+            if h.startswith(f"{key}=") and (
+                "Max-Age=0" in h or "expires=" in h.lower()
+            ):
+                cleared[key] = True
+    assert all(cleared.values()), (set_cookie_headers, cleared)
