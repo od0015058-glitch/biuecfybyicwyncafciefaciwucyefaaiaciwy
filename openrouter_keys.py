@@ -211,6 +211,54 @@ MAX_COOLDOWN_SECS: float = 3600.0
 _KEY_429_COUNTERS: dict[int, int] = {}
 _KEY_FALLBACK_COUNTERS: dict[int, int] = {}
 
+# ── Stage-15-Step-E #4 follow-up #5: one-shot retry on 429 ────────
+#
+# Aggregate (pool-wide, NOT per-key) counter for the one-shot retry
+# path :func:`ai_engine.chat_with_model` runs after a 429 from the
+# initially-picked key. Outcome labels:
+#
+# * ``"attempted"`` — every 429 that triggered a retry (regardless
+#   of how the retry ended). The denominator for retry-success rate
+#   plots; ``succeeded / attempted`` is the headline metric.
+# * ``"succeeded"`` — retry POST returned a 200 with a parseable
+#   chat-completion body. The user got an AI reply on the second
+#   try; the only operator-visible signal is the bumped counter.
+# * ``"second_429"`` — retry POST also returned 429. The user gets
+#   the existing ``ai_rate_limited`` / ``ai_rate_limited_free``
+#   localised string. The retry burned one extra POST request
+#   against the alternate key but didn't help — this counter
+#   measures "is the rate-limit pool-wide or per-key?".
+# * ``"second_other_status"`` — retry POST returned a non-200,
+#   non-429 (a 5xx, a 401 from a key that just got revoked, etc).
+#   The user sees ``ai_provider_unavailable``; the retry didn't
+#   recover but at least we surfaced the alternate-key error.
+# * ``"transport_error"`` — retry POST raised a ``ClientError`` /
+#   ``TimeoutError`` / similar. The user sees the existing outer
+#   ``ai_transient_error`` (the exception is re-raised after the
+#   counter bump).
+# * ``"no_alternate_key"`` — 429 from the only key in the pool
+#   (or every alternate is also in cooldown for this model). No
+#   retry attempted; the counter is bumped so an operator with a
+#   single-key deploy who's been hitting 429s can correlate the
+#   counter against their pool size and decide whether to add a
+#   second key.
+#
+# Keyed by the outcome label string (a small fixed alphabet) so a
+# Prometheus histogram-style "retry funnel" plot can be rendered
+# without a labelled counter family for each outcome. Reset on
+# ``load_keys()`` and ``reset_key_counters_for_tests`` like the
+# per-key counters.
+_ONE_SHOT_RETRY_COUNTERS: dict[str, int] = {}
+
+_ONE_SHOT_RETRY_OUTCOMES: tuple[str, ...] = (
+    "attempted",
+    "succeeded",
+    "second_429",
+    "second_other_status",
+    "transport_error",
+    "no_alternate_key",
+)
+
 # ── Stage-15-Step-E #4 follow-up #2: per-key request counter ──────
 #
 # Bumped every time :func:`key_for_user` returns a key — both for
@@ -279,6 +327,36 @@ def _increment_key_request(idx: int) -> None:
 def get_key_request_counters() -> dict[int, int]:
     """Read-only snapshot of the per-key request counters."""
     return dict(_KEY_REQUEST_COUNTERS)
+
+
+def _increment_oneshot_retry(outcome: str) -> None:
+    """Bump the pool-wide one-shot-retry counter for *outcome*.
+
+    Tolerates an unknown *outcome* label by silently no-oping —
+    a future caller passing a typoed label shouldn't poison the
+    counter table with an unindexed key. The fixed alphabet is
+    pinned in :data:`_ONE_SHOT_RETRY_OUTCOMES` and the label is
+    validated against it.
+    """
+    if outcome not in _ONE_SHOT_RETRY_OUTCOMES:
+        return
+    _ONE_SHOT_RETRY_COUNTERS[outcome] = (
+        _ONE_SHOT_RETRY_COUNTERS.get(outcome, 0) + 1
+    )
+
+
+def get_oneshot_retry_counters() -> dict[str, int]:
+    """Read-only snapshot of the one-shot-retry outcome counters.
+
+    Returns a fresh ``dict`` keyed by outcome label
+    (``"attempted"`` / ``"succeeded"`` / ``"second_429"`` /
+    ``"second_other_status"`` / ``"transport_error"`` /
+    ``"no_alternate_key"``). Outcomes that have never fired are
+    absent — the metrics layer renders absent labels as zero
+    counters so a deploy that's never seen a 429 retry doesn't
+    show empty rows in the exposition.
+    """
+    return dict(_ONE_SHOT_RETRY_COUNTERS)
 
 
 # ── Stage-15-Step-E #4 follow-up #3: per-key 24h usage tracker ────
@@ -465,6 +543,7 @@ def reset_key_counters_for_tests() -> None:
     _KEY_FALLBACK_COUNTERS.clear()
     _KEY_REQUEST_COUNTERS.clear()
     _KEY_USAGE_BUCKETS.clear()
+    _ONE_SHOT_RETRY_COUNTERS.clear()
 
 
 def load_keys() -> None:
@@ -512,6 +591,7 @@ def load_keys() -> None:
     _KEY_FALLBACK_COUNTERS.clear()
     _KEY_REQUEST_COUNTERS.clear()
     _KEY_USAGE_BUCKETS.clear()
+    _ONE_SHOT_RETRY_COUNTERS.clear()
     _KEY_META.clear()
     # Tag every env-loaded slot so the panel can render a "source"
     # column even on env-only deploys.

@@ -81,6 +81,79 @@ def _patched_session(response: _StubResponse):
     )
 
 
+class _SequencedSessionFactory:
+    """Hand out a fresh stub session for each ``ClientSession(...)``
+    call, with each session pre-bound to the next response in a list.
+
+    Stage-15-Step-E #4 follow-up #5 (one-shot retry on 429) makes
+    :func:`ai_engine.chat_with_model` open *two* ``ClientSession``
+    contexts on the retry path — one for the initial 429 and one
+    for the alternate-key retry. The single-response
+    :class:`_StubSession` returns the same response for both, which
+    can't model "first 429 → second 200". This factory walks a list
+    of responses in order; each ``ClientSession()`` call advances
+    the cursor.
+
+    On exhaustion we recycle the last response (a deliberately
+    forgiving fallback so a test that only declares one response
+    doesn't crash with ``IndexError`` if the production code ever
+    grows a third attempt — the test will fail on its assertion
+    instead, with a clearer message).
+    """
+
+    def __init__(self, responses: list[_StubResponse]):
+        if not responses:
+            raise ValueError("responses must be non-empty")
+        self._responses = list(responses)
+        self.calls: list[dict] = []  # one entry per ``session.post`` call
+
+    def __call__(self, *_args, **_kwargs):
+        if self._responses:
+            response = self._responses.pop(0)
+            if not self._responses:
+                # Keep the last response in case of an extra call.
+                self._responses.append(response)
+        else:  # pragma: no cover — unreachable per the constructor.
+            raise AssertionError("no responses left")
+        return _RecordingSession(response, self.calls)
+
+
+class _RecordingSession(_StubSession):
+    """:class:`_StubSession` that records the kwargs passed to
+    ``session.post`` so a test can assert which Authorization
+    header (i.e. which API key) drove which attempt."""
+
+    def __init__(self, response: _StubResponse, log: list[dict]):
+        super().__init__(response)
+        self._log = log
+
+    def post(self, url, *, headers=None, json=None, **_kwargs):
+        self._log.append(
+            {
+                "url": url,
+                "headers": dict(headers or {}),
+                "json": json,
+            }
+        )
+        return self._response
+
+
+def _patched_sessions(
+    responses: list[_StubResponse],
+) -> tuple[patch, _SequencedSessionFactory]:
+    """Return ``(patch_context, factory)`` — patch
+    ``aiohttp.ClientSession`` to dispense one stub session per call
+    from the factory. The caller uses the patch as a context
+    manager and inspects ``factory.calls`` after the chat to read
+    the per-attempt POST kwargs.
+    """
+    factory = _SequencedSessionFactory(responses)
+    return (
+        patch.object(ai_engine.aiohttp, "ClientSession", factory),
+        factory,
+    )
+
+
 @pytest.fixture
 def stub_db(monkeypatch):
     """Replace ``ai_engine.db`` with an ``AsyncMock`` we can configure
@@ -1344,3 +1417,332 @@ async def test_chat_swallows_record_key_usage_failure(stub_db, caplog):
     # Settlement still happened.
     stub_db.deduct_balance.assert_awaited_once()
     stub_db.log_usage.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #4 follow-up #5: one-shot retry on 429 with the next
+# available key.
+# ---------------------------------------------------------------------
+# Pre-feature: a 429 from OpenRouter on the user's sticky key bounced
+# back to the user immediately as ``ai_rate_limited`` even when the
+# pool had a non-cooled alternate key that would have served the
+# request. The user had to retry by hand. This block pins the
+# in-engine retry: after the first 429 + (key, model) cooldown mark,
+# the engine asks ``key_for_user`` for the next key and — if it's a
+# different key from the first attempt — retries the POST exactly
+# once. The outcome is recorded in the pool-wide one-shot-retry
+# counter so an operator panel can plot retry success rate.
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chat_429_retries_with_alternate_key_and_succeeds(stub_db, monkeypatch):
+    """First key 429s, alternate key returns 200 — user gets the AI
+    reply, the ``succeeded`` retry-outcome counter is bumped, and
+    the retry POST carries the alternate key in its Authorization
+    header (so OpenRouter actually sees the second key)."""
+    import openrouter_keys
+
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys.reset_key_counters_for_tests()
+    openrouter_keys._keys = ["primary-key", "alternate-key"]
+    openrouter_keys._loaded = True
+
+    # Picker: hand back "primary-key" on the first call, "alternate-key"
+    # on the second. Mirrors what ``key_for_user`` would do once
+    # ``mark_key_rate_limited`` cools the primary.
+    picks = iter(["primary-key", "alternate-key"])
+    monkeypatch.setattr(
+        ai_engine,
+        "key_for_user",
+        lambda tid, *, model=None: next(picks),
+    )
+    # ``record_key_usage`` is called with the alternate key after a
+    # successful retry — capture the calls so we can pin that.
+    record_calls: list[str] = []
+
+    async def fake_record_key_usage(api_key, cost, *, db):
+        record_calls.append(api_key)
+
+    monkeypatch.setattr(ai_engine, "record_key_usage", fake_record_key_usage)
+
+    responses = [
+        _StubResponseWithHeaders(status=429, headers={"Retry-After": "5"}),
+        _StubResponse(status=200),  # 200 with the default OK body
+    ]
+    patcher, factory = _patched_sessions(responses)
+    with patcher:
+        reply = await ai_engine.chat_with_model(42, "hi")
+
+    assert reply == "hello back"
+    counters = openrouter_keys.get_oneshot_retry_counters()
+    assert counters.get("attempted") == 1
+    assert counters.get("succeeded") == 1
+    assert counters.get("second_429", 0) == 0
+
+    # Retry POST carried the alternate key.
+    assert len(factory.calls) == 2
+    assert factory.calls[0]["headers"]["Authorization"] == "Bearer primary-key"
+    assert factory.calls[1]["headers"]["Authorization"] == "Bearer alternate-key"
+
+    # Per-key 24h tracker bumped for the alternate key only — the
+    # 429 from the primary never resulted in a billed reply.
+    assert record_calls == ["alternate-key"]
+
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys._keys = []
+    openrouter_keys._loaded = False
+    openrouter_keys.reset_key_counters_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_chat_429_retry_second_429_bumps_second_429_counter(stub_db, monkeypatch):
+    """First key 429s, retry also 429s — the user gets the existing
+    rate-limit reply, BOTH (key, model) pairs are cooled, and the
+    ``second_429`` outcome counter is bumped (but ``succeeded`` stays
+    at 0)."""
+    import openrouter_keys
+
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys.reset_key_counters_for_tests()
+    openrouter_keys._keys = ["primary-key", "alternate-key"]
+    openrouter_keys._loaded = True
+
+    picks = iter(["primary-key", "alternate-key"])
+    monkeypatch.setattr(
+        ai_engine,
+        "key_for_user",
+        lambda tid, *, model=None: next(picks),
+    )
+
+    responses = [
+        _StubResponseWithHeaders(status=429, headers={"Retry-After": "5"}),
+        _StubResponseWithHeaders(status=429, headers={"Retry-After": "10"}),
+    ]
+    patcher, _ = _patched_sessions(responses)
+    with patcher:
+        reply = await ai_engine.chat_with_model(42, "hi")
+
+    # User-facing reply is the rate-limit message (active_model is
+    # ``test/m1``, not ``:free``, so the non-free string is used).
+    assert "hello back" not in reply
+    counters = openrouter_keys.get_oneshot_retry_counters()
+    assert counters.get("attempted") == 1
+    assert counters.get("succeeded", 0) == 0
+    assert counters.get("second_429") == 1
+
+    # Both keys are now in cooldown for the active model — a
+    # subsequent caller's picker would skip both.
+    assert ("primary-key", "test/m1") in openrouter_keys._per_model_cooldowns
+    assert ("alternate-key", "test/m1") in openrouter_keys._per_model_cooldowns
+
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys._keys = []
+    openrouter_keys._loaded = False
+    openrouter_keys.reset_key_counters_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_chat_429_no_alternate_key_skips_retry(stub_db, monkeypatch):
+    """Single-key pool — no alternate to retry against. The picker
+    hands back the same key on the second call (whole-pool exhausted
+    cooldown branch), so we DO NOT make a second POST and bump
+    the ``no_alternate_key`` outcome counter."""
+    import openrouter_keys
+
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys.reset_key_counters_for_tests()
+    openrouter_keys._keys = ["only-key"]
+    openrouter_keys._loaded = True
+
+    # The picker always returns the same key.
+    monkeypatch.setattr(
+        ai_engine,
+        "key_for_user",
+        lambda tid, *, model=None: "only-key",
+    )
+
+    responses = [
+        _StubResponseWithHeaders(status=429, headers={"Retry-After": "5"}),
+    ]
+    patcher, factory = _patched_sessions(responses)
+    with patcher:
+        reply = await ai_engine.chat_with_model(42, "hi")
+
+    # Rate-limit reply (not the OK content).
+    assert reply != "hello back"
+    counters = openrouter_keys.get_oneshot_retry_counters()
+    assert counters.get("attempted", 0) == 0
+    assert counters.get("succeeded", 0) == 0
+    assert counters.get("no_alternate_key") == 1
+
+    # Exactly ONE POST happened — the retry was skipped.
+    assert len(factory.calls) == 1
+    assert factory.calls[0]["headers"]["Authorization"] == "Bearer only-key"
+
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys._keys = []
+    openrouter_keys._loaded = False
+    openrouter_keys.reset_key_counters_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_chat_429_retry_5xx_bumps_second_other_status(stub_db, monkeypatch):
+    """First key 429s, retry returns a 5xx — user gets
+    ``ai_provider_unavailable`` (NOT the rate-limit message — the
+    second attempt's failure isn't a rate-limit) and the
+    ``second_other_status`` counter is bumped."""
+    import openrouter_keys
+
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys.reset_key_counters_for_tests()
+    openrouter_keys._keys = ["primary-key", "alternate-key"]
+    openrouter_keys._loaded = True
+
+    picks = iter(["primary-key", "alternate-key"])
+    monkeypatch.setattr(
+        ai_engine,
+        "key_for_user",
+        lambda tid, *, model=None: next(picks),
+    )
+
+    responses = [
+        _StubResponseWithHeaders(status=429, headers={"Retry-After": "5"}),
+        _StubResponseWithHeaders(status=503, headers={}),
+    ]
+    patcher, _ = _patched_sessions(responses)
+    with patcher:
+        reply = await ai_engine.chat_with_model(42, "hi")
+
+    # The 5xx surfaces as provider-unavailable, not rate-limit.
+    counters = openrouter_keys.get_oneshot_retry_counters()
+    assert counters.get("attempted") == 1
+    assert counters.get("second_other_status") == 1
+    assert counters.get("succeeded", 0) == 0
+    assert counters.get("second_429", 0) == 0
+    assert reply != "hello back"
+
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys._keys = []
+    openrouter_keys._loaded = False
+    openrouter_keys.reset_key_counters_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_chat_429_retry_transport_error_bumps_transport_error(
+    stub_db, monkeypatch
+):
+    """First key 429s, retry POST raises an ``aiohttp.ClientError`` —
+    the engine's outer ``except Exception`` surfaces
+    ``ai_transient_error`` (the existing transport-failure
+    behaviour) and the ``transport_error`` outcome counter is
+    bumped."""
+    import openrouter_keys
+
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys.reset_key_counters_for_tests()
+    openrouter_keys._keys = ["primary-key", "alternate-key"]
+    openrouter_keys._loaded = True
+
+    picks = iter(["primary-key", "alternate-key"])
+    monkeypatch.setattr(
+        ai_engine,
+        "key_for_user",
+        lambda tid, *, model=None: next(picks),
+    )
+
+    # Custom factory: first call returns the 429 stub, second call
+    # raises a ClientError.
+    factory_calls = {"n": 0}
+
+    def factory(*_args, **_kwargs):
+        factory_calls["n"] += 1
+        if factory_calls["n"] == 1:
+            return _StubSession(
+                _StubResponseWithHeaders(
+                    status=429, headers={"Retry-After": "5"}
+                )
+            )
+        raise ai_engine.aiohttp.ClientError("simulated transport failure")
+
+    with patch.object(ai_engine.aiohttp, "ClientSession", factory):
+        reply = await ai_engine.chat_with_model(42, "hi")
+
+    counters = openrouter_keys.get_oneshot_retry_counters()
+    assert counters.get("attempted") == 1
+    assert counters.get("transport_error") == 1
+    # Outer except surfaces ai_transient_error / similar (NOT the
+    # success body).
+    assert reply != "hello back"
+    assert factory_calls["n"] == 2  # both attempts were made
+
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys._keys = []
+    openrouter_keys._loaded = False
+    openrouter_keys.reset_key_counters_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_chat_429_retry_succeeds_charges_correct_key(stub_db, monkeypatch):
+    """After a successful retry, ``record_key_usage`` is called with
+    the *alternate* key (not the original cooled key). Without this
+    rebinding, the 24h-spend dashboard would credit the wrong key
+    on every retry-success."""
+    import openrouter_keys
+
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys.reset_key_counters_for_tests()
+    openrouter_keys._keys = ["primary-key", "alternate-key"]
+    openrouter_keys._loaded = True
+
+    picks = iter(["primary-key", "alternate-key"])
+    monkeypatch.setattr(
+        ai_engine,
+        "key_for_user",
+        lambda tid, *, model=None: next(picks),
+    )
+
+    record_calls: list[tuple[str, float]] = []
+
+    async def fake_record_key_usage(api_key, cost, *, db):
+        record_calls.append((api_key, cost))
+
+    monkeypatch.setattr(ai_engine, "record_key_usage", fake_record_key_usage)
+
+    responses = [
+        _StubResponseWithHeaders(status=429, headers={"Retry-After": "5"}),
+        _StubResponse(status=200),
+    ]
+    patcher, _ = _patched_sessions(responses)
+    with patcher:
+        reply = await ai_engine.chat_with_model(42, "hi")
+
+    assert reply == "hello back"
+    assert len(record_calls) == 1
+    assert record_calls[0][0] == "alternate-key"
+    assert record_calls[0][1] >= 0.0
+
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys._keys = []
+    openrouter_keys._loaded = False
+    openrouter_keys.reset_key_counters_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_chat_200_first_attempt_does_not_bump_retry_counters(stub_db):
+    """Sanity pin: the happy path (200 on the first try) must NOT
+    bump *any* one-shot-retry counter. Without this check a future
+    refactor that mis-wires the counter at the top of the function
+    would inflate retry-success rate plots with non-retry traffic."""
+    import openrouter_keys
+
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys.reset_key_counters_for_tests()
+
+    with _patched_session(_StubResponse()):
+        reply = await ai_engine.chat_with_model(42, "hi")
+
+    assert reply == "hello back"
+    assert openrouter_keys.get_oneshot_retry_counters() == {}
+
+    openrouter_keys.reset_key_counters_for_tests()

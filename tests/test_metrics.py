@@ -761,3 +761,91 @@ def test_render_metrics_per_key_counters_zero_when_pool_empty(monkeypatch):
         'meowassist_openrouter_key_cooldown_remaining_seconds{'
         not in body
     )
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #4 follow-up #5 — one-shot retry exposition pins.
+# ---------------------------------------------------------------------
+
+
+def test_render_metrics_oneshot_retry_renders_outcome_label(monkeypatch):
+    """Each fired retry outcome must render with its label and count;
+    untouched outcomes are absent (Prometheus parses zero from
+    ``rate(...)`` over an absent series). The HELP/TYPE preamble is
+    always rendered so a deploy that's never seen a retry still has
+    a discoverable counter family in the exposition.
+    """
+    import openrouter_keys
+
+    metrics.reset_loop_ticks_for_tests()
+    openrouter_keys.reset_key_counters_for_tests()
+    _patch_collectors(monkeypatch)
+
+    openrouter_keys._increment_oneshot_retry("attempted")
+    openrouter_keys._increment_oneshot_retry("attempted")
+    openrouter_keys._increment_oneshot_retry("attempted")
+    openrouter_keys._increment_oneshot_retry("succeeded")
+    openrouter_keys._increment_oneshot_retry("succeeded")
+    openrouter_keys._increment_oneshot_retry("second_429")
+    openrouter_keys._increment_oneshot_retry("no_alternate_key")
+
+    body = metrics.render_metrics()
+
+    # HELP/TYPE preamble for the family.
+    assert "# HELP meowassist_openrouter_oneshot_retry_total " in body
+    assert "# TYPE meowassist_openrouter_oneshot_retry_total counter" in body
+
+    # Each fired outcome.
+    assert (
+        'meowassist_openrouter_oneshot_retry_total{outcome="attempted"} 3'
+        in body
+    )
+    assert (
+        'meowassist_openrouter_oneshot_retry_total{outcome="succeeded"} 2'
+        in body
+    )
+    assert (
+        'meowassist_openrouter_oneshot_retry_total{outcome="second_429"} 1'
+        in body
+    )
+    assert (
+        'meowassist_openrouter_oneshot_retry_total'
+        '{outcome="no_alternate_key"} 1'
+        in body
+    )
+    # Untouched outcomes don't render rows.
+    assert (
+        'meowassist_openrouter_oneshot_retry_total'
+        '{outcome="transport_error"}'
+        not in body
+    )
+    assert (
+        'meowassist_openrouter_oneshot_retry_total'
+        '{outcome="second_other_status"}'
+        not in body
+    )
+
+    openrouter_keys.reset_key_counters_for_tests()
+
+
+def test_render_metrics_oneshot_retry_empty_when_no_events(monkeypatch):
+    """Family preamble is rendered even with zero outcomes recorded —
+    Prometheus needs the HELP/TYPE rows so a fresh deploy's
+    ``rate(...)`` query doesn't produce a "metric does not exist"
+    no-data state for the operator's alert rule.
+    """
+    import openrouter_keys
+
+    metrics.reset_loop_ticks_for_tests()
+    openrouter_keys.reset_key_counters_for_tests()
+    _patch_collectors(monkeypatch)
+
+    body = metrics.render_metrics()
+
+    assert "# HELP meowassist_openrouter_oneshot_retry_total " in body
+    assert "# TYPE meowassist_openrouter_oneshot_retry_total counter" in body
+    # No labelled rows.
+    assert (
+        'meowassist_openrouter_oneshot_retry_total{'
+        not in body
+    )

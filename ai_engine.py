@@ -9,6 +9,7 @@ import aiohttp
 from admin_toggles import is_model_disabled
 from database import db
 from openrouter_keys import (
+    _increment_oneshot_retry,
     key_for_user,
     mark_key_rate_limited,
     record_key_usage,
@@ -109,6 +110,64 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 # surfaces as ``ai_transient_error``. Falling back to a known-good
 # id keeps the user productive while the row is repaired.
 _ACTIVE_MODEL_FALLBACK = "openai/gpt-3.5-turbo"
+
+
+async def _post_chat_completion(
+    *,
+    api_key: str,
+    payload: dict,
+    timeout: aiohttp.ClientTimeout,
+) -> tuple[int, dict[str, str], str, dict | None]:
+    """One POST attempt to OpenRouter's chat/completions endpoint.
+
+    Returns ``(status, response_headers, body_text, parsed_json)``:
+
+    * ``status`` — HTTP status int.
+    * ``response_headers`` — flat ``dict[str, str]`` mirror of the
+      response headers (only ``Retry-After`` is read by the caller
+      today, but copying the full set keeps the helper general).
+    * ``body_text`` — empty string on a 200 (the caller doesn't need
+      the raw text on the success path; it parses ``parsed_json``);
+      otherwise the raw response body for logging.
+    * ``parsed_json`` — JSON-parsed dict on a 200 (or ``None`` if the
+      body wasn't valid JSON, in which case the caller treats it as
+      ``ai_provider_unavailable``); ``None`` on every non-200.
+
+    Lifted out of the inline POST block in :func:`chat_with_model`
+    (Stage-15-Step-E #4 follow-up #5) so the one-shot retry path
+    can call it twice — once with the user's sticky key and once
+    with the alternate key handed back by ``key_for_user`` after
+    we mark the first key as rate-limited. Exceptions
+    (``aiohttp.ClientError`` / ``asyncio.TimeoutError``) propagate
+    so the caller's outer ``except Exception`` keeps surfacing
+    ``ai_transient_error`` for transport failures.
+    """
+    request_headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=request_headers,
+            json=payload,
+        ) as response:
+            # ``response.headers`` is a ``CIMultiDictProxy``; coerce
+            # to a plain ``dict`` so the caller doesn't need aiohttp
+            # to be importable when reading headers (and so the test
+            # stubs can hand back a plain dict).
+            raw_headers = getattr(response, "headers", None) or {}
+            response_headers = dict(raw_headers)
+            if response.status == 200:
+                # Parse the body once here so the success path
+                # doesn't have to keep the response context alive.
+                try:
+                    parsed = await response.json()
+                except (ValueError, TypeError, aiohttp.ContentTypeError):
+                    parsed = None
+                return response.status, response_headers, "", parsed
+            body_text = await response.text()
+            return response.status, response_headers, body_text, None
 
 
 def _resolve_active_model(raw: object) -> str:
@@ -297,258 +356,360 @@ async def chat_with_model(
     # from a stuck stream.
     timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=50)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload) as response:
-                if response.status != 200:
-                    body = await response.text()
-                    log.error(
-                        "OpenRouter HTTP %d for user %d model=%s: %s",
-                        response.status, telegram_id, active_model, body,
-                    )
-                    # 429 from OpenRouter most often comes from a free
-                    # model whose upstream provider (Google AI Studio,
-                    # Cerebras, etc.) is rate-limiting that specific
-                    # slug — usually the ":free" tier. Generic
-                    # "provider unavailable" obscures the actionable
-                    # advice ("pick a paid model or wait"). Detect the
-                    # ":free" suffix to give a more honest message.
-                    if response.status == 429:
-                        # Stage-15-Step-E #4: put this key in
-                        # cooldown so the next user routed to it
-                        # falls through to a different pool member
-                        # rather than retrying the same hot key.
-                        # Stage-15-Step-E #4 follow-up #4: scope
-                        # the cooldown to ``(api_key, active_model)``
-                        # so other models on the same key keep
-                        # serving — OpenRouter typically 429s a
-                        # specific (often ``:free``) model rather
-                        # than the API key as a whole, and a
-                        # whole-key cooldown over-blocked paid
-                        # traffic on the same key.
-                        # ``_parse_retry_after`` handles both the
-                        # delta-seconds form and the RFC HTTP-date
-                        # form (bundled bug fix); the inner
-                        # ``mark_key_rate_limited`` clamps + falls
-                        # back if the value is still unusable.
-                        # Wrapped in a broad except so a parsing
-                        # quirk doesn't mask the user-facing reply.
-                        try:
-                            retry_after_secs = _parse_retry_after(
-                                response.headers.get("Retry-After")
-                            )
-                            mark_key_rate_limited(
-                                api_key,
-                                retry_after_secs=retry_after_secs,
-                                model=active_model,
-                            )
-                        except Exception:
-                            log.exception(
-                                "mark_key_rate_limited raised "
-                                "unexpectedly for user %d; "
-                                "continuing to user reply.",
-                                telegram_id,
-                            )
-                        if active_model.endswith(":free"):
-                            return t(lang, "ai_rate_limited_free")
-                        return t(lang, "ai_rate_limited")
-                    return t(lang, "ai_provider_unavailable")
-                
-                data = await response.json()
-                # OpenRouter occasionally returns a 200 with a body
-                # shaped like ``{"error": {...}}`` (rate-limit info,
-                # safety-policy block, model-specific provider error)
-                # instead of the OpenAI-style chat completion shape.
-                # Indexing ``data['choices'][0]['message']['content']``
-                # on those bodies raises KeyError / IndexError and
-                # bubbles up as a 'Run polling' crash visible only in
-                # logs — the user sees nothing back. Guard explicitly
-                # and surface the existing 'provider unavailable'
-                # i18n message instead.
-                try:
-                    reply_text = data["choices"][0]["message"]["content"]
-                    prompt_tokens = data["usage"]["prompt_tokens"]
-                    completion_tokens = data["usage"]["completion_tokens"]
-                except (KeyError, IndexError, TypeError):
-                    log.error(
-                        "OpenRouter 200 with unexpected body for user %d "
-                        "model=%s: %.500r",
-                        telegram_id, active_model, data,
-                    )
-                    return t(lang, "ai_provider_unavailable")
+        status, response_headers, body_text, data = await _post_chat_completion(
+            api_key=api_key, payload=payload, timeout=timeout,
+        )
 
-                # Stage-13-Step-B: ``content`` is allowed to be ``null``
-                # in the OpenAI-compatible chat-completion spec — tool
-                # calls return ``{"role": "assistant", "content": null,
-                # "tool_calls": [...]}``, and upstream policy refusals
-                # / safety blocks at OpenRouter sometimes surface as
-                # 200s with ``content: null`` rather than the
-                # ``{"error": ...}`` body shape the guard above
-                # catches. Without this branch the bot would forward
-                # ``None`` (or an empty string) to the handler, which
-                # then hands it to Telegram and gets back ``Bad
-                # Request: message text is empty``. Treat empty /
-                # falsy reply text as the same provider-unavailable
-                # condition the explicit error-body branch already
-                # surfaces, so the user gets a useful message and we
-                # don't bill them for a non-reply.
-                if not reply_text or not str(reply_text).strip():
-                    log.warning(
-                        "OpenRouter 200 with empty/null content for user %d "
-                        "model=%s: %.500r",
-                        telegram_id, active_model, data,
-                    )
-                    return t(lang, "ai_provider_unavailable")
-                
-                # 4. Economic Settlement
-                #
-                # ``free_msgs`` was read from a stale ``users`` row at
-                # the top of this function. Between that read and now
-                # we made a (slow) HTTP call to OpenRouter, so several
-                # concurrent prompts from the same user can all observe
-                # the same pre-call snapshot and all enter the
-                # ``free_msgs > 0`` branch.
-                #
-                # ``decrement_free_message`` is atomic — its WHERE
-                # ``free_messages_left > 0`` only fires once per
-                # remaining free message — so a concurrent racer
-                # returns ``None`` instead of decrementing.
-                # Pre-fix that ``None`` was silently swallowed and
-                # the racer got a free reply with no settlement at
-                # all (no decrement, no balance deduction, no
-                # usage_log row). Five concurrent prompts with
-                # ``free_messages_left=1`` therefore granted four
-                # un-paid replies and the bot ate the OpenRouter cost.
-                #
-                # Fall through to the paid-settlement branch when the
-                # decrement no-ops so the wallet is charged like any
-                # other paid call. The pre-check at the top of this
-                # function still gates whether the user is allowed to
-                # call OpenRouter at all (``free_msgs <= 0`` AND
-                # ``balance < 0.05``), so the worst case here is a
-                # user with one free message and a paid balance who
-                # fires N concurrent prompts: the first decrements
-                # the free counter, the rest spend balance.
-                settled_as_free = False
-                if free_msgs > 0:
-                    decremented = await db.decrement_free_message(telegram_id)
-                    if decremented is not None:
-                        settled_as_free = True
-                    else:
-                        log.info(
-                            "free-message race for user %d: counter "
-                            "already exhausted by a concurrent prompt; "
-                            "falling back to paid settlement",
-                            telegram_id,
-                        )
-                # Stage-15-Step-E #4 follow-up #3: track per-key
-                # 24h usage / cost on the operator panel. We compute
-                # the *would-be* cost for both free and paid branches
-                # so the panel's "24h spend" column reflects upstream
-                # OpenRouter pressure for *this key* — a free user
-                # routed through key #2 still spent OpenRouter quota
-                # on key #2, even though we didn't bill the user.
-                #
-                # ``calculate_cost_async`` is a fast in-memory lookup
-                # (catalog cache + markup arithmetic) so the extra
-                # call on the free path is cheap.
-                cost_for_key_tracker = await calculate_cost_async(
-                    active_model, prompt_tokens, completion_tokens
+        # ── Stage-15-Step-E #4 follow-up #5: one-shot retry on 429
+        #
+        # If the first attempt was rate-limited, mark the (key, model)
+        # pair as cooled and ask the picker for the next available
+        # key. If it hands us back a *different* key (i.e. the pool
+        # has a non-cooled alternate for this model) we retry the
+        # POST exactly once. Past one extra attempt and we surface
+        # the user-visible rate-limit reply — burning more keys on
+        # the user's wait-time budget would feel like a stall, and
+        # we'd risk cooling every key in the pool from a single
+        # user's session (turning a transient single-key 429 into
+        # a pool-wide outage).
+        if status == 429:
+            log.error(
+                "OpenRouter HTTP 429 for user %d model=%s: %s",
+                telegram_id, active_model, body_text,
+            )
+            # Stage-15-Step-E #4: put this key in cooldown so the
+            # next user routed to it falls through to a different
+            # pool member rather than retrying the same hot key.
+            # Stage-15-Step-E #4 follow-up #4: scope the cooldown
+            # to ``(api_key, active_model)`` so other models on the
+            # same key keep serving — OpenRouter typically 429s a
+            # specific (often ``:free``) model rather than the API
+            # key as a whole, and a whole-key cooldown over-blocked
+            # paid traffic on the same key.
+            # ``_parse_retry_after`` handles both the delta-seconds
+            # form and the RFC HTTP-date form (bundled bug fix from
+            # follow-up #4); the inner ``mark_key_rate_limited``
+            # clamps + falls back if the value is still unusable.
+            # Wrapped in a broad except so a parsing quirk doesn't
+            # mask the user-facing reply.
+            try:
+                retry_after_secs = _parse_retry_after(
+                    response_headers.get("Retry-After")
                 )
-                if not settled_as_free:
-                    cost = cost_for_key_tracker
-                    deducted = await db.deduct_balance(telegram_id, cost)
-                    if not deducted:
-                        # Balance was sufficient at the pre-check but a
-                        # concurrent request already drained it. Record the
-                        # usage with cost_deducted_usd=0 so SUM(cost) on
-                        # usage_logs still reconciles with actual balance
-                        # changes; the next call is blocked by the pre-check.
-                        log.warning(
-                            "Insufficient balance at settlement for user %d "
-                            "(would-be cost $%.6f); logging at $0.00.",
-                            telegram_id, cost,
-                        )
-                    charged = cost if deducted else 0.0
-                    await db.log_usage(telegram_id, active_model, prompt_tokens, completion_tokens, charged)
+                mark_key_rate_limited(
+                    api_key,
+                    retry_after_secs=retry_after_secs,
+                    model=active_model,
+                )
+            except Exception:
+                log.exception(
+                    "mark_key_rate_limited raised unexpectedly "
+                    "for user %d; continuing to retry/reply path.",
+                    telegram_id,
+                )
 
-                # Bump the per-key 24h usage tracker + bump
-                # ``last_used_at`` on the DB-backed registry row
-                # (when applicable). Wrapped in a broad except so a
-                # transient failure on either path doesn't lose the
-                # AI reply the user just paid for.
+            # Ask the picker for the next available key. Because we
+            # just cooled ``(api_key, active_model)`` above, the
+            # picker walks past it. A ``RuntimeError`` here ("no
+            # keys configured") would be impossible — we already
+            # got a key once at the top of this function — but
+            # guard defensively so a future refactor that tears
+            # down the pool mid-call doesn't crash the user reply.
+            try:
+                next_key = key_for_user(telegram_id, model=active_model)
+            except RuntimeError:
+                next_key = api_key
+
+            if next_key == api_key:
+                # Single-key pool, OR every alternate is also in
+                # cooldown for this model. The picker logged a
+                # warning already; just record the no-retry outcome
+                # so the operator panel can correlate "lots of 429s
+                # without retries" → "I should add another key".
+                _increment_oneshot_retry("no_alternate_key")
+                if active_model.endswith(":free"):
+                    return t(lang, "ai_rate_limited_free")
+                return t(lang, "ai_rate_limited")
+
+            log.info(
+                "Retrying OpenRouter call for user %d model=%s on "
+                "alternate key after a 429 on the first key.",
+                telegram_id, active_model,
+            )
+            _increment_oneshot_retry("attempted")
+            try:
+                status, response_headers, body_text, data = (
+                    await _post_chat_completion(
+                        api_key=next_key,
+                        payload=payload,
+                        timeout=timeout,
+                    )
+                )
+            except Exception:
+                # Transport failure on the retry POST. Bump the
+                # outcome counter and re-raise so the outer
+                # ``except Exception`` surfaces the existing
+                # ``ai_transient_error`` reply — same behaviour as a
+                # transport failure on the first attempt.
+                _increment_oneshot_retry("transport_error")
+                raise
+
+            # The rest of the function tracks usage / cost /
+            # cooldown against ``api_key``; rebind to the alternate
+            # key the retry actually used so ``record_key_usage``
+            # and any further ``mark_key_rate_limited`` call below
+            # land on the correct slot.
+            api_key = next_key
+
+            if status == 429:
+                _increment_oneshot_retry("second_429")
+                log.error(
+                    "OpenRouter retry HTTP 429 for user %d model=%s: %s",
+                    telegram_id, active_model, body_text,
+                )
                 try:
-                    await record_key_usage(
-                        api_key, cost_for_key_tracker, db=db,
+                    retry_after_secs = _parse_retry_after(
+                        response_headers.get("Retry-After")
+                    )
+                    mark_key_rate_limited(
+                        api_key,
+                        retry_after_secs=retry_after_secs,
+                        model=active_model,
                     )
                 except Exception:
                     log.exception(
-                        "record_key_usage failed for user %d after "
-                        "successful settlement; continuing.",
+                        "mark_key_rate_limited (retry) raised "
+                        "unexpectedly for user %d; continuing to "
+                        "user reply.",
                         telegram_id,
                     )
+                if active_model.endswith(":free"):
+                    return t(lang, "ai_rate_limited_free")
+                return t(lang, "ai_rate_limited")
+            if status != 200:
+                _increment_oneshot_retry("second_other_status")
+                log.error(
+                    "OpenRouter retry HTTP %d for user %d model=%s: %s",
+                    status, telegram_id, active_model, body_text,
+                )
+                return t(lang, "ai_provider_unavailable")
+            # 200 on the retry — fall through to the success path
+            # with ``data`` populated by ``_post_chat_completion``.
+            _increment_oneshot_retry("succeeded")
 
-                # 5. Persist the turn for memory-enabled users. We do
-                #    this AFTER the settlement so a free / paid call
-                #    that already deducted balance doesn't get recorded
-                #    twice if the response parse fails. Persisting both
-                #    sides of the turn keeps the buffer balanced (so
-                #    each fetch returns alternating user/assistant
-                #    pairs in chronological order).
-                #
-                # Stage-15-Step-E #10 bundled fix: persistence is
-                # best-effort. Pre-fix, an INSERT that raised
-                # (``\\x00`` NUL byte in the prompt or reply —
-                # Postgres TEXT rejects with "invalid byte sequence
-                # for encoding UTF8: 0x00" — a transient connection
-                # drop, a deadlock, an FK violation if the user row
-                # was deleted between the chat starting and persist
-                # time, etc.) would bubble out to the outer
-                # ``except Exception`` at the bottom of this
-                # function, the user would see ``ai_transient_error``,
-                # and ``reply_text`` would be lost — even though the
-                # wallet had ALREADY been debited at line ~293 and
-                # the usage_log row had ALREADY been written at line
-                # ~306. Re-prompting would re-charge them. Net
-                # effect: silent double-billing whenever a memory-
-                # enabled user happened to send a prompt or receive
-                # a reply containing a NUL byte (which Telegram does
-                # allow). Fix: catch the persistence failure
-                # locally, log loud-and-once for ops, and still
-                # return the AI reply to the user. Losing one turn
-                # from the memory buffer is much better than
-                # double-billing them; the next turn re-establishes
-                # context naturally because the *current* prompt
-                # they just paid for is the one that matters most.
-                if memory_enabled:
-                    # Stage-15-Step-E #10 follow-up #2: persist the
-                    # image refs alongside the prompt text for vision
-                    # turns. Pre-follow-up, the image was silently
-                    # dropped from the persisted row, so the next
-                    # memory replay surfaced as a text-only turn —
-                    # the model kept the conversational thread but
-                    # lost the visual context that drove the question.
-                    # Empty / None ``image_data_uris`` keeps the
-                    # text-only INSERT shape unchanged.
-                    persisted_uris = (
-                        list(image_data_uris) if image_data_uris else None
-                    )
-                    try:
-                        await db.append_conversation_message(
-                            telegram_id, "user", user_prompt,
-                            image_data_uris=persisted_uris,
-                        )
-                        await db.append_conversation_message(
-                            telegram_id, "assistant", reply_text,
-                        )
-                    except Exception:
-                        log.exception(
-                            "memory persist failed for user %d after "
-                            "successful settlement; returning reply "
-                            "anyway to avoid double-billing on retry.",
-                            telegram_id,
-                        )
+        if status != 200:
+            log.error(
+                "OpenRouter HTTP %d for user %d model=%s: %s",
+                status, telegram_id, active_model, body_text,
+            )
+            return t(lang, "ai_provider_unavailable")
+        if data is None:
+            # 200 but body wasn't parseable JSON — same surface
+            # area the existing "unexpected body shape" branch
+            # below covers, so route it through the same i18n
+            # error string.
+            log.error(
+                "OpenRouter 200 with non-JSON body for user %d "
+                "model=%s.",
+                telegram_id, active_model,
+            )
+            return t(lang, "ai_provider_unavailable")
 
-                return reply_text
+        # OpenRouter occasionally returns a 200 with a body
+        # shaped like ``{"error": {...}}`` (rate-limit info,
+        # safety-policy block, model-specific provider error)
+        # instead of the OpenAI-style chat completion shape.
+        # Indexing ``data['choices'][0]['message']['content']``
+        # on those bodies raises KeyError / IndexError and
+        # bubbles up as a 'Run polling' crash visible only in
+        # logs — the user sees nothing back. Guard explicitly
+        # and surface the existing 'provider unavailable'
+        # i18n message instead.
+        try:
+            reply_text = data["choices"][0]["message"]["content"]
+            prompt_tokens = data["usage"]["prompt_tokens"]
+            completion_tokens = data["usage"]["completion_tokens"]
+        except (KeyError, IndexError, TypeError):
+            log.error(
+                "OpenRouter 200 with unexpected body for user %d "
+                "model=%s: %.500r",
+                telegram_id, active_model, data,
+            )
+            return t(lang, "ai_provider_unavailable")
+
+        # Stage-13-Step-B: ``content`` is allowed to be ``null``
+        # in the OpenAI-compatible chat-completion spec — tool
+        # calls return ``{"role": "assistant", "content": null,
+        # "tool_calls": [...]}``, and upstream policy refusals
+        # / safety blocks at OpenRouter sometimes surface as
+        # 200s with ``content: null`` rather than the
+        # ``{"error": ...}`` body shape the guard above
+        # catches. Without this branch the bot would forward
+        # ``None`` (or an empty string) to the handler, which
+        # then hands it to Telegram and gets back ``Bad
+        # Request: message text is empty``. Treat empty /
+        # falsy reply text as the same provider-unavailable
+        # condition the explicit error-body branch already
+        # surfaces, so the user gets a useful message and we
+        # don't bill them for a non-reply.
+        if not reply_text or not str(reply_text).strip():
+            log.warning(
+                "OpenRouter 200 with empty/null content for user %d "
+                "model=%s: %.500r",
+                telegram_id, active_model, data,
+            )
+            return t(lang, "ai_provider_unavailable")
+                
+        # 4. Economic Settlement
+        #
+        # ``free_msgs`` was read from a stale ``users`` row at
+        # the top of this function. Between that read and now
+        # we made a (slow) HTTP call to OpenRouter, so several
+        # concurrent prompts from the same user can all observe
+        # the same pre-call snapshot and all enter the
+        # ``free_msgs > 0`` branch.
+        #
+        # ``decrement_free_message`` is atomic — its WHERE
+        # ``free_messages_left > 0`` only fires once per
+        # remaining free message — so a concurrent racer
+        # returns ``None`` instead of decrementing.
+        # Pre-fix that ``None`` was silently swallowed and
+        # the racer got a free reply with no settlement at
+        # all (no decrement, no balance deduction, no
+        # usage_log row). Five concurrent prompts with
+        # ``free_messages_left=1`` therefore granted four
+        # un-paid replies and the bot ate the OpenRouter cost.
+        #
+        # Fall through to the paid-settlement branch when the
+        # decrement no-ops so the wallet is charged like any
+        # other paid call. The pre-check at the top of this
+        # function still gates whether the user is allowed to
+        # call OpenRouter at all (``free_msgs <= 0`` AND
+        # ``balance < 0.05``), so the worst case here is a
+        # user with one free message and a paid balance who
+        # fires N concurrent prompts: the first decrements
+        # the free counter, the rest spend balance.
+        settled_as_free = False
+        if free_msgs > 0:
+            decremented = await db.decrement_free_message(telegram_id)
+            if decremented is not None:
+                settled_as_free = True
+            else:
+                log.info(
+                    "free-message race for user %d: counter "
+                    "already exhausted by a concurrent prompt; "
+                    "falling back to paid settlement",
+                    telegram_id,
+                )
+        # Stage-15-Step-E #4 follow-up #3: track per-key
+        # 24h usage / cost on the operator panel. We compute
+        # the *would-be* cost for both free and paid branches
+        # so the panel's "24h spend" column reflects upstream
+        # OpenRouter pressure for *this key* — a free user
+        # routed through key #2 still spent OpenRouter quota
+        # on key #2, even though we didn't bill the user.
+        #
+        # ``calculate_cost_async`` is a fast in-memory lookup
+        # (catalog cache + markup arithmetic) so the extra
+        # call on the free path is cheap.
+        cost_for_key_tracker = await calculate_cost_async(
+            active_model, prompt_tokens, completion_tokens
+        )
+        if not settled_as_free:
+            cost = cost_for_key_tracker
+            deducted = await db.deduct_balance(telegram_id, cost)
+            if not deducted:
+                # Balance was sufficient at the pre-check but a
+                # concurrent request already drained it. Record the
+                # usage with cost_deducted_usd=0 so SUM(cost) on
+                # usage_logs still reconciles with actual balance
+                # changes; the next call is blocked by the pre-check.
+                log.warning(
+                    "Insufficient balance at settlement for user %d "
+                    "(would-be cost $%.6f); logging at $0.00.",
+                    telegram_id, cost,
+                )
+            charged = cost if deducted else 0.0
+            await db.log_usage(telegram_id, active_model, prompt_tokens, completion_tokens, charged)
+
+        # Bump the per-key 24h usage tracker + bump
+        # ``last_used_at`` on the DB-backed registry row
+        # (when applicable). Wrapped in a broad except so a
+        # transient failure on either path doesn't lose the
+        # AI reply the user just paid for.
+        try:
+            await record_key_usage(
+                api_key, cost_for_key_tracker, db=db,
+            )
+        except Exception:
+            log.exception(
+                "record_key_usage failed for user %d after "
+                "successful settlement; continuing.",
+                telegram_id,
+            )
+
+        # 5. Persist the turn for memory-enabled users. We do
+        #    this AFTER the settlement so a free / paid call
+        #    that already deducted balance doesn't get recorded
+        #    twice if the response parse fails. Persisting both
+        #    sides of the turn keeps the buffer balanced (so
+        #    each fetch returns alternating user/assistant
+        #    pairs in chronological order).
+        #
+        # Stage-15-Step-E #10 bundled fix: persistence is
+        # best-effort. Pre-fix, an INSERT that raised
+        # (``\\x00`` NUL byte in the prompt or reply —
+        # Postgres TEXT rejects with "invalid byte sequence
+        # for encoding UTF8: 0x00" — a transient connection
+        # drop, a deadlock, an FK violation if the user row
+        # was deleted between the chat starting and persist
+        # time, etc.) would bubble out to the outer
+        # ``except Exception`` at the bottom of this
+        # function, the user would see ``ai_transient_error``,
+        # and ``reply_text`` would be lost — even though the
+        # wallet had ALREADY been debited at line ~293 and
+        # the usage_log row had ALREADY been written at line
+        # ~306. Re-prompting would re-charge them. Net
+        # effect: silent double-billing whenever a memory-
+        # enabled user happened to send a prompt or receive
+        # a reply containing a NUL byte (which Telegram does
+        # allow). Fix: catch the persistence failure
+        # locally, log loud-and-once for ops, and still
+        # return the AI reply to the user. Losing one turn
+        # from the memory buffer is much better than
+        # double-billing them; the next turn re-establishes
+        # context naturally because the *current* prompt
+        # they just paid for is the one that matters most.
+        if memory_enabled:
+            # Stage-15-Step-E #10 follow-up #2: persist the
+            # image refs alongside the prompt text for vision
+            # turns. Pre-follow-up, the image was silently
+            # dropped from the persisted row, so the next
+            # memory replay surfaced as a text-only turn —
+            # the model kept the conversational thread but
+            # lost the visual context that drove the question.
+            # Empty / None ``image_data_uris`` keeps the
+            # text-only INSERT shape unchanged.
+            persisted_uris = (
+                list(image_data_uris) if image_data_uris else None
+            )
+            try:
+                await db.append_conversation_message(
+                    telegram_id, "user", user_prompt,
+                    image_data_uris=persisted_uris,
+                )
+                await db.append_conversation_message(
+                    telegram_id, "assistant", reply_text,
+                )
+            except Exception:
+                log.exception(
+                    "memory persist failed for user %d after "
+                    "successful settlement; returning reply "
+                    "anyway to avoid double-billing on retry.",
+                    telegram_id,
+                )
+
+        return reply_text
                 
     except Exception:
         log.exception("Unexpected error in chat_with_model for user %d", telegram_id)
