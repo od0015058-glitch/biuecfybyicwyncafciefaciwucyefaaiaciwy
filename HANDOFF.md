@@ -2136,7 +2136,7 @@ or unblock other work.
 | 3 | **Bot-health severity thresholds** (`BOT_HEALTH_*`). | Env-only. | Editor on `/admin/control` with effective/source columns. | P1 | **Shipped** (Stage-15-Step-F follow-up #4 — this PR) |
 | 4 | **`MIN_TOPUP_USD` / `MIN_TOPUP_TOMAN`** — minimum allowed top-up amounts. | Env-only. | Editor on a new `/admin/wallet-config` page. | P2 | **Shipped** — PR-2a (PR #169) added the DB-backed override layer in `payments.py` + boot warm-up; PR-2b (this PR) added the `/admin/wallet-config` page with the MIN_TOPUP_USD editor, audit row (`wallet_config_min_topup_update`), 13 web tests, and sidebar nav link. `MIN_TOPUP_TOMAN` is not a separate knob — it's derived from MIN_TOPUP_USD × FX rate at request time, and the page renders that derived figure inline. |
 | 5 | **`REQUIRED_CHANNEL`** — force-join channel handle. | Env-only. | Editor on `/admin/control` (or new `/admin/access`). | P2 | **Shipped** (this PR — DB-backed override layer in `force_join.py` + boot warm-up + `/admin/control` editor card with set / clear / force-OFF actions, audit row `control_required_channel_update`, sidebar source badge). |
-| 6 | **`FREE_MESSAGES_PER_USER`** — initial free-trial messages. | Env-only. | Editor on `/admin/wallet-config`. | P2 | Pending |
+| 6 | **`FREE_MESSAGES_PER_USER`** — initial free-trial messages. | Env-only. | Editor on `/admin/wallet-config`. | P2 | **Shipped** (this PR — DB-backed override layer in new `free_trial.py` + boot warm-up + `/admin/wallet-config` editor card with set / clear actions, audit row `wallet_config_free_messages_update`, source badge, `Database.create_user` now binds the resolved allowance to the `free_messages_left` parameter so a saved override applies to brand-new registrants without a process restart. Bounds `[0, 10_000]`; the explicit-zero "pay-to-play" path is allowed; existing users are unaffected — `ON CONFLICT (telegram_id) DO NOTHING`.) |
 | 7 | **`REFERRAL_BONUS_PERCENT` + `REFERRAL_BONUS_MAX_USD`** — referral payouts. (Earlier drafts of this row called these `REFERRAL_BONUS_USD` / `REFERRAL_PERCENT`; the actual env-var names in `referral.py` are `REFERRAL_BONUS_PERCENT` and `REFERRAL_BONUS_MAX_USD`.) | Env-only. | Editor on `/admin/wallet-config`. | P2 | **Shipped** (this PR — DB-backed override layer in `referral.py` for both knobs + boot warm-up + `/admin/wallet-config` editor card with combined Save form / per-knob Clear form, audit row `wallet_config_referral_update`). |
 | 8 | **`MEMORY_CONTEXT_LIMIT` / `MEMORY_CONTENT_MAX_CHARS`** — conversation memory caps. | Env-only. | Editor on a new `/admin/memory-config` page. | P3 | Pending |
 | 9 | **Pending-PENDING expiration window** (`PENDING_EXPIRATION_HOURS_DEFAULT`; the actual env-var name in `pending_expiration.py` is `PENDING_EXPIRATION_HOURS`). | Env-only. | Editor on `/admin/control` or `/admin/payments`. | P3 | **Shipped** (this PR — DB-backed override layer in `pending_expiration.py` + boot warm-up + `/admin/control` editor card with set / clear actions, audit row `control_expiration_hours_update`, source badge, audit `meta` carries `threshold_hours_used`). |
@@ -3003,6 +3003,150 @@ in depth for a future tampered audit row that bypasses the
   empty-state, history-query failure swallowed, eras-query
   failure swallowed, page passes the on-screen caps to the DB
   helpers).
+
+### §10b.9 — Row #6 (FREE_MESSAGES_PER_USER editor) — shipped
+
+**Why this was on the roadmap.** The trial allowance has historically
+been pinned by a `FREE_MESSAGES_PER_USER` env var (default `10`). To
+change it the operator had to edit the systemd unit file and restart
+the bot — an outage, even if a brief one. The feature also had a
+schema-level fallback: `users.free_messages_left` had `DEFAULT 10` on
+the column. So if you only changed the env var, the SQL default would
+still grant 10 to anyone who hit a code path that bypassed
+`Database.create_user`. Two sources of truth, both invisible from the
+admin panel.
+
+The Stage-15-Step-E #10b table called for a web editor on
+`/admin/wallet-config`. This row also had a substantive correctness
+component: the editor needed to actually take effect, which meant
+`Database.create_user` had to bind the resolved allowance to its
+`INSERT INTO users (..., free_messages_left)` statement. A naive
+"persist a row in `system_settings` and assume the rest of the bot
+reads it" PR would have left the SQL `DEFAULT 10` as the actual
+authority for new registrations.
+
+**What's in this PR.**
+
+* **`free_trial.py` (new module, 247 lines).** Mirrors
+  `payments.py` (MIN_TOPUP_USD), `referral.py`
+  (REFERRAL_BONUS_PERCENT / MAX_USD), and the
+  `bot_health.py` loop-stale machinery. Public surface:
+  * `DEFAULT_FREE_MESSAGES_PER_USER = 10`
+  * `FREE_MESSAGES_PER_USER_MINIMUM = 0` (explicit zero is allowed —
+    a "pay-to-play only" closed-beta is a real operator scenario)
+  * `FREE_MESSAGES_PER_USER_MAXIMUM = 10_000` (a fat-finger upper
+    limit; nobody should be granting 1M trial messages by accident)
+  * `FREE_MESSAGES_PER_USER_SETTING_KEY = "free_messages_per_user"`
+  * `_coerce_free_messages_per_user(value) → int | None` — strict
+    typed coercer that **rejects `bool` even though
+    `isinstance(True, int)` is True**, rejects `nan` / `inf`,
+    rejects non-integer-valued floats (`2.7` is not a meaningful
+    trial size; round-tripping it through the form would silently
+    drop the fractional part), and rejects out-of-range values.
+    Returns `None` to signal "drop, no fallback" rather than 0 — a
+    silent fallback to 0 would secretly disable the trial.
+  * `_FREE_MESSAGES_PER_USER_OVERRIDE` — process-local cache, set
+    by `set_free_messages_per_user_override`, cleared by
+    `clear_free_messages_per_user_override`, populated at boot
+    (`main.py`) and on every `/admin/wallet-config` GET via
+    `refresh_free_messages_per_user_override_from_db(db)`.
+  * `refresh_*` is **fail-soft**: if the DB pool is down or
+    returns a corrupt value, the previous cache is preserved (no
+    mid-incident revert to env / default). If the row is missing,
+    the cache is cleared (operator deleted it; falling through to
+    env / default is the desired behaviour).
+  * `get_free_messages_per_user()` — public lookup; resolution
+    order is **override → env → default**.
+  * `get_free_messages_per_user_source() → "db" | "env" |
+    "default"` — used for the source badge on the panel + the
+    audit-meta diff.
+
+* **`database.py` (modified).** `Database.create_user(telegram_id,
+  username)` now imports `free_trial`, resolves the allowance via
+  `get_free_messages_per_user()`, and binds it as `$3` to the
+  `INSERT INTO users (telegram_id, username, free_messages_left)`
+  statement. The schema-level `DEFAULT 10` is preserved as a
+  belt-and-suspenders fallback for any code path that bypasses this
+  method, but the explicit `$3` is what makes a saved override
+  actually apply to brand-new registrants. Existing users are
+  unaffected (`ON CONFLICT (telegram_id) DO NOTHING`); to retroactively
+  top up an existing user, the operator goes to `/admin/users/<id>`
+  and uses the balance-adjust form.
+
+* **`main.py` (modified).** Boot sequence now warms the
+  free-messages override from `system_settings` immediately after
+  the referral-bonus refresh and before the bot-health-alert
+  refresh. Logs the loaded value, source, and effective value so an
+  operator restarting the bot can confirm the override was picked up
+  in one `journalctl -u meowassist | grep FREE_MESSAGES_PER_USER`.
+
+* **`web_admin.py` (modified).**
+  * `_build_free_messages_view()` — same shape as
+    `_build_min_topup_view` and `_build_referral_view`: returns the
+    effective value, source, default, env value (raw + parsed),
+    override value, minimum, and maximum. The wallet-config GET
+    handler refreshes the override from the DB before rendering, so
+    a row written from a sibling Devin instance (or from a pgAdmin
+    one-liner) appears on the next page load.
+  * `wallet_config_get()` — calls
+    `free_trial.refresh_free_messages_per_user_override_from_db(db)`
+    in a try-except (DB hiccup must not 500 the page) and passes
+    the new view dict into the template context.
+  * `wallet_config_free_messages_post(request)` — operator-floored
+    (`_require_role(ROLE_OPERATOR)`). CSRF guard first, DB-presence
+    check next (returns to `/admin/wallet-config` with an error
+    flash if the app's DB pool is None, so a misconfigured
+    deployment doesn't crash). Empty form value → delete the row +
+    clear the cache + audit a `clear` action. Filled value → strict
+    coerce, upsert, set override, refresh, audit a `set` action.
+    The audit `meta` carries `before` / `before_source` / `after` /
+    `after_source` so an investigation pinpointing "why did the
+    funnel rate change?" can attribute the change to a specific
+    operator's knob tweak vs. an unrelated signup-funnel shift.
+  * Route registration: `POST /admin/wallet-config/free-messages`,
+    operator-floored. The economic blast radius (free messages =
+    OpenRouter cost we eat directly) earns a higher floor than a
+    pure read.
+  * `AUDIT_ACTION_LABELS["wallet_config_free_messages_update"] =
+    "Trial allowance updated"` so the dropdown filter on
+    `/admin/audit` lets you isolate "trial-allowance changes only".
+
+* **`templates/admin/wallet_config.html` (modified).** New panel
+  card after the referral card. Shows effective allowance + source
+  badge + a 4-row breakdown table (DB override / env / default /
+  effective) so a "we said the override was 5 but the bot's still
+  granting 10" report is debuggable from the page itself. Form has
+  a numeric input with `step=1`, `min=0`, `max=10_000`, plus
+  explanatory text about the new-registrants-only semantics and a
+  pointer to `/admin/users/<id>` for retroactive top-ups.
+
+* **`tests/test_free_trial.py` (new file, 56 tests).** Coercion
+  happy-path (int passthrough, string-to-int, int-valued floats),
+  rejections (bool, nan, inf, out-of-range, non-numeric, non-integer
+  floats), override set/clear/get round-trip, resolution-order
+  matrix (override → env → default), source-tracking matrix,
+  async refresh-from-DB scenarios (valid load, missing row, invalid
+  stored value, DB error preserves previous cache, None DB returns
+  current cache, out-of-range row clears cache, negative row clears
+  cache), and a `Database.create_user` wiring test that pins the
+  SQL parameter binding so a future refactor that "accidentally"
+  drops `$3` blows up at test time rather than silently regressing
+  to the schema-level `DEFAULT 10`.
+
+* **`tests/test_web_admin.py` (modified, +10 tests).** Renders the
+  editor form (CSRF + breakdown), CSRF guard, persists value +
+  refreshes cache, blank value clears the override, parameterised
+  rejection of bad values (non-numeric, nan, inf, negative,
+  non-integer, above cap, well above cap), accepts the explicit
+  zero (closed-beta path), accepts the inclusive maximum, DB
+  upsert failure keeps the previous value (no cache poisoning),
+  audit-meta diff carries before/after with sources.
+
+**Test counts.** 56 new unit tests in `test_free_trial.py` + 10 new
+web tests in `test_web_admin.py` = **66 net new tests**. Total
+suite: 3072 passed, 9 skipped (was 2999 / 9 before this PR). All 4
+CI checks (docker build, pytest 3.11, pytest 3.12, alembic
+roundtrip) green.
 
 ---
 

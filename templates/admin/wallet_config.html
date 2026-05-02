@@ -251,4 +251,90 @@
     </form>
   </details>
 </div>
+
+{# Stage-15-Step-E #10b row 6: FREE_MESSAGES_PER_USER editor.
+   Trial-message allowance for new /start registrants. Same
+   "effective / db / env / default" breakdown as the other
+   wallet-config knobs. Affects ONLY new registrants — existing
+   users keep whatever free_messages_left they had at /start. #}
+<div class="panel" style="margin-top: 1em;">
+  <h3>🎁 Free trial messages</h3>
+  <p style="margin: 0 0 0.75em 0;">
+    Effective allowance:
+    <strong>{{ free_messages_view.effective }}</strong>
+    free message{{ '' if free_messages_view.effective == 1 else 's' }}
+    per new user
+    &nbsp;<span class="badge badge-{{ free_messages_view.source }}">source: {{ free_messages_view.source }}</span>
+  </p>
+  <p style="color: var(--text-muted); margin: 0 0 0.75em 0; font-size: 0.9em;">
+    Granted at <code>/start</code>-time only. Existing users keep
+    whatever count they had at registration; this knob does NOT
+    retroactively top up the running balance. Use the
+    <code>/admin/users/&lt;id&gt;</code> adjust form to grant trial
+    messages to a specific existing user.
+  </p>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-muted); font-size: 0.9em;">
+      Edit free trial allowance (operator+)
+    </summary>
+    <table style="margin: 0.75em 0; font-size: 0.9em; max-width: 36em;">
+      <tbody>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;">DB override</td>
+          <td>
+            {% if free_messages_view.override_value is not none %}
+              <strong>{{ free_messages_view.override_value }}</strong>
+            {% else %}
+              <span style="color: var(--text-muted);">(none — fall through to env / default)</span>
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;">Env (<code>FREE_MESSAGES_PER_USER</code>)</td>
+          <td>
+            {% if free_messages_view.env_value is not none %}
+              {{ free_messages_view.env_value }}
+            {% elif free_messages_view.env_raw %}
+              <span style="color: var(--text-warn);">{{ free_messages_view.env_raw }} (rejected — see logs)</span>
+            {% else %}
+              <span style="color: var(--text-muted);">(unset)</span>
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;">Compile-time default</td>
+          <td>{{ free_messages_view.default_value }}</td>
+        </tr>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;"><strong>Effective</strong></td>
+          <td><strong>{{ free_messages_view.effective }}</strong> (source: {{ free_messages_view.source }})</td>
+        </tr>
+      </tbody>
+    </table>
+    <form method="post"
+          action="/admin/wallet-config/free-messages"
+          style="display: flex; gap: 0.75em; align-items: baseline; flex-wrap: wrap;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>
+        New allowance
+        <input type="number"
+               name="free_messages_per_user"
+               step="1"
+               min="{{ free_messages_view.minimum }}"
+               max="{{ free_messages_view.maximum }}"
+               value="{% if free_messages_view.override_value is not none %}{{ free_messages_view.override_value }}{% endif %}"
+               placeholder="leave blank to clear override"
+               style="width: 12em;">
+      </label>
+      <button type="submit">Save</button>
+      <span style="color: var(--text-muted); font-size: 0.85em;">
+        Range: {{ free_messages_view.minimum }} ≤ n ≤
+        {{ free_messages_view.maximum }}.
+        Blank clears the override. Setting to 0 disables the trial
+        entirely (pay-to-play only).
+      </span>
+    </form>
+  </details>
+</div>
 {% endblock %}

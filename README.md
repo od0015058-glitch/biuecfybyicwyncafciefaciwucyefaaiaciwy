@@ -70,6 +70,22 @@ NowPayments crypto invoices.
   less than cost) and at-or-above `MARKUP_OVERRIDE_MAXIMUM=100.0`
   (a fat-finger `150` for `1.50` is rejected rather than silently
   100× every charge).
+- **Trial-allowance editor** at `/admin/wallet-config` (Stage-15-Step-E
+  #10b row 6) — operator-floored editor for `FREE_MESSAGES_PER_USER`,
+  the trial-message allowance granted at `/start` time. Writes a
+  `free_messages_per_user` row to `system_settings`, warms an
+  in-process override cache in `free_trial.py`, and `Database.create_user`
+  binds the resolved allowance to the `INSERT INTO users (..., free_messages_left)`
+  statement so a saved override applies to every brand-new registrant
+  without a process restart. Existing users are unaffected
+  (`ON CONFLICT (telegram_id) DO NOTHING`); to retroactively top up
+  one user, use the balance-adjust form on `/admin/users/<id>`. Bounds
+  `[0, 10_000]` — explicit `0` is allowed (closed-beta "pay-to-play
+  only" path); the upper cap exists so a fat-finger can't quietly
+  burn through the trial budget. Audit slug
+  `wallet_config_free_messages_update` carries before/after with the
+  resolution source (`db` / `env` / `default`) for clean attribution
+  in the audit feed.
 - Telegram-side admin commands (`/admin`, `/admin_metrics`,
   `/admin_credit`, `/admin_broadcast`, …) for ops via DMs.
 - **Canonical slash-command menu** — on every startup the bot
