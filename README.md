@@ -147,6 +147,17 @@ NowPayments crypto invoices.
   (unlocked). Lock-state is in-process-cached (refreshed on
   every `/admin/strings` GET so a sibling worker's flip lands
   within one request) and warmed at boot.
+- **Spending stats with bucketing** on `/admin/users/{id}/stats`
+  (Stage-15-Step-E #10b row 17) — new admin page with day / week /
+  month bucket selector, aggregate tiles (bucket count, total calls,
+  total cost), and a spending-series table with inline bar chart.
+  `Database.get_user_daily_spending` accepts `bucket='day'` (default,
+  backwards-compatible) / `'week'` / `'month'` to control
+  `date_trunc` granularity. Link from user-detail page. Bundled bug
+  fix: `get_user_admin_summary` now scrubs NaN/Inf from
+  `total_credited_usd` / `total_spent_usd` — pre-fix
+  `float(credited or 0)` passed `Decimal('NaN')` through because NaN
+  is truthy in Python.
 - Telegram-side admin commands (`/admin`, `/admin_metrics`,
   `/admin_credit`, `/admin_broadcast`, …) for ops via DMs.
 - **Canonical slash-command menu** — on every startup the bot
