@@ -519,6 +519,38 @@ async def main():
             "from DB — falling through to env / cadence / default"
         )
 
+    # Stage-15-Step-E #10b row 8: warm the memory-config override
+    # caches so the very first ``append_conversation_message`` and
+    # ``get_recent_messages`` after boot see the operator's configured
+    # caps rather than the env / compile-time defaults. Both knobs
+    # affect every single memory-enabled chat turn, so a one-turn
+    # window where the wrong cap applies is visible to the user.
+    try:
+        import memory_config
+        loaded_ctx = await (
+            memory_config.refresh_memory_context_limit_override_from_db(db)
+        )
+        loaded_chars = await (
+            memory_config
+            .refresh_memory_content_max_chars_override_from_db(db)
+        )
+        log.info(
+            "loaded memory-config overrides from system_settings: "
+            "context_limit=%s (source=%s, effective=%d), "
+            "content_max_chars=%s (source=%s, effective=%d)",
+            loaded_ctx,
+            memory_config.get_memory_context_limit_source(),
+            memory_config.get_memory_context_limit(),
+            loaded_chars,
+            memory_config.get_memory_content_max_chars_source(),
+            memory_config.get_memory_content_max_chars(),
+        )
+    except Exception:
+        log.exception(
+            "failed to load memory-config overrides from DB — "
+            "falling through to env / compile-time defaults"
+        )
+
     # Overwrite BotFather's cached slash-command list with the
     # canonical one. Without this, Telegram shows whatever was last
     # typed into the BotFather "Edit Commands" panel — including
