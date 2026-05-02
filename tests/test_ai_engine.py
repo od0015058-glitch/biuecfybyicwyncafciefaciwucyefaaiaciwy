@@ -923,3 +923,135 @@ async def test_vision_empty_list_treated_as_no_images(stub_db):
 # These tests live in test_database_queries.py — see also the unit
 # tests there. We don't repeat them here; this comment is a cross-
 # reference for future readers who reach for ai_engine first.
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #4 follow-up #3: per-key 24h usage tracker hook +
+# bundled bug fix — ``mark_openrouter_key_used`` is now invoked
+# from the AI call path so the DB-backed registry's ``last_used_at``
+# column actually updates. Pre-fix that column was only set by tests
+# (the panel always rendered ``—``).
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chat_records_per_key_24h_usage(stub_db):
+    """A successful paid completion must append a ``(timestamp,
+    cost)`` entry to the 24h rolling buffer for the key that
+    served the request."""
+    import openrouter_keys
+
+    openrouter_keys._keys = ["test-key"]
+    openrouter_keys._loaded = True
+    openrouter_keys.reset_key_counters_for_tests()
+
+    stub_db.get_user.return_value = {
+        "free_messages_left": 0,
+        "balance_usd": 10.0,
+        "active_model": "test/m1",
+        "language_code": "en",
+        "memory_enabled": False,
+    }
+
+    with _patched_session(_StubResponse()):
+        reply = await ai_engine.chat_with_model(42, "hi")
+    assert reply == "hello back"
+
+    snapshot = openrouter_keys.get_key_24h_usage()
+    # Exactly one entry recorded against idx 0 ("test-key").
+    assert snapshot[0]["requests"] == 1.0
+    # Cost is whatever calculate_cost_async returned for the model
+    # — non-negative and finite.
+    assert snapshot[0]["cost_usd"] >= 0.0
+
+    openrouter_keys._keys = []
+    openrouter_keys._loaded = False
+    openrouter_keys.reset_key_counters_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_chat_free_message_path_still_records_24h_usage(stub_db):
+    """A free-message reply also goes through OpenRouter — so the
+    per-key 24h tracker must register the request even though the
+    user's wallet wasn't touched. The panel's "24h reqs" answer is
+    "what hit OpenRouter against this key", not "what we charged"."""
+    import openrouter_keys
+
+    openrouter_keys._keys = ["test-key"]
+    openrouter_keys._loaded = True
+    openrouter_keys.reset_key_counters_for_tests()
+
+    # Default stub_db has free_messages_left=5 and decrement
+    # returns 4 → free path is taken.
+    with _patched_session(_StubResponse()):
+        await ai_engine.chat_with_model(42, "hi")
+
+    # Verify free path was taken (no balance deduction).
+    stub_db.deduct_balance.assert_not_awaited()
+
+    # But the 24h tracker still got the entry.
+    snapshot = openrouter_keys.get_key_24h_usage()
+    assert snapshot[0]["requests"] == 1.0
+
+    openrouter_keys._keys = []
+    openrouter_keys._loaded = False
+    openrouter_keys.reset_key_counters_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_chat_failed_response_does_not_record_24h_usage(stub_db):
+    """An OpenRouter 429 (or any non-200) must NOT record a 24h
+    entry — the call didn't actually serve a reply, and counting
+    it would inflate the panel's "24h reqs" against the key that
+    just refused the request."""
+    import openrouter_keys
+
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys._keys = ["test-key"]
+    openrouter_keys._loaded = True
+    openrouter_keys.reset_key_counters_for_tests()
+
+    response = _StubResponseWithHeaders(status=429)
+    with _patched_session(response):
+        await ai_engine.chat_with_model(42, "hi")
+
+    snapshot = openrouter_keys.get_key_24h_usage()
+    # No entries appended — the 429 branch returns before settlement.
+    assert snapshot == {}
+
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys._keys = []
+    openrouter_keys._loaded = False
+    openrouter_keys.reset_key_counters_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_chat_swallows_record_key_usage_failure(stub_db, caplog):
+    """A bug or transient failure inside ``record_key_usage`` must
+    NOT lose the AI reply the user just paid for — the wrapper
+    catches and logs.
+    """
+    from unittest.mock import patch
+
+    stub_db.get_user.return_value = {
+        "free_messages_left": 0,
+        "balance_usd": 10.0,
+        "active_model": "test/m1",
+        "language_code": "en",
+        "memory_enabled": False,
+    }
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("simulated tracker bug")
+
+    with _patched_session(_StubResponse()), patch.object(
+        ai_engine, "record_key_usage", boom,
+    ):
+        reply = await ai_engine.chat_with_model(42, "hi")
+
+    # Reply still surfaced — the user was charged, the buffer
+    # update failed, but we returned the assistant text.
+    assert reply == "hello back"
+    # Settlement still happened.
+    stub_db.deduct_balance.assert_awaited_once()
+    stub_db.log_usage.assert_awaited_once()

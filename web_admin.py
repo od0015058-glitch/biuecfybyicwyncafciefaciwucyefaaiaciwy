@@ -5112,6 +5112,7 @@ async def openrouter_keys_get(request: web.Request) -> web.StreamResponse:
     history / DOM dumps.
     """
     from openrouter_keys import (
+        get_key_24h_usage,
         get_key_429_counters,
         get_key_fallback_counters,
         get_key_meta_snapshot,
@@ -5134,6 +5135,10 @@ async def openrouter_keys_get(request: web.Request) -> web.StreamResponse:
     counts_429 = get_key_429_counters()
     counts_fallback = get_key_fallback_counters()
     counts_request = get_key_request_counters()
+    # Stage-15-Step-E #4 follow-up #3: 24h rolling usage / cost
+    # per pool index. Empty dict is fine — the panel template
+    # defaults to zero for any idx not in the dict.
+    usage_24h = get_key_24h_usage()
     meta = get_key_meta_snapshot()
 
     rows: list[dict[str, object]] = []
@@ -5145,6 +5150,7 @@ async def openrouter_keys_get(request: web.Request) -> web.StreamResponse:
             display_name = m.get("label") or f"DB key #{m.get('db_id')}"
         else:
             display_name = f"Env slot {idx + 1}"
+        u = usage_24h.get(idx, {})
         rows.append(
             {
                 "index": idx,
@@ -5158,6 +5164,8 @@ async def openrouter_keys_get(request: web.Request) -> web.StreamResponse:
                 "count_429": int(counts_429.get(idx, 0)),
                 "count_fallback": int(counts_fallback.get(idx, 0)),
                 "count_request": int(counts_request.get(idx, 0)),
+                "requests_24h": int(u.get("requests", 0.0)),
+                "cost_24h_usd": float(u.get("cost_usd", 0.0)),
             }
         )
 

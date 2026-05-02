@@ -6,7 +6,11 @@ import aiohttp
 
 from admin_toggles import is_model_disabled
 from database import db
-from openrouter_keys import key_for_user, mark_key_rate_limited
+from openrouter_keys import (
+    key_for_user,
+    mark_key_rate_limited,
+    record_key_usage,
+)
 from pricing import calculate_cost_async
 from strings import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, t
 from vision import (
@@ -359,10 +363,22 @@ async def chat_with_model(
                             "falling back to paid settlement",
                             telegram_id,
                         )
+                # Stage-15-Step-E #4 follow-up #3: track per-key
+                # 24h usage / cost on the operator panel. We compute
+                # the *would-be* cost for both free and paid branches
+                # so the panel's "24h spend" column reflects upstream
+                # OpenRouter pressure for *this key* — a free user
+                # routed through key #2 still spent OpenRouter quota
+                # on key #2, even though we didn't bill the user.
+                #
+                # ``calculate_cost_async`` is a fast in-memory lookup
+                # (catalog cache + markup arithmetic) so the extra
+                # call on the free path is cheap.
+                cost_for_key_tracker = await calculate_cost_async(
+                    active_model, prompt_tokens, completion_tokens
+                )
                 if not settled_as_free:
-                    cost = await calculate_cost_async(
-                        active_model, prompt_tokens, completion_tokens
-                    )
+                    cost = cost_for_key_tracker
                     deducted = await db.deduct_balance(telegram_id, cost)
                     if not deducted:
                         # Balance was sufficient at the pre-check but a
@@ -377,6 +393,22 @@ async def chat_with_model(
                         )
                     charged = cost if deducted else 0.0
                     await db.log_usage(telegram_id, active_model, prompt_tokens, completion_tokens, charged)
+
+                # Bump the per-key 24h usage tracker + bump
+                # ``last_used_at`` on the DB-backed registry row
+                # (when applicable). Wrapped in a broad except so a
+                # transient failure on either path doesn't lose the
+                # AI reply the user just paid for.
+                try:
+                    await record_key_usage(
+                        api_key, cost_for_key_tracker, db=db,
+                    )
+                except Exception:
+                    log.exception(
+                        "record_key_usage failed for user %d after "
+                        "successful settlement; continuing.",
+                        telegram_id,
+                    )
 
                 # 5. Persist the turn for memory-enabled users. We do
                 #    this AFTER the settlement so a free / paid call

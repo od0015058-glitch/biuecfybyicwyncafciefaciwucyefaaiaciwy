@@ -915,3 +915,286 @@ async def test_refresh_from_db_no_op_fast_path_with_bare_and_numbered():
     await openrouter_keys.refresh_from_db(db)
     assert openrouter_keys._keys == ["n1", "n2", "db-x"]
     _reset_env()
+
+
+# ── Stage-15-Step-E #4 follow-up #3: per-key 24h usage tracker ──────
+
+
+def test_get_key_24h_usage_returns_empty_initially():
+    """Fresh process / fresh test → no 24h usage entries."""
+    openrouter_keys.reset_key_counters_for_tests()
+    assert openrouter_keys.get_key_24h_usage() == {}
+
+
+def test_record_usage_at_idx_appends_to_buffer():
+    """``_record_usage_at_idx`` appends a (timestamp, cost) pair."""
+    openrouter_keys.reset_key_counters_for_tests()
+    openrouter_keys._record_usage_at_idx(0, 0.0125)
+    openrouter_keys._record_usage_at_idx(0, 0.0375)
+    openrouter_keys._record_usage_at_idx(1, 0.0050)
+    snapshot = openrouter_keys.get_key_24h_usage()
+    assert snapshot[0]["requests"] == 2.0
+    # Float rounding tolerance — use approx.
+    assert snapshot[0]["cost_usd"] == pytest.approx(0.05, rel=1e-9)
+    assert snapshot[1]["requests"] == 1.0
+    assert snapshot[1]["cost_usd"] == pytest.approx(0.0050, rel=1e-9)
+    openrouter_keys.reset_key_counters_for_tests()
+
+
+def test_record_usage_at_idx_negative_index_is_noop():
+    """Defence in depth: a stale snapshot shouldn't poison the
+    buffer with a negative index."""
+    openrouter_keys.reset_key_counters_for_tests()
+    openrouter_keys._record_usage_at_idx(-1, 0.5)
+    assert openrouter_keys.get_key_24h_usage() == {}
+
+
+def test_record_usage_at_idx_rejects_non_finite_cost():
+    """NaN / -Inf / +Inf must coerce to 0.0 — a poisoned cost
+    shouldn't permanently corrupt the panel's 24h sum."""
+    openrouter_keys.reset_key_counters_for_tests()
+    openrouter_keys._record_usage_at_idx(0, float("nan"))
+    openrouter_keys._record_usage_at_idx(0, float("inf"))
+    openrouter_keys._record_usage_at_idx(0, float("-inf"))
+    openrouter_keys._record_usage_at_idx(0, -1.0)  # negative
+    snapshot = openrouter_keys.get_key_24h_usage()
+    # Four entries, all with cost coerced to 0.0.
+    assert snapshot[0]["requests"] == 4.0
+    assert snapshot[0]["cost_usd"] == 0.0
+    openrouter_keys.reset_key_counters_for_tests()
+
+
+def test_record_usage_at_idx_handles_non_numeric_cost():
+    """A non-numeric cost (e.g. a stringly-typed pricing bug)
+    must coerce to 0.0 rather than raise. The buffer is for ops
+    eyes-on, not a financial ledger."""
+    openrouter_keys.reset_key_counters_for_tests()
+    openrouter_keys._record_usage_at_idx(0, "not-a-number")  # type: ignore[arg-type]
+    snapshot = openrouter_keys.get_key_24h_usage()
+    assert snapshot[0]["requests"] == 1.0
+    assert snapshot[0]["cost_usd"] == 0.0
+    openrouter_keys.reset_key_counters_for_tests()
+
+
+def test_get_key_24h_usage_trims_expired_entries():
+    """Entries older than 24h must be evicted on read."""
+    openrouter_keys.reset_key_counters_for_tests()
+    import time as _time
+    now = _time.time()
+    # Entry from 25h ago — must be evicted.
+    openrouter_keys._record_usage_at_idx(
+        0, 1.0, ts=now - 25 * 3600,
+    )
+    # Entry from 23h ago — must survive.
+    openrouter_keys._record_usage_at_idx(
+        0, 2.0, ts=now - 23 * 3600,
+    )
+    # Entry from 1s ago — must survive.
+    openrouter_keys._record_usage_at_idx(
+        0, 3.0, ts=now - 1,
+    )
+    snapshot = openrouter_keys.get_key_24h_usage()
+    assert snapshot[0]["requests"] == 2.0
+    assert snapshot[0]["cost_usd"] == pytest.approx(5.0, rel=1e-9)
+    openrouter_keys.reset_key_counters_for_tests()
+
+
+def test_get_key_24h_usage_evicts_idx_when_buffer_empties():
+    """When all entries for an idx expire, the idx must drop out
+    of the dict so the dict size stays bounded by the active key
+    set, not the historical key set."""
+    openrouter_keys.reset_key_counters_for_tests()
+    import time as _time
+    now = _time.time()
+    # Both entries from 30h ago — both must evict.
+    openrouter_keys._record_usage_at_idx(0, 1.0, ts=now - 30 * 3600)
+    openrouter_keys._record_usage_at_idx(0, 2.0, ts=now - 29 * 3600)
+    snapshot = openrouter_keys.get_key_24h_usage()
+    assert snapshot == {}
+    # Internal state is also cleaned up.
+    assert 0 not in openrouter_keys._KEY_USAGE_BUCKETS
+    openrouter_keys.reset_key_counters_for_tests()
+
+
+def test_record_usage_safety_cap_evicts_oldest_entries():
+    """Buffer must self-limit at ``_KEY_USAGE_MAX_ENTRIES``
+    so a buggy caller can't OOM the process."""
+    openrouter_keys.reset_key_counters_for_tests()
+    cap = openrouter_keys._KEY_USAGE_MAX_ENTRIES
+    # Patch to a smaller cap for the test so we don't have to
+    # append 100k entries.
+    original_cap = openrouter_keys._KEY_USAGE_MAX_ENTRIES
+    openrouter_keys._KEY_USAGE_MAX_ENTRIES = 100
+    try:
+        for i in range(150):
+            openrouter_keys._record_usage_at_idx(0, 0.001)
+        # Buffer should be capped well below 150.
+        assert len(openrouter_keys._KEY_USAGE_BUCKETS[0]) < 150
+        assert len(openrouter_keys._KEY_USAGE_BUCKETS[0]) <= 100
+    finally:
+        openrouter_keys._KEY_USAGE_MAX_ENTRIES = original_cap
+        openrouter_keys.reset_key_counters_for_tests()
+
+
+def test_idx_for_api_key_returns_pool_index():
+    """Reverse lookup finds the right index for a known key."""
+    _setup_three_keys()
+    assert openrouter_keys._idx_for_api_key("k0") == 0
+    assert openrouter_keys._idx_for_api_key("k1") == 1
+    assert openrouter_keys._idx_for_api_key("k2") == 2
+    _reset_env()
+
+
+def test_idx_for_api_key_unknown_key_returns_none():
+    """A key not in the current pool returns None — a stale
+    reference (rotated-out key) won't poison the buffer."""
+    _setup_three_keys()
+    assert openrouter_keys._idx_for_api_key("not-in-pool") is None
+    assert openrouter_keys._idx_for_api_key("") is None
+    _reset_env()
+
+
+@pytest.mark.asyncio
+async def test_record_key_usage_appends_to_buffer():
+    """The public ``record_key_usage(api_key, cost)`` entry point
+    appends to the 24h buffer for the matching pool index."""
+    _setup_three_keys()
+    openrouter_keys.reset_key_counters_for_tests()
+    await openrouter_keys.record_key_usage("k1", 0.0125)
+    await openrouter_keys.record_key_usage("k1", 0.0375)
+    snapshot = openrouter_keys.get_key_24h_usage()
+    assert snapshot[1]["requests"] == 2.0
+    assert snapshot[1]["cost_usd"] == pytest.approx(0.05, rel=1e-9)
+    # k0 / k2 have no entries so they don't appear in the snapshot.
+    assert 0 not in snapshot
+    assert 2 not in snapshot
+    _reset_env()
+
+
+@pytest.mark.asyncio
+async def test_record_key_usage_unknown_key_silently_noops():
+    """A stale api_key reference (key rotated out between request
+    start and finish) is silently ignored — no exception, no
+    buffer entry."""
+    _setup_three_keys()
+    openrouter_keys.reset_key_counters_for_tests()
+    await openrouter_keys.record_key_usage("rotated-out-key", 1.0)
+    assert openrouter_keys.get_key_24h_usage() == {}
+    _reset_env()
+
+
+@pytest.mark.asyncio
+async def test_record_key_usage_calls_mark_openrouter_key_used_for_db_key():
+    """Bug fix: ``mark_openrouter_key_used`` is now invoked when
+    ``record_key_usage`` is called for a DB-loaded key. Pre-fix
+    the DB column ``last_used_at`` was never updated — the panel's
+    "Last used" column always rendered ``—``."""
+    _reset_env()
+    os.environ["OPENROUTER_API_KEY_1"] = "env-k0"
+    db = _StubDB([{"id": 42, "label": "main", "api_key": "db-key-1"}])
+    await openrouter_keys.refresh_from_db(db)
+    # Pool is now [env-k0, db-key-1] with idx 1 = db source.
+    assert openrouter_keys._keys == ["env-k0", "db-key-1"]
+
+    # Patch the DB stub to also track mark_openrouter_key_used calls.
+    mark_calls: list[int] = []
+
+    async def fake_mark(key_id):
+        mark_calls.append(key_id)
+
+    db.mark_openrouter_key_used = fake_mark  # type: ignore[attr-defined]
+
+    await openrouter_keys.record_key_usage("db-key-1", 0.025, db=db)
+    assert mark_calls == [42], (
+        "DB key should bump last_used_at via mark_openrouter_key_used"
+    )
+    _reset_env()
+
+
+@pytest.mark.asyncio
+async def test_record_key_usage_skips_mark_for_env_keys():
+    """Env-loaded keys have no DB row → no
+    ``mark_openrouter_key_used`` call."""
+    _setup_three_keys()
+    openrouter_keys.reset_key_counters_for_tests()
+
+    mark_calls: list[int] = []
+
+    class _DB:
+        async def mark_openrouter_key_used(self, key_id):
+            mark_calls.append(key_id)
+
+    db = _DB()
+    await openrouter_keys.record_key_usage("k1", 0.5, db=db)
+    assert mark_calls == []
+    _reset_env()
+
+
+@pytest.mark.asyncio
+async def test_record_key_usage_with_none_db_skips_mark_branch():
+    """``db=None`` is the contract for "don't bump last_used_at"
+    — used by tests / scripts that don't have a DB handle."""
+    _setup_three_keys()
+    openrouter_keys.reset_key_counters_for_tests()
+    # Should not raise even without a db.
+    await openrouter_keys.record_key_usage("k1", 0.5, db=None)
+    assert openrouter_keys.get_key_24h_usage()[1]["requests"] == 1.0
+    _reset_env()
+
+
+@pytest.mark.asyncio
+async def test_record_key_usage_swallows_db_error():
+    """A transient DB error on ``mark_openrouter_key_used`` must
+    not block the user-facing AI reply. The in-memory 24h buffer
+    must still be populated."""
+    _reset_env()
+    os.environ["OPENROUTER_API_KEY_1"] = "env-k0"
+    db = _StubDB([{"id": 7, "label": "x", "api_key": "db-key-1"}])
+    await openrouter_keys.refresh_from_db(db)
+
+    async def boom(key_id):
+        raise RuntimeError("transient DB blip")
+
+    db.mark_openrouter_key_used = boom  # type: ignore[attr-defined]
+
+    # Must NOT raise.
+    await openrouter_keys.record_key_usage("db-key-1", 0.125, db=db)
+
+    # Buffer was still populated — that's the contract.
+    snapshot = openrouter_keys.get_key_24h_usage()
+    assert snapshot[1]["requests"] == 1.0
+    assert snapshot[1]["cost_usd"] == pytest.approx(0.125, rel=1e-9)
+    _reset_env()
+
+
+def test_load_keys_resets_24h_usage_buffer():
+    """Hot reload must reset the per-index 24h buffer alongside
+    the 429/fallback counters — otherwise idx 0 in the new pool
+    inherits idx 0's 24h history from the old pool, even though
+    the underlying api_key is a different deployment slot."""
+    _setup_three_keys()
+    openrouter_keys.reset_key_counters_for_tests()
+    openrouter_keys._record_usage_at_idx(0, 0.5)
+    openrouter_keys._record_usage_at_idx(1, 0.25)
+    assert openrouter_keys.get_key_24h_usage() != {}
+
+    # Reload with a different pool — buffer must reset.
+    os.environ.pop("OPENROUTER_API_KEY_1", None)
+    os.environ.pop("OPENROUTER_API_KEY_2", None)
+    os.environ.pop("OPENROUTER_API_KEY_3", None)
+    os.environ["OPENROUTER_API_KEY_1"] = "new-k0"
+    openrouter_keys.load_keys()
+    assert openrouter_keys.get_key_24h_usage() == {}
+    _reset_env()
+
+
+def test_reset_key_counters_for_tests_clears_24h_buffer():
+    """Tests-only reset wipes the 24h buffer too so each case
+    starts from zero."""
+    _setup_three_keys()
+    openrouter_keys._record_usage_at_idx(0, 0.5)
+    openrouter_keys._record_usage_at_idx(1, 0.25)
+    assert openrouter_keys.get_key_24h_usage() != {}
+    openrouter_keys.reset_key_counters_for_tests()
+    assert openrouter_keys.get_key_24h_usage() == {}
+    _reset_env()
