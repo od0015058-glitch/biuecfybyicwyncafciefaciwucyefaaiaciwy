@@ -572,6 +572,27 @@ async def main():
             "— falling through to env / compile-time default"
         )
 
+    # Stage-15-Step-E #10b row 23: warm the model-discovery interval
+    # override so the first discovery tick uses the operator's saved
+    # cadence rather than the env / compile-time default.
+    try:
+        import model_discovery_config
+        loaded_interval = await (
+            model_discovery_config.refresh_discovery_interval_override_from_db(db)
+        )
+        log.info(
+            "loaded DISCOVERY_INTERVAL_SECONDS override from "
+            "system_settings: %s (source=%s, effective=%ds)",
+            loaded_interval,
+            model_discovery_config.get_discovery_interval_source(),
+            model_discovery_config.get_discovery_interval_seconds(),
+        )
+    except Exception:
+        log.exception(
+            "failed to load DISCOVERY_INTERVAL_SECONDS override from DB "
+            "— falling through to env / compile-time default"
+        )
+
     # Overwrite BotFather's cached slash-command list with the
     # canonical one. Without this, Telegram shows whatever was last
     # typed into the BotFather "Edit Commands" panel — including

@@ -2153,7 +2153,7 @@ or unblock other work.
 | 20 | **Audit retention policy** — audit log grows forever. | No retention. | Editor on `/admin/audit` + nightly delete loop. | P2 | **Shipped** (this PR — DB-backed override layer in new `audit_retention.py` for `AUDIT_RETENTION_DAYS` + background reaper loop that batch-deletes `admin_audit_log` rows older than the retention window (default 90 days, range [7, 3650]). Retention editor card on `/admin/audit` with breakdown table + set/clear form, audit slug `audit_retention_update`. Boot warm-up in `main.py`. Env vars `AUDIT_RETENTION_DAYS`, `AUDIT_RETENTION_INTERVAL_HOURS`, `AUDIT_RETENTION_BATCH` documented in `.env.example`. Bundled bug fix: `list_admin_audit_log` now caps `limit` to 10 000 — previously unbounded, a future caller could OOM the web worker by pulling every audit row.) |
 | 21 | **Bot-health alert cadence** — `BOT_HEALTH_ALERT_INTERVAL_SECONDS`. | Env-only. | Editor on `/admin/control`. | P3 | **Shipped** (PR #173) |
 | 22 | **`I18N_LOCK`** — gate live string overrides during deploy. | Not implemented. | Toggle on `/admin/strings` that blocks the upsert form. | P3 | Pending |
-| 23 | **`MODEL_DISCOVERY_INTERVAL_SECONDS`** — catalog refresh cadence. | Env-only. | Editor on a new `/admin/models-config` page. | P3 | Pending |
+| 23 | **`MODEL_DISCOVERY_INTERVAL_SECONDS`** — catalog refresh cadence. | Env-only. | Editor on a new `/admin/models-config` page. | P3 | **Shipped** (this PR — new `model_discovery_config.py` module with DB-backed override for `DISCOVERY_INTERVAL_SECONDS`. New `/admin/models-config` page with sidebar link + discovery interval editor (breakdown table + set/clear form). Boot warm-up in `main.py`. Discovery loop re-reads DB-backed interval every tick. Audit slug `models_config_discovery_interval_update`. Bundled bug fix: `delete_setting` now strips NUL bytes from the key, mirroring `upsert_setting`.) |
 | 24 | **`FX_REFRESH_INTERVAL_SECONDS`** — USD→Toman refresh cadence. | Env-only. | Editor on `/admin/wallet-config`. | P3 | Pending |
 | 25 | **`ADMIN_PASSWORD`** rotation — currently env-only. | Env-only. | "Rotate password" form on `/admin` profile page. | P2 | Pending |
 | 26 | **`ADMIN_2FA_ENROLLMENT_TIMEOUT`** — TOTP enrollment window. | Env-only. | Editor on the existing `/admin/enroll_2fa` page. | P3 | Pending |
@@ -4215,7 +4215,7 @@ The user's process for this project — **do not deviate**:
     vision turns surface a `[image]` marker in the `.txt` export
     instead of being silently dropped. 72 new tests in
     `tests/test_memory_config.py`. Total suite: 3144 passing.
-27. **Stage-15-Step-E #10b row 20 OPENED** — Audit retention policy.
+27. **Stage-15-Step-E #10b row 20 SHIPPED** — Audit retention policy.
     New `audit_retention.py` module (DB-backed override for
     `AUDIT_RETENTION_DAYS`, default 90, range [7, 3650]) + background
     reaper loop that batch-deletes `admin_audit_log` rows older than
@@ -4225,7 +4225,14 @@ The user's process for this project — **do not deviate**:
     documented in `.env.example`. Bundled bug fix:
     `list_admin_audit_log` now caps `limit` to 10 000 — previously
     unbounded. 50 new tests. Total suite: 3122 passing.
-28. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+28. **Stage-15-Step-E #10b row 23 OPENED** — DISCOVERY_INTERVAL_SECONDS
+    editor on `/admin/models-config`. New `model_discovery_config.py`
+    module (DB-backed override, range [60, 604800]). Discovery loop
+    re-reads interval from DB every tick. Sidebar link ⚙️ Models config.
+    Audit slug `models_config_discovery_interval_update`. Bundled bug fix:
+    `delete_setting` now strips NUL bytes, mirroring `upsert_setting`.
+    47 new tests. Total suite: 3119 passing.
+29. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-29. **Read the §11 working agreement before doing anything.**
+30. **Read the §11 working agreement before doing anything.**

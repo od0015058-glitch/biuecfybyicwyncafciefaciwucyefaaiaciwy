@@ -1,0 +1,113 @@
+{% extends "_layout.html" %}
+
+{% block title %}Models config{% endblock %}
+
+{% block extra_head %}
+<style>
+  .config-card {
+    margin-bottom: 20px;
+    padding: 14px;
+  }
+  .config-card summary {
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 14px;
+  }
+  .breakdown td { padding: 4px 16px 4px 0; font-size: 13px; }
+  .breakdown td:first-child { color: var(--text-muted); }
+  code.mono {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  .pill-source {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--text);
+  }
+  .edit-form {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+    flex-wrap: wrap;
+    margin-top: 12px;
+  }
+  .edit-form button.primary {
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 6px;
+    padding: 9px 18px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  .edit-form button.primary:hover { background: var(--accent-hover); }
+</style>
+{% endblock %}
+
+{% block main %}
+<h2>Models config</h2>
+
+{% if flash %}
+<div class="alert alert-{{ flash.kind or 'info' }}" style="margin-bottom: 16px;">
+  {{ flash.message }}
+</div>
+{% endif %}
+
+{# ── Discovery interval editor ───────────────────────────────── #}
+{% if discovery_view %}
+<details class="panel config-card" open>
+  <summary>
+    🔄 Model discovery interval
+    <span class="pill-source" style="margin-left: 8px;">
+      {{ discovery_view.effective_human }}
+      <span style="font-size: 10px; opacity: .7;">({{ discovery_view.source }})</span>
+    </span>
+  </summary>
+  <div style="margin-top: 12px;">
+    <p style="font-size: 13px; color: var(--text-muted); margin: 0 0 10px;">
+      How often the background loop checks OpenRouter for new models.
+      The env var name is <code class="mono">DISCOVERY_INTERVAL_SECONDS</code>.
+    </p>
+    <table class="breakdown">
+      <tr>
+        <td>DB override</td>
+        <td>{% if discovery_view.override_value is not none %}{{ discovery_view.override_value }}s ({{ discovery_view.override_human }}){% else %}—{% endif %}</td>
+      </tr>
+      <tr>
+        <td>Env <code class="mono">DISCOVERY_INTERVAL_SECONDS</code></td>
+        <td>{% if discovery_view.env_value is not none %}{{ discovery_view.env_value }}s{% elif discovery_view.env_raw %}{{ discovery_view.env_raw }} <em>(invalid)</em>{% else %}—{% endif %}</td>
+      </tr>
+      <tr>
+        <td>Default</td>
+        <td>{{ discovery_view.default_value }}s ({{ discovery_view.default_human }})</td>
+      </tr>
+      <tr>
+        <td>Effective</td>
+        <td><strong>{{ discovery_view.effective }}s ({{ discovery_view.effective_human }})</strong></td>
+      </tr>
+    </table>
+    <form method="post" action="/admin/models-config/discovery-interval" class="edit-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="field" style="margin-bottom: 0;">
+        <label for="discovery_interval">Interval (seconds)</label>
+        <input type="number" id="discovery_interval" name="discovery_interval_seconds"
+               min="{{ discovery_view.minimum }}" max="{{ discovery_view.maximum }}"
+               value="{% if discovery_view.override_value is not none %}{{ discovery_view.override_value }}{% endif %}"
+               placeholder="{{ discovery_view.effective }}"
+               style="width: 140px;">
+      </div>
+      <button type="submit" class="primary">Save</button>
+      <span style="font-size: 12px; color: var(--text-muted);">
+        Range: {{ discovery_view.minimum }}s – {{ discovery_view.maximum }}s. Leave blank and save to clear the DB override.
+      </span>
+    </form>
+  </div>
+</details>
+{% endif %}
+{% endblock %}
