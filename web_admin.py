@@ -1769,6 +1769,34 @@ def _build_referral_view() -> dict:
     }
 
 
+def _build_free_messages_view() -> dict:
+    """Snapshot of the resolved FREE_MESSAGES_PER_USER knob.
+
+    Stage-15-Step-E #10b row 6. Same shape as
+    :func:`_build_min_topup_view` so the wallet-config page renders
+    one consistent breakdown for every DB-backed override (effective
+    / db / env / default).
+    """
+    import free_trial
+
+    override_value = free_trial.get_free_messages_per_user_override()
+    env_raw = os.getenv("FREE_MESSAGES_PER_USER", "").strip()
+    env_value: int | None = None
+    if env_raw:
+        env_value = free_trial._coerce_free_messages_per_user(env_raw)
+    effective = int(free_trial.get_free_messages_per_user())
+    return {
+        "effective": effective,
+        "source": free_trial.get_free_messages_per_user_source(),
+        "default_value": int(free_trial.DEFAULT_FREE_MESSAGES_PER_USER),
+        "env_value": env_value,
+        "env_raw": env_raw,
+        "override_value": override_value,
+        "minimum": int(free_trial.FREE_MESSAGES_PER_USER_MINIMUM),
+        "maximum": int(free_trial.FREE_MESSAGES_PER_USER_MAXIMUM),
+    }
+
+
 async def _read_toman_per_usd_from_db(db) -> float | None:
     """Pull the latest USD→Toman rate from the request-scoped DB.
 
@@ -1825,6 +1853,7 @@ async def wallet_config_get(request: web.Request) -> web.StreamResponse:
 
     import payments
     import referral
+    import free_trial
 
     if db is not None:
         try:
@@ -1854,14 +1883,29 @@ async def wallet_config_get(request: web.Request) -> web.StreamResponse:
                 "refresh_referral_bonus_max_usd_override_from_db failed"
             )
             db_error = "Database query failed — see logs."
+        # Stage-15-Step-E #10b row 6: refresh the free-messages
+        # override on every render too.
+        try:
+            await (
+                free_trial
+                .refresh_free_messages_per_user_override_from_db(db)
+            )
+        except Exception:
+            log.exception(
+                "wallet_config_get: "
+                "refresh_free_messages_per_user_override_from_db failed"
+            )
+            db_error = "Database query failed — see logs."
 
     toman_per_usd = await _read_toman_per_usd_from_db(db)
     min_topup_view = _build_min_topup_view(toman_per_usd)
     referral_view = _build_referral_view()
+    free_messages_view = _build_free_messages_view()
 
     ctx = {
         "min_topup_view": min_topup_view,
         "referral_view": referral_view,
+        "free_messages_view": free_messages_view,
         "db_error": db_error,
         "active_page": "wallet_config",
         "csrf_token": csrf_token_for(request),
@@ -2487,6 +2531,229 @@ async def wallet_config_referral_post(
 
 
 # ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 6: /admin/wallet-config —
+# FREE_MESSAGES_PER_USER editor.
+# ---------------------------------------------------------------------
+
+
+async def wallet_config_free_messages_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/wallet-config/free-messages`` — update
+    ``FREE_MESSAGES_PER_USER``.
+
+    Stage-15-Step-E #10b row 6. Operators were forced to redeploy the
+    bot to re-tune the trial-message allowance because it was env-only
+    (with the schema ``DEFAULT 10`` as the compile-time floor). This
+    handler writes the override to the ``system_settings`` overlay
+    (DB-backed), refreshes the in-process cache so the next call to
+    :func:`free_trial.get_free_messages_per_user` (and therefore the
+    next ``Database.create_user`` call) sees the new value without a
+    restart, and audit-logs a row whose ``meta`` carries the diff.
+
+    Form keys:
+
+    * ``free_messages_per_user`` — new effective allowance, or empty /
+      blank to clear the override (fall through to env / default).
+
+    Validation order (mirrors :func:`wallet_config_min_topup_post`):
+
+    1. CSRF.
+    2. Integer parse via :func:`free_trial._coerce_free_messages_per_user`.
+    3. Range check ([``FREE_MESSAGES_PER_USER_MINIMUM``,
+       ``FREE_MESSAGES_PER_USER_MAXIMUM``]) — done by the coercer.
+    4. ``set_free_messages_per_user_override`` defence-in-depth.
+    5. Persist via ``upsert_setting``.
+    6. Audit row.
+    7. Redirect with a flash banner.
+
+    Note: this affects ONLY new ``/start`` registrants from the moment
+    it lands. Existing users keep whatever ``free_messages_left`` they
+    had at registration time — there is no retroactive top-up.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app.get(APP_KEY_DB)
+    form = await request.post()
+
+    guard = _wallet_config_csrf_guard(request, form)
+    if guard is not None:
+        return guard
+
+    if db is None:
+        response = web.HTTPFound(location="/admin/wallet-config")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Database is not configured — free-messages edits "
+                "require a live DB connection."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    import free_trial
+
+    raw_value = str(form.get("free_messages_per_user", "")).strip()
+    previous_effective = int(free_trial.get_free_messages_per_user())
+    previous_source = free_trial.get_free_messages_per_user_source()
+
+    if not raw_value:
+        # Empty field == clear override and fall through to env / default.
+        try:
+            await db.delete_setting(
+                free_trial.FREE_MESSAGES_PER_USER_SETTING_KEY,
+            )
+        except Exception:
+            log.exception(
+                "wallet_config_free_messages_post: delete_setting failed"
+            )
+            response = web.HTTPFound(location="/admin/wallet-config")
+            set_flash(
+                response, kind="error",
+                message=(
+                    "Failed to clear the override — see logs. "
+                    "The previous value is still in effect."
+                ),
+                secret=secret, cookie_secure=cookie_secure,
+            )
+            return response
+        free_trial.clear_free_messages_per_user_override()
+        try:
+            await (
+                free_trial
+                .refresh_free_messages_per_user_override_from_db(db)
+            )
+        except Exception:
+            log.exception(
+                "wallet_config_free_messages_post: "
+                "refresh after clear failed"
+            )
+        new_effective = int(free_trial.get_free_messages_per_user())
+        await _record_audit_safe(
+            request, "wallet_config_free_messages_update",
+            target="free_messages_per_user",
+            meta={
+                "action": "clear",
+                "before": previous_effective,
+                "before_source": previous_source,
+                "after": new_effective,
+                "after_source": (
+                    free_trial.get_free_messages_per_user_source()
+                ),
+            },
+        )
+        response = web.HTTPFound(location="/admin/wallet-config")
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Free-messages override cleared. Effective allowance "
+                f"is now {new_effective} "
+                f"(source: "
+                f"{free_trial.get_free_messages_per_user_source()})."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    parsed = free_trial._coerce_free_messages_per_user(raw_value)
+    if parsed is None:
+        response = web.HTTPFound(location="/admin/wallet-config")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Free messages must be an integer in "
+                f"[{free_trial.FREE_MESSAGES_PER_USER_MINIMUM}, "
+                f"{free_trial.FREE_MESSAGES_PER_USER_MAXIMUM}]. "
+                f"Got: {raw_value!r}. No changes were made."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    # Persist + apply.
+    try:
+        await db.upsert_setting(
+            free_trial.FREE_MESSAGES_PER_USER_SETTING_KEY, str(parsed),
+        )
+    except Exception:
+        log.exception(
+            "wallet_config_free_messages_post: upsert_setting failed "
+            "value=%r", parsed,
+        )
+        response = web.HTTPFound(location="/admin/wallet-config")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Failed to persist the new allowance — see logs. "
+                "The previous value is still in effect."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        free_trial.set_free_messages_per_user_override(parsed)
+    except ValueError:
+        log.exception(
+            "wallet_config_free_messages_post: "
+            "set_free_messages_per_user_override rejected %r after "
+            "upsert succeeded — refreshing from DB",
+            parsed,
+        )
+
+    # Re-read whatever ended up in the DB so the cache reflects the
+    # truth (in case e.g. the upsert wrote a sanitised value that
+    # differs from what set_free_messages_per_user_override accepted).
+    try:
+        await (
+            free_trial
+            .refresh_free_messages_per_user_override_from_db(db)
+        )
+    except Exception:
+        log.exception(
+            "wallet_config_free_messages_post: refresh after upsert failed"
+        )
+
+    new_effective = int(free_trial.get_free_messages_per_user())
+    await _record_audit_safe(
+        request, "wallet_config_free_messages_update",
+        target="free_messages_per_user",
+        meta={
+            "action": "set",
+            "before": previous_effective,
+            "before_source": previous_source,
+            "after": new_effective,
+            "after_source": (
+                free_trial.get_free_messages_per_user_source()
+            ),
+        },
+    )
+    response = web.HTTPFound(location="/admin/wallet-config")
+    if new_effective == previous_effective:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Free-messages allowance unchanged ({new_effective}). "
+                "The override is now persisted in the DB."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    else:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Free-messages allowance updated: "
+                f"{previous_effective} → {new_effective}. The new "
+                f"allowance applies to every NEW /start registration "
+                f"from now on; existing users are unaffected."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    return response
+
+
+# ---------------------------------------------------------------------
 # Admin audit helper (Stage-9-Step-2)
 # ---------------------------------------------------------------------
 
@@ -2609,6 +2876,14 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     # investigation can pin the cause to a knob tweak vs. organic
     # invite-traffic growth.
     "wallet_config_referral_update": "Referral payouts updated",
+    # Stage-15-Step-E #10b row 6: FREE_MESSAGES_PER_USER editor on
+    # ``/admin/wallet-config``. Recorded by
+    # :func:`wallet_config_free_messages_post`; the dropdown entry
+    # lets an operator filter the audit feed to "trial-allowance
+    # changes only" so a "why did our trial-conversion rate change?"
+    # investigation can pin the cause to a knob tweak vs. unrelated
+    # signup-funnel shifts.
+    "wallet_config_free_messages_update": "Trial allowance updated",
     # Stage-15-Step-E #10b row 21: BOT_HEALTH_ALERT_INTERVAL_SECONDS
     # editor on ``/admin/control``. Recorded by
     # :func:`control_alert_interval_post`; the dropdown entry lets
@@ -10413,6 +10688,15 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/wallet-config/referral",
         _require_role(ROLE_OPERATOR)(wallet_config_referral_post),
+    )
+    # Stage-15-Step-E #10b row 6: FREE_MESSAGES_PER_USER editor on
+    # ``/admin/wallet-config``. Operator-floored because changing the
+    # trial allowance directly affects the bot's pre-revenue funnel
+    # economics (free messages = OpenRouter cost we eat); a fat-finger
+    # here can quietly burn the trial budget before anyone notices.
+    app.router.add_post(
+        "/admin/wallet-config/free-messages",
+        _require_role(ROLE_OPERATOR)(wallet_config_free_messages_post),
     )
 
     # Stage-8-Part-2: promo codes. Stage-15-Step-E #5 follow-up #4:

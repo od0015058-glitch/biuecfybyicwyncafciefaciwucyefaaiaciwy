@@ -3558,6 +3558,358 @@ async def test_wallet_config_referral_post_db_failure_keeps_previous_value(
 
 
 # ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 6: /admin/wallet-config —
+# FREE_MESSAGES_PER_USER editor
+# ---------------------------------------------------------------------
+
+
+def _reset_free_messages_override_for_web():
+    """Scrub the in-process free-messages cache so each test sees a
+    clean baseline."""
+    import free_trial
+    free_trial.clear_free_messages_per_user_override()
+
+
+async def test_wallet_config_renders_free_messages_editor_form(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """The page renders the free-messages editor card alongside the
+    other wallet-config knobs, with the "effective / db / env /
+    default" breakdown + a CSRF token on the Save form."""
+    monkeypatch.setenv("FREE_MESSAGES_PER_USER", "15")
+    _reset_free_messages_override_for_web()
+
+    db = _stub_db_for_wallet_config()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/wallet-config")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert 'action="/admin/wallet-config/free-messages"' in body
+    assert 'name="free_messages_per_user"' in body
+    # Effective allowance + source badge for the env-sourced 15.
+    assert "15" in body
+
+
+async def test_wallet_config_free_messages_post_requires_auth(
+    aiohttp_client, make_admin_app,
+):
+    """Unauth requests redirect to /admin/login (the require_auth
+    guard fires before the handler runs)."""
+    client = await aiohttp_client(make_admin_app(password="letmein"))
+    resp = await client.post(
+        "/admin/wallet-config/free-messages",
+        data={"free_messages_per_user": "15", "csrf_token": "x"},
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303), resp.status
+    assert resp.headers.get("Location", "").startswith("/admin/login")
+
+
+async def test_wallet_config_free_messages_post_rejects_csrf_mismatch(
+    aiohttp_client, make_admin_app,
+):
+    """A wrong CSRF token redirects to /admin/wallet-config without
+    touching the DB or the cache."""
+    _reset_free_messages_override_for_web()
+    db = _stub_db_for_wallet_config()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.post(
+        "/admin/wallet-config/free-messages",
+        data={"free_messages_per_user": "15", "csrf_token": "wrong"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/wallet-config"
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+
+
+async def test_wallet_config_free_messages_post_persists_value_and_refreshes_cache(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """Happy path: a valid value goes through ``upsert_setting`` AND
+    updates the in-process override so the next call to
+    :func:`free_trial.get_free_messages_per_user` sees it without a
+    process restart."""
+    monkeypatch.setenv("FREE_MESSAGES_PER_USER", "10")
+    _reset_free_messages_override_for_web()
+
+    saved = {"value": None}
+
+    async def _upsert(key: str, value: str) -> None:
+        import free_trial
+        if key == free_trial.FREE_MESSAGES_PER_USER_SETTING_KEY:
+            saved["value"] = value
+
+    async def _get(key: str):
+        import free_trial
+        if key == free_trial.FREE_MESSAGES_PER_USER_SETTING_KEY:
+            return saved["value"]
+        return None
+
+    db = _stub_db_for_wallet_config()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/free-messages",
+        data={"free_messages_per_user": "25", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302, await resp.text()
+    assert resp.headers["Location"] == "/admin/wallet-config"
+
+    import free_trial
+    db.upsert_setting.assert_awaited_once_with(
+        free_trial.FREE_MESSAGES_PER_USER_SETTING_KEY, "25",
+    )
+    db.delete_setting.assert_not_awaited()
+    # In-process cache reflects the new value.
+    assert free_trial.get_free_messages_per_user_override() == 25
+    assert free_trial.get_free_messages_per_user() == 25
+    # Audit row was recorded.
+    audit_calls = db.record_admin_audit.await_args_list
+    matching = [
+        c for c in audit_calls
+        if c.kwargs.get("action") == "wallet_config_free_messages_update"
+    ]
+    assert matching, audit_calls
+    last_meta = matching[-1].kwargs["meta"]
+    assert last_meta["action"] == "set"
+    assert last_meta["before"] == 10
+    assert last_meta["after"] == 25
+
+
+async def test_wallet_config_free_messages_post_blank_value_clears_override(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """Empty form value drops the override; falls through to env / default."""
+    monkeypatch.setenv("FREE_MESSAGES_PER_USER", "10")
+    _reset_free_messages_override_for_web()
+    import free_trial
+    free_trial.set_free_messages_per_user_override(50)
+    assert free_trial.get_free_messages_per_user() == 50
+
+    db = _stub_db_for_wallet_config(
+        delete_setting_result=True, get_setting_result=None,
+    )
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/free-messages",
+        data={"free_messages_per_user": "", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.delete_setting.assert_awaited_once_with(
+        free_trial.FREE_MESSAGES_PER_USER_SETTING_KEY,
+    )
+    db.upsert_setting.assert_not_awaited()
+    assert free_trial.get_free_messages_per_user_override() is None
+    # Falls through to env (10).
+    assert free_trial.get_free_messages_per_user() == 10
+    # Audit row records the clear action.
+    audit_calls = db.record_admin_audit.await_args_list
+    matching = [
+        c for c in audit_calls
+        if c.kwargs.get("action") == "wallet_config_free_messages_update"
+    ]
+    assert matching
+    assert matching[-1].kwargs["meta"]["action"] == "clear"
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        "not-a-number",
+        "nan",
+        "inf",
+        "-inf",
+        "-1",
+        "10001",
+        "15.5",  # non-integer rejected
+        "100000",  # well above cap
+    ],
+)
+async def test_wallet_config_free_messages_post_rejects_invalid_value(
+    aiohttp_client, make_admin_app, monkeypatch, bad_value,
+):
+    """Anything non-int, non-finite, or outside [0, 10_000] is rejected
+    without touching the DB or the cache."""
+    _reset_free_messages_override_for_web()
+    db = _stub_db_for_wallet_config()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/free-messages",
+        data={
+            "free_messages_per_user": bad_value, "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+    import free_trial
+    assert free_trial.get_free_messages_per_user_override() is None
+
+
+async def test_wallet_config_free_messages_post_accepts_zero(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """A deliberate ``0`` ("no trial — pay-to-play only") IS valid and
+    must round-trip. Closed-beta operators sometimes want this."""
+    _reset_free_messages_override_for_web()
+
+    saved = {"value": None}
+
+    async def _upsert(key: str, value: str) -> None:
+        saved["value"] = value
+
+    async def _get(key: str):
+        return saved["value"]
+
+    db = _stub_db_for_wallet_config()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/free-messages",
+        data={"free_messages_per_user": "0", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    import free_trial
+    db.upsert_setting.assert_awaited_once_with(
+        free_trial.FREE_MESSAGES_PER_USER_SETTING_KEY, "0",
+    )
+    assert free_trial.get_free_messages_per_user() == 0
+
+
+async def test_wallet_config_free_messages_post_accepts_maximum(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """Boundary: the inclusive maximum (10_000) round-trips. Ensures
+    we don't accidentally reject the documented upper bound."""
+    _reset_free_messages_override_for_web()
+
+    saved = {"value": None}
+
+    async def _upsert(key: str, value: str) -> None:
+        saved["value"] = value
+
+    async def _get(key: str):
+        return saved["value"]
+
+    db = _stub_db_for_wallet_config()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    import free_trial
+    resp = await client.post(
+        "/admin/wallet-config/free-messages",
+        data={
+            "free_messages_per_user": str(
+                free_trial.FREE_MESSAGES_PER_USER_MAXIMUM,
+            ),
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_awaited_once()
+    assert (
+        free_trial.get_free_messages_per_user()
+        == free_trial.FREE_MESSAGES_PER_USER_MAXIMUM
+    )
+
+
+async def test_wallet_config_free_messages_post_db_failure_keeps_previous_value(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """A DB upsert failure must NOT poison the in-process cache;
+    previous value stays in effect."""
+    monkeypatch.setenv("FREE_MESSAGES_PER_USER", "10")
+    _reset_free_messages_override_for_web()
+
+    db = _stub_db_for_wallet_config(
+        upsert_setting_result=RuntimeError("boom"),
+    )
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/free-messages",
+        data={"free_messages_per_user": "25", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    import free_trial
+    # Previous env value still effective; no cache poisoning.
+    assert free_trial.get_free_messages_per_user() == 10
+    assert free_trial.get_free_messages_per_user_override() is None
+
+
+async def test_wallet_config_free_messages_post_persists_audit_meta_diff(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """The audit row's ``meta`` carries the before/after diff with
+    sources, so ``/admin/audit`` filter view shows a useful "what
+    changed" line. Sibling pin to the
+    ``wallet_config_min_topup_update`` audit-meta tests."""
+    monkeypatch.setenv("FREE_MESSAGES_PER_USER", "10")
+    _reset_free_messages_override_for_web()
+    saved = {"value": None}
+
+    async def _upsert(key: str, value: str) -> None:
+        saved["value"] = value
+
+    async def _get(key: str):
+        return saved["value"]
+
+    db = _stub_db_for_wallet_config()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/free-messages",
+        data={"free_messages_per_user": "30", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+
+    audit_calls = db.record_admin_audit.await_args_list
+    matching = [
+        c for c in audit_calls
+        if c.kwargs.get("action") == "wallet_config_free_messages_update"
+    ]
+    assert matching
+    meta = matching[-1].kwargs["meta"]
+    # Before came from env (10), after is the new override (30).
+    assert meta["before"] == 10
+    assert meta["before_source"] == "env"
+    assert meta["after"] == 30
+    assert meta["after_source"] == "db"
+
+
+# ---------------------------------------------------------------------
 # Stage-15-Step-E #9 follow-up #2: monetization CSV export
 # ---------------------------------------------------------------------
 

@@ -315,14 +315,30 @@ class Database:
             return await connection.fetchrow(query, telegram_id)
 
     async def create_user(self, telegram_id: int, username: str):
-        """Creates a new user with default 5 free messages."""
+        """Creates a new user with the trial-message allowance
+        resolved by :func:`free_trial.get_free_messages_per_user`.
+
+        Stage-15-Step-E #10b row 6: the historical SQL ``DEFAULT 10``
+        on ``users.free_messages_left`` is preserved as a
+        belt-and-suspenders fallback for any code path that bypasses
+        this method, but the explicit ``$3`` here is what makes a
+        saved override on ``/admin/wallet-config`` apply to new
+        registrants without a schema migration.
+
+        ``ON CONFLICT (telegram_id) DO NOTHING`` so a re-``/start``
+        from an existing user is a no-op — we never reset their
+        trial allowance back up to the configured value (that would
+        let users farm trial messages by re-registering).
+        """
+        from free_trial import get_free_messages_per_user
+        free_msgs = get_free_messages_per_user()
         query = """
-            INSERT INTO users (telegram_id, username) 
-            VALUES ($1, $2) 
+            INSERT INTO users (telegram_id, username, free_messages_left)
+            VALUES ($1, $2, $3)
             ON CONFLICT (telegram_id) DO NOTHING
         """
         async with self.pool.acquire() as connection:
-            await connection.execute(query, telegram_id, username)
+            await connection.execute(query, telegram_id, username, free_msgs)
 
     async def set_language(self, telegram_id: int, language_code: str) -> bool:
         """Sets the user's preferred language. Returns True iff a row was updated."""

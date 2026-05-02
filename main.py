@@ -397,6 +397,30 @@ async def main():
             "falling through to env / compile-time default"
         )
 
+    # Stage-15-Step-E #10b row 6: warm the FREE_MESSAGES_PER_USER
+    # override cache so the very first ``/start`` registration after
+    # boot grants the operator's configured trial allowance rather
+    # than the env / compile-time default. Existing users are
+    # unaffected (``create_user`` is ``ON CONFLICT DO NOTHING``); this
+    # only matters for genuinely-new registrants.
+    try:
+        import free_trial
+        loaded_free = await (
+            free_trial.refresh_free_messages_per_user_override_from_db(db)
+        )
+        log.info(
+            "loaded FREE_MESSAGES_PER_USER override from system_settings: "
+            "%s (source=%s, effective=%d)",
+            loaded_free,
+            free_trial.get_free_messages_per_user_source(),
+            free_trial.get_free_messages_per_user(),
+        )
+    except Exception:
+        log.exception(
+            "failed to load FREE_MESSAGES_PER_USER override from DB — "
+            "falling through to env / compile-time default"
+        )
+
     # Stage-15-Step-E #10b row 21: warm the bot-health alert interval
     # override cache so the very first tick of the alert loop after
     # boot uses the operator's configured cadence rather than the
