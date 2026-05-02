@@ -1421,6 +1421,98 @@ Files in this PR (Stage-15-Step-F follow-up #3):
   appear in the `/admin/audit` dropdown so a future PR can't
   silently drop them.
 
+#### Stage-15-Step-F follow-up #4: DB-backed tunable severity thresholds (queued 2026-05-01)
+
+The four `BOT_HEALTH_*` knobs that drive the classifier
+(`BOT_HEALTH_BUSY_INFLIGHT`, `BOT_HEALTH_LOOP_STALE_SECONDS`,
+`BOT_HEALTH_IPN_DROP_ATTACK_THRESHOLD`,
+`BOT_HEALTH_LOGIN_THROTTLE_ATTACK_KEYS`) used to be env-only — an
+operator who wanted to retune any of them after a traffic spike or
+a wave of forged IPNs had to redeploy the bot. This follow-up wires
+the long-dormant `system_settings` table (seeded since the 0001
+baseline migration but never read in code) as a DB-backed overlay
+that beats env at runtime, exposes a knob editor on
+`/admin/control`, and propagates the new value to every component
+(panel, `/metrics`, alert loop) without a process restart.
+
+The plumbing:
+
+* `database.py` — four new `Database` methods on the system_settings
+  table: `get_setting(key)`, `upsert_setting(key, value)`,
+  `delete_setting(key)`, `list_settings_with_prefix(prefix)`. The
+  whole API is intentionally generic (no per-key validation) — the
+  caller is responsible for parsing + validating the string value
+  before applying it. 50/255-char column limits are enforced
+  defensively to match the existing schema. A future feature (e.g.
+  the upcoming OpenRouter multi-key panel) reuses these methods
+  for any other env knob without touching the DB layer.
+
+* `bot_health.py` — module-level `_THRESHOLD_OVERRIDES` cache,
+  `set_threshold_override(name, value)`,
+  `clear_threshold_override(name)`,
+  `get_threshold_overrides_snapshot()`, and an async
+  `refresh_threshold_overrides_from_db(db)` helper. `_env_int`'s
+  resolution order is now: in-process override → env → default.
+  The refresh helper is fail-safe: a transient DB error keeps the
+  previous cache in place so an outage doesn't silently revert to
+  env defaults mid-incident. Non-dict returns from the DB layer
+  are also tolerated for the same reason.
+
+* `web_admin.py` — `control_get` calls
+  `refresh_threshold_overrides_from_db` on every render so a tweak
+  made in another replica is reflected in the panel. New
+  `_build_thresholds_view()` helper produces one dict per knob with
+  the resolved effective value, the source label
+  (`db` / `env` / `default`), the current DB override, and the
+  per-knob minimum. New `control_thresholds_post` handler does
+  full per-knob validation, writes each row via `upsert_setting`
+  (or `delete_setting` for blank fields), refreshes the cache, and
+  records a single `control_threshold_update` audit row whose
+  `meta` carries the diff (old → new for every changed key).
+  Route registered at `POST /admin/control/thresholds`.
+
+* `templates/admin/control.html` — new "Severity thresholds" card
+  rendering a 4-row table (one per knob) with Effective / Source /
+  Default columns plus a number-input for the new value. Blank
+  field = clear override + fall through to env / default.
+  Submit button + flash banner mirror the kill-switch UX.
+
+**Bundled bug fix.** Audit of `_env_int` while writing the override
+plumbing surfaced a real misconfiguration trap: the helper only
+refused *negative* env values. With `BOT_HEALTH_BUSY_INFLIGHT=0`
+every chat slot tripped BUSY because `inflight_count >= 0` is
+trivially true. With `BOT_HEALTH_IPN_DROP_ATTACK_THRESHOLD=0` the
+panel / Prometheus / alert loop permanently flagged UNDER_ATTACK on
+a healthy bot because `ipn_drops_recent >= 0` is always true. Same
+shape for the other two thresholds. An operator who typed `=0`
+thinking "0 = disabled" or as a typo would silently turn the
+classifier into a constant alarm. Fix: `_env_int` now takes a
+`minimum` kwarg (defaults to `1`) and rejects anything below it
+with the same warning + default fallback as before. All four
+call-sites use the default `minimum=1`. Regression tests cover
+all four env knobs.
+
+Files in this PR (Stage-15-Step-F follow-up #4):
+
+* `database.py` — `get_setting` / `upsert_setting` /
+  `delete_setting` / `list_settings_with_prefix` on `Database`.
+* `bot_health.py` — module-level override cache, public
+  set/clear/snapshot helpers, async refresh-from-DB helper, and
+  the `_env_int` `minimum` kwarg fix.
+* `web_admin.py` — `_build_thresholds_view`, `control_get`
+  refresh hook, `control_thresholds_post` handler, route wiring.
+* `templates/admin/control.html` — Severity thresholds card.
+* `tests/test_bot_health.py` — 12 new tests covering the bug fix
+  (one per knob), set/clear semantics, snapshot copy-on-read,
+  refresh-from-DB happy path, db-error path, none-db path, and
+  non-dict-return path.
+* `tests/test_web_admin.py` — 6 new tests covering form render,
+  happy-path POST + cache application, blank-clears-override,
+  below-minimum rejection, non-int rejection, and CSRF guard.
+  Plus a default `list_settings_with_prefix=AsyncMock({})` on
+  the shared `_stub_db` so existing control-panel tests still
+  pass without per-test wiring.
+
 ---
 
 #### Stage-15-Step-F follow-up #4: cadence introspection on /admin/control (queued 2026-05-01)
@@ -1702,6 +1794,66 @@ assumption.
 | `.env.example` | Documents every required env var including `REDIS_URL`, `ADMIN_USER_IDS`, `COST_MARKUP`. |
 | `tests/` | 286 cases. Strict-warnings pytest config + 3-job CI matrix. |
 | ~~`schema.sql`, `migrations/*.sql`~~ | **Deleted in cleanup PR.** Alembic owns schema. |
+
+---
+
+## 10b. Admin-panel feature gap roadmap (added 2026-05-01)
+
+User asked (2026-05-01) for a comprehensive audit of every
+operator-controllable feature today gated by env vars / commands
+/ DB-only state, with a target of "full access to change anything
+from there [the web admin panel]". The audit below is a running
+roadmap; mark rows as **shipped** + the PR number as each lands.
+Items are in rough priority order — top items are highest-impact
+or unblock other work.
+
+| # | Gap | Today | Target panel surface | Priority | Status |
+|---|-----|-------|----------------------|----------|--------|
+| 1 | **OpenRouter API keys** — multi-key load balancer is configured by env (`OPENROUTER_API_KEY` comma-separated). | Read-only `/admin/openrouter-keys` shows usage. | New `/admin/openrouter-keys` add/remove/disable + per-key 24h usage / cost / 429-cooldown stats. Persist in DB (encrypted at rest). | P1 | Pending |
+| 2 | **`COST_MARKUP`** — global price multiplier. | Env-only, default 1.5×. | Editor on `/admin/monetization` with audit row + history table. | P1 | Pending |
+| 3 | **Bot-health severity thresholds** (`BOT_HEALTH_*`). | Env-only. | Editor on `/admin/control` with effective/source columns. | P1 | **Shipped** (Stage-15-Step-F follow-up #4 — this PR) |
+| 4 | **`MIN_TOPUP_USD` / `MIN_TOPUP_TOMAN`** — minimum allowed top-up amounts. | Env-only. | Editor on a new `/admin/wallet-config` page. | P2 | Pending |
+| 5 | **`REQUIRED_CHANNEL`** — force-join channel handle. | Env-only. | Editor on `/admin/control` (or new `/admin/access`). | P2 | Pending |
+| 6 | **`FREE_MESSAGES_PER_USER`** — initial free-trial messages. | Env-only. | Editor on `/admin/wallet-config`. | P2 | Pending |
+| 7 | **`REFERRAL_BONUS_USD` + `REFERRAL_PERCENT`** — referral payouts. | Env-only. | Editor on `/admin/wallet-config`. | P2 | Pending |
+| 8 | **`MEMORY_CONTEXT_LIMIT` / `MEMORY_CONTENT_MAX_CHARS`** — conversation memory caps. | Env-only. | Editor on a new `/admin/memory-config` page. | P3 | Pending |
+| 9 | **Pending-PENDING expiration window** (`PENDING_EXPIRATION_HOURS_DEFAULT`). | Env-only. | Editor on `/admin/control` or `/admin/payments`. | P3 | Pending |
+| 10 | **Stuck-PENDING alert threshold** (`PENDING_ALERT_THRESHOLD_HOURS`). | Env-only. | Editor on `/admin/control`. | P3 | Pending |
+| 11 | **Per-loop cadence overrides** (`BOT_HEALTH_LOOP_STALE_<NAME>_SECONDS`). | Env-only. | Editor on `/admin/control` (one row per loop name). | P3 | Pending |
+| 12 | **`COST_MARKUP` history & analytics** — operator can see when markup last changed and the impact on revenue. | Not tracked. | Markup-history table + revenue-attribution chart on `/admin/monetization`. | P2 | Pending |
+| 13 | **Per-user revenue contribution panel** — top spenders. | Existed in `get_monetization_summary` aggregates but not surfaced. | New "Top users" tab on `/admin/monetization`. | P2 | Pending |
+| 14 | **Disable individual gateways** (NowPayments / TetraPay / Zarinpal). | DB row in `disabled_gateways` (already wired via `/admin/gateways`). | Already exposed — but no per-currency granularity. Add per-crypto toggle. | P3 | Partial |
+| 15 | **OpenRouter rate-limit per (key, model)** — currently per-key only. | Code path exists in `openrouter_keys.py`. | Per-(key, model) cooldown viewer on `/admin/openrouter-keys`. | P3 | Pending |
+| 16 | **Conversation-export pagination** — `/conversation_export` cmd dumps full history; large convos OOM. | One-shot dump. | Multi-part export with offset cursor on `/admin/users/<id>/conversations`. | P3 | Pending |
+| 17 | **Stats bucketing** (weekly/monthly) — only daily today. | `get_user_daily_spending` only. | New `bucket=` param + buttons on `/admin/users/<id>/stats`. | P3 | Pending |
+| 18 | **JSONB conversation_messages** — vision turns can't store image refs. | `content TEXT` only. | Schema migration to JSONB + read/write paths preserve attachments. | P2 | Pending |
+| 19 | **"View as <role>" toggle** — operators can preview viewer/operator views. | None. | Top-bar dropdown on `/admin` that swaps the active role for the current request only. | P3 | Pending |
+| 20 | **Audit retention policy** — audit log grows forever. | No retention. | Editor on `/admin/audit` + nightly delete loop. | P2 | Pending |
+| 21 | **Bot-health alert cadence** — `BOT_HEALTH_ALERT_INTERVAL_SECONDS`. | Env-only. | Editor on `/admin/control`. | P3 | Pending |
+| 22 | **`I18N_LOCK`** — gate live string overrides during deploy. | Not implemented. | Toggle on `/admin/strings` that blocks the upsert form. | P3 | Pending |
+| 23 | **`MODEL_DISCOVERY_INTERVAL_SECONDS`** — catalog refresh cadence. | Env-only. | Editor on a new `/admin/models-config` page. | P3 | Pending |
+| 24 | **`FX_REFRESH_INTERVAL_SECONDS`** — USD→Toman refresh cadence. | Env-only. | Editor on `/admin/wallet-config`. | P3 | Pending |
+| 25 | **`ADMIN_PASSWORD`** rotation — currently env-only. | Env-only. | "Rotate password" form on `/admin` profile page. | P2 | Pending |
+| 26 | **`ADMIN_2FA_ENROLLMENT_TIMEOUT`** — TOTP enrollment window. | Env-only. | Editor on the existing `/admin/enroll_2fa` page. | P3 | Pending |
+| 27 | **CSV export bulk download** — full transactions / usage history. | Per-user only. | Top-level `/admin/exports` page that streams big CSVs. | P3 | Pending |
+| 28 | **Refund presets** — predefined refund reasons / amounts. | Free-form text only. | Dropdown of presets + amount on `/admin/users/<id>/refund`. | P3 | Pending |
+| 29 | **Promo / gift code edit** — currently create-and-revoke, no edit. | None. | Inline edit on `/admin/promos` + `/admin/gifts`. | P3 | Pending |
+| 30 | **Disable individual models per-gateway** — e.g. block GPT-4o on Zarinpal-funded wallets. | None. | New cross-table on `/admin/models`. | P4 | Pending |
+
+Constraints / non-goals (called out so the next AI doesn't waste
+a slot):
+
+- **Stripe / international card** — operator is in Iran, can't
+  complete Stripe KYC. Not in scope. (Same as Step-E #8.)
+- **PDF export** — not a roadmap item; CSV is sufficient.
+- **Image graphs** — D3 / chart-js dependency not yet in deps.
+  Roadmap item only if the operator asks for it.
+- **Multi-bot routing** — out of scope; this is a single-bot deploy.
+- **Break-even analysis chart** — needs a new schema (running OR
+  cost vs. running revenue); P3, deferred.
+
+Each shipped row should also link the PR # so the audit table is
+the single source of truth for "what's wired up where".
 
 ---
 

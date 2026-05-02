@@ -145,6 +145,149 @@ DEFAULT_IPN_DROP_ATTACK_THRESHOLD = 100
 DEFAULT_LOGIN_THROTTLE_ATTACK_KEYS = 25
 
 
+# ── DB-backed threshold overrides ──────────────────────────────────
+#
+# Stage-15-Step-F follow-up. ``BOT_HEALTH_*`` were env-only
+# previously, so an operator had to redeploy the bot to retune
+# thresholds. The follow-up adds a DB-backed overlay
+# (``system_settings`` table) that beats env when set. Resolution
+# order for any threshold:
+#
+#   1. Module-level overrides cache (populated from the DB by
+#      :func:`refresh_threshold_overrides_from_db`).
+#   2. Env var (``os.getenv``).
+#   3. ``DEFAULT_*`` constant.
+#
+# The cache is process-local. The web admin panel both writes the
+# DB and refreshes this cache so the next ``compute_bot_status``
+# call sees the new value without a restart. Other callers
+# (``metrics.render_metrics``, ``bot_health_alert``) refresh the
+# cache on each tick so the override propagates to every observer.
+_THRESHOLD_OVERRIDES: dict[str, int] = {}
+
+# Names of every key the admin panel can override. Other modules
+# import this so the route handler + the template + the tests
+# stay in lockstep.
+THRESHOLD_KEYS: tuple[str, ...] = (
+    "BOT_HEALTH_BUSY_INFLIGHT",
+    "BOT_HEALTH_LOOP_STALE_SECONDS",
+    "BOT_HEALTH_IPN_DROP_ATTACK_THRESHOLD",
+    "BOT_HEALTH_LOGIN_THROTTLE_ATTACK_KEYS",
+)
+
+# Per-key minimum allowed value. The admin form refuses values
+# below these floors at validation time; the env-parser also
+# refuses them at runtime so a bad env override still falls
+# through to ``DEFAULT_*`` (defence in depth).
+THRESHOLD_MINIMUMS: dict[str, int] = {
+    "BOT_HEALTH_BUSY_INFLIGHT": 1,
+    "BOT_HEALTH_LOOP_STALE_SECONDS": 1,
+    "BOT_HEALTH_IPN_DROP_ATTACK_THRESHOLD": 1,
+    "BOT_HEALTH_LOGIN_THROTTLE_ATTACK_KEYS": 1,
+}
+
+
+def set_threshold_override(name: str, value: int) -> None:
+    """Set an in-process override for *name*.
+
+    Refuses non-positive values (a 0 / negative threshold would
+    permanently trip the corresponding alarm — see the bundled bug
+    fix in this PR's tests).
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(
+            f"threshold value must be int, got {type(value).__name__}"
+        )
+    minimum = THRESHOLD_MINIMUMS.get(name, 1)
+    if value < minimum:
+        raise ValueError(
+            f"threshold {name}={value} is below minimum {minimum}"
+        )
+    _THRESHOLD_OVERRIDES[name] = value
+
+
+def clear_threshold_override(name: str) -> bool:
+    """Remove an in-process override. Returns True if one existed."""
+    return _THRESHOLD_OVERRIDES.pop(name, None) is not None
+
+
+def get_threshold_overrides_snapshot() -> dict[str, int]:
+    """Read-only copy of the current overrides cache.
+
+    Used by the admin panel to render the "currently applied"
+    column. Returning a copy keeps the caller from mutating the
+    real cache by accident.
+    """
+    return dict(_THRESHOLD_OVERRIDES)
+
+
+async def refresh_threshold_overrides_from_db(db) -> dict[str, int]:
+    """Reload the override cache from the DB.
+
+    Reads every ``BOT_HEALTH_*`` row from ``system_settings``,
+    validates each against ``THRESHOLD_MINIMUMS``, and applies the
+    valid ones via :func:`set_threshold_override`. Invalid rows
+    are logged + skipped (the env / default fallback is the
+    fail-safe). Returns the resulting snapshot.
+
+    The whole call is wrapped so a transient DB error doesn't
+    blank the cache: on failure the existing cache stays in place
+    and the caller logs the exception. This means a DB outage
+    can't accidentally revert to env defaults mid-incident.
+    """
+    if db is None:
+        return get_threshold_overrides_snapshot()
+    try:
+        raw = await db.list_settings_with_prefix("BOT_HEALTH_")
+    except Exception:
+        log.exception(
+            "bot_health: refresh_threshold_overrides_from_db failed; "
+            "keeping previous overrides cache"
+        )
+        return get_threshold_overrides_snapshot()
+    if not isinstance(raw, dict):
+        log.warning(
+            "bot_health: list_settings_with_prefix returned %r "
+            "(not a dict); keeping previous overrides cache",
+            type(raw).__name__,
+        )
+        return get_threshold_overrides_snapshot()
+    # Keep keys we know about; ignore anything else stored under
+    # the BOT_HEALTH_* prefix (forward-compat: a future PR could
+    # store additional knobs without breaking this loader).
+    valid_keys = set(THRESHOLD_KEYS)
+    new_overrides: dict[str, int] = {}
+    for key, value in raw.items():
+        if key not in valid_keys:
+            continue
+        stripped = (value or "").strip()
+        if not stripped:
+            continue
+        try:
+            parsed = int(stripped)
+        except ValueError:
+            log.warning(
+                "bot_health: ignoring system_settings %s=%r "
+                "(not an int)",
+                key, value,
+            )
+            continue
+        minimum = THRESHOLD_MINIMUMS.get(key, 1)
+        if parsed < minimum:
+            log.warning(
+                "bot_health: ignoring system_settings %s=%d "
+                "(below minimum %d)",
+                key, parsed, minimum,
+            )
+            continue
+        new_overrides[key] = parsed
+    # Atomic swap: replace the whole map at once so a partial
+    # update doesn't leave the cache in a half-state.
+    _THRESHOLD_OVERRIDES.clear()
+    _THRESHOLD_OVERRIDES.update(new_overrides)
+    return dict(_THRESHOLD_OVERRIDES)
+
+
 # ── Per-loop expected cadences ──────────────────────────────────────
 #
 # Each background loop has a published interval (see HANDOFF.md).
@@ -316,14 +459,36 @@ def get_process_start_epoch() -> float:
     return _PROCESS_START_EPOCH
 
 
-def _env_int(key: str, default: int) -> int:
-    """Read a non-negative int from env, falling back to *default*.
+def _env_int(key: str, default: int, *, minimum: int = 1) -> int:
+    """Resolve a positive int threshold for *key*.
 
-    Empty / unset / malformed → *default*. Negative → *default*
-    (the thresholds are all "at-or-above" gates; a negative would
-    silently turn the gate into "always trip" which is the wrong
-    fail-safe).
+    Resolution order (Stage-15-Step-F follow-up):
+
+    1. In-process override (set by the admin panel via
+       :func:`set_threshold_override` after writing the DB).
+    2. Env var.
+    3. *default*.
+
+    Bug-fix history: prior versions only refused *negative* values
+    and silently accepted ``0``. With ``BOT_HEALTH_BUSY_INFLIGHT=0``
+    every chat slot tripped BUSY; with
+    ``BOT_HEALTH_IPN_DROP_ATTACK_THRESHOLD=0`` the panel /
+    Prometheus / alert loop permanently flagged UNDER_ATTACK on a
+    healthy bot because ``ipn_drops_recent >= 0`` is always
+    true. Same shape for the other two thresholds. The new
+    *minimum* kwarg refuses anything below it (defaults to ``1``
+    so the previous failure mode is now a default + warning); a
+    caller that genuinely needs ``0`` can pass ``minimum=0``.
     """
+    override = _THRESHOLD_OVERRIDES.get(key)
+    if override is not None:
+        if override >= minimum:
+            return override
+        log.warning(
+            "bot_health: ignoring override %s=%d (below minimum %d) — "
+            "falling through to env / default",
+            key, override, minimum,
+        )
     raw = os.getenv(key, "").strip()
     if not raw:
         return default
@@ -335,10 +500,10 @@ def _env_int(key: str, default: int) -> int:
             key, raw, default,
         )
         return default
-    if value < 0:
+    if value < minimum:
         log.warning(
-            "bot_health: invalid %s=%r (negative) — using default %d",
-            key, raw, default,
+            "bot_health: invalid %s=%r (below minimum %d) — using default %d",
+            key, raw, minimum, default,
         )
         return default
     return value

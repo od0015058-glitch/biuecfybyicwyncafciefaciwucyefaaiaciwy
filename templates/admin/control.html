@@ -309,6 +309,69 @@
   </div>
 </div>
 
+<div class="control-card">
+  <h3>⚙️ Severity thresholds</h3>
+  <p>
+    Tune the four <code>BOT_HEALTH_*</code> alarm gates without
+    redeploying. Any value you save here is written to the
+    <code>system_settings</code> table and beats the env / default for
+    every component (this panel, <code>/metrics</code>, the proactive
+    alert loop). Leave a field blank to clear the DB override and
+    fall back to env / default.
+  </p>
+  <p style="margin-top: 4px; color: var(--text-muted); font-size: 12px;">
+    The "source" column shows where the currently-applied value comes
+    from. <code>db</code> = saved here, <code>env</code> = process env
+    var, <code>default</code> = compile-time fallback. Values below
+    the per-knob minimum are rejected (a 0-value would permanently
+    trip the alarm — see HANDOFF for the underlying bug fix).
+  </p>
+  <form method="post" action="/admin/control/thresholds" style="margin-top: 12px;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <table class="signals-table">
+      <thead>
+        <tr>
+          <td class="label">Knob</td>
+          <td class="label">Effective</td>
+          <td class="label">Source</td>
+          <td class="label">Default</td>
+          <td class="label">New value (blank = clear DB override)</td>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in thresholds %}
+        <tr>
+          <td class="label">
+            {{ row.label }}<br>
+            <code style="font-size: 11px; opacity: 0.7;">{{ row.key }}</code>
+          </td>
+          <td class="value">{{ "{:,}".format(row.effective) }}</td>
+          <td class="value">
+            {% if row.source == 'db' %}
+              <span style="color: var(--success);">db</span>
+            {% elif row.source == 'env' %}
+              <span style="color: var(--warn, #f9e2af);">env</span>
+            {% else %}
+              <span style="color: var(--text-muted);">default</span>
+            {% endif %}
+          </td>
+          <td class="value">{{ "{:,}".format(row.default_value) }}</td>
+          <td class="value">
+            <input type="number" name="{{ row.key }}" min="{{ row.minimum }}"
+                   value="{% if row.override_value is not none %}{{ row.override_value }}{% endif %}"
+                   placeholder="(blank to clear)"
+                   style="width: 120px;">
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <button type="submit" class="btn-confirm" style="margin-top: 12px;">
+      Save thresholds
+    </button>
+  </form>
+</div>
+
 <div class="control-card danger-zone">
   <h3>🛑 Force-stop bot</h3>
   <p>

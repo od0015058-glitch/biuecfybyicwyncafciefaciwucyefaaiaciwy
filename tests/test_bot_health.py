@@ -665,3 +665,194 @@ def test_every_loop_in_metric_names_has_cadence_or_falls_back_safely():
         f"loops in _LOOP_METRIC_NAMES but missing LOOP_CADENCES "
         f"entries: {missing}"
     )
+
+
+# ── Stage-15-Step-F follow-up: DB-backed threshold overrides ──────
+
+
+@pytest.fixture(autouse=False)
+def _clear_overrides():
+    """Reset the module-level override cache before/after each test
+    so a leak across tests doesn't show up as a phantom flake."""
+    bh._THRESHOLD_OVERRIDES.clear()
+    yield
+    bh._THRESHOLD_OVERRIDES.clear()
+
+
+def test_zero_busy_inflight_env_falls_back_to_default(
+    monkeypatch, _clear_overrides,
+):
+    """Bug fix: ``BOT_HEALTH_BUSY_INFLIGHT=0`` previously made every
+    chat slot trip BUSY. The new ``minimum=1`` floor forces it to
+    fall through to ``DEFAULT_BUSY_INFLIGHT``."""
+    monkeypatch.setenv("BOT_HEALTH_BUSY_INFLIGHT", "0")
+    s = bh.compute_bot_status(
+        inflight_count=1, ipn_drops_total=0, loop_ticks={},
+        expected_loops=(), db_error=None,
+        login_throttle_active_keys=0,
+    )
+    # 1 in-flight is NOT >= the default 50, so HEALTHY (not BUSY).
+    assert s.level is bh.BotStatusLevel.HEALTHY
+
+
+def test_zero_ipn_attack_threshold_env_falls_back(
+    monkeypatch, _clear_overrides,
+):
+    """Bug fix: ``BOT_HEALTH_IPN_DROP_ATTACK_THRESHOLD=0`` previously
+    permanently flagged UNDER_ATTACK on a healthy bot because
+    ``ipn_drops_recent >= 0`` is always true."""
+    monkeypatch.setenv("BOT_HEALTH_IPN_DROP_ATTACK_THRESHOLD", "0")
+    s = bh.compute_bot_status(
+        inflight_count=0, ipn_drops_total=0, loop_ticks={},
+        expected_loops=(), db_error=None,
+        login_throttle_active_keys=0,
+    )
+    assert s.level is bh.BotStatusLevel.IDLE
+
+
+def test_zero_login_throttle_env_falls_back(
+    monkeypatch, _clear_overrides,
+):
+    monkeypatch.setenv("BOT_HEALTH_LOGIN_THROTTLE_ATTACK_KEYS", "0")
+    s = bh.compute_bot_status(
+        inflight_count=0, ipn_drops_total=0, loop_ticks={},
+        expected_loops=(), db_error=None,
+        login_throttle_active_keys=0,
+    )
+    assert s.level is bh.BotStatusLevel.IDLE
+
+
+def test_zero_loop_stale_env_falls_back(monkeypatch, _clear_overrides):
+    """Bug fix: legacy single-knob ``BOT_HEALTH_LOOP_STALE_SECONDS=0``
+    would make any positive delta trip DEGRADED on every loop."""
+    monkeypatch.setenv("BOT_HEALTH_LOOP_STALE_SECONDS", "0")
+    # Use a loop name not in LOOP_CADENCES so the legacy knob is
+    # actually consulted.
+    s = bh.compute_bot_status(
+        inflight_count=0, ipn_drops_total=0,
+        loop_ticks={"unknown_loop": 1.0},
+        expected_loops=("unknown_loop",), db_error=None,
+        login_throttle_active_keys=0,
+        now=10.0, process_start_epoch=0.0,
+    )
+    # With minimum=1, threshold=DEFAULT (1800), 9s delta is fresh.
+    assert s.level is bh.BotStatusLevel.IDLE
+
+
+def test_set_threshold_override_refuses_zero(_clear_overrides):
+    with pytest.raises(ValueError):
+        bh.set_threshold_override("BOT_HEALTH_BUSY_INFLIGHT", 0)
+    with pytest.raises(ValueError):
+        bh.set_threshold_override("BOT_HEALTH_BUSY_INFLIGHT", -5)
+
+
+def test_set_threshold_override_refuses_bool(_clear_overrides):
+    """``isinstance(True, int)`` is True in Python — guard against a
+    template / form bug accidentally storing a bool."""
+    with pytest.raises(ValueError):
+        bh.set_threshold_override("BOT_HEALTH_BUSY_INFLIGHT", True)
+
+
+def test_set_threshold_override_takes_effect_immediately(
+    monkeypatch, _clear_overrides,
+):
+    """Override beats env even when env is also set."""
+    monkeypatch.setenv("BOT_HEALTH_BUSY_INFLIGHT", "100")
+    bh.set_threshold_override("BOT_HEALTH_BUSY_INFLIGHT", 5)
+    s = bh.compute_bot_status(
+        inflight_count=5, ipn_drops_total=0, loop_ticks={},
+        expected_loops=(), db_error=None,
+        login_throttle_active_keys=0,
+    )
+    # 5 chat slots is >= override 5 → BUSY (would be HEALTHY without
+    # the override since env says 100).
+    assert s.level is bh.BotStatusLevel.BUSY
+
+
+def test_clear_threshold_override_returns_to_env(
+    monkeypatch, _clear_overrides,
+):
+    monkeypatch.setenv("BOT_HEALTH_BUSY_INFLIGHT", "100")
+    bh.set_threshold_override("BOT_HEALTH_BUSY_INFLIGHT", 1)
+    assert bh.clear_threshold_override("BOT_HEALTH_BUSY_INFLIGHT") is True
+    # No longer overridden: env says 100, so 5 slots is HEALTHY.
+    s = bh.compute_bot_status(
+        inflight_count=5, ipn_drops_total=0, loop_ticks={},
+        expected_loops=(), db_error=None,
+        login_throttle_active_keys=0,
+    )
+    assert s.level is bh.BotStatusLevel.HEALTHY
+    # Idempotent: clearing again returns False.
+    assert bh.clear_threshold_override("BOT_HEALTH_BUSY_INFLIGHT") is False
+
+
+def test_get_threshold_overrides_snapshot_returns_copy(_clear_overrides):
+    bh.set_threshold_override("BOT_HEALTH_BUSY_INFLIGHT", 7)
+    snap = bh.get_threshold_overrides_snapshot()
+    snap["BOT_HEALTH_BUSY_INFLIGHT"] = 999
+    # Mutating the snapshot does NOT mutate the cache.
+    again = bh.get_threshold_overrides_snapshot()
+    assert again["BOT_HEALTH_BUSY_INFLIGHT"] == 7
+
+
+@pytest.mark.asyncio
+async def test_refresh_overrides_from_db_applies_valid_rows(
+    _clear_overrides,
+):
+    class _Db:
+        async def list_settings_with_prefix(self, prefix):
+            assert prefix == "BOT_HEALTH_"
+            return {
+                "BOT_HEALTH_BUSY_INFLIGHT": "10",
+                "BOT_HEALTH_LOOP_STALE_SECONDS": "60",
+                # Invalid: not int.
+                "BOT_HEALTH_IPN_DROP_ATTACK_THRESHOLD": "abc",
+                # Invalid: below minimum.
+                "BOT_HEALTH_LOGIN_THROTTLE_ATTACK_KEYS": "0",
+                # Unknown key — ignored.
+                "BOT_HEALTH_FUTURE_KNOB": "42",
+            }
+
+    snap = await bh.refresh_threshold_overrides_from_db(_Db())
+    assert snap == {
+        "BOT_HEALTH_BUSY_INFLIGHT": 10,
+        "BOT_HEALTH_LOOP_STALE_SECONDS": 60,
+    }
+
+
+@pytest.mark.asyncio
+async def test_refresh_overrides_from_db_handles_db_error(
+    _clear_overrides,
+):
+    """A transient DB error must NOT blank the cache — the previous
+    overrides stay in place so an outage doesn't silently revert
+    every threshold to env defaults."""
+    bh.set_threshold_override("BOT_HEALTH_BUSY_INFLIGHT", 7)
+
+    class _Db:
+        async def list_settings_with_prefix(self, prefix):
+            raise RuntimeError("connection reset")
+
+    snap = await bh.refresh_threshold_overrides_from_db(_Db())
+    assert snap == {"BOT_HEALTH_BUSY_INFLIGHT": 7}
+
+
+@pytest.mark.asyncio
+async def test_refresh_overrides_from_db_handles_none_db(_clear_overrides):
+    snap = await bh.refresh_threshold_overrides_from_db(None)
+    assert snap == {}
+
+
+@pytest.mark.asyncio
+async def test_refresh_overrides_from_db_handles_non_dict_return(
+    _clear_overrides,
+):
+    bh.set_threshold_override("BOT_HEALTH_BUSY_INFLIGHT", 7)
+
+    class _Db:
+        async def list_settings_with_prefix(self, prefix):
+            return "not a dict"
+
+    snap = await bh.refresh_threshold_overrides_from_db(_Db())
+    # Cache unchanged — fail-safe behaviour.
+    assert snap == {"BOT_HEALTH_BUSY_INFLIGHT": 7}
