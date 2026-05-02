@@ -1641,3 +1641,111 @@ def test_normalise_model_returns_none_for_blank():
     assert openrouter_keys._normalise_model("") is None
     assert openrouter_keys._normalise_model("   ") is None
     assert openrouter_keys._normalise_model("\t\n  ") is None
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #4 follow-up #5: one-shot retry outcome counters.
+# ---------------------------------------------------------------------
+# The aggregate (pool-wide, NOT per-key) counter family is bumped by
+# ``ai_engine.chat_with_model`` after a 429 + retry attempt; this
+# block pins the helper API the engine relies on plus the alphabet
+# of valid outcome labels.
+# ---------------------------------------------------------------------
+
+
+def test_get_oneshot_retry_counters_starts_empty():
+    """Fresh process / fresh test → no outcomes recorded."""
+    openrouter_keys.reset_key_counters_for_tests()
+    assert openrouter_keys.get_oneshot_retry_counters() == {}
+
+
+def test_increment_oneshot_retry_records_each_outcome():
+    """Each valid outcome label gets its own counter entry; repeated
+    increments accumulate. The full alphabet (six labels) round-trips
+    through the accessor."""
+    openrouter_keys.reset_key_counters_for_tests()
+    openrouter_keys._increment_oneshot_retry("attempted")
+    openrouter_keys._increment_oneshot_retry("attempted")
+    openrouter_keys._increment_oneshot_retry("succeeded")
+    openrouter_keys._increment_oneshot_retry("second_429")
+    openrouter_keys._increment_oneshot_retry("second_other_status")
+    openrouter_keys._increment_oneshot_retry("transport_error")
+    openrouter_keys._increment_oneshot_retry("no_alternate_key")
+
+    snapshot = openrouter_keys.get_oneshot_retry_counters()
+    assert snapshot == {
+        "attempted": 2,
+        "succeeded": 1,
+        "second_429": 1,
+        "second_other_status": 1,
+        "transport_error": 1,
+        "no_alternate_key": 1,
+    }
+
+
+def test_increment_oneshot_retry_unknown_outcome_is_noop():
+    """Defence in depth: a typoed outcome label must not be able to
+    poison the counter table with a key outside the pinned alphabet
+    (``_ONE_SHOT_RETRY_OUTCOMES``). Without this guard a future
+    refactor that mistypes ``"succeded"`` would silently shift
+    success counts into a phantom bucket the metrics layer would
+    never render — making retry-success-rate plots wrong AND
+    untraceable.
+    """
+    openrouter_keys.reset_key_counters_for_tests()
+    openrouter_keys._increment_oneshot_retry("typo_outcome")
+    openrouter_keys._increment_oneshot_retry("")
+    openrouter_keys._increment_oneshot_retry("SUCCEEDED")  # case-sensitive
+    assert openrouter_keys.get_oneshot_retry_counters() == {}
+
+
+def test_get_oneshot_retry_counters_returns_independent_copy():
+    """Mutating the snapshot must not leak back into the registry —
+    same defensive shallow-copy discipline ``get_key_429_counters``
+    follows. Without this, a caller iterating the snapshot in a
+    metrics path could accidentally clobber the live counter."""
+    openrouter_keys.reset_key_counters_for_tests()
+    openrouter_keys._increment_oneshot_retry("succeeded")
+    snapshot = openrouter_keys.get_oneshot_retry_counters()
+    snapshot["succeeded"] = 999
+    snapshot["new_label"] = 1
+    # The live counters are untouched.
+    assert openrouter_keys.get_oneshot_retry_counters() == {"succeeded": 1}
+
+
+def test_reset_key_counters_for_tests_clears_oneshot_retry_counters():
+    """Stage-15-Step-E #4 follow-up #5 added the one-shot-retry
+    counter family — ensure ``reset_key_counters_for_tests`` (which
+    every test uses to start clean) wipes it too. Without this,
+    test isolation breaks: a counter set in test A leaks into test
+    B's assertions."""
+    openrouter_keys.reset_key_counters_for_tests()
+    openrouter_keys._increment_oneshot_retry("attempted")
+    openrouter_keys._increment_oneshot_retry("succeeded")
+    assert openrouter_keys.get_oneshot_retry_counters()
+    openrouter_keys.reset_key_counters_for_tests()
+    assert openrouter_keys.get_oneshot_retry_counters() == {}
+
+
+def test_load_keys_resets_oneshot_retry_counters():
+    """Hot reload (operator key rotation) must reset the
+    one-shot-retry counters too — they're process-global aggregates
+    and the new pool's retry behaviour is qualitatively different
+    from the old pool's. Without this, a deploy that rotated a hot
+    key carries forward stale ``second_429`` counts from the
+    pre-rotation key, misleading the next operator shift's retry-
+    success-rate plot.
+    """
+    _setup_three_keys()
+    openrouter_keys.reset_key_counters_for_tests()
+    openrouter_keys._increment_oneshot_retry("attempted")
+    openrouter_keys._increment_oneshot_retry("succeeded")
+    assert openrouter_keys.get_oneshot_retry_counters()
+
+    os.environ.pop("OPENROUTER_API_KEY_1", None)
+    os.environ.pop("OPENROUTER_API_KEY_2", None)
+    os.environ.pop("OPENROUTER_API_KEY_3", None)
+    os.environ["OPENROUTER_API_KEY_1"] = "new-k0"
+    openrouter_keys.load_keys()
+    assert openrouter_keys.get_oneshot_retry_counters() == {}
+    _reset_env()

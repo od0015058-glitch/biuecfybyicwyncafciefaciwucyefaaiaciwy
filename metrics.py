@@ -441,6 +441,7 @@ def render_metrics() -> str:
     from openrouter_keys import (
         get_key_429_counters,
         get_key_fallback_counters,
+        get_oneshot_retry_counters,
         key_status_snapshot,
         per_model_cooldown_snapshot,
     )
@@ -471,6 +472,39 @@ def render_metrics() -> str:
                 str(idx): n
                 for idx, n in get_key_fallback_counters().items()
             },
+        )
+    )
+
+    # Stage-15-Step-E #4 follow-up #5: one-shot retry outcome
+    # counter family. Emitted as a single counter family labelled
+    # by ``outcome`` (a small fixed alphabet — see
+    # ``openrouter_keys._ONE_SHOT_RETRY_OUTCOMES``) so an operator
+    # can plot the retry funnel via PromQL ``sum by (outcome)
+    # (rate(meowassist_openrouter_oneshot_retry_total[5m]))`` and
+    # alert on
+    # ``second_429 / attempted > 0.5`` ("the pool is hot enough
+    # that retries don't help — add another key"). Labels are NOT
+    # the api_key material so a leaked scrape doesn't expose
+    # secrets.
+    parts.extend(
+        _format_labelled_counter(
+            "meowassist_openrouter_oneshot_retry_total",
+            (
+                "One-shot retry events after an OpenRouter 429: "
+                "the engine asked the picker for the next "
+                "available key and retried the POST exactly once. "
+                "Outcome label values: 'attempted' (every retry — "
+                "the denominator), 'succeeded' (retry returned a "
+                "200 and the user got an AI reply), "
+                "'second_429' (retry also rate-limited), "
+                "'second_other_status' (retry returned a non-200 "
+                "non-429 — 5xx, 401, etc), 'transport_error' "
+                "(retry POST raised aiohttp.ClientError / "
+                "TimeoutError), 'no_alternate_key' (the pool had "
+                "no available alternate so the retry was skipped)."
+            ),
+            "outcome",
+            {label: n for label, n in get_oneshot_retry_counters().items()},
         )
     )
 

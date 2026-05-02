@@ -554,6 +554,52 @@ NowPayments crypto invoices.
   `email.utils.parsedate_to_datetime`), rejects past dates / NaN
   / Inf / negative values so the caller still falls back cleanly
   to the default when the header is unusable.
+  **Stage-15-Step-E #4 follow-up #5 — one-shot retry on 429:**
+  pre-feature, a 429 from OpenRouter on the user's sticky key
+  bounced back as `ai_rate_limited` even when a non-cooled
+  alternate key in the pool would have served the request — the
+  user had to retry by hand. Now: after the first 429 +
+  `(key, model)` cooldown mark, `ai_engine.chat_with_model`
+  asks the picker for the next key — if it's a different key
+  from the first attempt, it retries the POST exactly **once**
+  against the alternate. The retry is a single attempt (NOT a
+  loop) so a pool-wide outage can't cascade into N retries × N
+  cooldowns; latency cost is bounded to one extra round-trip on
+  the 429 path. Implementation extracts a
+  `_post_chat_completion(api_key, payload, timeout)` private
+  helper inside `ai_engine.py` so the retry doesn't duplicate
+  the 50+ lines of POST + response-parsing + error-logging the
+  original inline block carried; the helper takes the api_key
+  explicitly so the retry sends the alternate key in the
+  `Authorization` header. Outcome tracking lives in a new
+  pool-wide aggregate counter `_ONE_SHOT_RETRY_COUNTERS` in
+  `openrouter_keys.py` (deliberately *not* per-key — the retry
+  is a user-session-level event). Six outcome labels
+  (`_ONE_SHOT_RETRY_OUTCOMES`): `attempted` (every retry — the
+  denominator), `succeeded` (retry returned a 200 and the user
+  got an AI reply), `second_429` (retry also rate-limited;
+  surfaces "is the rate-limit pool-wide or per-key?"),
+  `second_other_status` (retry returned a non-200 non-429 — 5xx,
+  401, etc; user sees `ai_provider_unavailable`),
+  `transport_error` (retry POST raised `aiohttp.ClientError` /
+  `TimeoutError`; outer `except` surfaces `ai_transient_error`),
+  `no_alternate_key` (single-key pool or all alternates already
+  cooled — no retry attempted, the user gets the existing
+  rate-limit reply). New Prometheus counter family
+  `meowassist_openrouter_oneshot_retry_total{outcome="…"}` —
+  operators alert on
+  `rate(...{outcome="second_429"}[5m])
+  / rate(...{outcome="attempted"}[5m]) > 0.5` ("the pool is hot
+  enough that retries don't help — add another key"). The
+  HELP/TYPE preamble renders even with zero outcomes recorded so
+  a fresh deploy's PromQL query doesn't return a "metric does
+  not exist" no-data state. After a successful retry,
+  `record_key_usage` is bumped against the *alternate* key (not
+  the original cooled key) so the 24h-spend dashboard credits
+  the right key. Reset hooks (`reset_key_counters_for_tests`,
+  `load_keys`) wipe the new counter alongside the existing
+  per-key ones so test isolation and operator key rotations both
+  stay clean.
 - **Bot health & emergency control panel** — new `/admin/control`
   page surfaces a traffic-light status tile (idle / healthy /
   busy / degraded / under-attack / down) classified by
