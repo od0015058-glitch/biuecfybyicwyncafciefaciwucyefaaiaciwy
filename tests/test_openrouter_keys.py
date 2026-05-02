@@ -836,4 +836,82 @@ def test_load_keys_marks_env_source_in_meta():
     meta = openrouter_keys.get_key_meta_snapshot()
     assert len(meta) == 2
     assert all(m == {"source": "env"} for m in meta)
+
+
+# ---- Stage-15-Step-F follow-up #5: _read_env_keys() bug fix --------
+
+
+def test_read_env_keys_numbered_only():
+    _reset_env()
+    os.environ["OPENROUTER_API_KEY_1"] = "n1"
+    os.environ["OPENROUTER_API_KEY_2"] = "n2"
+    assert openrouter_keys._read_env_keys() == ["n1", "n2"]
+    _reset_env()
+
+
+def test_read_env_keys_bare_only():
+    _reset_env()
+    os.environ["OPENROUTER_API_KEY"] = "bare"
+    assert openrouter_keys._read_env_keys() == ["bare"]
+    _reset_env()
+
+
+def test_read_env_keys_empty_when_nothing_set():
+    _reset_env()
+    assert openrouter_keys._read_env_keys() == []
+
+
+def test_read_env_keys_numbered_overrides_bare_matches_load_keys():
+    """Bug fix regression: when both bare and numbered are set,
+    ``_read_env_keys`` MUST mirror ``load_keys`` and ignore the bare
+    value. Pre-fix it returned ``[bare, *numbered]``, causing
+    :func:`refresh_from_db` to compute a "desired" pool one entry
+    longer than the post-``load_keys`` pool — the rebuild branch
+    then duplicated the last numbered slot, and the no-op fast path
+    NEVER fired even when the env was unchanged. The right answer:
+    drop the bare entirely, return only numbered."""
+    _reset_env()
+    os.environ["OPENROUTER_API_KEY"] = "bare"
+    os.environ["OPENROUTER_API_KEY_1"] = "n1"
+    os.environ["OPENROUTER_API_KEY_2"] = "n2"
+
+    # _read_env_keys returns numbered only.
+    assert openrouter_keys._read_env_keys() == ["n1", "n2"]
+
+    # And load_keys() puts the same set of keys into ``_keys`` —
+    # the post-condition the fix exists to preserve.
+    openrouter_keys.load_keys()
+    assert openrouter_keys._keys == ["n1", "n2"]
+    _reset_env()
+
+
+def test_read_env_keys_dedupes_numbered_slots():
+    _reset_env()
+    os.environ["OPENROUTER_API_KEY_1"] = "same"
+    os.environ["OPENROUTER_API_KEY_2"] = "same"
+    os.environ["OPENROUTER_API_KEY_3"] = "different"
+    assert openrouter_keys._read_env_keys() == ["same", "different"]
+    _reset_env()
+
+
+@pytest.mark.asyncio
+async def test_refresh_from_db_no_op_fast_path_with_bare_and_numbered():
+    """Pre-fix this would have rebuilt every refresh AND duplicated
+    a key — the fast path's equality check on ``_keys == desired``
+    failed because ``desired`` over-counted by one. After the fix
+    the second refresh is a true no-op."""
+    _reset_env()
+    os.environ["OPENROUTER_API_KEY"] = "bare-ignored"
+    os.environ["OPENROUTER_API_KEY_1"] = "n1"
+    os.environ["OPENROUTER_API_KEY_2"] = "n2"
+    db = _StubDB([{"id": 5, "label": "x", "api_key": "db-x"}])
+
+    # First refresh: pool is built from scratch.
+    await openrouter_keys.refresh_from_db(db)
+    assert openrouter_keys._keys == ["n1", "n2", "db-x"]
+    # Second refresh: identical inputs → must be a no-op (no
+    # duplicate "db-x" appended). Pre-fix this assertion would
+    # fail with ``["n1", "n2", "db-x", "db-x"]``.
+    await openrouter_keys.refresh_from_db(db)
+    assert openrouter_keys._keys == ["n1", "n2", "db-x"]
     _reset_env()

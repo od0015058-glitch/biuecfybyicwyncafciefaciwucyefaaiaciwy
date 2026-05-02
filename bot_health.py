@@ -314,39 +314,107 @@ async def refresh_threshold_overrides_from_db(db) -> dict[str, int]:
 # adding to ``_LOOP_METRIC_NAMES`` doesn't need to also touch this
 # module — it'll fall back to the legacy knob until a cadence entry
 # is added here).
-LOOP_CADENCES: dict[str, int] = {
-    # NowPayments per-currency min-amount refresher — 15 min by
-    # default, see ``payments._MIN_AMOUNT_REFRESH_INTERVAL_SECONDS``.
-    "min_amount_refresh": 900,
-    # USD→Toman FX refresher — 10 min by default, see
-    # ``fx_rates._DEFAULT_INTERVAL_SECONDS``.
-    "fx_refresh": 600,
-    # OpenRouter model-discovery loop — 6h by default, see
-    # ``model_discovery._DEFAULT_DISCOVERY_INTERVAL_SECONDS``.
-    "model_discovery": 21_600,
-    # OpenRouter catalog refresh — TTL-gated at 24h, see
-    # ``models_catalog.CATALOG_TTL_SECONDS``. NB this is *not* a
-    # timer-driven loop — the gauge ticks only on a successful
-    # ``_refresh()`` call. A 48h threshold lets one TTL-cycle slip
-    # without flagging stale.
-    "catalog_refresh": 86_400,
-    # Stuck-PENDING alert loop — 30 min by default, see
-    # ``pending_alert._PENDING_ALERT_INTERVAL_MIN_DEFAULT``.
-    "pending_alert": 1_800,
-    # PENDING reaper — 15 min by default, see
-    # ``pending_expiration._DEFAULT_EXPIRATION_INTERVAL_MIN``.
-    "pending_reaper": 900,
-    # Bot-health proactive alert loop — 60 s by default, see
-    # ``bot_health_alert._BOT_HEALTH_ALERT_INTERVAL_SECONDS_DEFAULT``.
-    "bot_health_alert": 60,
-    # Zarinpal browser-close-race backfill reaper — 5 min by
-    # default, see ``zarinpal_backfill._DEFAULT_INTERVAL_MIN``.
-    # Without this entry the loop fell back to the legacy 30-min
-    # ``BOT_HEALTH_LOOP_STALE_SECONDS`` knob — six missed ticks
-    # before the panel flagged it stale, defeating the whole
-    # cadence-derived contract.
-    "zarinpal_backfill": 300,
-}
+#
+# Stage-15-Step-F follow-up #5: ``LOOP_CADENCES`` is no longer a
+# hand-maintained literal. Each loop module calls
+# :func:`register_loop` (decorator or direct call) at its loop's
+# definition site to populate this dict + ``metrics._LOOP_METRIC_NAMES``
+# at import time. The previous design had two separate hand-maintained
+# tables (the cadence dict in this module and the metric-names tuple
+# in ``metrics.py``) which had to stay in lockstep — a missing entry
+# in either silently downgraded the loop's stale-detection behaviour
+# (PR #157 fixed exactly that class of bug for ``zarinpal_backfill``;
+# the decorator prevents it by construction).
+LOOP_CADENCES: dict[str, int] = {}
+
+
+def register_loop(name: str, *, cadence_seconds: int):
+    """Register a background loop's cadence + heartbeat metric name.
+
+    Usable in two equivalent ways:
+
+    1. As a decorator on a loop coroutine, co-locating the cadence
+       with the loop's actual ``await asyncio.sleep(...)``::
+
+           @register_loop("fx_refresh", cadence_seconds=600)
+           async def _refresh_loop():
+               ...
+
+    2. As a direct call from module-init code, for tick sites that
+       are not a single loop function (e.g. the TTL-gated
+       ``catalog_refresh`` heartbeat lives inside ``get_catalog``)::
+
+           register_loop("catalog_refresh", cadence_seconds=86_400)
+
+    Side effects:
+
+    * Adds ``name -> cadence_seconds`` to :data:`LOOP_CADENCES` so
+      :func:`loop_cadence_seconds` and :func:`_stale_threshold_seconds`
+      can answer questions about *name*.
+    * Adds *name* to ``metrics._LOOP_METRIC_NAMES`` so the heartbeat
+      gauge ``meowassist_<name>_last_run_epoch`` is exposed via
+      ``/metrics`` and the panel can iterate every registered loop.
+
+    Idempotent: calling twice with the same args is a no-op.
+    Calling twice with mismatching cadence raises ``RuntimeError``
+    so a stale literal in one place can't drift from the other.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError(
+            f"register_loop: name must be a non-empty string, "
+            f"got {name!r}"
+        )
+    if (
+        isinstance(cadence_seconds, bool)
+        or not isinstance(cadence_seconds, int)
+        or cadence_seconds < 1
+    ):
+        raise ValueError(
+            f"register_loop: cadence_seconds must be a positive int, "
+            f"got {cadence_seconds!r}"
+        )
+
+    existing = LOOP_CADENCES.get(name)
+    if existing is not None and existing != cadence_seconds:
+        raise RuntimeError(
+            f"register_loop: cadence mismatch for {name!r} — "
+            f"already registered at {existing}, "
+            f"attempt to re-register at {cadence_seconds}. "
+            f"Update the call site so both match."
+        )
+    LOOP_CADENCES[name] = cadence_seconds
+
+    # Mirror to ``metrics._LOOP_METRIC_NAMES`` so the heartbeat
+    # gauge is exposed and the panel iterates this loop. Local
+    # import to keep ``bot_health`` / ``metrics`` from forming an
+    # eager-import cycle (``metrics`` imports nothing from
+    # ``bot_health`` at module load, but a future refactor that
+    # adds such an import would otherwise deadlock).
+    import metrics
+    if name not in metrics._LOOP_METRIC_NAMES:
+        metrics._LOOP_METRIC_NAMES = (
+            *metrics._LOOP_METRIC_NAMES, name,
+        )
+
+    def _decorator(fn):
+        return fn
+
+    return _decorator
+
+
+def reset_loop_registry_for_tests() -> None:
+    """Clear the loop registry. Tests-only.
+
+    Used by tests that want to exercise :func:`register_loop` from
+    a clean slate (e.g. mismatch-raises invariant). Production code
+    populates the registry at module import via decorator calls in
+    each loop module — calling this in production would empty
+    :data:`LOOP_CADENCES` and the next ``compute_bot_status`` call
+    would silently fall back to legacy thresholds for every loop.
+    """
+    LOOP_CADENCES.clear()
+    import metrics
+    metrics._LOOP_METRIC_NAMES = ()
 
 # Safety margin added on top of (2 × cadence) so a tick that lands
 # just past its nominal window doesn't oscillate the panel between
@@ -777,6 +845,8 @@ __all__ = (
     "get_process_start_epoch",
     "loop_cadence_seconds",
     "loop_stale_threshold_seconds",
+    "register_loop",
     "request_force_stop",
+    "reset_loop_registry_for_tests",
     "status_score",
 )

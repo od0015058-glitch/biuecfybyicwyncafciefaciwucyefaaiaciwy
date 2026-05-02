@@ -96,6 +96,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 import strings
 import zarinpal
+from bot_health import register_loop
 from database import db
 from metrics import record_loop_tick
 
@@ -366,6 +367,9 @@ async def backfill_pending_once(
     return credited
 
 
+@register_loop(
+    "zarinpal_backfill", cadence_seconds=_DEFAULT_INTERVAL_MIN * 60,
+)
 async def _backfill_loop(
     bot: Bot,
     *,

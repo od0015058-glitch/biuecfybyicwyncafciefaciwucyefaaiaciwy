@@ -59,6 +59,7 @@ from bot_health import (
     BotStatus,
     BotStatusLevel,
     compute_bot_status,
+    register_loop,
 )
 
 
@@ -551,6 +552,10 @@ async def run_bot_health_alert_pass(
     return sent
 
 
+@register_loop(
+    "bot_health_alert",
+    cadence_seconds=_BOT_HEALTH_ALERT_INTERVAL_SECONDS_DEFAULT,
+)
 async def _alert_loop(
     bot: Bot,
     *,

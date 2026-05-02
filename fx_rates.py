@@ -61,6 +61,8 @@ from typing import Any
 
 import aiohttp
 
+from bot_health import register_loop
+
 log = logging.getLogger("bot.fx_rates")
 
 
@@ -427,6 +429,7 @@ async def _notify_admins_of_rate_move(
     return sent
 
 
+@register_loop("fx_refresh", cadence_seconds=_DEFAULT_INTERVAL_SECONDS)
 async def refresh_usd_to_toman_loop(
     bot: Any = None,
     *,

@@ -56,6 +56,7 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
 
 from admin import get_admin_user_ids
+from bot_health import register_loop
 from database import db
 from models_catalog import CatalogModel, force_refresh
 
@@ -569,6 +570,9 @@ async def run_discovery_pass(bot: Bot) -> DiscoveryResult:
     )
 
 
+@register_loop(
+    "model_discovery", cadence_seconds=_DEFAULT_DISCOVERY_INTERVAL_SECONDS,
+)
 async def discover_new_models_loop(
     bot: Bot, *, interval_seconds: int | None = None
 ) -> None:

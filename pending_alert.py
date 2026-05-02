@@ -50,6 +50,7 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
 
 from admin import get_admin_user_ids
+from bot_health import register_loop
 from database import db
 
 
@@ -322,6 +323,10 @@ async def run_pending_alert_pass(
     return sent
 
 
+@register_loop(
+    "pending_alert",
+    cadence_seconds=_PENDING_ALERT_INTERVAL_MIN_DEFAULT * 60,
+)
 async def _alert_loop(
     bot: Bot,
     *,

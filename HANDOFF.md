@@ -1576,14 +1576,8 @@ cadence registration will fail loudly at PR-review time.
 
 What remains for a follow-up PR:
 
-* **Cadence registration via decorator** — `LOOP_CADENCES` is
-  still a hand-maintained dict. A `@register_loop("name",
-  cadence_seconds=N)` decorator at each loop's definition would
-  populate the dict at import time, eliminating the manual-sync
-  hazard between a loop's actual cadence and the classifier's
-  expected cadence. The new "missing from `LOOP_CADENCES`"
-  regression test catches the symptom; the decorator would
-  prevent the symptom.
+* **Cadence registration via decorator** — *shipped in
+  Stage-15-Step-F follow-up #5; see below.*
 * **Per-loop manual "tick now" button on the panel** — useful
   for operators who want to verify a freshly-deployed loop
   without waiting up to the cadence. Out of scope here because
@@ -1611,6 +1605,112 @@ Files in this PR (Stage-15-Step-F follow-up #4):
   enrichment (fresh / overdue / never-ticked-grace /
   past-grace-overdue) and the rendered HTML (cadence column,
   status badge, env override hint).
+
+#### Stage-15-Step-F follow-up #5: cadence registration via decorator (queued 2026-05-02)
+
+Goal: replace the hand-maintained `LOOP_CADENCES` dict + the
+hand-maintained `metrics._LOOP_METRIC_NAMES` tuple with a
+single decorator-based registration so a new loop's cadence
+and metric name are declared *once*, at the loop's definition
+site, and the two registries auto-populate at import time.
+
+Motivation: PR #157 caught (and fixed) the
+`zarinpal_backfill` slip — it was in `_LOOP_METRIC_NAMES` but
+missing from `LOOP_CADENCES`, so its 5-min loop fell back to
+the legacy 30-min stale threshold. The new decorator prevents
+that whole class of bug by construction: registering a name
+in one place automatically registers it in the other.
+
+API:
+
+```python
+from bot_health import register_loop
+
+@register_loop("fx_refresh", cadence_seconds=600)
+async def refresh_usd_to_toman_loop(...):
+    ...
+```
+
+Or, for tick sites that aren't a single forever-loop function
+(e.g. the TTL-gated `catalog_refresh` heartbeat lives inside
+`get_catalog`):
+
+```python
+register_loop("catalog_refresh", cadence_seconds=CATALOG_TTL_SECONDS)
+```
+
+Side effects of every `register_loop(name, cadence_seconds=N)`:
+
+1. Sets `bot_health.LOOP_CADENCES[name] = N` so
+   `loop_cadence_seconds(name)` and the cadence-derived stale
+   threshold are pinned for *name*.
+2. Appends *name* to `metrics._LOOP_METRIC_NAMES` so the
+   heartbeat gauge `meowassist_<name>_last_run_epoch` is
+   exposed via `/metrics` and the `/admin/control` panel
+   iterates this loop.
+
+Idempotency: re-registering the same `(name, cadence)` pair is
+a no-op. Registering the same name twice with *different*
+cadences raises `RuntimeError` so a stale literal in one place
+can't drift from the other.
+
+How `LOOP_CADENCES` is now built: every loop module's
+`@register_loop(...)` (or module-level `register_loop(...)`
+call for non-loop tick sites) fires at import time. `main.py`
+imports each loop module at startup, so by the time the first
+`/metrics` scrape or `/admin/control` GET runs, both the
+cadence dict and the metric-names tuple are fully populated.
+Tests trigger the same import via `tests/conftest.py` (one-line
+imports of every loop module — registrations are commutative
+and idempotent so order doesn't matter).
+
+Bundled bug fix: `openrouter_keys._read_env_keys` did not
+mirror `load_keys`'s "numbered slots win, bare ignored"
+semantics. With both `OPENROUTER_API_KEY=BARE` and
+`OPENROUTER_API_KEY_1..N` set, the helper returned
+`[BARE, *numbered]` while `load_keys` produced
+`["numbered_1", ...]` — a one-entry mismatch. That broke
+`refresh_from_db`'s no-op fast path (`_keys != desired` always)
+AND caused the rebuild branch to duplicate the last numbered
+slot into the in-process pool (the slice
+`desired[len(_keys):]` over-shot by one). Fix matches
+`load_keys` exactly: numbered slots win, bare honoured only
+when no numbered slot is set. Pinned by 5 new tests in
+`tests/test_openrouter_keys.py`.
+
+Files in this PR (Stage-15-Step-F follow-up #5):
+
+* `bot_health.py` — new `register_loop()` decorator + helper
+  `reset_loop_registry_for_tests()`, emptied initial
+  `LOOP_CADENCES`, updated `__all__`.
+* `metrics.py` — emptied initial `_LOOP_METRIC_NAMES`; the
+  tuple is now populated by `register_loop()` calls at import.
+* `payments.py`, `fx_rates.py`, `model_discovery.py`,
+  `models_catalog.py`, `pending_alert.py`,
+  `pending_expiration.py`, `bot_health_alert.py`,
+  `zarinpal_backfill.py` — added `from bot_health import
+  register_loop` import + `@register_loop(...)` decoration on
+  the loop function (or module-level call for
+  `models_catalog.py`).
+* `openrouter_keys.py` — bundled bug fix in `_read_env_keys`.
+* `tests/conftest.py` — eagerly imports every loop module so
+  the registry is populated before any test inspects it.
+* `tests/test_bot_health.py` — 11 new tests covering the
+  decorator API: registry population, decorator-form
+  identity, idempotency, mismatch error, type/value
+  validation (empty/None/non-positive/bool/float cadence),
+  end-to-end threshold-derivation, and an "all 8 production
+  loops registered" pin.
+* `tests/test_openrouter_keys.py` — 6 new tests covering the
+  `_read_env_keys` bug fix and the `refresh_from_db` no-op
+  fast path with both bare + numbered env vars.
+
+What remains for a follow-up PR:
+
+* **Per-loop manual "tick now" button on the panel** — the
+  next item in this stack.
+* **Sparkline / trend column** — still deferred per the
+  trade-off in follow-up #4's notes.
 
 ---
 
