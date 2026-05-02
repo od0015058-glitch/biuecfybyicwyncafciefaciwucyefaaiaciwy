@@ -388,3 +388,124 @@ class TestExtractFormatFieldsNestedSpec:
         Same try/except path; outer field still extracted."""
         result = strings.extract_format_fields("{x:{}}")
         assert result == {"x"}
+
+
+# ---------------------------------------------------------------------
+# Bundled bug fix (Stage-15-Step-E #7 follow-up #3): orphan-locale
+# detection in the .po drift gate
+# ---------------------------------------------------------------------
+
+
+def _stage_supported_locales(locale_dir):
+    """Helper: write a clean .po for every supported locale into
+    *locale_dir* so the per-supported-locale loop passes and only
+    the orphan-detection path can trip the gate."""
+    for lang in strings.SUPPORTED_LANGUAGES:
+        d = locale_dir / lang / "LC_MESSAGES"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "messages.po").write_text(
+            i18n_po.dump_po(lang), encoding="utf-8"
+        )
+
+
+class TestOrphanLocaleDetection:
+    """Pre-fix, ``_check_locale_files`` only iterated
+    :data:`strings.SUPPORTED_LANGUAGES`, so a stale
+    ``locale/<lang>/LC_MESSAGES/messages.po`` for a locale that had
+    been removed from the supported set lingered on disk forever.
+    Translators on Crowdin still saw the file, but
+    :func:`i18n_runtime.init_translations` doesn't load locales
+    outside the supported set, so any edits silently never reached
+    users. The fix adds an orphan scan that flags any such file
+    with a clear remediation hint.
+    """
+
+    def test_clean_locale_dir_is_not_drift(self, tmp_path):
+        _stage_supported_locales(tmp_path)
+        rc = i18n_po._check_locale_files(locale_dir=tmp_path)
+        assert rc == 0
+
+    def test_orphan_locale_with_po_file_is_drift(self, tmp_path, capsys):
+        _stage_supported_locales(tmp_path)
+        # Stage an orphan locale that is *not* in
+        # SUPPORTED_LANGUAGES — pick a code that's clearly outside
+        # the today's set ('de' for German).
+        orphan_lang = "de"
+        assert orphan_lang not in strings.SUPPORTED_LANGUAGES
+        orphan_dir = tmp_path / orphan_lang / "LC_MESSAGES"
+        orphan_dir.mkdir(parents=True)
+        (orphan_dir / "messages.po").write_text(
+            'msgid ""\nmsgstr ""\n',
+            encoding="utf-8",
+        )
+        rc = i18n_po._check_locale_files(locale_dir=tmp_path)
+        assert rc == 1
+        out = capsys.readouterr().out
+        # The remediation hint must name both the orphan locale
+        # and the surface the developer should edit.
+        assert "orphan locale 'de'" in out
+        assert "SUPPORTED_LANGUAGES" in out
+        assert "messages.po" in out
+
+    def test_orphan_locale_directory_without_po_is_ignored(
+        self, tmp_path
+    ):
+        """An empty `locale/<lang>` directory (no `.po` file inside)
+        is ignored — that's the harmless leftover of a `mkdir -p`
+        that didn't get a write. We only flag the case where a
+        translator could actually save edits into a dead file."""
+        _stage_supported_locales(tmp_path)
+        # Make a directory but no .po inside.
+        (tmp_path / "ru" / "LC_MESSAGES").mkdir(parents=True)
+        rc = i18n_po._check_locale_files(locale_dir=tmp_path)
+        assert rc == 0
+
+    def test_loose_files_at_locale_root_are_ignored(self, tmp_path):
+        """Files like `locale/README.md` or `locale/.gitkeep` aren't
+        directories, so the orphan scan doesn't try to interpret
+        them as locale folders."""
+        _stage_supported_locales(tmp_path)
+        (tmp_path / "README.md").write_text("# locale\n")
+        (tmp_path / ".gitkeep").write_text("")
+        rc = i18n_po._check_locale_files(locale_dir=tmp_path)
+        assert rc == 0
+
+    def test_orphan_drift_is_orthogonal_to_per_locale_drift(
+        self, tmp_path, capsys
+    ):
+        """Both classes of drift are reported in the same run —
+        fixing the orphan first shouldn't surprise the developer
+        with a second drift error after they re-run the gate."""
+        # Stage supported locales correctly *except* one — make en
+        # drift. Both errors should be in the output simultaneously.
+        for lang in strings.SUPPORTED_LANGUAGES:
+            d = tmp_path / lang / "LC_MESSAGES"
+            d.mkdir(parents=True, exist_ok=True)
+            if lang == "en":
+                # Intentional drift: stale content.
+                (d / "messages.po").write_text(
+                    "# stale\n", encoding="utf-8"
+                )
+            else:
+                (d / "messages.po").write_text(
+                    i18n_po.dump_po(lang), encoding="utf-8"
+                )
+        # Add an orphan.
+        orphan_dir = tmp_path / "de" / "LC_MESSAGES"
+        orphan_dir.mkdir(parents=True)
+        (orphan_dir / "messages.po").write_text(
+            'msgid ""\nmsgstr ""\n', encoding="utf-8"
+        )
+        rc = i18n_po._check_locale_files(locale_dir=tmp_path)
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "differs from strings._STRINGS export" in out
+        assert "orphan locale 'de'" in out
+
+    def test_default_locale_dir_still_clean_in_repo(self):
+        """Belt-and-suspenders: the existing on-disk locale dir
+        passes the new gate with no orphans (the repo wouldn't
+        otherwise pass CI). Pins that the orphan scan doesn't
+        flag the supported `fa` / `en` directories themselves."""
+        rc = i18n_po._check_locale_files()
+        assert rc == 0

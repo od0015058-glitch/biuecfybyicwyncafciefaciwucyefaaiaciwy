@@ -459,7 +459,13 @@ NowPayments crypto invoices.
   so CI / cron-driven imports can fail fast on bad input.
   Closes the .po round-trip: a community translator submits
   `messages.po`, the operator runs the import, and overrides go
-  live without a code deploy.
+  live without a code deploy. **Translator walkthrough
+  (Stage-15-Step-E #7 follow-up #3):** see the dedicated
+  ["Translating Meowassist"](#translating-meowassist-translator-workflow)
+  section below for the step-by-step Poedit / Crowdin recipe,
+  the code-deploy vs. hot-update paths, and the new orphan-locale
+  drift gate that flags stale `.po` files for locales that have
+  been removed from `strings.SUPPORTED_LANGUAGES`.
 - **Per-key 429 cooldown for OpenRouter** — when OpenRouter
   returns 429 for one of the configured pool keys (the upstream
   provider rate-limited it, or the key hit its OpenRouter plan
@@ -778,6 +784,164 @@ To roll back: `docker compose down && git checkout <previous-sha> && docker comp
 pip install -r requirements-dev.txt
 pytest tests/
 ```
+
+## Translating Meowassist (translator workflow)
+
+Meowassist ships two locales today (`fa` Persian as the source-of-truth, `en`
+English as a fallback). Translators don't need to touch Python — every
+user-facing string lives in standard gettext `.po` files at
+`locale/<lang>/LC_MESSAGES/messages.po`, editable in
+[Poedit](https://poedit.net/) or any
+[Crowdin](https://crowdin.com/) project (or a plain text editor at a pinch).
+Stage-15-Step-E #7 follow-up #3 — the round-trip foundation, runtime lookup,
+and DB importer are already in place; this section is the step-by-step
+recipe a translator follows.
+
+### What the runtime does with your `.po`
+
+```
+                   admin override (DB row)
+edit messages.po ─►─►─►─►─►─►─►─►─►──────────────────────►─► strings.t()
+       │           │   2. compiled-default fallback
+       │           └── messages.po (in-memory catalog)
+       │
+       ▼
+   PR / commit
+```
+
+Two paths to ship a translation, both supported:
+
+1. **Code-deploy path** (recommended for new languages and bulk edits). You
+   submit a PR with the edited `messages.po`, it merges, the next bot
+   release loads the new strings into the in-memory catalog at boot via
+   `i18n_runtime.init_translations` and `strings.t()` consults it
+   automatically — no DB write, no operator step.
+2. **Hot-update path** (for surgical fixes that can't wait for a release).
+   The operator runs `python -m i18n_po import <lang> <path-to-your.po>` to
+   bulk-load every validated `msgstr` into the `bot_strings` DB table, which
+   wins over the compiled defaults *and* over the on-disk `.po` (admin
+   overrides are highest priority). Translators don't run this themselves;
+   you ask the operator to apply your `.po` once it's been reviewed.
+
+### Step-by-step in Poedit
+
+1. **Install Poedit.** Download from <https://poedit.net/download> (free,
+   cross-platform). The Pro edition isn't required for `.po` editing.
+2. **Get the file.** Either fork+clone the repo and open
+   `locale/fa/LC_MESSAGES/messages.po` (or `en` for English), or download
+   just the file from GitHub's "Raw" link if you only want to look. Editing
+   in Poedit and submitting a PR is the supported flow.
+3. **Open in Poedit.** `File → Open` and pick the `.po` file. Poedit
+   reads the gettext header and the per-entry `#.` translator comments
+   (which show the source-locale rendering for context) and gives you a
+   two-column view: the slug on the left (the `msgid`), your translation
+   on the right (the `msgstr`).
+4. **Translate.** Click an empty entry, type the translation, hit `Tab` to
+   advance. Save with `Ctrl/Cmd-S`. Poedit preserves the entry order, the
+   header, and the `#.` comments so a `git diff` against the original
+   shows only your `msgstr` edits. Don't change `msgid`s — those are the
+   programmatic slugs the runtime keys off.
+5. **Mind the placeholders.** `msgstr "Your balance is {balance:.2f}"` —
+   the `{balance:.2f}` part is a Python format placeholder. You can
+   reorder it (e.g. `"{balance:.2f} موجودی"`) but you can't drop it or
+   rename it; the runtime feeds the same kwargs to your translation as
+   to the compiled default. Removing a placeholder renders without it
+   (fine), introducing a new one breaks. The validator described under
+   "Hot-update path" rejects mismatched placeholders before they reach
+   users.
+6. **Submit a PR.** `git checkout -b translation/<your-name>`,
+   `git commit -am "i18n(<lang>): batch from <date>"`, push, open a PR.
+   CI runs `python -m i18n_po check` which fails on any drift between the
+   `.po` files and `strings._STRINGS` — if you've only edited `msgstr`s,
+   it passes. CI also fails on a stale `.po` file for a locale that was
+   removed from `strings.SUPPORTED_LANGUAGES` (Stage-15-Step-E #7
+   follow-up #3), so PRs that remove a locale must remove the directory
+   in the same change.
+7. **A maintainer reviews and merges.** Once merged, the next deploy
+   ships your translation through the code-deploy path. If you need it
+   live before the next release, ping the operator and reference your
+   PR — they'll run the importer below.
+
+### Step-by-step in Crowdin
+
+1. **Get added to the Crowdin project.** Crowdin doesn't auto-create the
+   project; a maintainer sets up an organisation and shares an invite
+   link. There's no public Crowdin URL today — Stage-15-Step-E #7 #4
+   tracks integrating one with auto-PR-on-merge.
+2. **Upload the source `.po`.** A maintainer uses Crowdin's "upload to
+   source" flow on each language's `messages.po`. The `.po` format is
+   first-class in Crowdin so headers, comments, and placeholders all
+   round-trip cleanly.
+3. **Translate in the web UI.** Crowdin's editor surfaces the
+   per-entry `#.` translator-comment so you see the source-locale
+   rendering next to the slug.
+4. **Crowdin exports back to the repo.** When the maintainer pulls the
+   translated `.po` from Crowdin, they overwrite the on-disk file and
+   open a PR. From here it's identical to step 6+ of the Poedit flow.
+
+### Hot-update path (operator only)
+
+The on-disk-`.po` flow ships at the next deploy. For a faster turnaround
+the operator can bulk-load your `.po` into the `bot_strings` DB table:
+
+```bash
+# Preview what would change (validates every msgstr without writing).
+python -m i18n_po import fa /path/to/translated.po --dry-run
+
+# Apply for real, tagging the audit column with the PR number.
+python -m i18n_po import fa /path/to/translated.po \
+  --updated-by "crowdin-pr-241"
+```
+
+The CLI prints a five-bucket summary (`upserted` / `unchanged` /
+`skipped_empty` / `skipped_unknown_slug` / `invalid` / `errors`) and exits
+non-zero on any `invalid` or `errors`. `invalid` collects msgstrs that
+fail `strings.validate_override` (unknown placeholder, malformed format
+syntax, etc.) — the operator forwards the list to the translator with a
+"please retry these in your `.po`". `errors` collects DB / I/O problems
+that aren't the translator's fault.
+
+Once the import succeeds, the `bot_strings` rows take precedence over
+both the in-memory `.po` catalog and the compiled defaults; the
+translation is live on the next request.
+
+### Adding a new language
+
+1. Add the locale code (e.g. `'tr'`) to `strings.SUPPORTED_LANGUAGES` in
+   `strings.py`.
+2. Add a translation column to the `_STRINGS` dict for every existing
+   slug (Persian source-of-truth → your new locale).
+3. Run `python -m i18n_po export` to generate
+   `locale/tr/LC_MESSAGES/messages.po`.
+4. Run `python -m i18n_po check` to confirm the export round-trips.
+5. Run `pytest tests/test_i18n_po.py tests/test_i18n_runtime.py` to
+   confirm the parametrised round-trip + drift tests still pass under
+   the new locale.
+6. Submit a PR.
+
+A new locale is a code change, not a translation change — translators
+don't need to do this themselves. Once the locale is wired up, the
+`.po`-only flow above carries every subsequent edit.
+
+### Common pitfalls
+
+* **Don't edit `msgid`.** It's the slug; the runtime keys off it. Edit
+  only `msgstr`.
+* **Don't reformat the file in your editor.** Poedit preserves layout.
+  Other editors may "fix" line wrapping or reorder entries, which makes
+  the PR diff unreviewable. Use Poedit if you can.
+* **Empty `msgstr` means "untranslated".** The runtime treats an empty
+  translation as a miss and falls back to the compiled default. That's
+  the right behaviour for a partial translation in progress; commit
+  what you have.
+* **NUL bytes (`\x00`) get stripped.** Some Crowdin export pipelines
+  emit them inside multi-line `msgstr`s. The DB importer strips them
+  before insertion (Postgres `TEXT` rejects NUL). You'll see a `WARN`
+  in the logs but no row is dropped.
+* **Format-spec kwargs count too.** `{amount:.{precision}f}` requires
+  both `amount` and `precision` to exist as call-site kwargs. Don't
+  introduce a placeholder in the format spec that wasn't in the
+  compiled default; the validator catches this and rejects the entry.
 
 ## Source map
 

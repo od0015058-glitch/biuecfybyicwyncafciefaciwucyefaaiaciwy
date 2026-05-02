@@ -394,16 +394,46 @@ def _write_locale_files(*, dry_run: bool = False) -> list[Path]:
     return written
 
 
-def _check_locale_files() -> int:
+def _check_locale_files(locale_dir: Path | None = None) -> int:
     """Compare on-disk ``.po`` files against the dict export.
 
     Returns ``0`` when every locale matches, ``1`` otherwise. Used
     by CI to flag drift when a developer adds / changes a slug
     without re-exporting.
+
+    *locale_dir* defaults to the module-level :data:`LOCALE_DIR`
+    pointing at ``<repo>/locale``. Tests pass a tmp_path so they
+    can stage drift / orphan-locale fixtures without touching the
+    committed `.po` files.
+
+    Two drift classes are flagged:
+
+    1. **Per-supported-locale drift.** For every ``lang`` in
+       :data:`strings.SUPPORTED_LANGUAGES`: the on-disk
+       ``.po`` file must exist and match :func:`dump_po`'s
+       current export. A missing file or a content mismatch
+       prints an error and bumps the exit code to ``1``. This is
+       the "developer added a slug to ``strings.py`` but forgot
+       to re-export" guard.
+    2. **Orphan-locale drift** (Stage-15-Step-E #7 follow-up #3
+       bundled bug fix). A ``.po`` file for a locale that is *not*
+       in :data:`strings.SUPPORTED_LANGUAGES` is dead code on
+       disk: ``i18n_runtime.init_translations`` only iterates the
+       supported set, so any edits a translator makes to that
+       file silently never reach users. Pre-fix the drift gate
+       didn't notice — the per-supported-locale loop just skipped
+       any unrecognised directory. A pruned locale (or a
+       work-in-progress one whose runtime support got reverted)
+       could linger in the repo, occupy a Crowdin project slot,
+       and accumulate stale translations indefinitely. Post-fix
+       the gate prints a clear remediation hint pointing at the
+       orphan path and which list to update.
     """
+    if locale_dir is None:
+        locale_dir = LOCALE_DIR
     drift = False
     for lang in strings.SUPPORTED_LANGUAGES:
-        path = po_path(lang)
+        path = locale_dir / lang / "LC_MESSAGES" / "messages.po"
         expected = dump_po(lang)
         if not path.exists():
             print(
@@ -419,6 +449,27 @@ def _check_locale_files() -> int:
                 f"Run: python -m i18n_po export"
             )
             drift = True
+
+    # Orphan-locale scan — see docstring for rationale.
+    if locale_dir.is_dir():
+        supported = set(strings.SUPPORTED_LANGUAGES)
+        for child in sorted(locale_dir.iterdir()):
+            if not child.is_dir():
+                continue
+            if child.name in supported:
+                continue
+            orphan_po = child / "LC_MESSAGES" / "messages.po"
+            if orphan_po.is_file():
+                print(
+                    f"DRIFT: orphan locale {child.name!r} at "
+                    f"{orphan_po} — translator edits to this file "
+                    f"never reach users because {child.name!r} is "
+                    f"not in strings.SUPPORTED_LANGUAGES. Either "
+                    f"add it to SUPPORTED_LANGUAGES (and re-export "
+                    f"with `python -m i18n_po export`) or remove "
+                    f"the {child} directory."
+                )
+                drift = True
     return 1 if drift else 0
 
 
