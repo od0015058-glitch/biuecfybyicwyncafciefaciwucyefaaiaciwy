@@ -2150,7 +2150,7 @@ or unblock other work.
 | 17 | **Stats bucketing** (weekly/monthly) — only daily today. | `get_user_daily_spending` only. | New `bucket=` param + buttons on `/admin/users/<id>/stats`. | P3 | Pending |
 | 18 | **JSONB conversation_messages** — vision turns can't store image refs. | `content TEXT` only. | Schema migration to JSONB + read/write paths preserve attachments. | P2 | **Shipped** (PR #163) |
 | 19 | **"View as <role>" toggle** — operators can preview viewer/operator views. | None. | Top-bar dropdown on `/admin` that swaps the active role for the current request only. | P3 | **Shipped** (PR #162) |
-| 20 | **Audit retention policy** — audit log grows forever. | No retention. | Editor on `/admin/audit` + nightly delete loop. | P2 | Pending |
+| 20 | **Audit retention policy** — audit log grows forever. | No retention. | Editor on `/admin/audit` + nightly delete loop. | P2 | **Shipped** (this PR — DB-backed override layer in new `audit_retention.py` for `AUDIT_RETENTION_DAYS` + background reaper loop that batch-deletes `admin_audit_log` rows older than the retention window (default 90 days, range [7, 3650]). Retention editor card on `/admin/audit` with breakdown table + set/clear form, audit slug `audit_retention_update`. Boot warm-up in `main.py`. Env vars `AUDIT_RETENTION_DAYS`, `AUDIT_RETENTION_INTERVAL_HOURS`, `AUDIT_RETENTION_BATCH` documented in `.env.example`. Bundled bug fix: `list_admin_audit_log` now caps `limit` to 10 000 — previously unbounded, a future caller could OOM the web worker by pulling every audit row.) |
 | 21 | **Bot-health alert cadence** — `BOT_HEALTH_ALERT_INTERVAL_SECONDS`. | Env-only. | Editor on `/admin/control`. | P3 | **Shipped** (PR #173) |
 | 22 | **`I18N_LOCK`** — gate live string overrides during deploy. | Not implemented. | Toggle on `/admin/strings` that blocks the upsert form. | P3 | Pending |
 | 23 | **`MODEL_DISCOVERY_INTERVAL_SECONDS`** — catalog refresh cadence. | Env-only. | Editor on a new `/admin/models-config` page. | P3 | Pending |
@@ -4201,7 +4201,7 @@ The user's process for this project — **do not deviate**:
     `_require_role(ROLE_SUPER)` so a regression that drops a
     gate fails immediately. Total suite: 2454 → 2487 passing
     (+33 new).
-26. **Stage-15-Step-E #10b row 8 OPENED** — MEMORY_CONTEXT_LIMIT +
+26. **Stage-15-Step-E #10b row 8 SHIPPED** — MEMORY_CONTEXT_LIMIT +
     MEMORY_CONTENT_MAX_CHARS editor on new `/admin/memory-config` page.
     New `memory_config.py` module (DB-backed override layer, same
     pattern as `free_trial.py`). `database.py` now calls
@@ -4215,7 +4215,17 @@ The user's process for this project — **do not deviate**:
     vision turns surface a `[image]` marker in the `.txt` export
     instead of being silently dropped. 72 new tests in
     `tests/test_memory_config.py`. Total suite: 3144 passing.
-27. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+27. **Stage-15-Step-E #10b row 20 OPENED** — Audit retention policy.
+    New `audit_retention.py` module (DB-backed override for
+    `AUDIT_RETENTION_DAYS`, default 90, range [7, 3650]) + background
+    reaper loop that batch-deletes `admin_audit_log` rows older than
+    the retention window. Retention editor card (collapsible) on
+    `/admin/audit` with breakdown table + set/clear form, audit slug
+    `audit_retention_update`. Boot warm-up in `main.py`. Env vars
+    documented in `.env.example`. Bundled bug fix:
+    `list_admin_audit_log` now caps `limit` to 10 000 — previously
+    unbounded. 50 new tests. Total suite: 3122 passing.
+28. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-28. **Read the §11 working agreement before doing anything.**
+29. **Read the §11 working agreement before doing anything.**
