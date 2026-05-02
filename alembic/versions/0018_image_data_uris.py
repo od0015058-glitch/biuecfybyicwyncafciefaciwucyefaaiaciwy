@@ -59,15 +59,23 @@ from the dropped column anyway). This is the intended and
 documented downgrade contract for an additive nullable JSONB
 column.
 
-Revision ID: 0018_conversation_image_data_uris
+Revision ID: 0018_image_data_uris
 Revises: 0017_openrouter_api_keys
+
+NOTE on the (slightly cryptic) revision id: alembic's ``alembic_version``
+table stores the revision in a ``character varying(32)`` column, so any
+revision id longer than 32 characters crashes the upgrade with
+``value too long for type character varying(32)``. The natural-language
+``0018_conversation_image_data_uris`` (33 chars, one over the limit) was
+the first attempt and CI caught it on the alembic-roundtrip job.
+``0018_image_data_uris`` (20 chars) is the trimmed equivalent.
 """
 
 from alembic import op
 
 
 # revision identifiers, used by Alembic.
-revision = "0018_conversation_image_data_uris"
+revision = "0018_image_data_uris"
 down_revision = "0017_openrouter_api_keys"
 branch_labels = None
 depends_on = None
