@@ -15400,3 +15400,431 @@ async def test_role_gates_on_routes_module_definition():
             f"route {route} has no _require_role(ROLE_OPERATOR) "
             f"registration"
         )
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 22: I18N_LOCK toggle on /admin/strings.
+# ---------------------------------------------------------------------
+
+
+import i18n_lock as _il  # noqa: E402
+
+
+@pytest.fixture
+def _reset_i18n_lock_cache():
+    """Each lock test starts and ends with a clean override cache so
+    the module-level state doesn't leak between cases."""
+    _il.clear_i18n_lock_override()
+    yield
+    _il.clear_i18n_lock_override()
+
+
+async def _login_and_get_strings_index_csrf(client, password: str) -> str:
+    """Log in and pull the CSRF from the strings-index page so we can
+    POST to ``/admin/strings/lock``."""
+    await _login(client, password)
+    resp = await client.get("/admin/strings")
+    body = await resp.text()
+    import re
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+    assert m, "Expected CSRF token on /admin/strings page"
+    return m.group(1)
+
+
+async def test_strings_index_renders_unlocked_banner(
+    aiohttp_client, make_admin_app, _reset_i18n_lock_cache, monkeypatch
+):
+    """With no env override and no DB row, the banner shows the
+    unlocked state with source="default" and exposes the "Lock now"
+    button."""
+    monkeypatch.delenv("I18N_LOCK", raising=False)
+    db = _stub_db()
+    db.get_setting = AsyncMock(return_value=None)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/strings")
+    body = await resp.text()
+    assert resp.status == 200
+    assert "🔓 Bot text edits are unlocked" in body
+    assert "source: default" in body
+    assert 'value="lock"' in body
+    assert 'name="action"' in body
+    assert 'action="/admin/strings/lock"' in body
+
+
+async def test_strings_index_shows_locked_banner_from_env(
+    aiohttp_client, make_admin_app, _reset_i18n_lock_cache, monkeypatch
+):
+    monkeypatch.setenv("I18N_LOCK", "1")
+    db = _stub_db()
+    db.get_setting = AsyncMock(return_value=None)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/strings")
+    body = await resp.text()
+    assert "🔒 Bot text edits are LOCKED" in body
+    assert "source: env" in body
+    assert 'value="unlock"' in body
+    assert "I18N_LOCK=1" in body  # explicit env raw badge
+
+
+async def test_strings_index_shows_locked_banner_from_db_override(
+    aiohttp_client, make_admin_app, _reset_i18n_lock_cache, monkeypatch
+):
+    monkeypatch.delenv("I18N_LOCK", raising=False)
+    db = _stub_db()
+    db.get_setting = AsyncMock(return_value="1")
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/strings")
+    body = await resp.text()
+    assert "🔒 Bot text edits are LOCKED" in body
+    assert "source: db" in body
+    # When a DB override is active, the "Clear DB override" button
+    # surfaces.
+    assert 'value="clear"' in body
+
+
+async def test_strings_lock_post_requires_auth(
+    aiohttp_client, make_admin_app, _reset_i18n_lock_cache
+):
+    """An unauthenticated POST is bounced back to /admin/login."""
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    resp = await client.post(
+        "/admin/strings/lock",
+        data={"action": "lock", "csrf_token": "any"},
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303)
+    assert resp.headers.get("Location", "").startswith("/admin/login")
+
+
+async def test_strings_lock_post_rejects_csrf_mismatch(
+    aiohttp_client, make_admin_app, _reset_i18n_lock_cache
+):
+    db = _stub_db()
+    db.get_setting = AsyncMock(return_value=None)
+    db.upsert_setting = AsyncMock()
+    db.delete_setting = AsyncMock()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.post(
+        "/admin/strings/lock",
+        data={"action": "lock", "csrf_token": "wrong"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/strings"
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+
+
+async def test_strings_lock_post_rejects_unknown_action(
+    aiohttp_client, make_admin_app, _reset_i18n_lock_cache
+):
+    db = _stub_db()
+    db.get_setting = AsyncMock(return_value=None)
+    db.upsert_setting = AsyncMock()
+    db.delete_setting = AsyncMock()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_strings_index_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/strings/lock",
+        data={"action": "destroy", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+
+
+async def test_strings_lock_post_persists_lock_and_caches(
+    aiohttp_client, make_admin_app, _reset_i18n_lock_cache, monkeypatch
+):
+    """Happy path: action=lock writes "1" to system_settings AND sets
+    the in-process override so the very next save handler refuses."""
+    monkeypatch.delenv("I18N_LOCK", raising=False)
+    saved = {"value": None}
+
+    async def _upsert(key, value):
+        if key == _il.I18N_LOCK_SETTING_KEY:
+            saved["value"] = value
+
+    async def _get(key):
+        if key == _il.I18N_LOCK_SETTING_KEY:
+            return saved["value"]
+        return None
+
+    db = _stub_db()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+    db.delete_setting = AsyncMock(return_value=True)
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_strings_index_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/strings/lock",
+        data={"action": "lock", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/strings"
+    assert saved["value"] == "1"
+    assert _il.get_i18n_lock_override() is True
+    assert _il.is_i18n_locked() is True
+
+
+async def test_strings_lock_post_unlock_persists_zero(
+    aiohttp_client, make_admin_app, _reset_i18n_lock_cache
+):
+    saved = {"value": None}
+
+    async def _upsert(key, value):
+        if key == _il.I18N_LOCK_SETTING_KEY:
+            saved["value"] = value
+
+    async def _get(key):
+        return saved["value"] if key == _il.I18N_LOCK_SETTING_KEY else None
+
+    db = _stub_db()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+    db.delete_setting = AsyncMock(return_value=True)
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_strings_index_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/strings/lock",
+        data={"action": "unlock", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert saved["value"] == "0"
+    assert _il.get_i18n_lock_override() is False
+
+
+async def test_strings_lock_post_clear_drops_db_row(
+    aiohttp_client, make_admin_app, _reset_i18n_lock_cache, monkeypatch
+):
+    """action=clear deletes the system_settings row + clears the
+    in-process cache so the resolver falls through to env / default."""
+    monkeypatch.delenv("I18N_LOCK", raising=False)
+    db = _stub_db()
+    db.get_setting = AsyncMock(return_value=None)
+    db.delete_setting = AsyncMock(return_value=True)
+    db.upsert_setting = AsyncMock()
+
+    _il.set_i18n_lock_override(True)  # pre-state: override active.
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_strings_index_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/strings/lock",
+        data={"action": "clear", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.delete_setting.assert_awaited_once_with(_il.I18N_LOCK_SETTING_KEY)
+    assert _il.get_i18n_lock_override() is None
+    db.upsert_setting.assert_not_awaited()
+
+
+async def test_strings_lock_post_db_error_flashes(
+    aiohttp_client, make_admin_app, _reset_i18n_lock_cache
+):
+    db = _stub_db()
+    db.get_setting = AsyncMock(return_value=None)
+    db.upsert_setting = AsyncMock(side_effect=RuntimeError("disk full"))
+    db.delete_setting = AsyncMock()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_strings_index_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/strings/lock",
+        data={"action": "lock", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/strings"
+    assert _il.get_i18n_lock_override() is None  # untouched on failure
+    # Follow the redirect and check the error flash rendered.
+    resp2 = await client.get("/admin/strings")
+    body = await resp2.text()
+    assert "Database write failed" in body
+
+
+async def test_strings_save_post_blocked_when_locked(
+    aiohttp_client, make_admin_app, _reset_i18n_lock_cache, monkeypatch
+):
+    """When I18N_LOCK is on, the save handler refuses early — DB
+    write never lands and a "locked" error flash is emitted."""
+    import strings as bot_strings_module
+    bot_strings_module.set_overrides({})
+    monkeypatch.setenv("I18N_LOCK", "1")
+
+    db = _stub_db()
+    db.get_setting = AsyncMock(return_value=None)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_strings_csrf(client, "pw")
+
+    resp = await client.post(
+        "/admin/strings/en/hub_btn_wallet",
+        data={"csrf_token": csrf, "value": "💰 Custom"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_string_override.assert_not_awaited()
+
+    resp2 = await client.get("/admin/strings/en/hub_btn_wallet")
+    body = await resp2.text()
+    assert "Bot text edits are locked" in body
+
+
+async def test_strings_revert_post_blocked_when_locked(
+    aiohttp_client, make_admin_app, _reset_i18n_lock_cache, monkeypatch
+):
+    """When locked, /revert refuses. delete_string_override never lands."""
+    import strings as bot_strings_module
+    bot_strings_module.set_overrides(
+        {("en", "hub_btn_wallet"): "💰 Custom"}
+    )
+    monkeypatch.setenv("I18N_LOCK", "1")
+
+    db = _stub_db()
+    db.get_setting = AsyncMock(return_value=None)
+    db.load_all_string_overrides = AsyncMock(
+        return_value={("en", "hub_btn_wallet"): "💰 Custom"}
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_strings_csrf(client, "pw")
+
+    resp = await client.post(
+        "/admin/strings/en/hub_btn_wallet/revert",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.delete_string_override.assert_not_awaited()
+    bot_strings_module.set_overrides({})
+
+
+async def test_strings_save_post_works_after_unlock(
+    aiohttp_client, make_admin_app, _reset_i18n_lock_cache, monkeypatch
+):
+    """End-to-end: lock blocks the save, then unlock → save lands.
+    Demonstrates the toggle's effect propagates immediately within
+    the same process (no restart needed)."""
+    import re
+    import strings as bot_strings_module
+    bot_strings_module.set_overrides({})
+    monkeypatch.delenv("I18N_LOCK", raising=False)
+
+    saved = {"value": None}
+
+    async def _upsert(key, value):
+        if key == _il.I18N_LOCK_SETTING_KEY:
+            saved["value"] = value
+
+    async def _get(key):
+        return saved["value"] if key == _il.I18N_LOCK_SETTING_KEY else None
+
+    db = _stub_db()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+    db.delete_setting = AsyncMock(return_value=True)
+    db.load_all_string_overrides = AsyncMock(return_value={})
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    # Single login for the whole flow; CSRFs are bound to the session
+    # cookie, so re-logging in mid-test would rotate them and break
+    # subsequent POSTs.
+    await _login(client, "pw")
+
+    async def _csrf_from(path: str) -> str:
+        resp = await client.get(path)
+        body = await resp.text()
+        m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+        assert m, f"no CSRF token on {path}"
+        return m.group(1)
+
+    # Step 1: lock.
+    csrf_index = await _csrf_from("/admin/strings")
+    await client.post(
+        "/admin/strings/lock",
+        data={"action": "lock", "csrf_token": csrf_index},
+        allow_redirects=False,
+    )
+    assert _il.is_i18n_locked() is True
+
+    # Step 2: save attempt is refused.
+    csrf_detail = await _csrf_from("/admin/strings/en/hub_btn_wallet")
+    await client.post(
+        "/admin/strings/en/hub_btn_wallet",
+        data={"csrf_token": csrf_detail, "value": "💰 Locked"},
+        allow_redirects=False,
+    )
+    db.upsert_string_override.assert_not_awaited()
+
+    # Step 3: unlock.
+    await client.post(
+        "/admin/strings/lock",
+        data={"action": "unlock", "csrf_token": csrf_index},
+        allow_redirects=False,
+    )
+    assert _il.is_i18n_locked() is False
+
+    # Step 4: save works now.
+    await client.post(
+        "/admin/strings/en/hub_btn_wallet",
+        data={"csrf_token": csrf_detail, "value": "💰 Free"},
+        allow_redirects=False,
+    )
+    db.upsert_string_override.assert_awaited_once_with(
+        "en", "hub_btn_wallet", "💰 Free", updated_by="web"
+    )
+    bot_strings_module.set_overrides({})
+
+
+def test_string_detail_template_has_no_nested_form():
+    """Bundled bug fix regression test (Stage-15-Step-E #10b row 22).
+
+    The previous string_detail.html nested the revert <form> inside
+    the save <form>. Per the HTML5 parser spec, the inner <form>
+    start tag is dropped — so the "Revert to default" button rendered
+    inside the save form, with no ``formaction`` attribute. Clicking
+    it submitted the SAVE endpoint with the textarea contents instead
+    of calling /revert. This test asserts that no <form> ever appears
+    inside another <form> in the rendered template (after stripping
+    jinja comments and HTML comments so the bug-fix narrative in the
+    file doesn't trigger a false positive).
+    """
+    import re
+    from pathlib import Path
+    src = (
+        Path(__file__).resolve().parent.parent
+        / "templates" / "admin" / "string_detail.html"
+    ).read_text()
+    # Strip jinja comments {# ... #} (multi-line, non-greedy) and
+    # HTML comments <!-- ... --> so prose mentioning "<form>" does
+    # not feed the form-depth counter.
+    src = re.sub(r"\{#.*?#\}", "", src, flags=re.DOTALL)
+    src = re.sub(r"<!--.*?-->", "", src, flags=re.DOTALL)
+
+    # Walk through and confirm we never see a "<form" tag (i.e. the
+    # ``<`` followed by ``form`` followed by space / ``>`` / newline)
+    # while another form is still open before its ``</form>``.
+    depth = 0
+    pattern = re.compile(r"<\s*form\b|<\s*/\s*form\s*>", re.IGNORECASE)
+    for m in pattern.finditer(src):
+        token = m.group(0).lower()
+        if token.startswith("</") or "/" in token:
+            assert depth >= 1, (
+                f"</form> without opening at offset {m.start()}"
+            )
+            depth -= 1
+        else:
+            assert depth == 0, (
+                f"nested <form> detected at offset {m.start()} "
+                f"(depth={depth}); HTML5 forbids form-in-form"
+            )
+            depth += 1
+    assert depth == 0, "unbalanced <form> tags in string_detail.html"

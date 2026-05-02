@@ -250,6 +250,29 @@ async def main():
             "failed to load bot_strings overrides — using compiled defaults"
         )
 
+    # Stage-15-Step-E #10b row 22: warm the I18N_LOCK override so the
+    # save / revert handlers see the operator's saved gate state from
+    # the very first request after restart, rather than waiting for
+    # the next /admin/strings GET to refresh it. Fail-soft: a flaky
+    # DB at boot time keeps the cached value (None on cold start, so
+    # the env / default takes over).
+    try:
+        import i18n_lock
+        loaded_lock = await i18n_lock.refresh_i18n_lock_override_from_db(db)
+        env_lock = os.getenv("I18N_LOCK", "")
+        log.info(
+            "loaded I18N_LOCK override from system_settings: %s "
+            "(active source=%s, effective=%s)",
+            loaded_lock,
+            i18n_lock.get_i18n_lock_source(env_value=env_lock),
+            i18n_lock.is_i18n_locked(env_value=env_lock),
+        )
+    except Exception:
+        log.exception(
+            "failed to load I18N_LOCK override from DB — falling "
+            "through to env / default"
+        )
+
     # Stage-15-Step-E #7 follow-up #1: load community translations
     # from locale/<lang>/LC_MESSAGES/messages.po into the runtime
     # cache. These sit BETWEEN the admin-override cache (still top

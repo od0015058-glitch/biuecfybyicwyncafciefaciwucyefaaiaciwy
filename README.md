@@ -109,6 +109,19 @@ NowPayments crypto invoices.
   `DISCOVERY_INTERVAL_SECONDS` (default 21 600 s / 6 h, range
   [60, 604 800]). The background discovery loop re-reads the
   interval from the DB-backed config on every tick.
+- **Bot-text edit lock toggle** on `/admin/strings`
+  (Stage-15-Step-E #10b row 22) — `ROLE_SUPER`-gated lock /
+  unlock / clear-DB-override banner that gates the per-string
+  save and revert handlers. While locked, both `POST
+  /admin/strings/{lang}/{key}` and `POST .../revert` refuse
+  with a flash error and an `string_save_blocked_locked` /
+  `string_revert_blocked_locked` audit row. Useful during a
+  rolling deploy or `messages.po` round-trip when you don't
+  want a translator to land a half-finished edit. Resolution
+  order: DB override → env (`I18N_LOCK`) → default `False`
+  (unlocked). Lock-state is in-process-cached (refreshed on
+  every `/admin/strings` GET so a sibling worker's flip lands
+  within one request) and warmed at boot.
 - Telegram-side admin commands (`/admin`, `/admin_metrics`,
   `/admin_credit`, `/admin_broadcast`, …) for ops via DMs.
 - **Canonical slash-command menu** — on every startup the bot
@@ -1194,6 +1207,7 @@ don't need to do this themselves. Once the locale is wired up, the
 | `payments.py` | NowPayments invoice creation, IPN verification (HMAC-SHA512), idempotent finalize, partial-payment crediting. |
 | `memory_config.py` | DB-backed override layer for `MEMORY_CONTEXT_LIMIT` and `MEMORY_CONTENT_MAX_CHARS`. Same pattern as `free_trial.py`: module-level caches, coercion validators, set/clear/get/refresh-from-DB helpers, public lookup with resolution order (override → env → default), source reporting (`db`/`env`/`default`). Web editor at `/admin/memory-config`. |
 | `audit_retention.py` | DB-backed override layer for `AUDIT_RETENTION_DAYS` + background reaper loop. Same pattern as `free_trial.py`: module-level cache, coercion validator, set/clear/get/refresh-from-DB helpers, resolution order (override → env → default 90 days). The reaper loop wakes every `AUDIT_RETENTION_INTERVAL_HOURS` (default 24) and batch-deletes `admin_audit_log` rows older than the retention window. Per-process counters: `ticks`, `total_deleted`, `last_run_epoch`. Editor on `/admin/audit`. |
+| `i18n_lock.py` | DB-backed boolean override layer for `I18N_LOCK` (Stage-15-Step-E #10b row 22). Same pattern as `audit_retention.py` / `model_discovery_config.py` but for a boolean: module-level tri-state cache (`None` = no override, `True` = locked, `False` = explicitly unlocked), token-tolerant coercion validator (accepts `1`/`0`/`true`/`false`/`on`/`off`/`lock`/`unlock`), `set` / `clear` / `get` / `refresh_from_db` helpers, resolution order (DB override → env → default `False`). When locked, the `string_save_post` / `string_revert_post` web handlers refuse with a flash error and an audit row. Toggle on `/admin/strings`. Boot warm-up in `main.py`. |
 | `pending_expiration.py` | Background reaper task. Wakes every `PENDING_EXPIRATION_INTERVAL_MIN` (default 15) minutes, calls `Database.expire_stale_pending` to flip stuck `PENDING` rows older than `PENDING_EXPIRATION_HOURS` (default 24) to `EXPIRED`, drops a `payment_expired` audit row (`actor="reaper"`), and pings the affected user. `TelegramForbiddenError` / `TelegramBadRequest` are swallowed. Spawned by `main.main` after the webhook server, cancelled cleanly on shutdown. |
 | `zarinpal_backfill.py` | **Stage-15-Step-E #8 follow-up #2.** Background backfill reaper for Zarinpal browser-close races. Zarinpal's `?Authority=…&Status=OK` callback is a USER-AGENT redirect (not a server-to-server webhook); if the user closes the browser before the redirect lands, the gateway has the order settled but our ledger never gets the success signal. The reaper wakes every `ZARINPAL_BACKFILL_INTERVAL_MIN` (default 5) minutes, fetches PENDING Zarinpal rows in the window `(min_age, max_age)` (default 5min — 23h), calls `zarinpal.verify_payment` (the same authoritative gateway check the redirect callback would have made), then `Database.finalize_payment` (idempotent — FOR UPDATE + status check guards against double-credit if the user reopens their tab while the reaper is mid-tick), sends the same `zarinpal_credit_notification` DM, and writes a `zarinpal_backfill_credited` audit row marked `actor="zarinpal_backfill"` so forensics can distinguish backfill credits from callback credits. Per-process counters: `rows_examined`, `credited`, `verify_failed`, `transport_error`, `finalize_noop`, `audit_failed`. Heartbeat exposed as `meowassist_zarinpal_backfill_last_run_epoch`. Jurisdictional split with the expire reaper: backfill owns `(min_age, max_age * 3600)`; expire owns everything older — keep `ZARINPAL_BACKFILL_MAX_AGE_HOURS < PENDING_EXPIRATION_HOURS` to avoid races. TetraPay doesn't need this because its callback is a server-to-server POST that retries on 5xx. |
 | `model_discovery_config.py` | DB-backed override layer for `DISCOVERY_INTERVAL_SECONDS`. Same pattern as `free_trial.py`: module-level cache, coercion validator, set/clear/get/refresh-from-DB helpers, resolution order (override → env → default 21 600 s). Editor on `/admin/models-config`. |
