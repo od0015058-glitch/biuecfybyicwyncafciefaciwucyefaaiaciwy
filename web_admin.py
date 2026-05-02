@@ -80,7 +80,14 @@ from aiohttp import web
 # referenced — not the module-level ``db`` singleton — so the admin
 # still works against the injected DB in tests.
 import strings as bot_strings_module
-from admin_roles import VALID_ROLES, normalize_role
+from admin_roles import (
+    ROLE_OPERATOR,
+    ROLE_SUPER,
+    ROLE_VIEWER,
+    VALID_ROLES,
+    normalize_role,
+    role_at_least,
+)
 from database import Database
 from formatting import format_usd
 from rate_limit import (
@@ -97,6 +104,22 @@ log = logging.getLogger("bot.web_admin")
 # admin password — but we set a stable identity string so audit lines
 # can attribute actions to "the admin who logged in at <ts>".
 COOKIE_NAME = "meow_admin"
+
+# Stage-15-Step-E #5 follow-up #4: "view as <role>" toggle. The web
+# panel's single ``ADMIN_PASSWORD`` identity is implicitly
+# :data:`admin_roles.ROLE_SUPER` (the env-list backward-compat
+# fallback in :func:`admin_roles.effective_role` resolves the
+# password owner to ``super`` regardless of the DB
+# ``admin_roles`` table). This cookie carries a *signed* role
+# override so the operator can preview the panel as a viewer or
+# operator without provisioning a second password — useful for
+# verifying role gates without provisioning a second password (per-
+# user web auth is the multi-week redesign called out in Step-E
+# #5's open backlog). The cookie is signed with the same
+# ``ADMIN_SESSION_SECRET`` as the auth cookie so a malicious user
+# can't forge a "view as super" override on a viewer account once
+# per-user auth lands.
+VIEW_AS_COOKIE_NAME = "meow_admin_view_as"
 
 # aiohttp 3.9+ wants typed ``AppKey`` for ``app[...]`` storage instead
 # of bare string keys (otherwise it emits ``NotAppKeyWarning`` which
@@ -147,6 +170,15 @@ APP_KEY_FORCE_STOP_FN: web.AppKey = web.AppKey(
 # emit NotAppKeyWarning for string keys (only ``app[]`` does), so
 # this stays a plain string for readability.
 REQUEST_KEY_AUTHED = "admin_authed"
+# Stage-15-Step-E #5 follow-up #4: which role the panel is *previewing*
+# as. Always one of :data:`admin_roles.ROLE_VIEWER` /
+# ``ROLE_OPERATOR`` / ``ROLE_SUPER``; defaults to ``super`` (the
+# password owner's effective role) when no view-as cookie is present
+# or the cookie fails signature verification. Used by
+# :func:`_require_role` to gate routes and by
+# :func:`templates/admin/_layout.html` to hide nav items the
+# previewed role can't access.
+REQUEST_KEY_VIEW_AS = "admin_view_as_role"
 
 # Default cookie lifetime — long enough that the user isn't constantly
 # logging back in, short enough that a stolen cookie auto-expires
@@ -183,9 +215,30 @@ def sign_cookie(
     Format: ``<b64(iso)>.<b64(hmac_sha256(iso))>`` — no per-user
     payload, since there's only one admin identity. Plenty of headroom
     if we want to add user_id / role later.
+
+    Stage-15-Step-E #5 follow-up #4 bundled bug fix: rejects
+    timezone-naive *expires_at* up-front. ``datetime.astimezone(tz)``
+    on a naive datetime silently coerces it via the *deploy host's
+    system local time* — meaning a naive ``datetime(2026, 1, 1)``
+    on a UTC-7 box becomes ``2026-01-01T07:00:00+00:00`` after
+    ``.astimezone(utc)``, while the same naive value on a UTC box
+    becomes ``2026-01-01T00:00:00+00:00``. The cookie's wall-clock
+    expiry would then depend on the deploy host's ``TZ`` env, not on
+    what the caller wrote. ``verify_cookie`` already rejects naive
+    ISOs from a malformed *signed* cookie (line ~256), but a caller
+    that hands us a naive datetime *before* signing would silently
+    produce a TZ-dependent cookie that re-verifies fine on the same
+    host. Closing the loop on the writer side too.
     """
     if not secret:
         raise ValueError("ADMIN_SESSION_SECRET must not be empty")
+    if expires_at.tzinfo is None:
+        raise ValueError(
+            "sign_cookie: expires_at must be timezone-aware "
+            "(naive datetimes are coerced via the deploy host's "
+            "system local TZ, producing a host-dependent cookie "
+            "expiry)."
+        )
     iso = expires_at.astimezone(timezone.utc).isoformat()
     iso_bytes = iso.encode("utf-8")
     sig = hmac.new(
@@ -235,6 +288,86 @@ def verify_cookie(
     if now is None:
         now = datetime.now(timezone.utc)
     return now < expires_at
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #5 follow-up #4: "view as <role>" cookie helpers
+# ---------------------------------------------------------------------
+#
+# The cookie carries a single role string signed under the same
+# ``ADMIN_SESSION_SECRET`` as the auth cookie. The format mirrors
+# :func:`sign_cookie` (``<b64(payload)>.<b64(sig)>``) so a future
+# review of the auth surface only has one HMAC posture to audit.
+#
+# Domain separation: the HMAC payload is ``b"viewas:" + role_bytes``
+# rather than just ``role_bytes`` so a leaked auth-cookie HMAC
+# (signed over an ISO timestamp) can't be replayed as a view-as
+# cookie that happens to base64-decode to a recognised role string.
+# Belt-and-suspenders defence-in-depth: the auth cookie's ISO
+# timestamp would never collide with a 6-9 character role name in
+# practice, but pinning the prefix makes the invariant explicit and
+# protects against a future format change to either side.
+
+
+def sign_view_as_cookie(role: str, *, secret: str) -> str:
+    """Return a signed view-as cookie carrying *role*.
+
+    *role* MUST be one of :data:`admin_roles.VALID_ROLES` — the caller
+    is responsible for validating before signing. We don't normalise
+    here so a typo at the caller is a hard error rather than a silent
+    fall-through to a different role.
+    """
+    if not secret:
+        raise ValueError("ADMIN_SESSION_SECRET must not be empty")
+    if role not in VALID_ROLES:
+        raise ValueError(f"role must be one of {sorted(VALID_ROLES)!r}")
+    role_bytes = role.encode("ascii")
+    sig = hmac.new(
+        secret.encode("utf-8"),
+        b"viewas:" + role_bytes,
+        hashlib.sha256,
+    ).digest()
+    return f"{_b64url_encode(role_bytes)}.{_b64url_encode(sig)}"
+
+
+def verify_view_as_cookie(
+    raw: str | None, *, secret: str
+) -> str | None:
+    """Return the validated role string, or ``None`` if the cookie is
+    missing / malformed / tampered / carries an unknown role.
+
+    Mirrors :func:`verify_cookie`'s "fail-soft, no-raise" posture so a
+    middleware that reads a stale cookie left over from a deploy where
+    the secret rotated never crashes — it just falls back to the
+    default view-as role.
+    """
+    if not raw or not secret:
+        return None
+    try:
+        role_b64, sig_b64 = raw.split(".", 1)
+        role_bytes = _b64url_decode(role_b64)
+        provided_sig = _b64url_decode(sig_b64)
+    except (ValueError, base64.binascii.Error):
+        return None
+    expected_sig = hmac.new(
+        secret.encode("utf-8"),
+        b"viewas:" + role_bytes,
+        hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(expected_sig, provided_sig):
+        return None
+    try:
+        role = role_bytes.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    if role not in VALID_ROLES:
+        # A signed role that's no longer in the allow-list (e.g. the
+        # operator removed a role from the application code while a
+        # cookie carrying it is still in the wild) MUST fail closed.
+        # Same fail-closed posture as :func:`role_at_least` on an
+        # unknown role argument.
+        return None
+    return role
 
 
 # ---------------------------------------------------------------------
@@ -389,10 +522,19 @@ async def admin_auth_middleware(
     Doesn't redirect on its own — `_require_auth` handles that. The
     middleware just stamps the request so per-route handlers can
     check ``request[REQUEST_KEY_AUTHED]`` cheaply.
+
+    Stage-15-Step-E #5 follow-up #4: also stamps
+    ``request[REQUEST_KEY_VIEW_AS]`` with the validated view-as
+    role from the ``meow_admin_view_as`` cookie, falling back to
+    :data:`ROLE_SUPER` (the password owner's effective role) when
+    the cookie is missing / tampered / carries a stale role name.
     """
     secret = request.app.get(APP_KEY_SESSION_SECRET, "")
     raw = request.cookies.get(COOKIE_NAME)
     request[REQUEST_KEY_AUTHED] = verify_cookie(raw, secret=secret)
+    raw_view_as = request.cookies.get(VIEW_AS_COOKIE_NAME)
+    view_as = verify_view_as_cookie(raw_view_as, secret=secret)
+    request[REQUEST_KEY_VIEW_AS] = view_as or ROLE_SUPER
     return await handler(request)
 
 
@@ -408,6 +550,84 @@ def _require_auth(
 
     wrapper.__name__ = handler.__name__
     return wrapper
+
+
+def _require_role(
+    required: str,
+) -> Callable[
+    [Callable[[web.Request], Awaitable[web.StreamResponse]]],
+    Callable[[web.Request], Awaitable[web.StreamResponse]],
+]:
+    """Decorator factory: gate a handler behind the ``view_as`` role.
+
+    Stage-15-Step-E #5 follow-up #4. Wraps :func:`_require_auth` so
+    an unauthenticated request still 302s to ``/admin/login`` first;
+    an authenticated request whose ``view_as`` role is below
+    *required* gets a 302 to ``/admin/`` with a flash banner
+    explaining the gate. The flash uses the same one-shot signed
+    cookie surface as every other ``set_flash`` call so the banner
+    survives the redirect and clears on the next page render.
+
+    POST handlers gated this way still 302 to ``/admin/`` rather than
+    surfacing a 403 — operators previewing as a lower role expect a
+    "you can't do that as a viewer" banner on the dashboard, not a
+    raw HTTP error page. The banner makes the gate observable so
+    role-coverage testing actually surfaces the right messaging.
+
+    The required role is validated at decoration time so a typo in
+    the call-site fails the import rather than every request.
+    """
+    if required not in VALID_ROLES:
+        raise ValueError(
+            f"_require_role: required must be one of "
+            f"{sorted(VALID_ROLES)!r}, got {required!r}"
+        )
+
+    def decorator(
+        handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
+    ) -> Callable[[web.Request], Awaitable[web.StreamResponse]]:
+        @_require_auth
+        async def wrapper(request: web.Request) -> web.StreamResponse:
+            view_as = request.get(REQUEST_KEY_VIEW_AS, ROLE_SUPER)
+            if not role_at_least(view_as, required):
+                secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+                cookie_secure = request.app.get(
+                    APP_KEY_COOKIE_SECURE, True,
+                )
+                response = web.HTTPFound(location="/admin/")
+                set_flash(
+                    response,
+                    kind="error",
+                    message=(
+                        f"That action requires {required} role — "
+                        f"you are previewing as {view_as}. "
+                        f"Use the role toggle in the sidebar to "
+                        f"switch back to super."
+                    ),
+                    secret=secret,
+                    cookie_secure=cookie_secure,
+                )
+                # Audit-log the deny so a role-coverage probe leaves
+                # a paper trail. Best-effort — an audit-write failure
+                # MUST NOT regress the user-visible deny banner.
+                await _record_audit_safe(
+                    request,
+                    "view_as_deny",
+                    outcome="deny",
+                    meta={
+                        "required": required,
+                        "view_as": view_as,
+                        "path": request.path,
+                        "method": request.method,
+                    },
+                )
+                return response
+            return await handler(request)
+
+        wrapper.__name__ = handler.__name__
+        return wrapper
+
+    return decorator
 
 
 # ---------------------------------------------------------------------
@@ -1148,6 +1368,14 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     "openrouter_key_disable": "OpenRouter key disabled",
     "openrouter_key_enable": "OpenRouter key re-enabled",
     "openrouter_key_delete": "OpenRouter key deleted",
+    # Stage-15-Step-E #5 follow-up #4: "view as <role>" toggle. These
+    # slugs are recorded by :func:`view_as_post` (every toggle) and
+    # :func:`_require_role` (every gate-deny on a previewed role).
+    # Surfacing them in the dropdown lets an operator audit "did
+    # anyone preview as a lower role and try something they couldn't
+    # do" without scrolling the full feed.
+    "view_as_change": "Role-preview toggled",
+    "view_as_deny": "Role-preview gate denied",
 }
 
 
@@ -5771,6 +5999,126 @@ async def roles_revoke(request: web.Request) -> web.StreamResponse:
     return response
 
 
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #5 follow-up #4: "view as <role>" toggle handler.
+# ---------------------------------------------------------------------
+#
+# POST /admin/view-as accepts ``role`` ∈ {viewer, operator, super}
+# and signs a :data:`VIEW_AS_COOKIE_NAME` cookie carrying that role.
+# All other request handlers consult the cookie via the auth
+# middleware (``request[REQUEST_KEY_VIEW_AS]``) and the
+# :func:`_require_role` decorator. The toggle is the *only* surface
+# that mutates the cookie — operators clear the override (return to
+# ``super``, the password owner's effective role) by selecting
+# ``super`` or by submitting the same form with ``clear=1``.
+#
+# CSRF-protected. Audit-logged via the new ``view_as_change`` slug
+# so a forensic operator can see when an admin previewed as a
+# lower role (and what they tried to do during that preview, via
+# the corresponding ``view_as_deny`` rows from
+# :func:`_require_role`). The redirect target is taken from
+# ``next=<path>`` (allow-listed to ``/admin/...`` to prevent open-
+# redirect abuse) so toggling on a deep page lands the operator
+# back where they started.
+
+
+async def view_as_post(request: web.Request) -> web.StreamResponse:
+    """POST /admin/view-as — set / clear the role-preview override."""
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+
+    form = await request.post()
+
+    # Resolve redirect target up-front so every error path lands
+    # back on the same page the operator was on. We allow-list
+    # to ``/admin/...`` so a tampered ``next=https://evil/`` can't
+    # turn the toggle into an open-redirect.
+    raw_next = str(form.get("next", "/admin/")).strip()
+    if not raw_next.startswith("/admin/") or "\n" in raw_next or "\r" in raw_next:
+        next_target = "/admin/"
+    else:
+        next_target = raw_next
+
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning(
+            "view_as_post: CSRF token mismatch from %s", request.remote,
+        )
+        response = web.HTTPFound(location=next_target)
+        set_flash(
+            response,
+            kind="error",
+            message=(
+                "Form submission was rejected (CSRF). Refresh and "
+                "try again."
+            ),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    raw_role = str(form.get("role", "")).strip()
+    role = normalize_role(raw_role)
+    if role is None:
+        response = web.HTTPFound(location=next_target)
+        set_flash(
+            response,
+            kind="error",
+            message=(
+                f"Role must be one of: {', '.join(sorted(VALID_ROLES))}."
+            ),
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    response = web.HTTPFound(location=next_target)
+    if role == ROLE_SUPER:
+        # Selecting ``super`` is equivalent to clearing the override
+        # (the default falls back to ``super``). Drop the cookie so
+        # the operator's browser doesn't carry a stale signed value
+        # past a session-secret rotation.
+        response.del_cookie(VIEW_AS_COOKIE_NAME, path="/admin/")
+    else:
+        cookie_value = sign_view_as_cookie(role, secret=secret)
+        response.set_cookie(
+            VIEW_AS_COOKIE_NAME,
+            cookie_value,
+            # Same TTL as the auth cookie — when the operator's
+            # session expires the override naturally expires with it.
+            max_age=int(
+                timedelta(
+                    hours=request.app.get(
+                        APP_KEY_TTL_HOURS, DEFAULT_TTL_HOURS,
+                    ),
+                ).total_seconds()
+            ),
+            httponly=True,
+            secure=cookie_secure,
+            samesite="Lax",
+            path="/admin/",
+        )
+
+    await _record_audit_safe(
+        request,
+        "view_as_change",
+        outcome="ok",
+        meta={"role": role},
+    )
+    set_flash(
+        response,
+        kind="success" if role == ROLE_SUPER else "info",
+        message=(
+            f"Now previewing the panel as {role}. "
+            f"Use the role toggle in the sidebar to switch back."
+            if role != ROLE_SUPER
+            else "Returned to full super access."
+        ),
+        secret=secret,
+        cookie_secure=cookie_secure,
+    )
+    return response
+
+
 async def gateways_get(request: web.Request) -> web.StreamResponse:
     """GET /admin/gateways — list all payment gateways with toggles."""
     from admin_toggles import get_disabled_gateways
@@ -6968,6 +7316,52 @@ async def control_thresholds_post(
 
 
 # ---------------------------------------------------------------------
+# Stage-15-Step-E #5 follow-up #4: per-template globals.
+# ---------------------------------------------------------------------
+#
+# aiohttp_jinja2 invokes every entry in ``context_processors`` per
+# render and merges the returned dict into the template context BEFORE
+# the per-handler ``ctx`` dict (so an explicit ``ctx["view_as"]``
+# wins). We surface ``view_as`` and ``view_as_csrf_token`` so
+# ``_layout.html`` can render the role-toggle form without each
+# handler having to remember to thread them through.
+
+
+async def _template_globals(request: web.Request) -> dict:
+    """Inject ``view_as``, ``view_as_csrf_token``, and the role
+    constants into every rendered template.
+
+    Async because aiohttp_jinja2's ``context_processors_middleware``
+    awaits each processor. Reads ``request[REQUEST_KEY_VIEW_AS]``
+    which is stamped by :func:`admin_auth_middleware` — see the
+    middleware-ordering note in :func:`setup_admin_routes` for why
+    the auth middleware MUST be appended before
+    ``aiohttp_jinja2.setup`` so its stamp is visible here.
+
+    The role constants let ``_layout.html`` write
+    ``{% if view_as_role_at_least(view_as, ROLE_OPERATOR) %}`` rather
+    than hard-coding role names — keeps the template in lockstep with
+    :data:`admin_roles.ROLE_ORDER` if a future stage adds a fourth
+    role.
+    """
+    return {
+        "view_as": request.get(REQUEST_KEY_VIEW_AS, ROLE_SUPER),
+        # The toggle form's CSRF token is the same as every other
+        # form on the panel — it's keyed off the auth cookie, not the
+        # view-as cookie. Surfacing it here makes the toggle widget
+        # render consistently regardless of which page it's on.
+        "view_as_csrf_token": csrf_token_for(request),
+        "ROLE_VIEWER": ROLE_VIEWER,
+        "ROLE_OPERATOR": ROLE_OPERATOR,
+        "ROLE_SUPER": ROLE_SUPER,
+        "view_as_role_at_least": role_at_least,
+        # The current request path so the toggle's ``next`` field
+        # can land the operator back on the same page after toggling.
+        "view_as_next": request.path,
+    }
+
+
+# ---------------------------------------------------------------------
 # App wiring
 # ---------------------------------------------------------------------
 
@@ -7090,6 +7484,19 @@ def setup_admin_routes(
             "secret."
         )
 
+    # Stage-15-Step-E #5 follow-up #4: middleware-ordering note.
+    # ``admin_auth_middleware`` MUST run *before* aiohttp_jinja2's
+    # ``context_processors_middleware`` so that ``_template_globals``
+    # can read ``request[REQUEST_KEY_VIEW_AS]`` (the value the auth
+    # middleware stamps from the view-as cookie). aiohttp executes
+    # middlewares in the order they appear in ``app.middlewares`` —
+    # so we MUST append the auth middleware *first*, then call
+    # ``aiohttp_jinja2.setup`` which appends its own context
+    # processors middleware behind it. Reversing this ordering
+    # silently breaks the toggle widget — the layout would always
+    # render ``Previewing as: super`` regardless of the cookie.
+    app.middlewares.append(admin_auth_middleware)
+
     aiohttp_jinja2.setup(
         app,
         loader=jinja2.FileSystemLoader(str(TEMPLATES_DIR)),
@@ -7101,8 +7508,14 @@ def setup_admin_routes(
         # ``formatting.format_usd`` for why the ad-hoc per-template
         # ``"${:,.4f}".format(...)`` calls were replaced.
         filters={"format_usd": format_usd},
+        # Stage-15-Step-E #5 follow-up #4: every template can read
+        # ``view_as`` (the previewed role) and the canonical CSRF
+        # token without each handler having to thread them through
+        # the per-request context dict. Used by ``_layout.html`` to
+        # render the toggle widget and hide nav items the previewed
+        # role can't access.
+        context_processors=[_template_globals],
     )
-    app.middlewares.append(admin_auth_middleware)
 
     # Per-IP token-bucket throttle on /admin/login. Mounted here so the
     # cache lives on the same aiohttp app the handler reads from. See
@@ -7133,20 +7546,27 @@ def setup_admin_routes(
         _require_auth(monetization_csv_get),
     )
 
-    # Stage-8-Part-2: promo codes.
+    # Stage-8-Part-2: promo codes. Stage-15-Step-E #5 follow-up #4:
+    # operator floor on the write paths (matches the Telegram side's
+    # ``/admin_promo_*`` floor); list view stays viewer-readable.
     app.router.add_get("/admin/promos", _require_auth(promos_get))
-    app.router.add_post("/admin/promos", _require_auth(promos_create))
+    app.router.add_post(
+        "/admin/promos", _require_role(ROLE_OPERATOR)(promos_create),
+    )
     app.router.add_post(
         "/admin/promos/{code}/revoke",
-        _require_auth(promos_revoke),
+        _require_role(ROLE_OPERATOR)(promos_revoke),
     )
 
-    # Stage-8-Part-3: gift codes.
+    # Stage-8-Part-3: gift codes. Stage-15-Step-E #5 follow-up #4:
+    # operator floor on writes; list / detail view stay viewer-readable.
     app.router.add_get("/admin/gifts", _require_auth(gifts_get))
-    app.router.add_post("/admin/gifts", _require_auth(gifts_create))
+    app.router.add_post(
+        "/admin/gifts", _require_role(ROLE_OPERATOR)(gifts_create),
+    )
     app.router.add_post(
         "/admin/gifts/{code}/revoke",
-        _require_auth(gifts_revoke),
+        _require_role(ROLE_OPERATOR)(gifts_revoke),
     )
     # Stage-12-Step-D: per-code redemption drilldown.
     app.router.add_get(
@@ -7160,9 +7580,11 @@ def setup_admin_routes(
         "/admin/users/{telegram_id}",
         _require_auth(user_detail_get),
     )
+    # Stage-15-Step-E #5 follow-up #4: super floor on credit / debit
+    # writes (mirrors Telegram ``/admin_credit`` / ``/admin_debit``).
     app.router.add_post(
         "/admin/users/{telegram_id}/adjust",
-        _require_auth(user_adjust_post),
+        _require_role(ROLE_SUPER)(user_adjust_post),
     )
     # Stage-9-Step-8: per-user AI usage log browser.
     app.router.add_get(
@@ -7170,9 +7592,15 @@ def setup_admin_routes(
         _require_auth(user_usage_get),
     )
 
-    # Stage-8-Part-5: broadcast.
+    # Stage-8-Part-5: broadcast. Stage-15-Step-E #5 follow-up #4:
+    # operator floor on enqueue + cancel (matches the Telegram
+    # ``/admin_broadcast`` floor); detail / status views stay viewer-
+    # readable so a forensic operator can audit a job they didn't kick.
     app.router.add_get("/admin/broadcast", _require_auth(broadcast_get))
-    app.router.add_post("/admin/broadcast", _require_auth(broadcast_post))
+    app.router.add_post(
+        "/admin/broadcast",
+        _require_role(ROLE_OPERATOR)(broadcast_post),
+    )
     app.router.add_get(
         "/admin/broadcast/{job_id}",
         _require_auth(broadcast_detail_get),
@@ -7184,7 +7612,7 @@ def setup_admin_routes(
     # Stage-9-Step-6: soft-cancel for a running/queued broadcast.
     app.router.add_post(
         "/admin/broadcast/{job_id}/cancel",
-        _require_auth(broadcast_cancel_post),
+        _require_role(ROLE_OPERATOR)(broadcast_cancel_post),
     )
 
     # Stage-8-Part-6: transactions browser (read-only, paginated).
@@ -7195,13 +7623,19 @@ def setup_admin_routes(
     # Stage-12-Step-A: refund a SUCCESS transaction. Issued from the
     # inline form on the transactions browser; CSRF-protected and
     # audit-logged. The handler always redirects back to the list
-    # view with a flash banner.
+    # view with a flash banner. Stage-15-Step-E #5 follow-up #4:
+    # super floor (mirrors the Telegram ``/admin_credit`` floor — a
+    # refund is just a debit-on-the-bot's-side that an operator-tier
+    # admin shouldn't be issuing without explicit super sign-off).
     app.router.add_post(
         "/admin/transactions/{transaction_id}/refund",
-        _require_auth(transaction_refund_post),
+        _require_role(ROLE_SUPER)(transaction_refund_post),
     )
 
-    # Stage-9-Step-1.6: editable bot strings.
+    # Stage-9-Step-1.6: editable bot strings. Stage-15-Step-E #5
+    # follow-up #4: super floor on save / revert; list and detail
+    # views stay viewer-readable so a translator-tier user can audit
+    # the live overrides without being able to write.
     app.router.add_get("/admin/strings", _require_auth(strings_get))
     app.router.add_get(
         "/admin/strings/{lang}/{key}",
@@ -7209,17 +7643,21 @@ def setup_admin_routes(
     )
     app.router.add_post(
         "/admin/strings/{lang}/{key}",
-        _require_auth(string_save_post),
+        _require_role(ROLE_SUPER)(string_save_post),
     )
     app.router.add_post(
         "/admin/strings/{lang}/{key}/revert",
-        _require_auth(string_revert_post),
+        _require_role(ROLE_SUPER)(string_revert_post),
     )
 
     # Stage-9-Step-2: user-field editor + audit-log viewer.
+    # Stage-15-Step-E #5 follow-up #4: super floor on the field
+    # editor (mirrors the legacy ``ADMIN_PASSWORD``-only posture and
+    # the Telegram ``/admin_credit``/``/admin_debit`` super floor —
+    # editing user fields IS the operator's most-sensitive surface).
     app.router.add_post(
         "/admin/users/{telegram_id}/edit",
-        _require_auth(user_edit_post),
+        _require_role(ROLE_SUPER)(user_edit_post),
     )
     app.router.add_get("/admin/audit", _require_auth(audit_get))
 
@@ -7233,71 +7671,113 @@ def setup_admin_routes(
         _require_auth(enroll_2fa_get),
     )
 
-    # Stage-14: model & gateway toggle pages.
+    # Stage-14: model & gateway toggle pages. Stage-15-Step-E #5
+    # follow-up #4: super floor on every toggle (matches the panel's
+    # original "only super-admins should disable AI / payments"
+    # posture — an operator-tier user shouldn't be able to take the
+    # bot offline mid-incident without super sign-off).
     app.router.add_get("/admin/models", _require_auth(models_get))
-    app.router.add_post("/admin/models/disable", _require_auth(models_disable_post))
-    app.router.add_post("/admin/models/enable", _require_auth(models_enable_post))
+    app.router.add_post(
+        "/admin/models/disable",
+        _require_role(ROLE_SUPER)(models_disable_post),
+    )
+    app.router.add_post(
+        "/admin/models/enable",
+        _require_role(ROLE_SUPER)(models_enable_post),
+    )
     app.router.add_get("/admin/gateways", _require_auth(gateways_get))
-    app.router.add_post("/admin/gateways/disable", _require_auth(gateways_disable_post))
-    app.router.add_post("/admin/gateways/enable", _require_auth(gateways_enable_post))
+    app.router.add_post(
+        "/admin/gateways/disable",
+        _require_role(ROLE_SUPER)(gateways_disable_post),
+    )
+    app.router.add_post(
+        "/admin/gateways/enable",
+        _require_role(ROLE_SUPER)(gateways_enable_post),
+    )
 
     # Stage-15-Step-E #4 follow-up: per-key OpenRouter ops view.
+    # Stage-15-Step-E #5 follow-up #4: super floor on the registry
+    # CRUD — leaking an OpenRouter key affects billing across every
+    # admin's deploy, so a viewer / operator MUST NOT be able to add
+    # / disable / delete entries even if they can browse the list.
     app.router.add_get(
         "/admin/openrouter-keys", _require_auth(openrouter_keys_get),
     )
-    # Stage-15-Step-E #4 follow-up #2: DB-backed key registry CRUD.
     app.router.add_post(
         "/admin/openrouter-keys/add",
-        _require_auth(openrouter_keys_add_post),
+        _require_role(ROLE_SUPER)(openrouter_keys_add_post),
     )
     app.router.add_post(
         "/admin/openrouter-keys/{key_id}/{action:disable|enable}",
-        _require_auth(openrouter_keys_toggle_post),
+        _require_role(ROLE_SUPER)(openrouter_keys_toggle_post),
     )
     app.router.add_post(
         "/admin/openrouter-keys/{key_id}/delete",
-        _require_auth(openrouter_keys_delete_post),
+        _require_role(ROLE_SUPER)(openrouter_keys_delete_post),
     )
 
     # Stage-15-Step-E #5 follow-up #2: admin-roles web page.
+    # Stage-15-Step-E #5 follow-up #4: super floor on grant / revoke
+    # — a DB-tracked role can authorise super access to other admins,
+    # so an operator-tier user MUST NOT be able to mutate the table.
+    # The list view stays viewer-readable so a viewer doing a role
+    # audit can see who has what.
     app.router.add_get("/admin/roles", _require_auth(roles_get))
-    app.router.add_post("/admin/roles", _require_auth(roles_create))
+    app.router.add_post(
+        "/admin/roles", _require_role(ROLE_SUPER)(roles_create),
+    )
     app.router.add_post(
         "/admin/roles/{telegram_id}/revoke",
-        _require_auth(roles_revoke),
+        _require_role(ROLE_SUPER)(roles_revoke),
+    )
+
+    # Stage-15-Step-E #5 follow-up #4: "view as <role>" toggle
+    # endpoint. Lives at ``_require_auth`` (not ``_require_role``)
+    # because every authenticated admin must be able to *return*
+    # to super after previewing as a lower role — if the toggle
+    # itself were gated below super, a viewer-preview would be
+    # one-way.
+    app.router.add_post(
+        "/admin/view-as", _require_auth(view_as_post),
     )
 
     # Stage-15-Step-F: bot health & emergency control panel.
+    # Stage-15-Step-E #5 follow-up #4: super floor on every
+    # destructive action (disable-all / enable-all / force-stop /
+    # thresholds / tick-now) — these can take the bot offline or
+    # rewrite alerting parameters mid-incident, so an operator-tier
+    # user MUST NOT be able to issue them. The dashboard view stays
+    # viewer-readable so the panel is usable for live diagnosis.
     app.router.add_get("/admin/control", _require_auth(control_get))
     app.router.add_post(
         "/admin/control/disable-all-models",
-        _require_auth(control_disable_all_models_post),
+        _require_role(ROLE_SUPER)(control_disable_all_models_post),
     )
     app.router.add_post(
         "/admin/control/enable-all-models",
-        _require_auth(control_enable_all_models_post),
+        _require_role(ROLE_SUPER)(control_enable_all_models_post),
     )
     app.router.add_post(
         "/admin/control/disable-all-gateways",
-        _require_auth(control_disable_all_gateways_post),
+        _require_role(ROLE_SUPER)(control_disable_all_gateways_post),
     )
     app.router.add_post(
         "/admin/control/enable-all-gateways",
-        _require_auth(control_enable_all_gateways_post),
+        _require_role(ROLE_SUPER)(control_enable_all_gateways_post),
     )
     app.router.add_post(
         "/admin/control/force-stop",
-        _require_auth(control_force_stop_post),
+        _require_role(ROLE_SUPER)(control_force_stop_post),
     )
     # Stage-15-Step-F follow-up: DB-backed tunable severity thresholds.
     app.router.add_post(
         "/admin/control/thresholds",
-        _require_auth(control_thresholds_post),
+        _require_role(ROLE_SUPER)(control_thresholds_post),
     )
     # Stage-15-Step-F follow-up #6: per-loop manual "tick now" button.
     app.router.add_post(
         "/admin/control/loop/{name}/tick-now",
-        _require_auth(control_loop_tick_now_post),
+        _require_role(ROLE_SUPER)(control_loop_tick_now_post),
     )
 
     # Stage-9-Step-10: durable broadcast registry orphan sweep.

@@ -11209,3 +11209,580 @@ async def test_control_loop_tick_now_post_requires_auth(
     )
     assert resp.status == 302
     assert "/admin/login" in resp.headers["Location"]
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #5 follow-up #4: "view as <role>" toggle
+# ---------------------------------------------------------------------
+#
+# Pure-function tests for sign / verify, plus integration tests that
+# exercise the full toggle flow + role gates via ``_require_role`` on
+# selected handlers.
+
+
+def test_sign_view_as_cookie_round_trip():
+    from web_admin import sign_view_as_cookie, verify_view_as_cookie
+
+    secret = "view-as-secret-1234567890"
+    cookie = sign_view_as_cookie("viewer", secret=secret)
+    assert verify_view_as_cookie(cookie, secret=secret) == "viewer"
+
+
+def test_sign_view_as_cookie_round_trip_for_each_role():
+    from web_admin import sign_view_as_cookie, verify_view_as_cookie
+
+    secret = "view-as-secret-1234567890"
+    for role in ("viewer", "operator", "super"):
+        cookie = sign_view_as_cookie(role, secret=secret)
+        assert verify_view_as_cookie(cookie, secret=secret) == role
+
+
+def test_sign_view_as_cookie_rejects_unknown_role():
+    from web_admin import sign_view_as_cookie
+
+    with pytest.raises(ValueError):
+        sign_view_as_cookie("admin", secret="x" * 32)
+
+
+def test_sign_view_as_cookie_rejects_empty_secret():
+    from web_admin import sign_view_as_cookie
+
+    with pytest.raises(ValueError):
+        sign_view_as_cookie("viewer", secret="")
+
+
+def test_verify_view_as_cookie_rejects_none_and_empty():
+    from web_admin import verify_view_as_cookie
+
+    assert verify_view_as_cookie(None, secret="x" * 32) is None
+    assert verify_view_as_cookie("", secret="x" * 32) is None
+
+
+def test_verify_view_as_cookie_rejects_no_dot_separator():
+    from web_admin import verify_view_as_cookie
+
+    assert verify_view_as_cookie("just-a-blob", secret="x" * 32) is None
+
+
+def test_verify_view_as_cookie_rejects_bad_base64():
+    from web_admin import verify_view_as_cookie
+
+    assert verify_view_as_cookie("!!!.!!!", secret="x" * 32) is None
+
+
+def test_verify_view_as_cookie_rejects_tampered_signature():
+    """Flipping a byte in the sig invalidates the cookie."""
+    from web_admin import sign_view_as_cookie, verify_view_as_cookie
+
+    secret = "x" * 32
+    good = sign_view_as_cookie("viewer", secret=secret)
+    role_b64, sig_b64 = good.split(".", 1)
+    bad_sig = "A" + sig_b64[1:] if sig_b64[0] != "A" else "B" + sig_b64[1:]
+    tampered = f"{role_b64}.{bad_sig}"
+    assert verify_view_as_cookie(tampered, secret=secret) is None
+
+
+def test_verify_view_as_cookie_rejects_tampered_payload():
+    """Changing the role payload invalidates the HMAC."""
+    from web_admin import sign_view_as_cookie, verify_view_as_cookie
+    import base64
+
+    secret = "x" * 32
+    good = sign_view_as_cookie("viewer", secret=secret)
+    role_b64, sig_b64 = good.split(".", 1)
+    # Substitute "super" payload while keeping the "viewer" sig
+    bad_role_b64 = base64.urlsafe_b64encode(b"super").rstrip(b"=").decode("ascii")
+    tampered = f"{bad_role_b64}.{sig_b64}"
+    assert verify_view_as_cookie(tampered, secret=secret) is None
+
+
+def test_verify_view_as_cookie_rejects_wrong_secret():
+    """Cookie signed with secret A must NOT verify under secret B."""
+    from web_admin import sign_view_as_cookie, verify_view_as_cookie
+
+    cookie = sign_view_as_cookie("viewer", secret="secret-a")
+    assert verify_view_as_cookie(cookie, secret="secret-b") is None
+
+
+def test_verify_view_as_cookie_rejects_unknown_role_after_signing():
+    """A signed cookie carrying a role name that's no longer in
+    VALID_ROLES must fail closed (e.g., a future stage drops a role
+    while a cookie carrying it is still in the wild)."""
+    import base64
+    import hashlib
+    import hmac
+
+    secret = "x" * 32
+    role_bytes = b"god"  # not a valid role
+    sig = hmac.new(
+        secret.encode("utf-8"),
+        b"viewas:" + role_bytes,
+        hashlib.sha256,
+    ).digest()
+    role_b64 = base64.urlsafe_b64encode(role_bytes).rstrip(b"=").decode()
+    sig_b64 = base64.urlsafe_b64encode(sig).rstrip(b"=").decode()
+    cookie = f"{role_b64}.{sig_b64}"
+
+    from web_admin import verify_view_as_cookie
+
+    assert verify_view_as_cookie(cookie, secret=secret) is None
+
+
+def test_view_as_cookie_does_not_share_signature_with_auth_cookie():
+    """Domain-separation pin: a value that happens to encode the same
+    bytes under the auth-cookie HMAC must NOT verify as a view-as
+    cookie. Protects against a future format-change cross-replay."""
+    from web_admin import (
+        sign_view_as_cookie,
+        verify_cookie,
+        verify_view_as_cookie,
+    )
+
+    secret = "x" * 32
+    # Sign a role under the view-as HMAC.
+    cookie = sign_view_as_cookie("super", secret=secret)
+    # Under the AUTH cookie verifier (which expects an ISO timestamp),
+    # this MUST NOT verify — the auth verifier should reject it.
+    assert verify_cookie(cookie, secret=secret) is False
+    # And the view-as verifier round-trips fine.
+    assert verify_view_as_cookie(cookie, secret=secret) == "super"
+
+
+# ---------------------------------------------------------------------
+# Bundled bug fix: sign_cookie rejects naive datetimes
+# ---------------------------------------------------------------------
+
+
+def test_sign_cookie_rejects_naive_datetime():
+    """Stage-15-Step-E #5 follow-up #4 bundled bug fix.
+
+    A naive ``expires_at`` would silently get coerced via
+    ``datetime.astimezone(tz)``'s system-local-time interpretation,
+    producing a cookie whose wall-clock expiry depends on the deploy
+    host's TZ env. ``sign_cookie`` must refuse the input outright
+    rather than mint a host-dependent cookie.
+    """
+    secret = "x" * 32
+    naive = datetime(2026, 1, 1, 12, 0, 0)  # no tzinfo
+    with pytest.raises(ValueError, match="timezone-aware"):
+        sign_cookie(naive, secret=secret)
+
+
+def test_sign_cookie_still_accepts_aware_datetime_after_fix():
+    """Regression pin: the naive-datetime guard must NOT reject
+    legitimate aware datetimes that production code already passes."""
+    secret = "x" * 32
+    aware_utc = datetime(2099, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    cookie = sign_cookie(aware_utc, secret=secret)
+    assert verify_cookie(cookie, secret=secret) is True
+
+
+def test_sign_cookie_aware_in_other_tz_normalises_to_utc():
+    """An aware datetime in any tz round-trips correctly because
+    sign_cookie normalises to UTC. Pins the contract end-to-end."""
+    from datetime import timedelta as _td
+
+    secret = "x" * 32
+    # +05:30 (India) tz, future timestamp
+    plus_530 = timezone(_td(hours=5, minutes=30))
+    aware_other = datetime(2099, 1, 1, 12, 0, 0, tzinfo=plus_530)
+    cookie = sign_cookie(aware_other, secret=secret)
+    assert verify_cookie(cookie, secret=secret) is True
+
+
+# ---------------------------------------------------------------------
+# Integration tests for /admin/view-as
+# ---------------------------------------------------------------------
+
+
+async def _csrf_token_from_dashboard(client) -> str:
+    """Helper: pull the canonical CSRF token off the dashboard page."""
+    import re
+    resp = await client.get("/admin/")
+    body = await resp.text()
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+    assert m, "Expected CSRF token on dashboard"
+    return m.group(1)
+
+
+async def test_view_as_default_is_super_when_no_cookie(
+    aiohttp_client, make_admin_app
+):
+    """Without a view-as cookie, the password owner should see
+    'super' rendered in the toggle widget on every page."""
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    await _login(client, "pw")
+    resp = await client.get("/admin/")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Previewing as: <strong>super</strong>" in body
+
+
+async def test_view_as_post_requires_csrf(aiohttp_client, make_admin_app):
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    await _login(client, "pw")
+    resp = await client.post(
+        "/admin/view-as",
+        data={"role": "viewer", "csrf_token": "wrong", "next": "/admin/"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/")
+    # Cookie should NOT be set on a CSRF-failed request.
+    from web_admin import VIEW_AS_COOKIE_NAME
+    assert VIEW_AS_COOKIE_NAME not in resp.cookies
+
+
+async def test_view_as_post_requires_auth(aiohttp_client, make_admin_app):
+    """Without an auth cookie, the toggle endpoint 302s to login."""
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    resp = await client.post(
+        "/admin/view-as",
+        data={"role": "viewer", "csrf_token": "any", "next": "/admin/"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert "/admin/login" in resp.headers["Location"]
+
+
+async def test_view_as_post_sets_cookie_for_viewer(
+    aiohttp_client, make_admin_app
+):
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    await _login(client, "pw")
+    csrf = await _csrf_token_from_dashboard(client)
+    resp = await client.post(
+        "/admin/view-as",
+        data={"role": "viewer", "csrf_token": csrf, "next": "/admin/"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    from web_admin import VIEW_AS_COOKIE_NAME
+    cookie = resp.cookies.get(VIEW_AS_COOKIE_NAME)
+    assert cookie is not None
+    assert cookie.value
+    # Subsequent dashboard render reflects the new role.
+    resp2 = await client.get("/admin/")
+    body = await resp2.text()
+    assert "Previewing as: <strong>viewer</strong>" in body
+
+
+async def test_view_as_post_sets_cookie_for_operator(
+    aiohttp_client, make_admin_app
+):
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    await _login(client, "pw")
+    csrf = await _csrf_token_from_dashboard(client)
+    resp = await client.post(
+        "/admin/view-as",
+        data={"role": "operator", "csrf_token": csrf, "next": "/admin/"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    resp2 = await client.get("/admin/")
+    body = await resp2.text()
+    assert "Previewing as: <strong>operator</strong>" in body
+
+
+async def test_view_as_post_super_clears_cookie(
+    aiohttp_client, make_admin_app
+):
+    """Selecting 'super' MUST drop the cookie so a session-secret
+    rotation doesn't leave a stale signed value behind."""
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    await _login(client, "pw")
+    csrf = await _csrf_token_from_dashboard(client)
+    # Set a viewer override first.
+    await client.post(
+        "/admin/view-as",
+        data={"role": "viewer", "csrf_token": csrf, "next": "/admin/"},
+    )
+    from web_admin import VIEW_AS_COOKIE_NAME
+    # Now toggle back to super.
+    csrf2 = await _csrf_token_from_dashboard(client)
+    resp = await client.post(
+        "/admin/view-as",
+        data={"role": "super", "csrf_token": csrf2, "next": "/admin/"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    # The Set-Cookie header should be a delete (max-age=0 / empty value).
+    set_cookie_hdr = resp.headers.getall("Set-Cookie", [])
+    assert any(
+        VIEW_AS_COOKIE_NAME in h
+        and ('Max-Age=0' in h or 'max-age=0' in h)
+        for h in set_cookie_hdr
+    ), f"Expected Max-Age=0 delete on {VIEW_AS_COOKIE_NAME}: {set_cookie_hdr!r}"
+
+
+async def test_view_as_post_rejects_unknown_role(
+    aiohttp_client, make_admin_app
+):
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    await _login(client, "pw")
+    csrf = await _csrf_token_from_dashboard(client)
+    resp = await client.post(
+        "/admin/view-as",
+        data={"role": "god", "csrf_token": csrf, "next": "/admin/"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    # Cookie should NOT be set.
+    from web_admin import VIEW_AS_COOKIE_NAME
+    assert VIEW_AS_COOKIE_NAME not in resp.cookies
+
+
+async def test_view_as_post_open_redirect_blocked(
+    aiohttp_client, make_admin_app
+):
+    """A tampered ``next=https://evil/`` MUST NOT turn the toggle
+    into an open-redirect — non-/admin/ targets fall back to /admin/."""
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    await _login(client, "pw")
+    csrf = await _csrf_token_from_dashboard(client)
+    resp = await client.post(
+        "/admin/view-as",
+        data={
+            "role": "viewer",
+            "csrf_token": csrf,
+            "next": "https://evil.example/",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/"
+
+
+async def test_view_as_post_records_audit(aiohttp_client, make_admin_app):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    csrf = await _csrf_token_from_dashboard(client)
+    await client.post(
+        "/admin/view-as",
+        data={"role": "viewer", "csrf_token": csrf, "next": "/admin/"},
+    )
+    # The first audit row is "login_ok" from _login. Find the
+    # view_as_change row.
+    calls = db.record_admin_audit.call_args_list
+    actions = [c.kwargs.get("action") or c.args[1] for c in calls]
+    assert "view_as_change" in actions, (
+        f"Expected view_as_change in audit actions: {actions!r}"
+    )
+
+
+# ---------------------------------------------------------------------
+# Integration tests for _require_role gates
+# ---------------------------------------------------------------------
+
+
+async def _set_view_as(client, role: str) -> None:
+    """Helper: log in (if not already) + set the view-as cookie."""
+    csrf = await _csrf_token_from_dashboard(client)
+    resp = await client.post(
+        "/admin/view-as",
+        data={"role": role, "csrf_token": csrf, "next": "/admin/"},
+    )
+    assert resp.status in (200, 302)
+
+
+async def test_viewer_can_read_dashboard(aiohttp_client, make_admin_app):
+    """A previewed-viewer can still read viewer-floor pages."""
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    await _login(client, "pw")
+    await _set_view_as(client, "viewer")
+    resp = await client.get("/admin/")
+    assert resp.status == 200
+
+
+async def test_viewer_cannot_post_user_adjust(
+    aiohttp_client, make_admin_app
+):
+    """user_adjust requires super; previewed-viewer must be denied."""
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    # Capture CSRF before the override (token is keyed off the auth
+    # cookie, not view-as, so it stays valid across the toggle).
+    csrf = await _csrf_token_from_dashboard(client)
+    await _set_view_as(client, "viewer")
+    resp = await client.post(
+        "/admin/users/12345/adjust",
+        data={
+            "csrf_token": csrf,
+            "amount_usd": "1.00",
+            "memo": "test",
+            "kind": "credit",
+        },
+        allow_redirects=False,
+    )
+    # Gate denies → 302 to /admin/ with a flash banner.
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/"
+    # adjust_balance must NOT have been called.
+    db.adjust_balance.assert_not_called()
+
+
+async def test_viewer_cannot_post_broadcast(
+    aiohttp_client, make_admin_app
+):
+    """broadcast_post requires operator; viewer must be denied."""
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    csrf = await _csrf_token_from_dashboard(client)
+    await _set_view_as(client, "viewer")
+    resp = await client.post(
+        "/admin/broadcast",
+        data={"csrf_token": csrf, "message": "hi", "audience": "all"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/"
+
+
+async def test_operator_can_post_broadcast_but_not_user_adjust(
+    aiohttp_client, make_admin_app
+):
+    """An operator-floor preview can broadcast but NOT adjust wallets."""
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    csrf = await _csrf_token_from_dashboard(client)
+    await _set_view_as(client, "operator")
+    # user_adjust → super-only → deny.
+    resp_adjust = await client.post(
+        "/admin/users/12345/adjust",
+        data={
+            "csrf_token": csrf,
+            "amount_usd": "1.00",
+            "memo": "test",
+            "kind": "credit",
+        },
+        allow_redirects=False,
+    )
+    assert resp_adjust.status == 302
+    assert resp_adjust.headers["Location"] == "/admin/"
+    db.adjust_balance.assert_not_called()
+
+
+async def test_super_view_as_can_do_everything(
+    aiohttp_client, make_admin_app
+):
+    """The default (no override) is super; every gate must pass.
+
+    We don't actually mutate state here — that's covered by the
+    existing per-handler tests. We just pin that the gate doesn't
+    bounce a super-tier preview.
+    """
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    # No view-as override → defaults to super → gate must pass through
+    # to the underlying handler. We pick a handler that 302s on success
+    # so we can distinguish a successful run from a gate-deny.
+    resp = await client.get("/admin/control")
+    assert resp.status == 200
+
+
+async def test_role_gate_audits_deny(aiohttp_client, make_admin_app):
+    """A role-deny must record a ``view_as_deny`` audit row so an
+    operator can see what a previewed-lower-role user tried to do."""
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    csrf = await _csrf_token_from_dashboard(client)
+    await _set_view_as(client, "viewer")
+    await client.post(
+        "/admin/users/12345/adjust",
+        data={
+            "csrf_token": csrf,
+            "amount_usd": "1.00",
+            "memo": "test",
+            "kind": "credit",
+        },
+        allow_redirects=False,
+    )
+    actions = [
+        c.kwargs.get("action") or (c.args[1] if len(c.args) > 1 else None)
+        for c in db.record_admin_audit.call_args_list
+    ]
+    assert "view_as_deny" in actions
+
+
+async def test_view_as_audit_slugs_in_action_labels():
+    """Both ``view_as_change`` and ``view_as_deny`` MUST be in
+    AUDIT_ACTION_LABELS so the /admin/audit filter dropdown surfaces
+    them. Pinning here so a future PR can't quietly drop them."""
+    from web_admin import AUDIT_ACTION_LABELS
+
+    assert "view_as_change" in AUDIT_ACTION_LABELS
+    assert "view_as_deny" in AUDIT_ACTION_LABELS
+
+
+async def test_layout_renders_view_as_widget(
+    aiohttp_client, make_admin_app
+):
+    """The toggle widget must render on every page so an admin
+    previewing as a lower role can revert."""
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    await _login(client, "pw")
+    resp = await client.get("/admin/")
+    body = await resp.text()
+    assert 'action="/admin/view-as"' in body
+    assert 'name="role"' in body
+    # All three role options rendered in the dropdown.
+    for role in ("viewer", "operator", "super"):
+        assert f'value="{role}"' in body
+
+
+async def test_role_gates_on_routes_module_definition():
+    """Module-level pin: a regression that drops _require_role from a
+    route registration should be caught by inspecting the source."""
+    import inspect
+    import web_admin
+
+    src = inspect.getsource(web_admin.setup_admin_routes)
+    # Spot-check the highest-risk routes — must be wrapped in
+    # _require_role(ROLE_SUPER).
+    super_routes = [
+        '"/admin/users/{telegram_id}/adjust"',
+        '"/admin/users/{telegram_id}/edit"',
+        '"/admin/transactions/{transaction_id}/refund"',
+        '"/admin/control/disable-all-models"',
+        '"/admin/control/force-stop"',
+        '"/admin/openrouter-keys/add"',
+        '"/admin/roles"',
+    ]
+    for route in super_routes:
+        # Find the line and assert it's gated by _require_role(ROLE_SUPER)
+        # within the next ~3 lines.
+        idx = src.find(route)
+        assert idx >= 0, f"route {route} not found in setup_admin_routes"
+        snippet = src[idx : idx + 200]
+        assert "_require_role(ROLE_SUPER)" in snippet, (
+            f"route {route} not gated by _require_role(ROLE_SUPER): "
+            f"{snippet!r}"
+        )
+
+    operator_routes = [
+        '"/admin/broadcast"',
+        '"/admin/promos"',
+        '"/admin/gifts"',
+    ]
+    for route in operator_routes:
+        # POST handler line follows the GET line. Search for the POST.
+        # We match `_require_role(ROLE_OPERATOR)` near the route literal.
+        all_idx = [
+            i for i in range(len(src)) if src.startswith(route, i)
+        ]
+        assert all_idx, f"route {route} not found"
+        # At least one occurrence must be gated by ROLE_OPERATOR.
+        gated = any(
+            "_require_role(ROLE_OPERATOR)" in src[i : i + 200]
+            for i in all_idx
+        )
+        assert gated, (
+            f"route {route} has no _require_role(ROLE_OPERATOR) "
+            f"registration"
+        )

@@ -4,7 +4,31 @@
 <div class="layout">
   <aside class="sidebar">
     <h1>Meowassist Admin</h1>
+    {#
+      Stage-15-Step-E #5 follow-up #4: "view as <role>" toggle.
+      Lets the password-owner (implicitly :data:`ROLE_SUPER`) preview
+      the panel as a viewer / operator so role gates can be exercised
+      without provisioning a second password. Per-user web auth is
+      the multi-week redesign called out in Step-E #5's open backlog.
+      The widget always renders so an admin previewing as a lower
+      role can revert; the toggle endpoint itself is gated only by
+      ``_require_auth`` for that reason.
+    #}
+    <form method="post" action="/admin/view-as" class="view-as-toggle">
+      <label for="view-as-role" class="view-as-label">
+        Previewing as: <strong>{{ view_as }}</strong>
+      </label>
+      <input type="hidden" name="csrf_token" value="{{ view_as_csrf_token }}">
+      <input type="hidden" name="next" value="{{ view_as_next }}">
+      <select id="view-as-role" name="role" onchange="this.form.submit()">
+        <option value="{{ ROLE_VIEWER }}" {% if view_as == ROLE_VIEWER %}selected{% endif %}>👁 viewer</option>
+        <option value="{{ ROLE_OPERATOR }}" {% if view_as == ROLE_OPERATOR %}selected{% endif %}>🛠 operator</option>
+        <option value="{{ ROLE_SUPER }}" {% if view_as == ROLE_SUPER %}selected{% endif %}>👑 super</option>
+      </select>
+      <noscript><button type="submit">Switch</button></noscript>
+    </form>
     <nav>
+      {# Viewer-readable: dashboard, monetization, audit, transactions, gateway/model lists, openrouter list, broadcast list, users list, gifts list, promos list, strings list, role list, control read, 2FA enrol. #}
       <a href="/admin/" class="{% if active_page == 'dashboard' %}active{% endif %}">📊 Dashboard</a>
       <a href="/admin/control" class="{% if active_page == 'control' %}active{% endif %}">🚨 Bot health</a>
       <a href="/admin/monetization" class="{% if active_page == 'monetization' %}active{% endif %}">💰 Monetization</a>
