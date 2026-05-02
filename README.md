@@ -558,6 +558,31 @@ NowPayments crypto invoices.
   last numbered slot into the in-process pool. Now matches
   `load_keys` exactly, pinned by 5 new tests. Stage-15-Step-F
   follow-up #5.
+- **Per-loop manual "tick now" button on `/admin/control`** —
+  every background loop registers an async runner alongside its
+  cadence (`@register_loop("fx_refresh", cadence_seconds=600,
+  runner=_tick_fx_refresh_from_app)`), and the panel's heartbeat
+  table grew an "Action" column with a per-row "Tick now" button
+  that POSTs to `/admin/control/loop/<name>/tick-now`. The handler
+  CSRF-guards, audit-logs `control_loop_tick_now` *before*
+  invoking, and runs the runner under
+  `asyncio.wait_for(_, timeout=60s)` so a wedged outbound
+  connection can't tie up the request worker. Operators verifying
+  a freshly-deployed loop no longer wait up to 24 h
+  (`catalog_refresh`) or 6 h (`model_discovery`) before the panel
+  proves the loop actually works. Heartbeat metrics update through
+  the runner's normal `record_loop_tick(name)` path — the panel
+  reads exactly as if the loop had naturally fired. Bundled bug
+  fix: the panel rendered "(overdue by Ns)" the moment a loop's
+  age passed its cadence, but the classifier's actual overdue
+  threshold is ≈ 2× cadence + 60 s — so in the grace window the
+  next-tick text said "overdue" while the status badge said
+  "fresh", confusing during incident triage. Now classifies that
+  grace window as `is_running_late` (mutually exclusive with
+  `is_overdue`, more severe wins) and the template renders three
+  distinct sub-text strings: `(overdue by ~Ns)`,
+  `(running late ~Ns)`, `(next in ~Ns)`. Pinned by 3 new tests
+  covering each grace-window state. Stage-15-Step-F follow-up #6.
 - **Proactive bot-health Telegram DMs** — new `bot_health_alert.py`
   background loop wakes every `BOT_HEALTH_ALERT_INTERVAL_SECONDS`
   (default 60), runs the same `bot_health.compute_bot_status`

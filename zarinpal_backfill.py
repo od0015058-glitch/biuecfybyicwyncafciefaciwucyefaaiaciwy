@@ -367,8 +367,37 @@ async def backfill_pending_once(
     return credited
 
 
+async def _tick_zarinpal_backfill_from_app(app) -> None:
+    """Run a single ``zarinpal_backfill`` pass, deps from *app*.
+
+    Reads the same env vars the loop spawner does so a manual
+    tick respects whatever overrides the operator has set.
+    """
+    from web_admin import APP_KEY_BOT  # local: avoid import cycle
+
+    bot = app.get(APP_KEY_BOT)
+    if bot is None:
+        raise RuntimeError(
+            "zarinpal_backfill tick-now: bot not in app state — "
+            "manual ticks require a bot to DM credited users."
+        )
+    min_age_seconds = (
+        _read_int_env("ZARINPAL_BACKFILL_MIN_AGE_MINUTES", 5) * 60
+    )
+    max_age_hours = _read_int_env("ZARINPAL_BACKFILL_MAX_AGE_HOURS", 23)
+    batch_limit = _read_int_env("ZARINPAL_BACKFILL_BATCH", 100)
+    await backfill_pending_once(
+        bot,
+        min_age_seconds=min_age_seconds,
+        max_age_hours=max_age_hours,
+        batch_limit=batch_limit,
+    )
+
+
 @register_loop(
-    "zarinpal_backfill", cadence_seconds=_DEFAULT_INTERVAL_MIN * 60,
+    "zarinpal_backfill",
+    cadence_seconds=_DEFAULT_INTERVAL_MIN * 60,
+    runner=_tick_zarinpal_backfill_from_app,
 )
 async def _backfill_loop(
     bot: Bot,

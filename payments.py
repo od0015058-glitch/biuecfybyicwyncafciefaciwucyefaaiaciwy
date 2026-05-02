@@ -469,7 +469,28 @@ async def refresh_min_amounts_once(
     await asyncio.gather(*(_one(t) for t in tickers))
 
 
-@register_loop("min_amount_refresh", cadence_seconds=900)
+async def _tick_min_amount_refresh_from_app(app) -> None:
+    """Run a single ``min_amount_refresh`` pass, deps from *app*.
+
+    The "Tick now" button on ``/admin/control`` POSTs to a handler
+    that calls this. It mirrors the loop's once-per-tick body —
+    one call to :func:`refresh_min_amounts_once` over every
+    currently-supported pay currency.
+
+    Local import of ``handlers`` to avoid a top-level import cycle
+    (``handlers`` already imports ``payments``).
+    """
+    from handlers import SUPPORTED_PAY_CURRENCIES
+
+    tickers = [ticker for _label, ticker in SUPPORTED_PAY_CURRENCIES]
+    await refresh_min_amounts_once(tickers)
+
+
+@register_loop(
+    "min_amount_refresh",
+    cadence_seconds=900,
+    runner=_tick_min_amount_refresh_from_app,
+)
 async def refresh_min_amounts_loop(
     tickers: "list[str]",
     *,

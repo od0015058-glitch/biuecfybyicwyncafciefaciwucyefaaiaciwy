@@ -570,8 +570,29 @@ async def run_discovery_pass(bot: Bot) -> DiscoveryResult:
     )
 
 
+async def _tick_model_discovery_from_app(app) -> None:
+    """Run a single ``model_discovery`` pass, deps from *app*.
+
+    Requires a bot in app state — discovery DMs admins about
+    newly-introduced models. If the bot is missing (test path),
+    raises ``RuntimeError`` so the panel surfaces a clear
+    failure rather than silently no-oping.
+    """
+    from web_admin import APP_KEY_BOT  # local: avoid import cycle
+
+    bot = app.get(APP_KEY_BOT)
+    if bot is None:
+        raise RuntimeError(
+            "model_discovery tick-now: bot not in app state — "
+            "manual ticks require a bot to DM about new models."
+        )
+    await run_discovery_pass(bot)
+
+
 @register_loop(
-    "model_discovery", cadence_seconds=_DEFAULT_DISCOVERY_INTERVAL_SECONDS,
+    "model_discovery",
+    cadence_seconds=_DEFAULT_DISCOVERY_INTERVAL_SECONDS,
+    runner=_tick_model_discovery_from_app,
 )
 async def discover_new_models_loop(
     bot: Bot, *, interval_seconds: int | None = None

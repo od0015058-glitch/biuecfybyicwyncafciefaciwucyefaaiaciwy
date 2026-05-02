@@ -429,7 +429,23 @@ async def _notify_admins_of_rate_move(
     return sent
 
 
-@register_loop("fx_refresh", cadence_seconds=_DEFAULT_INTERVAL_SECONDS)
+async def _tick_fx_refresh_from_app(app) -> None:
+    """Run a single ``fx_refresh`` pass, deps from *app*.
+
+    The bot is optional in :func:`refresh_usd_to_toman_once` —
+    when present it's used to DM admins about large FX moves.
+    """
+    from web_admin import APP_KEY_BOT  # local: avoid import cycle
+
+    bot = app.get(APP_KEY_BOT)
+    await refresh_usd_to_toman_once(bot)
+
+
+@register_loop(
+    "fx_refresh",
+    cadence_seconds=_DEFAULT_INTERVAL_SECONDS,
+    runner=_tick_fx_refresh_from_app,
+)
 async def refresh_usd_to_toman_loop(
     bot: Any = None,
     *,

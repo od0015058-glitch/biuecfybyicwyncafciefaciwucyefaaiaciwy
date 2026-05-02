@@ -119,6 +119,23 @@
   .loop-status-badge.warming  { background: rgba(249, 226, 175, 0.15); color: #f9e2af; }
   .loop-status-badge.overdue  { background: rgba(243, 139, 168, 0.18); color: #f38ba8; }
   .loop-status-badge.unknown  { background: rgba(180, 180, 200, 0.10); color: var(--text-muted); }
+
+  /* "Tick now" per-loop button (Stage-15-Step-F follow-up #6). Same
+     visual weight as the threshold-form ``btn-confirm`` but smaller
+     and quiet so it doesn't drown out the heartbeats table. */
+  .btn-tick {
+    background: transparent;
+    color: var(--text-muted);
+    border: 1px solid rgba(180, 180, 200, 0.25);
+    border-radius: 3px;
+    padding: 3px 8px;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .btn-tick:hover {
+    color: var(--text);
+    border-color: rgba(180, 180, 200, 0.5);
+  }
 </style>
 {% endblock %}
 
@@ -201,6 +218,7 @@
         <td class="label">Last tick</td>
         <td class="label">Stale after</td>
         <td class="label">Status</td>
+        <td class="label">Action</td>
       </tr>
     </thead>
     <tbody>
@@ -221,10 +239,12 @@
             {{ "{:,}".format(loop_row.last_tick_age_s) }}s ago
             {% if loop_row.next_tick_in_s is not none %}
               <span style="color: var(--text-muted); font-size: 11px;">
-                {% if loop_row.next_tick_in_s >= 0 %}
-                  (next in ~{{ "{:,}".format(loop_row.next_tick_in_s) }}s)
-                {% else %}
+                {% if loop_row.is_overdue %}
                   (overdue by ~{{ "{:,}".format(-loop_row.next_tick_in_s) }}s)
+                {% elif loop_row.is_running_late %}
+                  (running late ~{{ "{:,}".format(-loop_row.next_tick_in_s) }}s)
+                {% elif loop_row.next_tick_in_s >= 0 %}
+                  (next in ~{{ "{:,}".format(loop_row.next_tick_in_s) }}s)
                 {% endif %}
               </span>
             {% endif %}
@@ -246,6 +266,22 @@
             <span class="loop-status-badge unknown">no tick</span>
           {% else %}
             <span class="loop-status-badge fresh">fresh</span>
+          {% endif %}
+        </td>
+        <td class="value">
+          {% if loop_row.has_runner %}
+            <form method="post"
+                  action="/admin/control/loop/{{ loop_row.name }}/tick-now"
+                  style="margin: 0;">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button type="submit"
+                      class="btn-tick"
+                      title="Run a single iteration of {{ loop_row.name }} now (bypasses cadence)">
+                Tick now
+              </button>
+            </form>
+          {% else %}
+            <span style="color: var(--text-muted); font-size: 11px;">—</span>
           {% endif %}
         </td>
       </tr>

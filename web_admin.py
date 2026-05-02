@@ -6021,6 +6021,15 @@ def _collect_control_signals(
         cadence_lookup = lambda _name: None  # noqa: E731
         threshold_lookup = lambda _name: 0  # noqa: E731
 
+    # Stage-15-Step-F follow-up #6: report per-loop runner registration
+    # so the panel can hide the "Tick now" button for loops that
+    # haven't opted in (e.g. a future loop in development) instead of
+    # offering a button that 500s.
+    try:
+        from bot_health import LOOP_RUNNERS as _runners
+    except Exception:
+        _runners: dict = {}
+
     now = time.time()
     uptime_s = max(0.0, now - boot_epoch)
     loops: list[dict] = []
@@ -6029,6 +6038,7 @@ def _collect_control_signals(
         cadence = cadence_lookup(name)
         threshold = threshold_lookup(name)
         last = get_last(name)
+        has_runner = name in _runners
         if last is None or last == 0.0:
             # Never ticked. Mirror the classifier's grace-period
             # contract — a fresh deploy whose long-cadence loop
@@ -6044,7 +6054,9 @@ def _collect_control_signals(
                 "stale_threshold_s": threshold,
                 "next_tick_in_s": None,
                 "is_overdue": past_grace,
+                "is_running_late": False,
                 "grace_pending": not past_grace,
+                "has_runner": has_runner,
             })
             continue
         age = max(0, int(now - float(last)))
@@ -6054,14 +6066,36 @@ def _collect_control_signals(
         # (where we genuinely don't know when the next tick should
         # land).
         next_in = (cadence - age) if cadence is not None else None
+        is_overdue = threshold > 0 and age > threshold
+        # Bug fix (bundled in PR #159): pre-fix the template rendered
+        # "(overdue by Ns)" any time ``next_in < 0`` — i.e. as soon as
+        # the loop's age passed its cadence. But the classifier's
+        # actual overdue threshold is ≈ 2× cadence + 60s, so a loop
+        # one cadence past its last tick is still *fresh* per the
+        # classifier and the status badge would say "fresh" while the
+        # next-tick text said "overdue by Ns". Confusing for ops.
+        #
+        # Add an explicit ``is_running_late`` flag for the grace
+        # window between cadence and stale-threshold so the template
+        # can render "(running late ~Ns)" — visibly distinct from
+        # "(overdue)" and matching what the classifier actually
+        # thinks about the loop's health.
+        is_running_late = (
+            cadence is not None
+            and next_in is not None
+            and next_in < 0
+            and not is_overdue
+        )
         loops.append({
             "name": name,
             "last_tick_age_s": age,
             "cadence_s": cadence,
             "stale_threshold_s": threshold,
             "next_tick_in_s": next_in,
-            "is_overdue": threshold > 0 and age > threshold,
+            "is_overdue": is_overdue,
+            "is_running_late": is_running_late,
             "grace_pending": False,
+            "has_runner": has_runner,
         })
         loop_ticks_for_classifier[name] = float(last)
 
@@ -6589,6 +6623,155 @@ async def control_force_stop_post(
     return response
 
 
+# Stage-15-Step-F follow-up #6: per-loop manual "tick now" button.
+# Bounded wait so a slow loop (network-bound discovery, FX fetch)
+# doesn't tie up the request worker indefinitely. The loop's own
+# tick runs in the same task; if we time out the loop's coroutine
+# is cancelled — which is the desired behaviour (better than
+# leaking a zombie task into the request handler).
+_TICK_NOW_TIMEOUT_SECONDS = 60.0
+
+
+async def control_loop_tick_now_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/control/loop/{name}/tick-now`` — run a single
+    iteration of *name* on demand.
+
+    The handler:
+
+    1. Verifies the CSRF token (else 302 + flash).
+    2. Looks up the runner via :func:`bot_health.loop_runner`. A
+       missing or unregistered name 302s back with an error flash
+       — never silently no-ops.
+    3. Audit-logs the action *before* invoking the runner so a
+       runner that crashes the request handler still leaves a
+       trace.
+    4. Invokes the runner with a bounded
+       ``_TICK_NOW_TIMEOUT_SECONDS`` (60 s default) — long enough
+       for the slowest network-bound loop (discovery, FX) but
+       short enough to avoid leaking the request worker if a
+       runner hangs on a wedged outbound connection.
+    5. 302s back to ``/admin/control`` with a success or error
+       flash. Heartbeat metrics update through the runner's
+       normal ``record_loop_tick`` path — there's no separate
+       'tick-now' metric so the panel reads exactly as if the
+       loop had naturally fired.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    form = await request.post()
+
+    guard = _control_csrf_guard(request, form)
+    if guard is not None:
+        return guard
+
+    name = request.match_info.get("name", "").strip()
+    response = web.HTTPFound(location="/admin/control")
+
+    from bot_health import loop_runner, LOOP_CADENCES
+
+    if not name or name not in LOOP_CADENCES:
+        log.warning(
+            "control: tick-now POST for unknown loop %r from %s",
+            name, request.remote,
+        )
+        await _record_audit_safe(
+            request, "control_loop_tick_now",
+            outcome="deny",
+            target=name,
+            meta={"reason": "unknown_loop"},
+        )
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Unknown loop {name!r} — refusing to tick-now. "
+                f"Loop names are case-sensitive."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    runner = loop_runner(name)
+    if runner is None:
+        log.warning(
+            "control: tick-now POST for loop %r with no runner from %s",
+            name, request.remote,
+        )
+        await _record_audit_safe(
+            request, "control_loop_tick_now",
+            outcome="deny",
+            target=name,
+            meta={"reason": "no_runner_registered"},
+        )
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Loop {name!r} has no registered tick-now runner. "
+                f"This is a programmer error — please file an issue."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    log.info(
+        "control: tick-now invoked for loop %r from %s",
+        name, request.remote,
+    )
+    await _record_audit_safe(
+        request, "control_loop_tick_now",
+        outcome="ok",
+        target=name,
+        meta={"loop": name},
+    )
+
+    try:
+        await asyncio.wait_for(
+            runner(request.app),
+            timeout=_TICK_NOW_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        log.warning(
+            "control: tick-now for loop %r exceeded %ss timeout",
+            name, _TICK_NOW_TIMEOUT_SECONDS,
+        )
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Loop {name!r} tick exceeded "
+                f"{int(_TICK_NOW_TIMEOUT_SECONDS)}s timeout — the "
+                f"runner was cancelled. Check logs for the partial "
+                f"tick state."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+    except Exception as exc:
+        log.exception(
+            "control: tick-now for loop %r raised", name,
+        )
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Loop {name!r} tick failed: "
+                f"{exc.__class__.__name__}: {exc}. See server logs."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    set_flash(
+        response, kind="success",
+        message=(
+            f"Loop {name!r} ticked successfully. The heartbeat "
+            f"timestamp on this panel will update on the next "
+            f"refresh."
+        ),
+        secret=secret, cookie_secure=cookie_secure,
+    )
+    return response
+
+
 async def control_thresholds_post(
     request: web.Request,
 ) -> web.StreamResponse:
@@ -7102,6 +7285,11 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/control/thresholds",
         _require_auth(control_thresholds_post),
+    )
+    # Stage-15-Step-F follow-up #6: per-loop manual "tick now" button.
+    app.router.add_post(
+        "/admin/control/loop/{name}/tick-now",
+        _require_auth(control_loop_tick_now_post),
     )
 
     # Stage-9-Step-10: durable broadcast registry orphan sweep.
