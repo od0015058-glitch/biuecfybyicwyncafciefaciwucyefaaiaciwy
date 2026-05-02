@@ -78,6 +78,138 @@ _PENDING_ALERT_LIMIT_DEFAULT = 500
 _PENDING_ALERT_MAX_ROWS_IN_BODY = 10
 
 
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 10: DB-backed override for the
+# PENDING_ALERT_THRESHOLD_HOURS knob.
+# ---------------------------------------------------------------------
+#
+# Same shape as the Row-#9 override layer in ``pending_expiration``.
+# The reaper threshold (``PENDING_EXPIRATION_HOURS``) is the *terminal*
+# 24h cleanup line; the alert threshold (``PENDING_ALERT_THRESHOLD_HOURS``,
+# default 2h) is the much-earlier "something is wrong" line. Operators
+# need to retune the latter without a redeploy when traffic patterns
+# change (e.g. a slow chain that legitimately keeps invoices PENDING
+# for 4+h would page admins constantly under the default 2h threshold).
+
+ALERT_THRESHOLD_SETTING_KEY: str = "PENDING_ALERT_THRESHOLD_HOURS"
+ALERT_THRESHOLD_DEFAULT: int = _PENDING_ALERT_THRESHOLD_HOURS_DEFAULT
+ALERT_THRESHOLD_MINIMUM: int = 1
+# 1-year cap on the override slot. The alert threshold is *less* than
+# the reaper threshold by definition (2h vs 24h), so values above 24h
+# don't make operational sense — but the slot is bounded by the
+# reaper's own cap rather than the reaper threshold (which is itself
+# a runtime-tunable override) so the bounds don't go stale if Row #9
+# is also retuned.
+ALERT_THRESHOLD_OVERRIDE_MAXIMUM: int = 24 * 365
+_ALERT_THRESHOLD_OVERRIDE: int | None = None
+
+
+def _coerce_alert_threshold_hours(value: object) -> int | None:
+    """Validate a threshold-hours candidate for the override slot.
+
+    Rejects ``bool`` explicitly even though it's an ``int`` subclass —
+    a stored ``"true"`` / ``"True"`` row would otherwise coerce to
+    ``1`` and shrink the threshold to "anything PENDING for an hour
+    is suspicious", which would page admins constantly.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        candidate = value
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            candidate = int(stripped)
+        except ValueError:
+            return None
+    else:
+        return None
+    if candidate < ALERT_THRESHOLD_MINIMUM:
+        return None
+    if candidate > ALERT_THRESHOLD_OVERRIDE_MAXIMUM:
+        return None
+    return candidate
+
+
+def set_alert_threshold_override(value: int) -> None:
+    """Apply an in-process override for the alert threshold.
+
+    Defence-in-depth: re-validates via :func:`_coerce_alert_threshold_hours`
+    so a future caller that bypasses the web-UI's coercer (e.g. a
+    test that sets a bad value directly) still gets a clean rejection.
+    """
+    coerced = _coerce_alert_threshold_hours(value)
+    if coerced is None:
+        raise ValueError(
+            f"alert_threshold must be int in "
+            f"[{ALERT_THRESHOLD_MINIMUM}, {ALERT_THRESHOLD_OVERRIDE_MAXIMUM}], "
+            f"got {value!r}"
+        )
+    global _ALERT_THRESHOLD_OVERRIDE
+    _ALERT_THRESHOLD_OVERRIDE = coerced
+
+
+def clear_alert_threshold_override() -> bool:
+    """Drop the in-process override. Returns ``True`` if one was active."""
+    global _ALERT_THRESHOLD_OVERRIDE
+    had = _ALERT_THRESHOLD_OVERRIDE is not None
+    _ALERT_THRESHOLD_OVERRIDE = None
+    return had
+
+
+def get_alert_threshold_override() -> int | None:
+    """Return the current in-process override (or ``None``)."""
+    return _ALERT_THRESHOLD_OVERRIDE
+
+
+def reset_alert_threshold_override_for_tests() -> None:
+    """Test-helper: drop the override slot without the public API.
+
+    Mirrors :func:`pending_expiration.reset_expiration_hours_override_for_tests`
+    so the autouse reset fixture in ``test_pending_alert.py`` can
+    null the slot in setUp / tearDown.
+    """
+    global _ALERT_THRESHOLD_OVERRIDE
+    _ALERT_THRESHOLD_OVERRIDE = None
+
+
+async def refresh_alert_threshold_override_from_db(database) -> int | None:
+    """Reload the override from the ``system_settings`` overlay.
+
+    Best-effort: a transient DB error keeps the cache value in place
+    (logged at ERROR). A malformed value (non-int, below min, above
+    max) clears the cache (logged at WARNING). Returns the new cache
+    value.
+    """
+    global _ALERT_THRESHOLD_OVERRIDE
+    if database is None:
+        return _ALERT_THRESHOLD_OVERRIDE
+    try:
+        raw = await database.get_setting(ALERT_THRESHOLD_SETTING_KEY)
+    except Exception:
+        log.exception(
+            "refresh_alert_threshold_override_from_db: get_setting failed; "
+            "keeping previous cache value"
+        )
+        return _ALERT_THRESHOLD_OVERRIDE
+    if raw is None:
+        _ALERT_THRESHOLD_OVERRIDE = None
+        return None
+    coerced = _coerce_alert_threshold_hours(raw)
+    if coerced is None:
+        log.warning(
+            "refresh_alert_threshold_override_from_db: rejected stored "
+            "value %r — clearing override and falling through to env / default",
+            raw,
+        )
+        _ALERT_THRESHOLD_OVERRIDE = None
+        return None
+    _ALERT_THRESHOLD_OVERRIDE = coerced
+    return coerced
+
+
 def _read_int_env(name: str, default: int, *, minimum: int = 1) -> int:
     """Parse a small integer env var with a clamping floor.
 
@@ -112,13 +244,46 @@ def get_pending_alert_threshold_hours() -> int:
     Exposed so the dashboard tile (``web_admin.dashboard``) and this
     loop's invocation of :meth:`Database.list_pending_payments_over_threshold`
     use the *same* threshold without duplicating the env-parse logic
-    (the bug fix in this PR — pre-Step-B, the dashboard tile read
-    ``MIN(created_at)`` while there was no separate "overdue" notion).
+    (the bug fix in Stage-12-Step-B — the original dashboard tile
+    read ``MIN(created_at)`` while there was no separate "overdue"
+    notion).
+
+    Stage-15-Step-E #10b row 10: DB-backed override beats env beats
+    compile-time default. The :func:`_alert_loop` re-reads this on
+    every iteration so a saved override takes effect on the next
+    tick (no restart). The :func:`_tick_pending_alert_from_app`
+    manual-tick path already calls this resolver, so the "Tick now"
+    button respects overrides too.
     """
+    if _ALERT_THRESHOLD_OVERRIDE is not None:
+        return _ALERT_THRESHOLD_OVERRIDE
     return _read_int_env(
         "PENDING_ALERT_THRESHOLD_HOURS",
         _PENDING_ALERT_THRESHOLD_HOURS_DEFAULT,
     )
+
+
+def get_pending_alert_threshold_source() -> str:
+    """Return ``db`` / ``env`` / ``default`` for the resolved threshold.
+
+    Mirrors :func:`pending_expiration.get_pending_expiration_hours_source`.
+    Used by the source-badge in the ``/admin/control`` editor card so
+    operators can see at a glance where the live threshold comes
+    from.
+    """
+    if _ALERT_THRESHOLD_OVERRIDE is not None:
+        return "db"
+    raw = os.getenv("PENDING_ALERT_THRESHOLD_HOURS", "").strip()
+    if not raw:
+        return "default"
+    try:
+        int(raw)
+    except ValueError:
+        # ``_read_int_env`` falls back to the compile-time default
+        # for non-numeric env values, so the resolved threshold is
+        # actually the default — surface that.
+        return "default"
+    return "env"
 
 
 def get_pending_alert_interval_seconds() -> int:
@@ -367,6 +532,13 @@ async def _alert_loop(
 
     One iteration that raises is logged and the loop keeps going — we
     don't let a transient DB blip take the alert plumbing off the air.
+
+    Stage-15-Step-E #10b row 10: ``threshold_hours`` is the value
+    captured at startup but the loop re-reads it via
+    :func:`get_pending_alert_threshold_hours` on every iteration so
+    a saved DB override takes effect on the next tick — no restart
+    required. The kwarg is retained as the bootstrap value for the
+    very first iteration (mirrors :func:`pending_expiration._expiration_loop`).
     """
     state: set[tuple[int, int]] = set()
     log.info(
@@ -376,12 +548,13 @@ async def _alert_loop(
         threshold_hours,
         row_limit,
     )
+    next_threshold = threshold_hours
     try:
         while True:
             try:
                 await run_pending_alert_pass(
                     bot,
-                    threshold_hours=threshold_hours,
+                    threshold_hours=next_threshold,
                     state=state,
                     row_limit=row_limit,
                 )
@@ -398,6 +571,14 @@ async def _alert_loop(
 
                 record_loop_tick("pending_alert")
             await asyncio.sleep(interval_seconds)
+            try:
+                next_threshold = get_pending_alert_threshold_hours()
+            except Exception:
+                log.exception(
+                    "get_pending_alert_threshold_hours raised; keeping "
+                    "previous threshold %dh",
+                    next_threshold,
+                )
     except asyncio.CancelledError:
         log.info("pending-alert loop cancelled; exiting cleanly")
         raise

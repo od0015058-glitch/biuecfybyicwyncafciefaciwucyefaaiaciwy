@@ -447,6 +447,29 @@ async def main():
             "— falling through to env / compile-time default"
         )
 
+    # Stage-15-Step-E #10b row 10: warm the pending-PENDING alert
+    # threshold override cache so the very first pending-alert tick
+    # after boot uses the operator's configured threshold rather
+    # than the env / compile-time default. Same iteration-time
+    # re-read pattern as the reaper loop above.
+    try:
+        import pending_alert
+        loaded_alert_hours = await (
+            pending_alert.refresh_alert_threshold_override_from_db(db)
+        )
+        log.info(
+            "loaded PENDING_ALERT_THRESHOLD_HOURS override from "
+            "system_settings: %s (source=%s, effective=%dh)",
+            loaded_alert_hours,
+            pending_alert.get_pending_alert_threshold_source(),
+            pending_alert.get_pending_alert_threshold_hours(),
+        )
+    except Exception:
+        log.exception(
+            "failed to load PENDING_ALERT_THRESHOLD_HOURS override from DB "
+            "— falling through to env / compile-time default"
+        )
+
     # Overwrite BotFather's cached slash-command list with the
     # canonical one. Without this, Telegram shows whatever was last
     # typed into the BotFather "Edit Commands" panel — including

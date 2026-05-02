@@ -469,3 +469,427 @@ async def test_get_system_metrics_threshold_matches_alert_loop_default():
     assert result["pending_payments_over_threshold_count"] == 3
     # The threshold made it into the SQL bind.
     assert conn.fetchrow.await_args.args[1] == str(threshold)
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 10 — DB-backed PENDING_ALERT_THRESHOLD_HOURS
+# override.
+# ---------------------------------------------------------------------
+
+
+import logging  # noqa: E402  (kept local to the new section)
+
+
+@pytest.fixture(autouse=True)
+def _reset_alert_threshold_override():
+    """Each test starts from a clean override slot.
+
+    Mirrors :func:`test_pending_expiration._reset_expiration_hours_override`
+    so a test that monkeypatches env doesn't see a leaked override
+    from a previous test, and a leaked override doesn't survive
+    into later tests in the same module.
+    """
+    pending_alert.reset_alert_threshold_override_for_tests()
+    yield
+    pending_alert.reset_alert_threshold_override_for_tests()
+
+
+class _StubDB:
+    """Minimal DB stub mirroring ``test_pending_expiration._StubDB``."""
+
+    def __init__(
+        self,
+        initial=None,
+        *,
+        raise_on_get=None,
+        raise_on_upsert=None,
+        raise_on_delete=None,
+    ):
+        self.rows = dict(initial or {})
+        self.raise_on_get = raise_on_get
+        self.raise_on_upsert = raise_on_upsert
+        self.raise_on_delete = raise_on_delete
+        self.upserts = []
+        self.deletes = []
+
+    async def get_setting(self, key):
+        if self.raise_on_get is not None:
+            raise self.raise_on_get
+        return self.rows.get(key)
+
+    async def upsert_setting(self, key, value):
+        if self.raise_on_upsert is not None:
+            raise self.raise_on_upsert
+        self.upserts.append((key, value))
+        self.rows[key] = value
+
+    async def delete_setting(self, key):
+        if self.raise_on_delete is not None:
+            raise self.raise_on_delete
+        self.deletes.append(key)
+        return self.rows.pop(key, None) is not None
+
+
+# ---- _coerce_alert_threshold_hours ----------------------------------
+
+
+def test_coerce_alert_threshold_hours_accepts_int():
+    assert pending_alert._coerce_alert_threshold_hours(2) == 2
+
+
+def test_coerce_alert_threshold_hours_accepts_string():
+    assert pending_alert._coerce_alert_threshold_hours("4") == 4
+
+
+def test_coerce_alert_threshold_hours_strips_string():
+    assert pending_alert._coerce_alert_threshold_hours("  6  ") == 6
+
+
+def test_coerce_alert_threshold_hours_rejects_bool():
+    """A stored ``"true"`` row would coerce to ``1`` and shrink the
+    threshold to "anything PENDING for an hour is suspicious", which
+    would page admins constantly. Reject explicitly."""
+    assert pending_alert._coerce_alert_threshold_hours(True) is None
+    assert pending_alert._coerce_alert_threshold_hours(False) is None
+
+
+def test_coerce_alert_threshold_hours_rejects_zero():
+    assert pending_alert._coerce_alert_threshold_hours(0) is None
+
+
+def test_coerce_alert_threshold_hours_rejects_negative():
+    assert pending_alert._coerce_alert_threshold_hours(-1) is None
+
+
+def test_coerce_alert_threshold_hours_rejects_above_maximum():
+    above_max = pending_alert.ALERT_THRESHOLD_OVERRIDE_MAXIMUM + 1
+    assert pending_alert._coerce_alert_threshold_hours(above_max) is None
+
+
+def test_coerce_alert_threshold_hours_accepts_at_minimum():
+    assert pending_alert._coerce_alert_threshold_hours(
+        pending_alert.ALERT_THRESHOLD_MINIMUM
+    ) == pending_alert.ALERT_THRESHOLD_MINIMUM
+
+
+def test_coerce_alert_threshold_hours_accepts_at_maximum():
+    assert pending_alert._coerce_alert_threshold_hours(
+        pending_alert.ALERT_THRESHOLD_OVERRIDE_MAXIMUM
+    ) == pending_alert.ALERT_THRESHOLD_OVERRIDE_MAXIMUM
+
+
+def test_coerce_alert_threshold_hours_rejects_non_numeric_string():
+    assert pending_alert._coerce_alert_threshold_hours("notanint") is None
+
+
+def test_coerce_alert_threshold_hours_rejects_blank_string():
+    assert pending_alert._coerce_alert_threshold_hours("") is None
+    assert pending_alert._coerce_alert_threshold_hours("   ") is None
+
+
+def test_coerce_alert_threshold_hours_rejects_other_types():
+    assert pending_alert._coerce_alert_threshold_hours(None) is None
+    assert pending_alert._coerce_alert_threshold_hours([2]) is None
+    assert pending_alert._coerce_alert_threshold_hours({"hours": 2}) is None
+    assert pending_alert._coerce_alert_threshold_hours(2.5) is None
+
+
+# ---- set / clear / get override -------------------------------------
+
+
+def test_set_alert_threshold_override_persists():
+    pending_alert.set_alert_threshold_override(4)
+    assert pending_alert.get_alert_threshold_override() == 4
+
+
+def test_set_alert_threshold_override_revalidates():
+    """Defence-in-depth: the public setter re-runs the coercer so a
+    bad value rejected by the coercer is also rejected here."""
+    with pytest.raises(ValueError):
+        pending_alert.set_alert_threshold_override(0)
+    with pytest.raises(ValueError):
+        pending_alert.set_alert_threshold_override(True)
+    with pytest.raises(ValueError):
+        pending_alert.set_alert_threshold_override(
+            pending_alert.ALERT_THRESHOLD_OVERRIDE_MAXIMUM + 1
+        )
+
+
+def test_clear_alert_threshold_override_returns_true_when_active():
+    pending_alert.set_alert_threshold_override(4)
+    assert pending_alert.clear_alert_threshold_override() is True
+    assert pending_alert.get_alert_threshold_override() is None
+
+
+def test_clear_alert_threshold_override_returns_false_when_clean():
+    assert pending_alert.clear_alert_threshold_override() is False
+
+
+def test_get_pending_alert_threshold_hours_returns_override():
+    """Override beats env beats default."""
+    pending_alert.set_alert_threshold_override(7)
+    with patch.dict(os.environ, {"PENDING_ALERT_THRESHOLD_HOURS": "3"}):
+        assert pending_alert.get_pending_alert_threshold_hours() == 7
+
+
+def test_get_pending_alert_threshold_hours_env_when_no_override():
+    with patch.dict(os.environ, {"PENDING_ALERT_THRESHOLD_HOURS": "5"}):
+        assert pending_alert.get_pending_alert_threshold_hours() == 5
+
+
+def test_get_pending_alert_threshold_hours_default_when_no_override_or_env():
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("PENDING_ALERT_THRESHOLD_HOURS", None)
+        assert pending_alert.get_pending_alert_threshold_hours() == \
+            pending_alert.ALERT_THRESHOLD_DEFAULT
+
+
+# ---- get_pending_alert_threshold_source -----------------------------
+
+
+def test_get_pending_alert_threshold_source_db_when_override():
+    pending_alert.set_alert_threshold_override(4)
+    assert pending_alert.get_pending_alert_threshold_source() == "db"
+
+
+def test_get_pending_alert_threshold_source_env_when_env_set():
+    with patch.dict(os.environ, {"PENDING_ALERT_THRESHOLD_HOURS": "3"}):
+        assert pending_alert.get_pending_alert_threshold_source() == "env"
+
+
+def test_get_pending_alert_threshold_source_default_when_clean():
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("PENDING_ALERT_THRESHOLD_HOURS", None)
+        assert pending_alert.get_pending_alert_threshold_source() == "default"
+
+
+def test_get_pending_alert_threshold_source_default_when_env_garbage():
+    """Non-numeric env var falls back to the compile-time default;
+    surface that as ``default`` so the panel doesn't lie."""
+    with patch.dict(os.environ, {"PENDING_ALERT_THRESHOLD_HOURS": "abc"}):
+        assert pending_alert.get_pending_alert_threshold_source() == "default"
+
+
+def test_get_pending_alert_threshold_source_db_overrides_env():
+    pending_alert.set_alert_threshold_override(7)
+    with patch.dict(os.environ, {"PENDING_ALERT_THRESHOLD_HOURS": "3"}):
+        assert pending_alert.get_pending_alert_threshold_source() == "db"
+
+
+# ---- refresh_alert_threshold_override_from_db -----------------------
+
+
+async def test_refresh_alert_threshold_from_db_with_no_row_clears_override():
+    pending_alert.set_alert_threshold_override(7)
+    db = _StubDB()  # no rows
+    result = await pending_alert.refresh_alert_threshold_override_from_db(db)
+    assert result is None
+    assert pending_alert.get_alert_threshold_override() is None
+
+
+async def test_refresh_alert_threshold_from_db_loads_valid_row():
+    db = _StubDB({pending_alert.ALERT_THRESHOLD_SETTING_KEY: "4"})
+    result = await pending_alert.refresh_alert_threshold_override_from_db(db)
+    assert result == 4
+    assert pending_alert.get_alert_threshold_override() == 4
+
+
+async def test_refresh_alert_threshold_from_db_keeps_cache_on_get_error(caplog):
+    pending_alert.set_alert_threshold_override(7)
+    db = _StubDB(raise_on_get=RuntimeError("pool blip"))
+    with caplog.at_level(logging.ERROR, logger="bot.pending_alert"):
+        result = await pending_alert.refresh_alert_threshold_override_from_db(db)
+    assert result == 7
+    assert pending_alert.get_alert_threshold_override() == 7
+    assert any(
+        "refresh_alert_threshold_override_from_db: get_setting failed" in r.message
+        for r in caplog.records
+    )
+
+
+async def test_refresh_alert_threshold_from_db_clears_on_malformed_value(caplog):
+    pending_alert.set_alert_threshold_override(7)
+    db = _StubDB({pending_alert.ALERT_THRESHOLD_SETTING_KEY: "notanint"})
+    with caplog.at_level(logging.WARNING, logger="bot.pending_alert"):
+        result = await pending_alert.refresh_alert_threshold_override_from_db(db)
+    assert result is None
+    assert pending_alert.get_alert_threshold_override() is None
+
+
+async def test_refresh_alert_threshold_from_db_clears_on_above_max(caplog):
+    pending_alert.set_alert_threshold_override(7)
+    db = _StubDB({
+        pending_alert.ALERT_THRESHOLD_SETTING_KEY: str(
+            pending_alert.ALERT_THRESHOLD_OVERRIDE_MAXIMUM + 1
+        )
+    })
+    with caplog.at_level(logging.WARNING, logger="bot.pending_alert"):
+        result = await pending_alert.refresh_alert_threshold_override_from_db(db)
+    assert result is None
+    assert pending_alert.get_alert_threshold_override() is None
+
+
+async def test_refresh_alert_threshold_from_db_returns_cache_when_db_none():
+    pending_alert.set_alert_threshold_override(7)
+    result = await pending_alert.refresh_alert_threshold_override_from_db(None)
+    assert result == 7
+    assert pending_alert.get_alert_threshold_override() == 7
+
+
+# ---- _alert_loop iteration-time re-read -----------------------------
+
+
+async def test_alert_loop_rereads_threshold_each_iteration():
+    """The loop's threshold kwarg is the bootstrap value for the very
+    first iteration; subsequent iterations re-read via
+    :func:`get_pending_alert_threshold_hours`. Pin this so a saved DB
+    override is live within at most one tick — no restart required.
+
+    Drives two iterations, asserts that iteration 2 uses the
+    override, not the bootstrap kwarg."""
+    import asyncio
+
+    bot = MagicMock()
+    seen_thresholds: list[int] = []
+
+    async def _fake_pass(b, *, threshold_hours, state, row_limit):
+        seen_thresholds.append(threshold_hours)
+        # After the first iteration completes, install an override
+        # so iteration 2 sees the new value.
+        if len(seen_thresholds) == 1:
+            pending_alert.set_alert_threshold_override(8)
+        if len(seen_thresholds) >= 2:
+            raise asyncio.CancelledError()
+        return 0
+
+    with patch(
+        "pending_alert.run_pending_alert_pass",
+        side_effect=_fake_pass,
+    ):
+        # Tiny sleep so the test doesn't actually sleep 30 min.
+        with patch("asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(asyncio.CancelledError):
+                await pending_alert._alert_loop(
+                    bot,
+                    interval_seconds=1,
+                    threshold_hours=2,  # bootstrap
+                    row_limit=500,
+                )
+
+    # First iteration: bootstrap. Second iteration: override.
+    assert seen_thresholds[0] == 2
+    assert seen_thresholds[1] == 8
+
+
+async def test_alert_loop_keeps_previous_threshold_when_resolver_raises(caplog):
+    """If :func:`get_pending_alert_threshold_hours` raises during the
+    iteration-time re-read, the loop falls back to the previous
+    threshold (logged loudly) rather than crashing or alerting on
+    age=0 rows.
+
+    Drives two iterations: the resolver raises during the re-read
+    after iteration 1, and iteration 2 should still see the bootstrap
+    threshold."""
+    import asyncio
+
+    bot = MagicMock()
+    seen_thresholds: list[int] = []
+
+    async def _fake_pass(b, *, threshold_hours, state, row_limit):
+        seen_thresholds.append(threshold_hours)
+        if len(seen_thresholds) >= 2:
+            raise asyncio.CancelledError()
+        return 0
+
+    with patch(
+        "pending_alert.run_pending_alert_pass",
+        side_effect=_fake_pass,
+    ):
+        with patch("asyncio.sleep", new=AsyncMock()):
+            with patch(
+                "pending_alert.get_pending_alert_threshold_hours",
+                side_effect=RuntimeError("resolver blip"),
+            ):
+                with caplog.at_level(
+                    logging.ERROR, logger="bot.pending_alert"
+                ):
+                    with pytest.raises(asyncio.CancelledError):
+                        await pending_alert._alert_loop(
+                            bot,
+                            interval_seconds=1,
+                            threshold_hours=3,  # bootstrap
+                            row_limit=500,
+                        )
+
+    # Iteration 1 (bootstrap = 3), then resolver raises during re-read,
+    # iteration 2 falls back to the previous value (still 3).
+    assert seen_thresholds == [3, 3]
+    assert any(
+        "get_pending_alert_threshold_hours raised" in r.message
+        for r in caplog.records
+    )
+
+
+# ---- start_pending_alert_task bootstrap respects override ----------
+
+
+async def test_start_pending_alert_task_bootstrap_respects_override():
+    """The loop's bootstrap threshold (passed to ``_alert_loop`` as a
+    kwarg) routes through the override-aware resolver, so a warmed
+    override is live for the very first iteration. Defence-in-depth
+    against ordering bugs in :mod:`main`."""
+    import asyncio
+
+    pending_alert.set_alert_threshold_override(8)
+    bot = MagicMock()
+
+    captured = {}
+
+    async def _fake_loop(b, *, interval_seconds, threshold_hours, row_limit):
+        captured["threshold_hours"] = threshold_hours
+
+    with patch("pending_alert._alert_loop", side_effect=_fake_loop):
+        task = pending_alert.start_pending_alert_task(bot)
+        await task
+
+    assert captured["threshold_hours"] == 8
+
+
+# ---- _tick_pending_alert_from_app respects override ---------------
+
+
+async def test_tick_pending_alert_from_app_respects_override():
+    """The manual 'Tick now' button path uses
+    :func:`get_pending_alert_threshold_hours` so it picks up DB
+    overrides without ceremony. Pin against a regression that would
+    silently re-introduce the env-only read.
+    """
+    pending_alert.set_alert_threshold_override(8)
+
+    app = MagicMock()
+    bot = MagicMock()
+    from web_admin import APP_KEY_BOT
+    app.get = MagicMock(return_value=bot)
+    seen_thresholds: list[int] = []
+
+    async def _fake_pass(b, *, threshold_hours, state, row_limit):
+        seen_thresholds.append(threshold_hours)
+        return 0
+
+    with patch(
+        "pending_alert.run_pending_alert_pass",
+        side_effect=_fake_pass,
+    ):
+        await pending_alert._tick_pending_alert_from_app(app)
+
+    app.get.assert_called_with(APP_KEY_BOT)
+    assert seen_thresholds == [8]
+
+
+async def test_tick_pending_alert_from_app_raises_when_bot_missing():
+    """No ``bot`` in app state → manual tick raises a clear error
+    instead of silently doing nothing."""
+    app = MagicMock()
+    app.get = MagicMock(return_value=None)
+    with pytest.raises(RuntimeError, match="bot not in app state"):
+        await pending_alert._tick_pending_alert_from_app(app)

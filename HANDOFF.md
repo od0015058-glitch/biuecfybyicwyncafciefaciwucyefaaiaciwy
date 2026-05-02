@@ -2140,7 +2140,7 @@ or unblock other work.
 | 7 | **`REFERRAL_BONUS_PERCENT` + `REFERRAL_BONUS_MAX_USD`** — referral payouts. (Earlier drafts of this row called these `REFERRAL_BONUS_USD` / `REFERRAL_PERCENT`; the actual env-var names in `referral.py` are `REFERRAL_BONUS_PERCENT` and `REFERRAL_BONUS_MAX_USD`.) | Env-only. | Editor on `/admin/wallet-config`. | P2 | **Shipped** (this PR — DB-backed override layer in `referral.py` for both knobs + boot warm-up + `/admin/wallet-config` editor card with combined Save form / per-knob Clear form, audit row `wallet_config_referral_update`). |
 | 8 | **`MEMORY_CONTEXT_LIMIT` / `MEMORY_CONTENT_MAX_CHARS`** — conversation memory caps. | Env-only. | Editor on a new `/admin/memory-config` page. | P3 | Pending |
 | 9 | **Pending-PENDING expiration window** (`PENDING_EXPIRATION_HOURS_DEFAULT`; the actual env-var name in `pending_expiration.py` is `PENDING_EXPIRATION_HOURS`). | Env-only. | Editor on `/admin/control` or `/admin/payments`. | P3 | **Shipped** (this PR — DB-backed override layer in `pending_expiration.py` + boot warm-up + `/admin/control` editor card with set / clear actions, audit row `control_expiration_hours_update`, source badge, audit `meta` carries `threshold_hours_used`). |
-| 10 | **Stuck-PENDING alert threshold** (`PENDING_ALERT_THRESHOLD_HOURS`). | Env-only. | Editor on `/admin/control`. | P3 | Pending |
+| 10 | **Stuck-PENDING alert threshold** (`PENDING_ALERT_THRESHOLD_HOURS`). | Env-only. | Editor on `/admin/control`. | P3 | **Shipped** (this PR — DB-backed override layer in `pending_alert.py` + boot warm-up + `/admin/control` editor card with set / clear actions, audit row `control_alert_threshold_update`, source badge, iteration-time re-read in `_alert_loop` so a saved override is live on the next tick). |
 | 11 | **Per-loop cadence overrides** (`BOT_HEALTH_LOOP_STALE_<NAME>_SECONDS`). | Env-only. | Editor on `/admin/control` (one row per loop name). | P3 | Pending |
 | 12 | **`COST_MARKUP` history & analytics** — operator can see when markup last changed and the impact on revenue. | Not tracked. | Markup-history table + revenue-attribution chart on `/admin/monetization`. | P2 | Pending |
 | 13 | **Per-user revenue contribution panel** — top spenders. | Existed in `get_monetization_summary` aggregates but not surfaced. | New "Top users" tab on `/admin/monetization`. | P2 | **Shipped** (PR #166) |
@@ -2638,6 +2638,109 @@ time behaviour. Now the manual tick agrees with the loop.
   coerce / set / clear / get / refresh-from-DB / source resolver /
   loop bootstrap re-read / manual-tick path consistency / audit
   meta carries `threshold_hours_used`.
+- `tests/test_web_admin.py` — 12 new tests covering the new POST
+  handler (auth / CSRF / persist / clear / below-minimum /
+  above-max / non-int / blank-set / unknown-action / DB-blip),
+  the GET-render card, and the audit-slug regression.
+
+### §10b.6 — Row #10 (PENDING_ALERT_THRESHOLD_HOURS web surface) — shipped
+
+**Diagnosis.** `PENDING_ALERT_THRESHOLD_HOURS` (default 2h) was
+env-only: operators who wanted to retune the "stuck-PENDING" alert
+line had to redeploy. The pending-alert loop in
+`pending_alert._alert_loop` already runs forever, so flipping the
+threshold via a DB-backed override + iteration-time re-read is
+enough — no restart needed.
+
+**Surface.** `/admin/control` already had four `system_settings`
+editors (REQUIRED_CHANNEL, BOT_HEALTH_ALERT_INTERVAL_SECONDS,
+PENDING_EXPIRATION_HOURS, the cluster of kill-switch toggles), so
+this PR slots a fifth card next to them — same pattern as Row #9
+(effective / source / override / env table + Save / Clear submit
+pair). The dashboard tile, the panel, and the loop all call
+`pending_alert.get_pending_alert_threshold_hours()` so they cannot
+disagree about "what counts as overdue".
+
+**DB layer.** `pending_alert.py` gains the same shape as the
+Row-#9 / Row-#21 / Row-#5 / Row-#7 / Row-#4 layers:
+
+- `ALERT_THRESHOLD_SETTING_KEY = "PENDING_ALERT_THRESHOLD_HOURS"`,
+  `ALERT_THRESHOLD_DEFAULT = 2`, `ALERT_THRESHOLD_MINIMUM = 1`,
+  `ALERT_THRESHOLD_OVERRIDE_MAXIMUM = 24 * 365` (1-year cap; the
+  threshold is logically smaller than the reaper's cap but the
+  slot is bounded by the reaper's cap to stay consistent with
+  the Row-#9 layer).
+- `_coerce_alert_threshold_hours(value)` — explicit `bool`
+  rejection (so a stored `"true"` row can't coerce to `1` and shrink
+  the threshold to "anything PENDING for an hour is suspicious",
+  paging admins constantly), int coercion, range check.
+- `set_/clear_/get_alert_threshold_override()` — module-level
+  cache slot; `set_*` re-validates as defence-in-depth.
+- `refresh_alert_threshold_override_from_db(database)` — async,
+  best-effort. Transient `get_setting` error keeps the cache value
+  in place (logs at ERROR). Malformed value (non-int, below min,
+  above max) clears the cache (logs at WARNING). Returns the new
+  cache value.
+- `get_pending_alert_threshold_hours()` — DB → env → default
+  precedence.
+- `get_pending_alert_threshold_source()` — returns
+  `"db" / "env" / "default"`.
+- `reset_alert_threshold_override_for_tests()` — test helper.
+
+**Loop re-read.** `_alert_loop` now re-reads the threshold via
+`get_pending_alert_threshold_hours()` on every iteration (after the
+sleep and before the next pass), so a saved DB override takes effect
+on the next tick — no restart required. The existing
+`threshold_hours` kwarg is retained as the bootstrap value for the
+very first iteration (mirrors `pending_expiration._expiration_loop`
+and `bot_health_alert._alert_loop`).
+
+**Boot warm-up.** `main.py` now calls
+`pending_alert.refresh_alert_threshold_override_from_db(db)` after
+the Row-#9 expiration warm-up so the very first pending-alert tick
+after boot uses the operator's configured threshold. Best-effort —
+a startup DB blip falls through to env / default and logs
+`failed to load PENDING_ALERT_THRESHOLD_HOURS override from DB`.
+
+**Web surface.**
+
+- `_build_alert_threshold_view()` returns a single-knob view dict
+  (`effective` / `source` / `override_value` / `env_value` /
+  `env_raw` / `default_value` / `minimum` / `maximum`) and is bound
+  to the `alert_threshold` template var.
+- `control_get` calls `refresh_alert_threshold_override_from_db`
+  on every page render so a DB poke from another admin instance
+  becomes visible in this process within one HTTP round-trip.
+- `control_alert_threshold_post` (`POST
+  /admin/control/alert-threshold`, `ROLE_SUPER`) — CSRF guard,
+  action allowlist (`set` / `clear`), coerce + range-check, upsert
+  / delete `system_settings`, refresh cache, audit row
+  `control_alert_threshold_update` with `meta = {action, before,
+  before_source, after, after_source}`, redirect with flash.
+- Audit slug `control_alert_threshold_update` =
+  `"Pending-alert threshold updated"` registered in
+  `AUDIT_ACTION_LABELS` so `/admin/audit` filter dropdown
+  surfaces this row type.
+- `templates/admin/control.html` gets a new card with a number
+  input bounded by `min`/`max` from the view, two distinct submit
+  buttons (`action=set` and `action=clear`), and a status table
+  matching the Row-#9 expiration card.
+
+**Bundled defensive measure.** `_alert_loop` wraps the iteration-
+time re-read of `get_pending_alert_threshold_hours()` in a
+`try/except` that falls back to the previous threshold (logged at
+ERROR) rather than letting a transient resolver blip propagate up
+and starve the loop. Pre-Row-#10, the threshold was captured once
+at boot and never re-read, so this failure mode didn't exist; the
+new re-read site introduces it, so we defensively handle it. Pinned
+by `test_alert_loop_keeps_previous_threshold_when_resolver_raises`.
+
+**Tests.** All running, all green:
+
+- `tests/test_pending_alert.py` — 35 new tests covering
+  coerce / set / clear / get / refresh-from-DB / source resolver /
+  loop iteration-time re-read (happy path + resolver-raises) /
+  bootstrap respects override / manual-tick path consistency.
 - `tests/test_web_admin.py` — 12 new tests covering the new POST
   handler (auth / CSRF / persist / clear / below-minimum /
   above-max / non-int / blank-set / unknown-action / DB-blip),
