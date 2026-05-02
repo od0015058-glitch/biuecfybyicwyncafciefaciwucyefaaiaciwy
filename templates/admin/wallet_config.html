@@ -1,0 +1,104 @@
+{% extends "_layout.html" %}
+
+{% block title %}Wallet config{% endblock %}
+
+{% block main %}
+<h2 style="margin: 0 0 0.5em 0;">Wallet config</h2>
+
+<p style="color: var(--text-muted); margin: 0 0 1em 0; font-size: 0.9em;">
+  Operator-controllable wallet defaults. The minimum top-up floor below
+  is the smallest USD amount any paid path (custom-USD, Toman, gateway
+  picker) will accept. Tweaks land live for the next paid request — no
+  redeploy required.
+</p>
+
+{% if db_error %}
+<div class="alert alert-warn">{{ db_error }}</div>
+{% endif %}
+
+{% if flash %}
+<div class="alert alert-{{ flash.kind }}">{{ flash.message }}</div>
+{% endif %}
+
+<div class="panel">
+  <h3>Minimum top-up</h3>
+  <p style="margin: 0 0 0.75em 0;">
+    Effective floor:
+    <strong>${{ "{:,.2f}".format(min_topup_view.effective) }}</strong>
+    {% if min_topup_view.derived_min_toman is not none %}
+      &nbsp;(≈ {{ "{:,.0f}".format(min_topup_view.derived_min_toman) }} تومان
+      at {{ "{:,.0f}".format(min_topup_view.toman_per_usd) }} per USD)
+    {% endif %}
+    &nbsp;<span class="badge badge-{{ min_topup_view.source }}">source: {{ min_topup_view.source }}</span>
+  </p>
+
+  {# Stage-15-Step-E #10b row 4 part 2/2: MIN_TOPUP_USD editor.
+     Same "effective / db / env / default" breakdown the
+     COST_MARKUP editor and the bot-health thresholds card use,
+     so an operator gets one consistent shape across every
+     DB-backed override. Operators+ can POST a new value via the
+     form below; viewer-readonly callers see the read-only
+     summary. #}
+  <details>
+    <summary style="cursor: pointer; color: var(--text-muted); font-size: 0.9em;">
+      Edit minimum top-up (operator+)
+    </summary>
+    <table style="margin: 0.75em 0; font-size: 0.9em; max-width: 36em;">
+      <tbody>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;">DB override</td>
+          <td>
+            {% if min_topup_view.override_value is not none %}
+              <strong>${{ "{:,.2f}".format(min_topup_view.override_value) }}</strong>
+            {% else %}
+              <span style="color: var(--text-muted);">(none — fall through to env / default)</span>
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;">Env (<code>MIN_TOPUP_USD</code>)</td>
+          <td>
+            {% if min_topup_view.env_value is not none %}
+              ${{ "{:,.2f}".format(min_topup_view.env_value) }}
+            {% elif min_topup_view.env_raw %}
+              <span style="color: var(--text-warn);">{{ min_topup_view.env_raw }} (rejected — see logs)</span>
+            {% else %}
+              <span style="color: var(--text-muted);">(unset)</span>
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;">Compile-time default</td>
+          <td>${{ "{:,.2f}".format(min_topup_view.default_value) }}</td>
+        </tr>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;"><strong>Effective</strong></td>
+          <td><strong>${{ "{:,.2f}".format(min_topup_view.effective) }}</strong> (source: {{ min_topup_view.source }})</td>
+        </tr>
+      </tbody>
+    </table>
+    <form method="post"
+          action="/admin/wallet-config/min-topup"
+          style="display: flex; gap: 0.75em; align-items: baseline; flex-wrap: wrap;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>
+        New minimum (USD)
+        <input type="number"
+               name="min_topup_usd"
+               step="0.01"
+               min="{{ min_topup_view.minimum }}"
+               max="{{ min_topup_view.maximum_exclusive }}"
+               value="{% if min_topup_view.override_value is not none %}{{ min_topup_view.override_value }}{% endif %}"
+               placeholder="leave blank to clear override"
+               style="width: 12em;">
+      </label>
+      <button type="submit">Save</button>
+      <span style="color: var(--text-muted); font-size: 0.85em;">
+        Range: ≥ ${{ "{:.2f}".format(min_topup_view.minimum) }} and
+        &lt; ${{ "{:.0f}".format(min_topup_view.maximum_exclusive) }}.
+        Blank clears the override.
+      </span>
+    </form>
+  </details>
+</div>
+{% endblock %}

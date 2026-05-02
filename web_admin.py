@@ -60,6 +60,7 @@ import hashlib
 import hmac
 import io
 import logging
+import math
 import os
 import secrets
 import time
@@ -1637,6 +1638,355 @@ async def monetization_markup_post(
 
 
 # ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 4 part 2/2: /admin/wallet-config
+# (MIN_TOPUP_USD editor)
+# ---------------------------------------------------------------------
+
+
+def _build_min_topup_view(toman_per_usd: float | None) -> dict:
+    """Snapshot of the resolved MIN_TOPUP_USD floor + per-source values.
+
+    Mirrors :func:`_build_markup_view` so the wallet-config page renders
+    the same "effective / db / env / default" breakdown the operator is
+    already used to from the COST_MARKUP editor and the bot-health
+    thresholds card on ``/admin/control``.
+    """
+    import payments
+
+    override_value = payments.get_min_topup_override()
+    env_raw = os.getenv("MIN_TOPUP_USD", "").strip()
+    env_value: float | None = None
+    if env_raw:
+        env_value = payments._coerce_min_topup(env_raw)
+    effective = float(payments.get_min_topup_usd())
+    derived_min_toman: float | None = None
+    if toman_per_usd is not None:
+        try:
+            derived_min_toman = float(toman_per_usd) * effective
+        except (TypeError, ValueError):
+            derived_min_toman = None
+    return {
+        "effective": effective,
+        "source": payments.get_min_topup_source(),
+        "default_value": float(payments.DEFAULT_MIN_TOPUP_USD),
+        "env_value": env_value,
+        "env_raw": env_raw,
+        "override_value": override_value,
+        "minimum": float(payments.MIN_TOPUP_USD_MINIMUM),
+        "maximum_exclusive": float(payments.MIN_TOPUP_USD_MAXIMUM),
+        "derived_min_toman": derived_min_toman,
+        "toman_per_usd": (
+            float(toman_per_usd) if toman_per_usd is not None else None
+        ),
+    }
+
+
+async def _read_toman_per_usd_from_db(db) -> float | None:
+    """Pull the latest USD→Toman rate from the request-scoped DB.
+
+    The wallet-config page wants to render the *derived* min-Toman
+    figure ("at the current rate, $X is roughly Y تومان") so operators
+    can sanity-check the floor without doing the math in their head.
+
+    We deliberately read ``db.get_fx_snapshot()`` directly rather than
+    going through :func:`fx_rates.get_usd_to_toman_snapshot` because
+    that helper falls back to the module-level ``database.db`` singleton
+    when the in-memory FX cache is cold — and that singleton's ``pool``
+    is ``None`` in tests, raising ``AttributeError`` on ``acquire()``
+    which races weirdly under ``pytest-aiohttp``'s TestServer (see
+    HANDOFF §10b.1 — the symptom was an intermittent
+    ``ServerDisconnectedError`` on the GET).
+    """
+    if db is None:
+        return None
+    try:
+        snap = await db.get_fx_snapshot()
+    except Exception:
+        log.exception("wallet_config_get: get_fx_snapshot failed")
+        return None
+    if snap is None:
+        return None
+    try:
+        rate = float(snap[0])
+    except (TypeError, ValueError, IndexError):
+        log.exception(
+            "wallet_config_get: invalid fx snapshot shape %r", snap
+        )
+        return None
+    if not math.isfinite(rate) or rate <= 0:
+        return None
+    return rate
+
+
+async def wallet_config_get(request: web.Request) -> web.StreamResponse:
+    """``GET /admin/wallet-config`` — render the minimum-top-up editor.
+
+    Mirrors :func:`monetization` for the COST_MARKUP editor:
+
+    1. Best-effort refresh the in-process override cache from the DB
+       so a tweak made on a different replica is reflected here.
+    2. Best-effort read the latest FX snapshot so the page can render
+       the derived Toman floor at the current rate.
+    3. Render the breakdown + form.
+
+    All DB calls are fail-soft: a transient blip leaves the previous
+    cache in place rather than reverting to env / default mid-incident.
+    """
+    db = request.app.get(APP_KEY_DB)
+    db_error: str | None = None
+
+    import payments
+
+    if db is not None:
+        try:
+            await payments.refresh_min_topup_override_from_db(db)
+        except Exception:
+            log.exception(
+                "wallet_config_get: refresh_min_topup_override_from_db failed"
+            )
+            db_error = "Database query failed — see logs."
+
+    toman_per_usd = await _read_toman_per_usd_from_db(db)
+    min_topup_view = _build_min_topup_view(toman_per_usd)
+
+    ctx = {
+        "min_topup_view": min_topup_view,
+        "db_error": db_error,
+        "active_page": "wallet_config",
+        "csrf_token": csrf_token_for(request),
+        "flash": None,
+    }
+    response = aiohttp_jinja2.render_template(
+        "wallet_config.html", request, ctx,
+    )
+    flash = pop_flash(request, response)
+    if flash is not None:
+        ctx["flash"] = flash
+        response = aiohttp_jinja2.render_template(
+            "wallet_config.html", request, ctx,
+        )
+    return response
+
+
+def _wallet_config_csrf_guard(
+    request: web.Request, form,
+) -> web.StreamResponse | None:
+    """CSRF guard mirroring :func:`_monetization_csrf_guard`, redirecting
+    to ``/admin/wallet-config`` on failure rather than the monetization
+    page."""
+    if verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        return None
+    log.warning(
+        "wallet_config: CSRF token mismatch from %s (path=%s)",
+        request.remote, request.path,
+    )
+    response = web.HTTPFound(location="/admin/wallet-config")
+    set_flash(
+        response, kind="error",
+        message="Form submission was rejected (CSRF). Refresh and try again.",
+        secret=request.app.get(APP_KEY_SESSION_SECRET, ""),
+        cookie_secure=request.app.get(APP_KEY_COOKIE_SECURE, True),
+    )
+    return response
+
+
+async def wallet_config_min_topup_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/wallet-config/min-topup`` — update MIN_TOPUP_USD.
+
+    Stage-15-Step-E #10b row 4 part 2/2. Operators were forced to
+    redeploy the bot to re-tune ``MIN_TOPUP_USD`` because it was
+    env-only. This handler writes the override to the
+    ``system_settings`` overlay (DB-backed), refreshes the in-process
+    cache so the next call to :func:`payments.get_min_topup_usd` sees
+    the new value without a restart, and audit-logs a row whose
+    ``meta`` carries the diff.
+
+    Form keys:
+
+    * ``min_topup_usd`` — new effective floor in USD, or empty / blank
+      to clear the override (fall through to env / default).
+
+    Validation order (mirrors :func:`monetization_markup_post`):
+
+    1. CSRF.
+    2. Numeric parse via :func:`payments._coerce_min_topup`.
+    3. Range check (``MIN_TOPUP_USD_MINIMUM <= value <
+       MIN_TOPUP_USD_MAXIMUM``) — done by ``_coerce_min_topup``.
+    4. ``set_min_topup_override`` defence-in-depth (re-runs the same
+       checks; any drift between the two is loud).
+    5. Persist via ``upsert_setting`` (NUL-stripped at the DB layer).
+    6. Audit row.
+    7. Redirect with a flash banner.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app.get(APP_KEY_DB)
+    form = await request.post()
+
+    guard = _wallet_config_csrf_guard(request, form)
+    if guard is not None:
+        return guard
+
+    if db is None:
+        response = web.HTTPFound(location="/admin/wallet-config")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Database is not configured — minimum top-up edits "
+                "require a live DB connection."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    import payments
+
+    raw_value = str(form.get("min_topup_usd", "")).strip()
+    previous_effective = float(payments.get_min_topup_usd())
+    previous_source = payments.get_min_topup_source()
+
+    if not raw_value:
+        # Empty field == clear override and fall through to env / default.
+        try:
+            await db.delete_setting(payments.MIN_TOPUP_SETTING_KEY)
+        except Exception:
+            log.exception(
+                "wallet_config_min_topup_post: delete_setting failed"
+            )
+            response = web.HTTPFound(location="/admin/wallet-config")
+            set_flash(
+                response, kind="error",
+                message=(
+                    "Failed to clear the override — see logs. "
+                    "The previous value is still in effect."
+                ),
+                secret=secret, cookie_secure=cookie_secure,
+            )
+            return response
+        payments.clear_min_topup_override()
+        try:
+            await payments.refresh_min_topup_override_from_db(db)
+        except Exception:
+            log.exception(
+                "wallet_config_min_topup_post: refresh after clear failed"
+            )
+        new_effective = float(payments.get_min_topup_usd())
+        await _record_audit_safe(
+            request, "wallet_config_min_topup_update",
+            target="min_topup_usd",
+            meta={
+                "action": "clear",
+                "before": previous_effective,
+                "before_source": previous_source,
+                "after": new_effective,
+                "after_source": payments.get_min_topup_source(),
+            },
+        )
+        response = web.HTTPFound(location="/admin/wallet-config")
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Minimum top-up override cleared. Effective floor is "
+                f"now ${new_effective:.2f} "
+                f"(source: {payments.get_min_topup_source()})."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    parsed = payments._coerce_min_topup(raw_value)
+    if parsed is None:
+        response = web.HTTPFound(location="/admin/wallet-config")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Minimum top-up must be a finite number in "
+                f"[{payments.MIN_TOPUP_USD_MINIMUM:.2f}, "
+                f"{payments.MIN_TOPUP_USD_MAXIMUM:.2f}). "
+                f"Got: {raw_value!r}. No changes were made."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    # Persist + apply.
+    try:
+        await db.upsert_setting(
+            payments.MIN_TOPUP_SETTING_KEY, str(parsed),
+        )
+    except Exception:
+        log.exception(
+            "wallet_config_min_topup_post: upsert_setting failed value=%r",
+            parsed,
+        )
+        response = web.HTTPFound(location="/admin/wallet-config")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Failed to persist the new minimum — see logs. "
+                "The previous value is still in effect."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        payments.set_min_topup_override(parsed)
+    except ValueError:
+        log.exception(
+            "wallet_config_min_topup_post: set_min_topup_override "
+            "rejected %r after upsert succeeded — refreshing from DB",
+            parsed,
+        )
+
+    # Re-read whatever ended up in the DB so the cache reflects the
+    # truth (in case e.g. the upsert wrote a sanitised value that
+    # differs from what set_min_topup_override accepted).
+    try:
+        await payments.refresh_min_topup_override_from_db(db)
+    except Exception:
+        log.exception(
+            "wallet_config_min_topup_post: refresh after upsert failed"
+        )
+
+    new_effective = float(payments.get_min_topup_usd())
+    await _record_audit_safe(
+        request, "wallet_config_min_topup_update",
+        target="min_topup_usd",
+        meta={
+            "action": "set",
+            "before": previous_effective,
+            "before_source": previous_source,
+            "after": new_effective,
+            "after_source": payments.get_min_topup_source(),
+        },
+    )
+    response = web.HTTPFound(location="/admin/wallet-config")
+    if abs(new_effective - previous_effective) < 1e-9:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Minimum top-up unchanged (${new_effective:.2f}). "
+                "The override is now persisted in the DB."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    else:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Minimum top-up updated: ${previous_effective:.2f} → "
+                f"${new_effective:.2f}. The new floor is live for "
+                f"every paid path (custom-USD, Toman, gateway pickers)."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    return response
+
+
+# ---------------------------------------------------------------------
 # Admin audit helper (Stage-9-Step-2)
 # ---------------------------------------------------------------------
 
@@ -1737,6 +2087,13 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     # while answering "did revenue jump because we changed pricing
     # on Tuesday or because traffic spiked".
     "monetization_markup_update": "Markup multiplier updated",
+    # Stage-15-Step-E #10b row 4 part 2/2: MIN_TOPUP_USD editor on
+    # ``/admin/wallet-config``. Recorded by
+    # :func:`wallet_config_min_topup_post`; the dropdown entry lets
+    # an operator filter the audit feed to "minimum top-up changes
+    # only" so a "why did support tickets jump?" investigation
+    # can pin the cause to a floor change vs. unrelated activity.
+    "wallet_config_min_topup_update": "Minimum top-up updated",
 }
 
 
@@ -7914,6 +8271,21 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/monetization/markup",
         _require_role(ROLE_OPERATOR)(monetization_markup_post),
+    )
+
+    # Stage-15-Step-E #10b row 4 part 2/2: MIN_TOPUP_USD editor on
+    # ``/admin/wallet-config``. GET stays viewer-readable so a
+    # forensic operator can see "what's the current floor and where
+    # is it sourced from" without write privileges; POST is
+    # operator-floored because the floor directly gates whether a
+    # paying user can fund their wallet at all.
+    app.router.add_get(
+        "/admin/wallet-config",
+        _require_auth(wallet_config_get),
+    )
+    app.router.add_post(
+        "/admin/wallet-config/min-topup",
+        _require_role(ROLE_OPERATOR)(wallet_config_min_topup_post),
     )
 
     # Stage-8-Part-2: promo codes. Stage-15-Step-E #5 follow-up #4:

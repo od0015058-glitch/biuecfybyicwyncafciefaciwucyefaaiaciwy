@@ -2597,6 +2597,330 @@ async def test_monetization_markup_post_db_failure_keeps_previous_value(
 
 
 # ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 4 part 2/2: /admin/wallet-config
+# (MIN_TOPUP_USD editor)
+# ---------------------------------------------------------------------
+
+
+def _stub_db_for_wallet_config(
+    *,
+    upsert_setting_result: object | Exception = None,
+    delete_setting_result: bool | Exception = True,
+    get_setting_result: str | None | Exception = None,
+    get_fx_snapshot_result: object | None | Exception = None,
+):
+    """Stub DB pre-wired with the system_settings CRUD + FX snapshot
+    accessor needed by the wallet-config editor.
+
+    Matches the shape of :func:`_stub_db_for_markup_editor` but for
+    the MIN_TOPUP_USD path. ``get_fx_snapshot`` defaults to ``None``
+    (cold cache) so the page renders without the derived-Toman line
+    in the no-rate path; pass a ``(rate, fetched_at)`` tuple to
+    exercise the rate-rendering branch.
+    """
+    db = _stub_db()
+    if isinstance(upsert_setting_result, Exception):
+        db.upsert_setting = AsyncMock(side_effect=upsert_setting_result)
+    else:
+        db.upsert_setting = AsyncMock(return_value=upsert_setting_result)
+    if isinstance(delete_setting_result, Exception):
+        db.delete_setting = AsyncMock(side_effect=delete_setting_result)
+    else:
+        db.delete_setting = AsyncMock(return_value=delete_setting_result)
+    if isinstance(get_setting_result, Exception):
+        db.get_setting = AsyncMock(side_effect=get_setting_result)
+    else:
+        db.get_setting = AsyncMock(return_value=get_setting_result)
+    if isinstance(get_fx_snapshot_result, Exception):
+        db.get_fx_snapshot = AsyncMock(side_effect=get_fx_snapshot_result)
+    else:
+        db.get_fx_snapshot = AsyncMock(return_value=get_fx_snapshot_result)
+    return db
+
+
+async def _login_and_get_wallet_config_csrf(
+    client, password: str = "letmein",
+) -> str:
+    """Log in, fetch /admin/wallet-config, scrape its CSRF token."""
+    await client.post(
+        "/admin/login", data={"password": password}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/wallet-config")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    import re
+
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+    assert m, "Expected CSRF token on /admin/wallet-config min-topup form"
+    return m.group(1)
+
+
+async def test_wallet_config_renders_min_topup_editor_form(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """The page renders the editor section with a CSRF token + the
+    "effective / db / env / default" breakdown, and surfaces the
+    derived-Toman figure when an FX snapshot is present."""
+    monkeypatch.setenv("MIN_TOPUP_USD", "2.0")
+    import payments
+    payments.clear_min_topup_override()
+    db = _stub_db_for_wallet_config(
+        get_fx_snapshot_result=(100_000.0, datetime.now(timezone.utc)),
+    )
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/wallet-config")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert 'action="/admin/wallet-config/min-topup"' in body
+    assert 'name="csrf_token"' in body
+    assert 'name="min_topup_usd"' in body
+    # Source badge surfaces "env" since MIN_TOPUP_USD is set + no override.
+    assert "source: env" in body
+    # Derived-Toman line surfaces with the canned 100k rate.
+    assert "200,000 تومان" in body or "200,000" in body
+
+
+async def test_wallet_config_min_topup_post_requires_auth(
+    aiohttp_client, make_admin_app,
+):
+    client = await aiohttp_client(make_admin_app(password="letmein"))
+    resp = await client.post(
+        "/admin/wallet-config/min-topup",
+        data={"min_topup_usd": "5.0", "csrf_token": "x"},
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303), resp.status
+    assert resp.headers.get("Location", "").startswith("/admin/login")
+
+
+async def test_wallet_config_min_topup_post_rejects_csrf_mismatch(
+    aiohttp_client, make_admin_app,
+):
+    db = _stub_db_for_wallet_config()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.post(
+        "/admin/wallet-config/min-topup",
+        data={"min_topup_usd": "5.0", "csrf_token": "wrong"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/wallet-config"
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+
+
+async def test_wallet_config_min_topup_post_persists_value_and_refreshes_cache(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """Happy path: a valid value goes through ``upsert_setting`` AND
+    updates the in-process override so the next ``get_min_topup_usd()``
+    sees it without a process restart."""
+    monkeypatch.setenv("MIN_TOPUP_USD", "2.0")
+    import payments
+    payments.clear_min_topup_override()
+
+    saved = {"value": None}
+
+    async def _upsert(key: str, value: str) -> None:
+        if key == payments.MIN_TOPUP_SETTING_KEY:
+            saved["value"] = value
+
+    async def _get(key: str):
+        if key == payments.MIN_TOPUP_SETTING_KEY:
+            return saved["value"]
+        return None
+
+    db = _stub_db_for_wallet_config()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/min-topup",
+        data={"min_topup_usd": "5.5", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302, await resp.text()
+    assert resp.headers["Location"] == "/admin/wallet-config"
+
+    db.upsert_setting.assert_awaited_once_with(
+        payments.MIN_TOPUP_SETTING_KEY, "5.5",
+    )
+    db.delete_setting.assert_not_awaited()
+    # In-process cache reflects the new value.
+    assert payments.get_min_topup_override() == 5.5
+    assert payments.get_min_topup_usd() == 5.5
+    # Audit row was recorded.
+    audit_calls = db.record_admin_audit.await_args_list
+    matching = [
+        c for c in audit_calls
+        if c.kwargs.get("action") == "wallet_config_min_topup_update"
+    ]
+    assert matching, audit_calls
+
+
+async def test_wallet_config_min_topup_post_blank_value_clears_override(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """Empty form value drops the override; falls through to env / default."""
+    monkeypatch.setenv("MIN_TOPUP_USD", "2.0")
+    import payments
+    payments.clear_min_topup_override()
+    payments.set_min_topup_override(5.5)
+    assert payments.get_min_topup_usd() == 5.5
+
+    db = _stub_db_for_wallet_config(
+        delete_setting_result=True, get_setting_result=None,
+    )
+
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/min-topup",
+        data={"min_topup_usd": "", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.delete_setting.assert_awaited_once_with(
+        payments.MIN_TOPUP_SETTING_KEY,
+    )
+    db.upsert_setting.assert_not_awaited()
+    assert payments.get_min_topup_override() is None
+    assert payments.get_min_topup_usd() == 2.0  # falls through to env
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    ["not-a-number", "nan", "inf", "-inf", "-1"],
+)
+async def test_wallet_config_min_topup_post_rejects_invalid_value(
+    aiohttp_client, make_admin_app, monkeypatch, bad_value,
+):
+    """Anything non-finite or below MIN_TOPUP_USD_MINIMUM is rejected
+    without touching the DB / cache."""
+    monkeypatch.setenv("MIN_TOPUP_USD", "2.0")
+    import payments
+    payments.clear_min_topup_override()
+
+    db = _stub_db_for_wallet_config()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/min-topup",
+        data={"min_topup_usd": bad_value, "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+    assert payments.get_min_topup_override() is None
+
+
+async def test_wallet_config_min_topup_post_rejects_above_maximum(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """A fat-fingered ``99999`` is rejected at the form rather than
+    locking out every paying user (anything ≥ MIN_TOPUP_USD_MAXIMUM
+    must be refused)."""
+    import payments
+    payments.clear_min_topup_override()
+
+    db = _stub_db_for_wallet_config()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/min-topup",
+        data={
+            "min_topup_usd": str(payments.MIN_TOPUP_USD_MAXIMUM),
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+    assert payments.get_min_topup_override() is None
+
+
+async def test_wallet_config_min_topup_post_db_failure_keeps_previous_value(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """A DB write failure must NOT poison the in-process cache;
+    the previous override stays in effect and the page renders an
+    error banner."""
+    monkeypatch.setenv("MIN_TOPUP_USD", "2.0")
+    import payments
+    payments.clear_min_topup_override()
+
+    # Stub returns "5.0" from get_setting so the GET-render that
+    # ``_login_and_get_wallet_config_csrf`` does keeps the override
+    # at 5.0 — that's what the test wants to assert is *preserved*
+    # when the upsert fails.
+    db = _stub_db_for_wallet_config(
+        upsert_setting_result=RuntimeError("DB down"),
+        get_setting_result="5.0",
+    )
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+    assert payments.get_min_topup_override() == 5.0  # warmed via GET-render
+
+    resp = await client.post(
+        "/admin/wallet-config/min-topup",
+        data={"min_topup_usd": "7.0", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    # Cache untouched — the previous override is still active.
+    assert payments.get_min_topup_override() == 5.0
+    assert payments.get_min_topup_usd() == 5.0
+
+
+async def test_wallet_config_renders_when_db_unavailable(
+    aiohttp_client, monkeypatch,
+):
+    """When no DB is wired (local dev) the page still renders the
+    "effective / env / default" breakdown without crashing — just
+    skips the DB-override row.
+
+    Bypasses ``make_admin_app`` because that fixture substitutes a
+    stub DB when ``db=None`` is passed; the dev-mode branch we're
+    pinning specifically wants ``app[APP_KEY_DB]`` to be ``None``.
+    """
+    monkeypatch.setenv("MIN_TOPUP_USD", "3.5")
+    import payments
+    payments.clear_min_topup_override()
+
+    app = web.Application()
+    setup_admin_routes(
+        app,
+        db=None,
+        password="letmein",
+        session_secret="x" * 32,
+        ttl_hours=24,
+        cookie_secure=False,
+    )
+    client = await aiohttp_client(app)
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/wallet-config")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert 'action="/admin/wallet-config/min-topup"' in body
+    assert "source: env" in body
+
+
+# ---------------------------------------------------------------------
 # Stage-15-Step-E #9 follow-up #2: monetization CSV export
 # ---------------------------------------------------------------------
 
