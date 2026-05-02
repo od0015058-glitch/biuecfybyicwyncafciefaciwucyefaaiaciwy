@@ -196,20 +196,27 @@ NowPayments crypto invoices.
   future regression in one accessor cannot blank the other two.
 - **Conversation history export** — the memory screen now has a
   "📥 Export conversation" button (or run `/history`) that ships
-  the user's full persisted buffer back as a `.txt` document
-  (role labels + ISO-8601 UTC timestamps + a summary header).
-  Hard 1 MB cap; oldest messages are trimmed first when a heavy
-  buffer overflows, with the trim count surfaced in both the
-  in-file header and the upload caption (caption used to lie
-  pre-Step-E #2 — see HANDOFF §5 Step-E #2 bundled bug fix). The
-  `/history` slash-command surface and the wallet-menu callback
-  share `_build_history_export_document` so they can never drift
-  on filename / encoding / trim semantics; the slash path is
-  rate-limited via the same chat-token bucket as the AI-chat
-  handler so a user can't pivot from "out of AI prompts" to
-  "spam an unbounded `conversation_messages` table scan". The
-  trim loop itself runs in O(n) bytes processed (was O(n²)
-  pre-Step-E #1 follow-up).
+  the user's full persisted buffer back as one or more `.txt`
+  documents (role labels + ISO-8601 UTC timestamps + a summary
+  header). Buffers up to 1 MB land as a single file with the
+  legacy filename pattern. Larger buffers are paginated into
+  parts of up to 1 MB each (`-part-NN-of-M.txt` filename suffix,
+  zero-padded for lex-sort order, `Part: N/M` line in each part's
+  header), capped at 10 parts × 10 MB total — a heavy user with
+  months of memory ON gets the full archive instead of having
+  the earliest content silently trimmed away. When the buffer
+  exceeds the 10 MB total budget the oldest messages are trimmed
+  first (the trim count lands on part 1's header only); the
+  caption count for each document matches that part's body
+  (which used to lie pre-Step-E #2 — see HANDOFF §5 Step-E #2
+  bundled bug fix). The `/history` slash-command surface and the
+  wallet-menu callback share `_build_history_export_documents` so
+  they can never drift on filename / encoding / pagination
+  semantics; the slash path is rate-limited via the same chat-
+  token bucket as the AI-chat handler so a user can't pivot from
+  "out of AI prompts" to "spam an unbounded
+  `conversation_messages` table scan". The trim loop itself runs
+  in O(n) bytes processed (was O(n²) pre-Step-E #1 follow-up).
 - **Per-user spending dashboard** — a new "📊 My usage stats"
   button on the wallet menu opens a per-user analytics screen
   showing lifetime totals (calls / tokens / spent), the same

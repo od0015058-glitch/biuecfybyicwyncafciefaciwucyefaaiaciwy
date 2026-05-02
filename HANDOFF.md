@@ -646,7 +646,7 @@ What remains (next AI's TODO):
 
 * **`.pdf` export** — the original spec mentioned both `.txt` and `.pdf`. PDF needs `reportlab` or `weasyprint` added to `requirements.txt`. **Important for Persian users:** RTL rendering is a known PDF pain point — `reportlab` needs an Arabic shaping library (`python-bidi` + `arabic-reshaper`). Confirm with the operator which dependency surface is acceptable before adding.
 * ✅ **`/history` command alias** — shipped in the Stage-15-Step-E #1 follow-up. `cmd_history` (`@router.message(Command("history"))`) re-uses the new `_build_history_export_document(user_id, username)` helper so the slash and the wallet-menu button can never drift on filename / encoding / trim semantics.
-* **Pagination for very long buffers** — current 1 MB cap drops oldest rows. A heavy user with months of memory ON could legitimately want all of it; chunk the rendered text into multiple `.txt` files (`-part-1.txt`, `-part-2.txt`, ...) when above ~10 MB. Telegram's document cap is 50 MB.
+* ✅ **Pagination for very long buffers** — shipped in Stage-15-Step-E #1 follow-up #2. `conversation_export.format_history_as_text_multipart(rows, *, user_handle)` returns a list of `(text, kept_count_in_part)` pairs, packing whole messages into parts of up to `EXPORT_PART_MAX_BYTES` (1 MB) each and capping the export at `EXPORT_MAX_PARTS` (10) parts × `EXPORT_TOTAL_MAX_BYTES` (10 MB) total. Single-part exports return a one-element list with byte-for-byte identical output to the legacy `format_history_as_text` (no `Part:` line, legacy filename pattern) so the common small-buffer case is unchanged. Multi-part exports include a `Part: N/M` header line and use a `-part-NN-of-M.txt` filename suffix (zero-padded so file managers sort lexicographically in the right order). When the buffer exceeds the total budget, oldest messages are trimmed first (the trim header lands on part 1 only). The handler (`memory_export_handler` + `cmd_history`) sends each part as its own `answer_document` call with a per-part caption (`memory_export_caption_part`); the final callback toast announces the cross-part totals (`memory_export_done_multipart`).
 * ✅ **Rate limiting** — shipped in the same follow-up. `cmd_history` consumes a token from the existing `consume_chat_token` bucket before hitting the DB; same throttle, same forgiveness window as the AI-chat path. The menu button stays unrate-limited (Telegram itself debounces callback queries).
 * **Schema-rotation hook** — if the operator ever needs to comply with a "delete all my data" request, `Database.clear_conversation` already exists. Document that the export button is the user-facing read side and `mem_reset` is the user-facing delete side.
 
@@ -2984,7 +2984,81 @@ The user's process for this project — **do not deviate**:
     non-int id / empty list / row mapping with total_tokens
     sum / NaN cost scrub at boundary). Suite: 2240 → 2296
     passing (+56 new).
-24. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+24. **Stage-15-Step-E #1 follow-up #2 OPENED** (PR-after-#160) —
+    multi-part conversation export pagination. Replaces the
+    legacy 1 MB single-file oldest-trim with a paginated export
+    that ships up to 10 × 1 MB parts so a heavy user with months
+    of memory ON gets the full archive instead of having the
+    earliest content silently dropped. New
+    `format_history_as_text_multipart(rows, *, user_handle)` in
+    `conversation_export.py` returns a list of `(text,
+    kept_count_in_part)` pairs, packing whole messages into
+    parts of up to `EXPORT_PART_MAX_BYTES` (1 MB) each (greedy,
+    oldest-first, never splits a single message across two
+    parts) and capping the total at `EXPORT_MAX_PARTS` (10) ×
+    `EXPORT_TOTAL_MAX_BYTES` (10 MB). Single-part exports return
+    a one-element list with byte-for-byte identical output to
+    the legacy `format_history_as_text` (no `Part:` line, legacy
+    filename pattern) — the common small-buffer case is
+    unchanged for the user. Multi-part exports include a
+    `Part: N/M` header line and use a `-part-NN-of-M.txt`
+    filename suffix (zero-padded so file managers sort
+    lexicographically in the right order). When the buffer
+    exceeds the total budget, oldest messages are trimmed first
+    and the trim header (`(trimmed K oldest)`) lands on part 1
+    only so the user sees the trim note exactly once when
+    paging through the files. Step-2b post-pack guard caps
+    `len(parts)` to `EXPORT_MAX_PARTS` even if greedy-packing
+    leaves slack at the tail of each part (a message that
+    barely overflows the running total forces a new part with
+    most of the cap unused, which can produce one extra part
+    over the cap). The handler (`memory_export_handler` for the
+    wallet-menu callback + `cmd_history` for the slash command)
+    swap to the new shared `_build_history_export_documents`
+    helper that returns a list and sends each part as its own
+    `answer_document` call with a per-part caption
+    (`memory_export_caption_part` — "Conversation history —
+    part N/M (K messages)"); the final callback toast announces
+    the cross-part totals via the new `memory_export_done_multipart`
+    string. Bundled real bug fix: `_format_one_message`
+    previously did `str(row.get("content", ""))` /
+    `str(row.get("role", ""))`, which renders the literal
+    four-character string `"None"` when the column value is
+    `None` (Python's `str(None)` is `"None"`, not `""`). The
+    `conversation_messages.content` column is `TEXT NOT NULL`
+    so this can't happen on a healthy production row, but it
+    DOES surface in (a) test fixtures that pass `content=None`
+    to exercise the empty-body case, (b) a future schema
+    change adding nullability, (c) a manual SQL fix that
+    nullifies a row mid-incident, (d) a custom row shim that
+    returns `None` for unknown columns. Same defensive shape on
+    the role side. Pre-fix output for an offending row was
+    `[ts] None:\nNone\n`; post-fix the row renders with the
+    role's existing capitalised-fallback (`Unknown:`) and an
+    empty body, so the export stays clean. New helper
+    `_coerce_text_field(value)` accepts `str` (passthrough),
+    `int` / `float` (legitimate numeric values, coerced via
+    `str(...)`), and rejects `bool` (a subclass of `int` —
+    `True` / `False` would otherwise render as the ambiguous
+    `"1"` / `"0"`) along with `None` / `bytes` / arbitrary
+    objects (returns `""` so the caller's existing placeholder
+    logic picks up). 16 new tests:
+    `tests/test_conversation_export.py` — multipart split
+    behaviour (single-part legacy shape pin, oversize-splits-
+    into-2+-parts, `Part: N/M` header pin, oldest-first
+    packing preserves order, over-total-budget oldest-trim
+    with single trim note on part 1, empty-rows still returns
+    one-part list, kept-counts sum equals total kept), filename
+    helper (single-part matches legacy, multi-part includes
+    suffix, zero-pad lex-sorts correctly, ValueError on
+    invalid args), bundled bug fix (no literal `"None"` for
+    null content, no literal `"None:"` for null role, no
+    bytes-repr leak, numeric content renders as string,
+    bool-content rejected). Two existing handler-level tests
+    rewritten to pin the new pagination contract instead of
+    the legacy single-file trim contract. Total suite: 2438 →
+    2454 passing (+16 new).
+25. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
 25. **Read the §11 working agreement before doing anything.**
