@@ -1,0 +1,134 @@
+{% extends "_layout.html" %}
+
+{# Stage-15-Step-E #10b row 25: admin profile / security page. #}
+{# Hosts password rotation, 2FA pointer, and sign-out. The password #}
+{# itself is never echoed back — only its provenance + length floor. #}
+
+{% block title %}Profile &middot; Meowassist Admin{% endblock %}
+
+{% block main %}
+<h2>Profile &amp; security</h2>
+
+<p style="color: var(--text-muted);">
+  This page lets the panel owner rotate the admin password without
+  redeploying the bot. The new password takes effect on the next
+  sign-in; existing sessions stay valid until they expire normally.
+</p>
+
+{% if flash %}
+<div class="alert alert-{{ flash.kind or 'info' }}">{{ flash.message }}</div>
+{% endif %}
+
+<div class="panel">
+  <h3>Current credential</h3>
+  <table>
+    <tr>
+      <th style="width: 240px;">Source of the active password</th>
+      <td>
+        {% if password_view.source == "db" %}
+          <strong>Database</strong> &mdash; rotated via this page
+        {% elif password_view.source == "env" %}
+          <strong>Environment variable</strong> &mdash;
+          <code>ADMIN_PASSWORD</code> in <code>.env</code>
+        {% else %}
+          <strong>Not configured</strong> &mdash; the panel will refuse
+          every sign-in until either an env value or a DB rotation lands
+        {% endif %}
+      </td>
+    </tr>
+    <tr>
+      <th>DB-rotated hash present?</th>
+      <td>
+        {% if password_view.has_db_hash %}Yes{% else %}No{% endif %}
+        <span style="color: var(--text-muted); font-size: 0.85em;">
+          (settings key <code>{{ password_view.setting_key }}</code>)
+        </span>
+      </td>
+    </tr>
+    <tr>
+      <th>Env fallback armed?</th>
+      <td>
+        {% if password_view.has_env %}Yes{% else %}No{% endif %}
+        <span style="color: var(--text-muted); font-size: 0.85em;">
+          &mdash; the env value is the back-compat for unrotated deploys;
+          a rotated DB hash always wins.
+        </span>
+      </td>
+    </tr>
+  </table>
+</div>
+
+<div class="panel">
+  <h3>Rotate password</h3>
+  <p>
+    Choose a long passphrase you can remember. Minimum
+    <strong>{{ password_view.min_length }} characters</strong>; must
+    include at least one letter and at least one digit or symbol. Pure
+    alphabetic, pure numeric, and whitespace-only values are refused.
+  </p>
+  <form method="post" action="/admin/profile/rotate-password" style="display: flex; flex-direction: column; gap: 10px; max-width: 420px;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label for="current_password" style="display: flex; flex-direction: column; gap: 4px;">
+      <span>Current password</span>
+      <input
+        type="password" id="current_password" name="current_password"
+        required autocomplete="current-password" autofocus
+        maxlength="{{ password_view.max_length }}"
+      >
+    </label>
+    <label for="new_password" style="display: flex; flex-direction: column; gap: 4px;">
+      <span>New password</span>
+      <input
+        type="password" id="new_password" name="new_password"
+        required autocomplete="new-password"
+        minlength="{{ password_view.min_length }}"
+        maxlength="{{ password_view.max_length }}"
+      >
+    </label>
+    <label for="confirm_password" style="display: flex; flex-direction: column; gap: 4px;">
+      <span>Confirm new password</span>
+      <input
+        type="password" id="confirm_password" name="confirm_password"
+        required autocomplete="new-password"
+        minlength="{{ password_view.min_length }}"
+        maxlength="{{ password_view.max_length }}"
+      >
+    </label>
+    <p style="color: var(--text-muted); font-size: 0.85em; margin: 4px 0;">
+      The browser-side <code>minlength</code> hint is a UX guard only
+      &mdash; the server enforces the same floor and refuses anything
+      below it regardless of what reaches the form post.
+    </p>
+    <div>
+      <button type="submit" class="primary">Rotate password</button>
+    </div>
+  </form>
+</div>
+
+<div class="panel">
+  <h3>Two-factor authentication</h3>
+  {% if has_totp %}
+    <p>
+      2FA is currently <strong>enabled</strong>. Visit
+      <a href="/admin/enroll_2fa">2FA setup</a> to re-pair a new device
+      (the existing secret stays valid until you rotate it via env).
+    </p>
+  {% else %}
+    <p>
+      2FA is <strong>disabled</strong>. Provision a TOTP secret on
+      <a href="/admin/enroll_2fa">2FA setup</a> and add it to your
+      <code>.env</code> as <code>ADMIN_2FA_SECRET</code>.
+    </p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <h3>Sign out</h3>
+  <p>
+    <a href="/admin/logout">Sign out of all panels</a>
+    &mdash; clears every cookie this browser holds for the admin panel
+    (session, viewing-as preview, status banner). Other browsers /
+    devices stay signed in until their own cookies expire.
+  </p>
+</div>
+{% endblock %}

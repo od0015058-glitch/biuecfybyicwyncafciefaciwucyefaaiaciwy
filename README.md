@@ -120,6 +120,20 @@ NowPayments crypto invoices.
   the cadence from the panel no longer leaves the panel forever
   showing the FX loop as "running late". Mirrors the row-21
   bot-health-alert fix.
+- **Admin password rotation** on `/admin/profile` (Stage-15-Step-E
+  #10b row 25) — DB-backed scrypt-hashed override for the panel
+  login password. Stored under `system_settings.ADMIN_PASSWORD_HASH`
+  in the canonical `scrypt$N$r$p$salt$hash` format (n = 2¹⁵, r = 8,
+  p = 1) so a future cost-factor bump verifies older hashes without
+  a flag-day rotation. Login flow prefers the DB hash → falls back
+  to the env `ADMIN_PASSWORD` plaintext → refuses every sign-in if
+  neither is configured. Rotation form gated to `ROLE_SUPER` (the
+  password owner) with strength gate (≥12 chars, must include
+  letter + digit/symbol, refuses whitespace-only and current-equals-
+  new). Bundled bug fix: `/admin/logout` now clears the signed
+  view-as cookie and the flash cookie in addition to the session
+  cookie — prior impl leaked the prior operator's "viewing as
+  &lt;role&gt;" preview into the next sign-in on a shared workstation.
 - Telegram-side admin commands (`/admin`, `/admin_metrics`,
   `/admin_credit`, `/admin_broadcast`, …) for ops via DMs.
 - **Canonical slash-command menu** — on every startup the bot

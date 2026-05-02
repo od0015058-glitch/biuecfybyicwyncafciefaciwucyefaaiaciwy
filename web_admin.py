@@ -80,6 +80,7 @@ from aiohttp import web
 # parse_transactions_query (Stage-8-Part-6). Only the class is
 # referenced — not the module-level ``db`` singleton — so the admin
 # still works against the injected DB in tests.
+import admin_password
 import strings as bot_strings_module
 from admin_roles import (
     ROLE_OPERATOR,
@@ -658,7 +659,25 @@ async def login_post(request: web.Request) -> web.StreamResponse:
     ttl_hours = request.app.get(APP_KEY_TTL_HOURS, DEFAULT_TTL_HOURS)
     secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
 
-    if not expected or not secret:
+    # Stage-15-Step-E #10b row 25: prefer a DB-stored scrypt hash over
+    # the env plaintext when one's been rotated in. Refresh from DB
+    # on every login so a sibling worker's rotation lands on this
+    # process without a restart; transient DB errors keep the cached
+    # hash so an outage doesn't lock every operator out.
+    db = request.app.get(APP_KEY_DB)
+    if db is not None:
+        try:
+            await admin_password.refresh_admin_password_hash_from_db(db)
+        except Exception:
+            log.exception(
+                "login_post: admin-password hash refresh failed; "
+                "using cached value",
+            )
+    has_db_hash = (
+        admin_password.get_admin_password_hash_override() is not None
+    )
+
+    if (not expected and not has_db_hash) or not secret:
         # Misconfigured deploy — refuse to log anyone in. Better to
         # surface this loudly than silently let in everyone with an
         # empty cookie.
@@ -707,10 +726,14 @@ async def login_post(request: web.Request) -> web.StreamResponse:
     form = await request.post()
     submitted = str(form.get("password", ""))
 
-    # Constant-time compare on the bytes — the lengths can differ, but
-    # ``compare_digest`` handles that without leaking which one was
-    # right.
-    if not hmac.compare_digest(submitted, expected):
+    # Stage-15-Step-E #10b row 25: ``verify_admin_password`` consults
+    # the DB-backed scrypt hash first (if rotated) and falls back to
+    # the env plaintext for back-compat. Both branches do a constant-
+    # time compare so an attacker can't time-attack which path was
+    # taken.
+    if not admin_password.verify_admin_password(
+        submitted, env_expected=expected,
+    ):
         log.warning(
             "admin login: bad password key=%s remote=%s",
             client_key, request.remote,
@@ -779,8 +802,23 @@ async def login_post(request: web.Request) -> web.StreamResponse:
 
 
 async def logout(request: web.Request) -> web.StreamResponse:
+    """Sign the admin out — clears every cookie the panel sets.
+
+    Stage-15-Step-E #10b row 25 bundled bug fix: the previous
+    implementation only cleared the session cookie, leaving
+    ``meow_admin_view_as`` AND the one-shot flash cookie on the
+    browser. On a shared workstation this leaked the previous
+    operator's "viewing as <role>" preference into the next person's
+    session — they'd open ``/admin/login``, sign in, and find
+    themselves implicitly previewing as whatever role the prior user
+    had selected, with no audit trail explaining where that came
+    from. Per-user web auth (the open Step-E #5 redesign) makes this
+    leak louder, so a defensive sweep here is the right floor today.
+    """
     response = web.HTTPFound(location="/admin/login")
     response.del_cookie(COOKIE_NAME, path="/admin/")
+    response.del_cookie(VIEW_AS_COOKIE_NAME, path="/admin/")
+    response.del_cookie(FLASH_COOKIE, path="/admin/")
     return response
 
 
@@ -3492,6 +3530,10 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     "string_save": "Bot text override saved",
     "string_revert": "Bot text override reverted",
     "enroll_2fa_view": "2FA enrolment page viewed",
+    # Stage-15-Step-E #10b row 25: admin password rotation.
+    "profile_view": "Admin profile page viewed",
+    "admin_password_rotated": "Admin panel password rotated",
+    "admin_password_rotation_failed": "Admin password rotation refused",
     # Stage-12-Step-A: refund flow on /admin/transactions.
     "refund_issued": "Refund issued",
     "refund_refused": "Refund refused",
@@ -7620,6 +7662,273 @@ async def enroll_2fa_get(request: web.Request) -> web.StreamResponse:
             "is_suggestion": is_suggestion,
         },
     )
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 25: /admin/profile (password rotation)
+# ---------------------------------------------------------------------
+
+
+def _build_password_view(env_expected: str) -> dict:
+    """Snapshot of the live admin-password credential for the
+    ``/admin/profile`` page.
+
+    Mirrors the ``effective / db / env / default / source`` shape
+    used by the wallet-config knobs, but the credential itself is
+    NEVER shown — only its provenance (where the live value comes
+    from) and the env-flagged "is the back-compat fallback armed?".
+    """
+    has_db_hash = (
+        admin_password.get_admin_password_hash_override() is not None
+    )
+    has_env = bool(env_expected)
+    return {
+        "source": admin_password.get_admin_password_source(
+            env_expected=env_expected,
+        ),
+        "has_db_hash": has_db_hash,
+        "has_env": has_env,
+        "min_length": admin_password.MIN_PASSWORD_LENGTH,
+        "max_length": admin_password.MAX_PASSWORD_LENGTH,
+        "setting_key": admin_password.ADMIN_PASSWORD_HASH_SETTING_KEY,
+    }
+
+
+async def profile_get(request: web.Request) -> web.StreamResponse:
+    """Render the admin profile / security page.
+
+    Hosts the password-rotation form and links to 2FA enrolment +
+    sign-out. Read-only; the actual rotation lives on
+    ``/admin/profile/rotate-password``.
+    """
+    env_expected = request.app.get(APP_KEY_PASSWORD, "")
+    db = request.app.get(APP_KEY_DB)
+
+    # Refresh from DB on every render so a sibling worker's rotation
+    # lands here without a redeploy. Fail-soft so an outage on the DB
+    # doesn't lock the page out — the page is read-only anyway.
+    if db is not None:
+        try:
+            await admin_password.refresh_admin_password_hash_from_db(db)
+        except Exception:
+            log.exception(
+                "profile_get: refresh_admin_password_hash_from_db failed; "
+                "falling back to cached value",
+            )
+
+    password_view = _build_password_view(env_expected)
+    totp_secret = request.app.get(APP_KEY_TOTP_SECRET, "")
+    has_totp = bool(totp_secret)
+
+    await _record_audit_safe(request, "profile_view")
+    ctx = {
+        "active_page": "profile",
+        "password_view": password_view,
+        "has_totp": has_totp,
+        "csrf_token": csrf_token_for(request),
+        "flash": None,
+    }
+    response = aiohttp_jinja2.render_template(
+        "profile.html", request, ctx,
+    )
+    flash = pop_flash(request, response)
+    if flash is not None:
+        ctx["flash"] = flash
+        response = aiohttp_jinja2.render_template(
+            "profile.html", request, ctx,
+        )
+        response.del_cookie(FLASH_COOKIE, path="/admin/")
+    return response
+
+
+async def profile_password_post(request: web.Request) -> web.StreamResponse:
+    """Rotate the admin panel password.
+
+    Gated to :data:`ROLE_SUPER` (the password owner). Verifies the
+    current password before accepting a new one — mirrors the
+    pattern every webmail / banking flow uses to refuse a casually-
+    captured session from rotating credentials.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app.get(APP_KEY_DB)
+    env_expected = request.app.get(APP_KEY_PASSWORD, "")
+
+    response = web.HTTPFound(location="/admin/profile")
+
+    form = await request.post()
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning(
+            "profile_password_post: CSRF token mismatch from %s",
+            request.remote,
+        )
+        set_flash(
+            response, kind="error",
+            message=(
+                "Form submission was rejected (CSRF). "
+                "Refresh and try again."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    if db is None:
+        log.error(
+            "profile_password_post: no DB attached; refusing rotation",
+        )
+        set_flash(
+            response, kind="error",
+            message=(
+                "Admin panel database is not attached — the rotation "
+                "cannot be persisted. Contact the deploy operator."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    current = str(form.get("current_password", ""))
+    new_password = str(form.get("new_password", ""))
+    confirm_password = str(form.get("confirm_password", ""))
+
+    # Refresh cache so a sibling worker's rotation is reflected when
+    # we verify the "current password" — otherwise an operator who
+    # rotated on worker A would see worker B refuse their NEW
+    # password as "wrong current".
+    try:
+        await admin_password.refresh_admin_password_hash_from_db(db)
+    except Exception:
+        log.exception(
+            "profile_password_post: refresh failed; using cached value",
+        )
+
+    if not admin_password.verify_admin_password(
+        current, env_expected=env_expected,
+    ):
+        await _record_audit_safe(
+            request,
+            "admin_password_rotation_failed",
+            outcome="deny",
+            meta={"reason": "wrong_current"},
+        )
+        set_flash(
+            response, kind="error",
+            message="Current password is incorrect.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    if new_password != confirm_password:
+        await _record_audit_safe(
+            request,
+            "admin_password_rotation_failed",
+            outcome="deny",
+            meta={"reason": "confirm_mismatch"},
+        )
+        set_flash(
+            response, kind="error",
+            message="New password and confirmation do not match.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    err = admin_password.validate_password_strength(new_password)
+    if err is not None:
+        await _record_audit_safe(
+            request,
+            "admin_password_rotation_failed",
+            outcome="deny",
+            meta={"reason": "weak_password"},
+        )
+        set_flash(
+            response, kind="error",
+            message=f"New password is too weak: {err}.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    if new_password == current:
+        await _record_audit_safe(
+            request,
+            "admin_password_rotation_failed",
+            outcome="deny",
+            meta={"reason": "unchanged"},
+        )
+        set_flash(
+            response, kind="error",
+            message=(
+                "New password must differ from the current password."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    # Capture the source BEFORE we persist so the audit row records
+    # the rotation step ("env→db" on first rotation, "db→db" on
+    # subsequent rotations).
+    previous_source = admin_password.get_admin_password_source(
+        env_expected=env_expected,
+    )
+
+    stored = admin_password.hash_password(new_password)
+    try:
+        await db.upsert_setting(
+            admin_password.ADMIN_PASSWORD_HASH_SETTING_KEY, stored,
+        )
+    except Exception:
+        log.exception(
+            "profile_password_post: upsert_setting failed; not "
+            "rotating in-process cache",
+        )
+        await _record_audit_safe(
+            request,
+            "admin_password_rotation_failed",
+            outcome="deny",
+            meta={"reason": "db_error"},
+        )
+        set_flash(
+            response, kind="error",
+            message=(
+                "Failed to persist the new password — please retry. "
+                "If the failure persists, check the application log."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    # Refresh-from-DB instead of set_admin_password_hash_override so
+    # the cache only loads a value that round-trips through the
+    # storage layer — guards against the rare case where the DB
+    # silently truncates / mangles the stored value.
+    try:
+        await admin_password.refresh_admin_password_hash_from_db(db)
+    except Exception:
+        log.exception(
+            "profile_password_post: post-rotation refresh failed; "
+            "in-process cache may be stale until the next render",
+        )
+
+    await _record_audit_safe(
+        request,
+        "admin_password_rotated",
+        meta={
+            "previous_source": previous_source,
+            "new_source": "db",
+        },
+    )
+    log.info(
+        "admin_password_rotated: panel password rotated from %s",
+        request.remote,
+    )
+
+    set_flash(
+        response, kind="success",
+        message=(
+            "Admin password rotated. Existing sessions stay valid; "
+            "the new password takes effect on the next sign-in."
+        ),
+        secret=secret, cookie_secure=cookie_secure,
+    )
+    return response
 
 
 # ---------------------------------------------------------------------
@@ -12023,6 +12332,19 @@ def setup_admin_routes(
     app.router.add_get(
         "/admin/enroll_2fa",
         _require_auth(enroll_2fa_get),
+    )
+
+    # Stage-15-Step-E #10b row 25: admin profile + password rotation.
+    # GET is read-only (auth-gated); POST is super-floored (the
+    # password owner is implicitly ROLE_SUPER per the env-list back-
+    # compat in admin_roles.effective_role).
+    app.router.add_get(
+        "/admin/profile",
+        _require_auth(profile_get),
+    )
+    app.router.add_post(
+        "/admin/profile/rotate-password",
+        _require_role(ROLE_SUPER)(profile_password_post),
     )
 
     # Stage-14: model & gateway toggle pages. Stage-15-Step-E #5
