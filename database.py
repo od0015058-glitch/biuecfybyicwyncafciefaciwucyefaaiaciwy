@@ -5592,6 +5592,97 @@ class Database:
             int(key_id),
         )
 
+    # ── system_settings: generic key/value overlay ────────────────
+    #
+    # The ``system_settings`` table has lived in the baseline schema
+    # since 0001 but went unread in code (only seeded with
+    # ``usd_to_toman_rate``). Stage-15-Step-F follow-up wires it as
+    # the canonical DB-backed override surface so an operator can
+    # tune env-defaulted knobs (bot_health thresholds, etc.) from
+    # the web admin without restarting the bot. The methods below
+    # are intentionally generic (no per-key validation) — callers
+    # that consume a key are responsible for parsing + validating
+    # the string value before applying it.
+
+    async def get_setting(self, setting_key: str) -> str | None:
+        """Return the stored value for *setting_key*, or ``None`` if unset.
+
+        Raises ``ValueError`` if the key is empty / over the table's
+        50-char limit (mirrors ``set_admin_role``'s defensive shape:
+        a buggy caller with an oversize key gets a loud error
+        instead of an asyncpg-side ``StringDataRightTruncation``).
+        """
+        if not isinstance(setting_key, str) or not setting_key:
+            raise ValueError("setting_key must be a non-empty string")
+        if len(setting_key) > 50:
+            raise ValueError("setting_key exceeds the 50-char column limit")
+        row = await self.pool.fetchrow(
+            "SELECT setting_value FROM system_settings "
+            "WHERE setting_key = $1",
+            setting_key,
+        )
+        if row is None:
+            return None
+        value = row["setting_value"]
+        return None if value is None else str(value)
+
+    async def upsert_setting(self, setting_key: str, value: str) -> None:
+        """Insert-or-update *setting_key* to *value*.
+
+        ``value`` is coerced to ``str`` to match the column type.
+        Bumps ``last_updated`` on every write so an operator can see
+        when the override was last touched.
+        """
+        if not isinstance(setting_key, str) or not setting_key:
+            raise ValueError("setting_key must be a non-empty string")
+        if len(setting_key) > 50:
+            raise ValueError("setting_key exceeds the 50-char column limit")
+        coerced = "" if value is None else str(value)
+        if len(coerced) > 255:
+            raise ValueError(
+                "setting value exceeds the 255-char column limit"
+            )
+        await self.pool.execute(
+            "INSERT INTO system_settings (setting_key, setting_value) "
+            "VALUES ($1, $2) "
+            "ON CONFLICT (setting_key) DO UPDATE "
+            "SET setting_value = EXCLUDED.setting_value, "
+            "    last_updated = CURRENT_TIMESTAMP",
+            setting_key, coerced,
+        )
+
+    async def delete_setting(self, setting_key: str) -> bool:
+        """Delete *setting_key*. Returns True if a row was removed."""
+        if not isinstance(setting_key, str) or not setting_key:
+            raise ValueError("setting_key must be a non-empty string")
+        result = await self.pool.execute(
+            "DELETE FROM system_settings WHERE setting_key = $1",
+            setting_key,
+        )
+        return result.endswith("1")
+
+    async def list_settings_with_prefix(self, prefix: str) -> dict[str, str]:
+        """Return a dict of all rows whose key starts with *prefix*.
+
+        Used by the admin panel to render every override of a
+        family (e.g. ``BOT_HEALTH_*``) in one round-trip rather
+        than N sequential `get_setting` calls.
+        """
+        if not isinstance(prefix, str):
+            raise ValueError("prefix must be a string")
+        rows = await self.pool.fetch(
+            "SELECT setting_key, setting_value FROM system_settings "
+            "WHERE setting_key LIKE $1 "
+            "ORDER BY setting_key",
+            prefix + "%",
+        )
+        return {
+            r["setting_key"]: (
+                "" if r["setting_value"] is None else str(r["setting_value"])
+            )
+            for r in rows
+        }
+
 
 # Export a single instance to be used across the app
 db = Database()

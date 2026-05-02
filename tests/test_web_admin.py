@@ -9002,6 +9002,13 @@ def _stub_toggle_db(
         db.enable_gateway = AsyncMock(return_value=enable_gateway_result)
     db.get_disabled_models = AsyncMock(return_value=set())
     db.get_disabled_gateways = AsyncMock(return_value=set())
+    # Stage-15-Step-F follow-up: ``/admin/control`` calls
+    # ``refresh_threshold_overrides_from_db`` on every render. Default
+    # to "no overrides stored" so existing tests don't have to opt in.
+    db.list_settings_with_prefix = AsyncMock(return_value={})
+    db.upsert_setting = AsyncMock(return_value=None)
+    db.delete_setting = AsyncMock(return_value=False)
+    db.get_setting = AsyncMock(return_value=None)
     return db
 
 
@@ -10292,3 +10299,214 @@ async def test_openrouter_keys_delete_post_requires_auth(
     assert resp.status == 302
     assert resp.headers["Location"].startswith("/admin/login")
     db.delete_openrouter_key.assert_not_called()
+
+
+# ── Stage-15-Step-F follow-up: tunable thresholds ──────────────────
+
+
+async def test_control_get_renders_thresholds_form(
+    aiohttp_client, make_admin_app
+):
+    """The new severity-thresholds form is rendered with one row per
+    knob, the effective value column, and the source badge."""
+    import bot_health as bh
+
+    bh._THRESHOLD_OVERRIDES.clear()
+
+    db = _stub_toggle_db()
+    db.list_settings_with_prefix = AsyncMock(return_value={
+        "BOT_HEALTH_BUSY_INFLIGHT": "7",
+    })
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.get("/admin/control")
+    body = await resp.text()
+    assert resp.status == 200
+    # The form posts to the new route.
+    assert 'action="/admin/control/thresholds"' in body
+    # Every knob label is present.
+    for key in bh.THRESHOLD_KEYS:
+        assert key in body
+    # The DB-stored value is shown in the input pre-filled.
+    assert 'value="7"' in body
+    # Source column shows db for the overridden knob, default for the rest.
+    assert ">db<" in body
+    bh._THRESHOLD_OVERRIDES.clear()
+
+
+async def test_control_thresholds_post_writes_db_and_applies(
+    aiohttp_client, make_admin_app
+):
+    """A valid POST upserts each knob into ``system_settings`` and
+    immediately applies the override so the next render uses it.
+
+    The test wires the stub's ``list_settings_with_prefix`` to
+    reflect every upsert, mirroring real DB semantics — the
+    handler's post-write refresh re-reads the table and so the
+    snapshot it produces should match what was just written.
+    """
+    import bot_health as bh
+
+    bh._THRESHOLD_OVERRIDES.clear()
+
+    settings_store: dict[str, str] = {}
+
+    db = _stub_toggle_db()
+
+    async def _upsert(key, value):
+        settings_store[key] = value
+
+    async def _delete(key):
+        return settings_store.pop(key, None) is not None
+
+    async def _list(prefix):
+        return {
+            k: v for k, v in settings_store.items() if k.startswith(prefix)
+        }
+
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.delete_setting = AsyncMock(side_effect=_delete)
+    db.list_settings_with_prefix = AsyncMock(side_effect=_list)
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+    db.delete_setting.reset_mock()
+    settings_store.clear()
+
+    resp = await client.post(
+        "/admin/control/thresholds",
+        data={
+            "csrf_token": csrf,
+            "BOT_HEALTH_BUSY_INFLIGHT": "11",
+            "BOT_HEALTH_LOOP_STALE_SECONDS": "120",
+            "BOT_HEALTH_IPN_DROP_ATTACK_THRESHOLD": "200",
+            "BOT_HEALTH_LOGIN_THROTTLE_ATTACK_KEYS": "30",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/control"
+
+    # Each knob upserted exactly once with the posted value.
+    db.upsert_setting.assert_any_await("BOT_HEALTH_BUSY_INFLIGHT", "11")
+    db.upsert_setting.assert_any_await(
+        "BOT_HEALTH_LOOP_STALE_SECONDS", "120",
+    )
+    db.upsert_setting.assert_any_await(
+        "BOT_HEALTH_IPN_DROP_ATTACK_THRESHOLD", "200",
+    )
+    db.upsert_setting.assert_any_await(
+        "BOT_HEALTH_LOGIN_THROTTLE_ATTACK_KEYS", "30",
+    )
+    # In-process cache reflects the new values (no restart needed).
+    snap = bh.get_threshold_overrides_snapshot()
+    assert snap == {
+        "BOT_HEALTH_BUSY_INFLIGHT": 11,
+        "BOT_HEALTH_LOOP_STALE_SECONDS": 120,
+        "BOT_HEALTH_IPN_DROP_ATTACK_THRESHOLD": 200,
+        "BOT_HEALTH_LOGIN_THROTTLE_ATTACK_KEYS": 30,
+    }
+    # Audit row written.
+    db.record_admin_audit.assert_awaited()
+    bh._THRESHOLD_OVERRIDES.clear()
+
+
+async def test_control_thresholds_post_blank_clears_override(
+    aiohttp_client, make_admin_app
+):
+    """Posting blank for a knob clears the DB override + cache so the
+    knob falls through to env / default again."""
+    import bot_health as bh
+
+    bh.set_threshold_override("BOT_HEALTH_BUSY_INFLIGHT", 50)
+
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+    db.delete_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/thresholds",
+        data={
+            "csrf_token": csrf,
+            # All blank — clears every knob.
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+
+    # Every knob deleted (blank → clear).
+    for key in bh.THRESHOLD_KEYS:
+        db.delete_setting.assert_any_await(key)
+    db.upsert_setting.assert_not_awaited()
+    # Cache empty.
+    assert bh.get_threshold_overrides_snapshot() == {}
+
+
+async def test_control_thresholds_post_rejects_below_minimum(
+    aiohttp_client, make_admin_app
+):
+    """Bug fix coverage: a 0 value is rejected with no DB writes."""
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/thresholds",
+        data={
+            "csrf_token": csrf,
+            "BOT_HEALTH_BUSY_INFLIGHT": "0",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+    follow = await client.get("/admin/control")
+    body = await follow.text()
+    assert "below the minimum" in body.lower()
+
+
+async def test_control_thresholds_post_rejects_non_int(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/thresholds",
+        data={
+            "csrf_token": csrf,
+            "BOT_HEALTH_BUSY_INFLIGHT": "abc",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+    follow = await client.get("/admin/control")
+    body = await follow.text()
+    assert "not an integer" in body.lower()
+
+
+async def test_control_thresholds_post_csrf_required(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False,
+    )
+    db.upsert_setting.reset_mock()
+    resp = await client.post(
+        "/admin/control/thresholds",
+        data={"BOT_HEALTH_BUSY_INFLIGHT": "11"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()

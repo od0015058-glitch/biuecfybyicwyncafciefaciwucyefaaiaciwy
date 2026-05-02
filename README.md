@@ -480,6 +480,17 @@ NowPayments crypto invoices.
   5=down) so existing alerting rules can target
   `meowassist_bot_status_score >= 4` to page on under-attack /
   down. First slice of Stage-15-Step-F.
+- **Tunable severity thresholds via panel (no restart)** —
+  `/admin/control` now ships a "Severity thresholds" card that
+  edits the four `BOT_HEALTH_*` knobs at runtime. Values are
+  written to the `system_settings` table, beat env / default for
+  every component (panel, `/metrics`, alert loop), propagate
+  without a process restart, and audit-log a per-submission diff.
+  Blank field clears the override and falls back to env / default.
+  A bundled bug fix refuses `=0` values that would have
+  permanently tripped the corresponding alarm (e.g.
+  `BOT_HEALTH_IPN_DROP_ATTACK_THRESHOLD=0` flagged UNDER_ATTACK
+  on every dashboard hit). Stage-15-Step-F follow-up #4.
 - **Alert-loop audit trail** — every bot-health alert DM
   (`bot_health_alert.py`) and recovery DM now appends one row to
   `admin_audit_log`, alongside the human-admin actions on

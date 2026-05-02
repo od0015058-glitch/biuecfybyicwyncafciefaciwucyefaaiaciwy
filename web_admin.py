@@ -6053,7 +6053,21 @@ async def control_get(request: web.Request) -> web.StreamResponse:
 
     signals = _collect_control_signals(app=request.app, db_error=db_error)
 
-    from bot_health import compute_bot_status
+    # Stage-15-Step-F follow-up: refresh the in-process threshold
+    # overrides cache from ``system_settings`` so a tweak made on a
+    # different replica (or in a previous request that hasn't
+    # propagated yet) is reflected on this page. Best-effort — a
+    # transient DB blip leaves the previous cache in place rather
+    # than silently reverting to env / default.
+    from bot_health import (
+        compute_bot_status,
+        refresh_threshold_overrides_from_db,
+    )
+
+    try:
+        await refresh_threshold_overrides_from_db(db)
+    except Exception:
+        log.exception("control: refresh_threshold_overrides_from_db failed")
 
     # Read the bot-health alert loop's most-recent rate-windowed drop
     # count so the panel + the loop + Prometheus all classify
@@ -6079,12 +6093,15 @@ async def control_get(request: web.Request) -> web.StreamResponse:
         login_throttle_active_keys=signals["login_throttle_active_keys"],
     )
 
+    thresholds_view = _build_thresholds_view()
+
     ctx = {
         "active_page": "control",
         "csrf_token": csrf_token_for(request),
         "flash": None,
         "status": status,
         "signals": signals,
+        "thresholds": thresholds_view,
     }
     response = aiohttp_jinja2.render_template("control.html", request, ctx)
     flash = pop_flash(request, response)
@@ -6092,6 +6109,77 @@ async def control_get(request: web.Request) -> web.StreamResponse:
         ctx["flash"] = flash
         response = aiohttp_jinja2.render_template("control.html", request, ctx)
     return response
+
+
+def _build_thresholds_view() -> list[dict]:
+    """Snapshot of every BOT_HEALTH threshold for the panel.
+
+    Each row exposes the resolved effective value + the source
+    (db / env / default) so the operator sees at a glance which
+    knobs are actually live and which are still on their
+    compile-time fallback.
+    """
+    import bot_health
+
+    defaults: dict[str, int] = {
+        "BOT_HEALTH_BUSY_INFLIGHT": bot_health.DEFAULT_BUSY_INFLIGHT,
+        "BOT_HEALTH_LOOP_STALE_SECONDS": (
+            bot_health.DEFAULT_LOOP_STALE_SECONDS
+        ),
+        "BOT_HEALTH_IPN_DROP_ATTACK_THRESHOLD": (
+            bot_health.DEFAULT_IPN_DROP_ATTACK_THRESHOLD
+        ),
+        "BOT_HEALTH_LOGIN_THROTTLE_ATTACK_KEYS": (
+            bot_health.DEFAULT_LOGIN_THROTTLE_ATTACK_KEYS
+        ),
+    }
+    labels: dict[str, str] = {
+        "BOT_HEALTH_BUSY_INFLIGHT":
+            "Busy threshold (in-flight chat slots)",
+        "BOT_HEALTH_LOOP_STALE_SECONDS":
+            "Legacy loop-stale threshold (seconds, "
+            "unknown loops only)",
+        "BOT_HEALTH_IPN_DROP_ATTACK_THRESHOLD":
+            "Under-attack threshold (recent IPN drops)",
+        "BOT_HEALTH_LOGIN_THROTTLE_ATTACK_KEYS":
+            "Under-attack threshold (login-throttle IPs)",
+    }
+    overrides = bot_health.get_threshold_overrides_snapshot()
+    rows: list[dict] = []
+    for key in bot_health.THRESHOLD_KEYS:
+        default_value = defaults[key]
+        override_value = overrides.get(key)
+        env_raw = os.getenv(key, "").strip()
+        env_value: int | None = None
+        if env_raw:
+            try:
+                parsed = int(env_raw)
+            except ValueError:
+                env_value = None
+            else:
+                minimum = bot_health.THRESHOLD_MINIMUMS.get(key, 1)
+                env_value = parsed if parsed >= minimum else None
+        if override_value is not None:
+            effective = override_value
+            source = "db"
+        elif env_value is not None:
+            effective = env_value
+            source = "env"
+        else:
+            effective = default_value
+            source = "default"
+        rows.append({
+            "key": key,
+            "label": labels[key],
+            "default_value": default_value,
+            "env_value": env_value,
+            "env_raw": env_raw,
+            "override_value": override_value,
+            "effective": effective,
+            "source": source,
+            "minimum": bot_health.THRESHOLD_MINIMUMS.get(key, 1),
+        })
+    return rows
 
 
 def _control_csrf_guard(
@@ -6444,6 +6532,193 @@ async def control_force_stop_post(
     return response
 
 
+async def control_thresholds_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/control/thresholds`` — update bot-health thresholds.
+
+    Stage-15-Step-F follow-up. Operators were forced to redeploy
+    the bot to re-tune the four ``BOT_HEALTH_*`` knobs because they
+    were env-only. This handler writes each posted threshold to the
+    ``system_settings`` overlay (DB-backed), refreshes the
+    in-process cache so the next ``compute_bot_status`` reflects the
+    change without a restart, and logs an audit row per changed key.
+
+    Flow:
+
+    1. CSRF-check.
+    2. Per-knob: parse, validate ≥ minimum, refuse anything else
+       with a flash banner pointing at the offending field.
+    3. Persist + apply each knob.
+    4. Audit-log a single ``control_threshold_update`` row whose
+       ``meta`` carries the diff (old → new for every changed key)
+       so the audit feed is one row per submission, not four.
+    5. Redirect with a success flash.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app.get(APP_KEY_DB)
+    form = await request.post()
+
+    guard = _control_csrf_guard(request, form)
+    if guard is not None:
+        return guard
+
+    if db is None:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Database is not configured — threshold edits "
+                "require a live DB connection."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    import bot_health
+
+    parsed: dict[str, int | None] = {}
+    errors: list[str] = []
+    for key in bot_health.THRESHOLD_KEYS:
+        raw = str(form.get(key, "")).strip()
+        if not raw:
+            # Empty field == clear the override (fall through to env).
+            parsed[key] = None
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            errors.append(f"{key}: '{raw}' is not an integer.")
+            continue
+        minimum = bot_health.THRESHOLD_MINIMUMS.get(key, 1)
+        if value < minimum:
+            errors.append(
+                f"{key}: {value} is below the minimum {minimum}."
+            )
+            continue
+        parsed[key] = value
+
+    if errors:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Threshold update rejected: "
+                + " ".join(errors)
+                + " No values were changed."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    # Snapshot the current effective values so the audit row can
+    # surface the actual diff. We call ``_env_int`` per knob so the
+    # snapshot reflects the same resolution order
+    # ``compute_bot_status`` would use.
+    previous_effective = {
+        key: bot_health._env_int(
+            key,
+            {
+                "BOT_HEALTH_BUSY_INFLIGHT":
+                    bot_health.DEFAULT_BUSY_INFLIGHT,
+                "BOT_HEALTH_LOOP_STALE_SECONDS":
+                    bot_health.DEFAULT_LOOP_STALE_SECONDS,
+                "BOT_HEALTH_IPN_DROP_ATTACK_THRESHOLD":
+                    bot_health.DEFAULT_IPN_DROP_ATTACK_THRESHOLD,
+                "BOT_HEALTH_LOGIN_THROTTLE_ATTACK_KEYS":
+                    bot_health.DEFAULT_LOGIN_THROTTLE_ATTACK_KEYS,
+            }[key],
+        )
+        for key in bot_health.THRESHOLD_KEYS
+    }
+
+    persist_errors: list[str] = []
+    for key, value in parsed.items():
+        try:
+            if value is None:
+                await db.delete_setting(key)
+                bot_health.clear_threshold_override(key)
+            else:
+                await db.upsert_setting(key, str(value))
+                bot_health.set_threshold_override(key, value)
+        except Exception:
+            log.exception(
+                "control: failed to persist threshold %s=%r", key, value,
+            )
+            persist_errors.append(key)
+
+    # Re-read whatever ended up in the DB so the cache reflects the
+    # truth (in case e.g. a delete failed but an upsert succeeded).
+    try:
+        await bot_health.refresh_threshold_overrides_from_db(db)
+    except Exception:
+        log.exception(
+            "control: refresh_threshold_overrides_from_db after write failed",
+        )
+
+    new_effective = {
+        key: bot_health._env_int(
+            key,
+            {
+                "BOT_HEALTH_BUSY_INFLIGHT":
+                    bot_health.DEFAULT_BUSY_INFLIGHT,
+                "BOT_HEALTH_LOOP_STALE_SECONDS":
+                    bot_health.DEFAULT_LOOP_STALE_SECONDS,
+                "BOT_HEALTH_IPN_DROP_ATTACK_THRESHOLD":
+                    bot_health.DEFAULT_IPN_DROP_ATTACK_THRESHOLD,
+                "BOT_HEALTH_LOGIN_THROTTLE_ATTACK_KEYS":
+                    bot_health.DEFAULT_LOGIN_THROTTLE_ATTACK_KEYS,
+            }[key],
+        )
+        for key in bot_health.THRESHOLD_KEYS
+    }
+    diff = {
+        key: {
+            "before": previous_effective[key],
+            "after": new_effective[key],
+        }
+        for key in bot_health.THRESHOLD_KEYS
+        if previous_effective[key] != new_effective[key]
+    }
+
+    await _record_audit_safe(
+        request, "control_threshold_update",
+        outcome="partial" if persist_errors else "ok",
+        meta={"diff": diff, "errors": persist_errors},
+    )
+
+    response = web.HTTPFound(location="/admin/control")
+    if persist_errors:
+        set_flash(
+            response, kind="error",
+            message=(
+                "Some thresholds failed to save: "
+                + ", ".join(persist_errors)
+                + ". The remaining values were applied."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    elif diff:
+        keys_changed = ", ".join(diff.keys()) or "none"
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Thresholds updated ({keys_changed}). "
+                "The new values are live for every component "
+                "(panel, Prometheus, alert loop)."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    else:
+        set_flash(
+            response, kind="success",
+            message="No threshold changes — current values were unchanged.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    return response
+
+
 # ---------------------------------------------------------------------
 # App wiring
 # ---------------------------------------------------------------------
@@ -6765,6 +7040,11 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/control/force-stop",
         _require_auth(control_force_stop_post),
+    )
+    # Stage-15-Step-F follow-up: DB-backed tunable severity thresholds.
+    app.router.add_post(
+        "/admin/control/thresholds",
+        _require_auth(control_thresholds_post),
     )
 
     # Stage-9-Step-10: durable broadcast registry orphan sweep.
