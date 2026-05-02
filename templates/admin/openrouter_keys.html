@@ -6,11 +6,11 @@
 <style>
   .or-row {
     display: grid;
-    grid-template-columns: 60px 1fr 140px 140px 200px;
+    grid-template-columns: 50px 1fr 80px 110px 110px 90px 90px 90px;
     align-items: center;
     padding: 10px 0;
     border-bottom: 1px solid var(--border);
-    gap: 16px;
+    gap: 10px;
   }
   .or-row.header {
     font-size: 11px;
@@ -31,6 +31,13 @@
     font-size: 13px;
   }
   .or-counter.hot { color: var(--danger); }
+  .or-source {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+  }
+  .or-source.db { color: var(--accent); }
   .summary {
     color: var(--text-muted);
     font-size: 13px;
@@ -42,52 +49,111 @@
     padding: 24px 0;
     text-align: center;
   }
+  .db-row {
+    display: grid;
+    grid-template-columns: 60px 1fr 140px 110px 110px 1fr 200px;
+    align-items: center;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border);
+    gap: 12px;
+  }
+  .db-row.header {
+    font-size: 11px;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    letter-spacing: 0.04em;
+  }
+  .db-row.disabled { opacity: 0.55; }
+  .key-tail {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  .add-form {
+    display: grid;
+    grid-template-columns: 1fr 2fr 2fr auto;
+    gap: 12px;
+    align-items: end;
+    margin-top: 12px;
+  }
+  .add-form label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    display: block;
+    margin-bottom: 4px;
+  }
+  .add-form input[type=text] {
+    width: 100%;
+  }
+  .inline-form {
+    display: inline;
+    margin: 0 4px;
+  }
+  .btn-link-danger {
+    background: none;
+    border: none;
+    color: var(--danger);
+    cursor: pointer;
+    padding: 0;
+    font-size: 12px;
+  }
+  .btn-link-danger:hover { text-decoration: underline; }
+  .btn-link-action {
+    background: none;
+    border: none;
+    color: var(--accent);
+    cursor: pointer;
+    padding: 0;
+    font-size: 12px;
+  }
+  .btn-link-action:hover { text-decoration: underline; }
 </style>
 {% endblock %}
 
 {% block main %}
-<h2>OpenRouter keys — ops view</h2>
+<h2>OpenRouter keys</h2>
 
 {% if flash %}
 <div class="alert alert-{{ flash.kind }}">{{ flash.message }}</div>
 {% endif %}
 
 <p class="summary">
-  Per-key health for the multi-key OpenRouter pool. Each row shows one
-  pool slot's cooldown state plus the per-process counters that drive
-  the matching <code>meowassist_openrouter_key_*</code> Prometheus
-  family. Counters reset on every process restart and on a deliberate
-  <code>load_keys()</code> call. Key material is never rendered — keys
-  are referenced by 0-based pool index only.
+  Manage the multi-key OpenRouter pool. Env-loaded keys (set via
+  <code>OPENROUTER_API_KEY</code> /
+  <code>OPENROUTER_API_KEY_1</code>..<code>_10</code>) appear with
+  source <strong>env</strong>; keys added below are stored in the
+  <code>openrouter_api_keys</code> table and appear with source
+  <strong>db</strong>. Per-key counters reset on every process
+  restart and on a deliberate <code>load_keys()</code> call.
+  Plaintext key material is never rendered — only a 4-char tail.
 </p>
 
+<h3 style="margin-top: 24px;">Live pool</h3>
 {% if rows %}
 <div class="panel">
   <div class="or-row header">
     <span>Idx</span>
+    <span>Name</span>
+    <span>Source</span>
     <span>Status</span>
     <span>Cooldown left</span>
+    <span>Requests</span>
     <span>429s</span>
-    <span>Fallbacks absorbed</span>
+    <span>Fallbacks</span>
   </div>
   {% for row in rows %}
   <div class="or-row">
     <span class="or-idx">#{{ row.index }}</span>
-    {% if row.rate_limited %}
-    <span class="or-status-cool">cooldown</span>
-    {% else %}
-    <span class="or-status-ok">available</span>
-    {% endif %}
+    <span>{{ row.display_name }}</span>
+    <span class="or-source {{ row.source }}">{{ row.source }}</span>
+    {% if row.rate_limited %}<span class="or-status-cool">cooldown</span>{% else %}<span class="or-status-ok">available</span>{% endif %}
     <span class="or-counter {% if row.rate_limited %}hot{% endif %}">
-      {% if row.cooldown_remaining_secs is not none %}
-      {{ "%.0f"|format(row.cooldown_remaining_secs) }}s
-      {% else %}
-      —
-      {% endif %}
+      {% if row.cooldown_remaining_secs is not none %}{{ "%.0f"|format(row.cooldown_remaining_secs) }}s{% else %}—{% endif %}
     </span>
-    <span class="or-counter {% if row.count_429 %}hot{% endif %}">
-      {{ row.count_429 }}
-    </span>
+    <span class="or-counter">{{ row.count_request }}</span>
+    <span class="or-counter {% if row.count_429 %}hot{% endif %}">{{ row.count_429 }}</span>
     <span class="or-counter">{{ row.count_fallback }}</span>
   </div>
   {% endfor %}
@@ -95,11 +161,98 @@
 {% else %}
 <div class="panel">
   <div class="or-empty">
-    No OpenRouter API keys configured. Set
-    <code>OPENROUTER_API_KEY</code> or
-    <code>OPENROUTER_API_KEY_1</code> through
-    <code>OPENROUTER_API_KEY_10</code> in the environment.
+    No OpenRouter API keys configured. Add one below or set
+    <code>OPENROUTER_API_KEY</code> /
+    <code>OPENROUTER_API_KEY_1</code>..<code>_10</code> in the
+    environment.
   </div>
 </div>
 {% endif %}
+
+<h3 style="margin-top: 32px;">DB-managed keys</h3>
+<p class="summary">
+  Add, disable, or delete keys without restarting the bot.
+  Disabled keys stay in the table (per-key counters survive) but
+  the loader skips them on its next refresh.
+</p>
+
+<div class="panel">
+  <div class="db-row header">
+    <span>ID</span>
+    <span>Label</span>
+    <span>Tail</span>
+    <span>Status</span>
+    <span>Last used</span>
+    <span>Notes</span>
+    <span>Actions</span>
+  </div>
+  {% if db_rows %}
+    {% for r in db_rows %}
+    <div class="db-row {% if not r.enabled %}disabled{% endif %}">
+      <span class="or-idx">#{{ r.id }}</span>
+      <span>{{ r.label }}</span>
+      <span class="key-tail">…{{ r.api_key_tail }}</span>
+      <span>
+        {% if r.enabled %}
+          <span class="or-status-ok">enabled</span>
+        {% else %}
+          <span class="or-status-cool">disabled</span>
+        {% endif %}
+      </span>
+      <span class="or-counter">
+        {% if r.last_used_at %}{{ r.last_used_at[:19] }}{% else %}—{% endif %}
+      </span>
+      <span class="or-counter">{{ r.notes or "—" }}</span>
+      <span>
+        {% if r.enabled %}
+        <form method="post" action="/admin/openrouter-keys/{{ r.id }}/disable" class="inline-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="btn-link-action">disable</button>
+        </form>
+        {% else %}
+        <form method="post" action="/admin/openrouter-keys/{{ r.id }}/enable" class="inline-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="btn-link-action">enable</button>
+        </form>
+        {% endif %}
+        <form method="post" action="/admin/openrouter-keys/{{ r.id }}/delete" class="inline-form"
+              onsubmit="return confirm('Delete OpenRouter key id={{ r.id }}? This cannot be undone.');">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="btn-link-danger">delete</button>
+        </form>
+      </span>
+    </div>
+    {% endfor %}
+  {% else %}
+    <div class="or-empty">No DB-managed keys yet.</div>
+  {% endif %}
+</div>
+
+<h3 style="margin-top: 32px;">Add a key</h3>
+<form method="post" action="/admin/openrouter-keys/add" class="panel">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="add-form">
+    <div>
+      <label for="or-add-label">Label</label>
+      <input type="text" id="or-add-label" name="label"
+             maxlength="64" required
+             placeholder="e.g. main, backup-1">
+    </div>
+    <div>
+      <label for="or-add-key">API key</label>
+      <input type="text" id="or-add-key" name="api_key"
+             maxlength="200" required autocomplete="off"
+             placeholder="sk-or-v1-…">
+    </div>
+    <div>
+      <label for="or-add-notes">Notes (optional)</label>
+      <input type="text" id="or-add-notes" name="notes"
+             maxlength="500"
+             placeholder="account email, expiry date, …">
+    </div>
+    <div>
+      <button type="submit" class="btn btn-primary">Add key</button>
+    </div>
+  </div>
+</form>
 {% endblock %}

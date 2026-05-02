@@ -3189,3 +3189,201 @@ def test_append_conversation_message_invalid_role_still_rejected():
         asyncio.get_event_loop().run_until_complete(
             db.append_conversation_message(42, "system", "hi"),
         )
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #4 follow-up #2: openrouter_api_keys CRUD
+# ---------------------------------------------------------------------
+
+
+def _make_pool_with_methods(
+    *, fetch=None, fetchrow=None, fetchval=None, execute=None
+):
+    """Build a pool stub that exposes ``fetch`` / ``fetchrow`` /
+    ``execute`` / ``fetchval`` directly (the openrouter_api_keys
+    methods don't go through ``acquire()``).
+    """
+    pool = MagicMock()
+    pool.fetch = AsyncMock(return_value=fetch if fetch is not None else [])
+    pool.fetchrow = AsyncMock(return_value=fetchrow)
+    pool.fetchval = AsyncMock(return_value=fetchval)
+    pool.execute = AsyncMock(return_value=execute or "DELETE 0")
+    return pool
+
+
+async def test_list_openrouter_keys_returns_masked_tail():
+    pool = _make_pool_with_methods(fetch=[
+        {
+            "id": 1, "label": "main", "api_key_tail": "abcd",
+            "api_key_len": 48, "enabled": True,
+            "created_at": None, "last_used_at": None, "notes": None,
+        },
+    ])
+    db = database_module.Database()
+    db.pool = pool
+    rows = await db.list_openrouter_keys()
+    assert rows == [
+        {
+            "id": 1, "label": "main", "api_key_tail": "abcd",
+            "api_key_len": 48, "enabled": True,
+            "created_at": None, "last_used_at": None, "notes": None,
+        },
+    ]
+    # The query must NEVER select the raw api_key column — that's
+    # the whole point of having a separate "_with_secret" method.
+    sql = pool.fetch.await_args.args[0]
+    assert "RIGHT(api_key, 4)" in sql
+    # No SELECT api_key (without RIGHT/LEFT/etc) — only the tail.
+    import re
+    assert not re.search(r"SELECT[^,]*\bapi_key\b(?!_)", sql), sql
+
+
+async def test_list_openrouter_keys_include_disabled_default():
+    pool = _make_pool_with_methods(fetch=[])
+    db = database_module.Database()
+    db.pool = pool
+    await db.list_openrouter_keys()
+    sql = pool.fetch.await_args.args[0]
+    # Default includes disabled rows (no WHERE enabled = TRUE).
+    assert "WHERE enabled = TRUE" not in sql
+
+
+async def test_list_openrouter_keys_filter_disabled_when_requested():
+    pool = _make_pool_with_methods(fetch=[])
+    db = database_module.Database()
+    db.pool = pool
+    await db.list_openrouter_keys(include_disabled=False)
+    sql = pool.fetch.await_args.args[0]
+    assert "WHERE enabled = TRUE" in sql
+
+
+async def test_list_enabled_openrouter_keys_with_secret_returns_plaintext():
+    pool = _make_pool_with_methods(fetch=[
+        {"id": 1, "label": "main", "api_key": "sk-or-v1-secret"},
+    ])
+    db = database_module.Database()
+    db.pool = pool
+    rows = await db.list_enabled_openrouter_keys_with_secret()
+    assert rows == [{"id": 1, "label": "main", "api_key": "sk-or-v1-secret"}]
+    sql = pool.fetch.await_args.args[0]
+    assert "WHERE enabled = TRUE" in sql
+
+
+async def test_add_openrouter_key_inserts_and_returns_id():
+    pool = _make_pool_with_methods(fetchrow={"id": 99})
+    db = database_module.Database()
+    db.pool = pool
+    new_id = await db.add_openrouter_key(
+        label="main", api_key="sk-or-v1-x", notes="primary",
+    )
+    assert new_id == 99
+    args = pool.fetchrow.await_args.args
+    assert args[1] == "main"
+    assert args[2] == "sk-or-v1-x"
+    assert args[3] == "primary"
+
+
+@pytest.mark.parametrize("label", ["", "  ", None])
+async def test_add_openrouter_key_rejects_blank_label(label):
+    db = database_module.Database()
+    db.pool = _make_pool_with_methods()
+    with pytest.raises(ValueError, match="label"):
+        await db.add_openrouter_key(label=label, api_key="sk-or-v1-x")
+
+
+@pytest.mark.parametrize("api_key", ["", "  ", None])
+async def test_add_openrouter_key_rejects_blank_api_key(api_key):
+    db = database_module.Database()
+    db.pool = _make_pool_with_methods()
+    with pytest.raises(ValueError, match="api_key"):
+        await db.add_openrouter_key(label="x", api_key=api_key)
+
+
+async def test_add_openrouter_key_translates_unique_violation_to_value_error():
+    """A duplicate api_key (UNIQUE constraint) must surface as a
+    ValueError so the panel can render a flash banner without
+    coupling to asyncpg's exception hierarchy."""
+
+    class _UniqueViolationError(Exception):
+        pass
+
+    _UniqueViolationError.__name__ = "UniqueViolationError"
+    pool = _make_pool_with_methods()
+    pool.fetchrow = AsyncMock(side_effect=_UniqueViolationError("dup"))
+    db = database_module.Database()
+    db.pool = pool
+    with pytest.raises(ValueError, match="already registered"):
+        await db.add_openrouter_key(label="x", api_key="dup-key")
+
+
+async def test_set_openrouter_key_enabled_returns_true_on_update():
+    pool = _make_pool_with_methods(execute="UPDATE 1")
+    db = database_module.Database()
+    db.pool = pool
+    assert await db.set_openrouter_key_enabled(7, enabled=False) is True
+
+
+async def test_set_openrouter_key_enabled_returns_false_on_no_match():
+    pool = _make_pool_with_methods(execute="UPDATE 0")
+    db = database_module.Database()
+    db.pool = pool
+    assert await db.set_openrouter_key_enabled(7, enabled=False) is False
+
+
+async def test_delete_openrouter_key_returns_true_on_delete():
+    pool = _make_pool_with_methods(execute="DELETE 1")
+    db = database_module.Database()
+    db.pool = pool
+    assert await db.delete_openrouter_key(7) is True
+
+
+async def test_delete_openrouter_key_returns_false_on_no_match():
+    pool = _make_pool_with_methods(execute="DELETE 0")
+    db = database_module.Database()
+    db.pool = pool
+    assert await db.delete_openrouter_key(7) is False
+
+
+async def test_mark_openrouter_key_used_runs_update():
+    pool = _make_pool_with_methods(execute="UPDATE 1")
+    db = database_module.Database()
+    db.pool = pool
+    await db.mark_openrouter_key_used(7)
+    sql = pool.execute.await_args.args[0]
+    assert "last_used_at = NOW()" in sql
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #4 follow-up #2: _command_count helper
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "tag,expected",
+    [
+        ("UPDATE 1", 1),
+        ("UPDATE 0", 0),
+        ("UPDATE 11", 11),  # used to false-match endswith("1")
+        ("DELETE 1", 1),
+        ("DELETE 0", 0),
+        ("INSERT 0 3", 3),  # the middle 0 is the OID, ignore it
+        ("INSERT 0 0", 0),
+        ("", 0),
+        (None, 0),
+        ("SELECT", 0),  # no trailing int
+        ("UPDATE", 0),
+    ],
+)
+def test_command_count_parses_pg_tags(tag, expected):
+    assert database_module._command_count(tag) == expected
+
+
+async def test_set_openrouter_key_enabled_handles_double_digit_count():
+    """Regression: the previous ``endswith("1")`` pattern would
+    have returned True for ``"UPDATE 11"`` even though that's
+    impossible for the by-id path; the parsed-count helper is
+    the right shape regardless."""
+    pool = _make_pool_with_methods(execute="UPDATE 11")
+    db = database_module.Database()
+    db.pool = pool
+    assert await db.set_openrouter_key_enabled(7, enabled=False) is True

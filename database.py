@@ -173,6 +173,27 @@ def _coerce_usage_log_row(r) -> dict:
     }
 
 
+def _command_count(tag: str | None) -> int:
+    """Parse the trailing rowcount from an asyncpg ``execute()`` tag.
+
+    asyncpg returns command tags like ``"UPDATE 1"``, ``"DELETE 0"``,
+    ``"INSERT 0 3"`` (the middle zero is OID, only meaningful for
+    legacy WITH-OID tables — irrelevant here). The reliable way to
+    extract the affected row count is *the last whitespace-separated
+    token* parsed as int. ``str.endswith("1")`` was the previous
+    pattern but it false-matches every two-digit count ending in 1
+    ("UPDATE 11" → also True), which is brittle for any future
+    bulk-update path.
+    """
+    if not tag:
+        return 0
+    tail = tag.rsplit(" ", 1)[-1]
+    try:
+        return int(tail)
+    except (TypeError, ValueError):
+        return 0
+
+
 class Database:
     def __init__(self):
         self.pool = None
@@ -5383,6 +5404,193 @@ class Database:
             gateway_key,
         )
         return result.endswith("1")
+
+    # ------------------------------------------------------------------
+    # Stage-15-Step-E #4 follow-up #2: DB-backed OpenRouter key registry
+    # ------------------------------------------------------------------
+    #
+    # Schema lives in alembic ``0017_openrouter_api_keys.py`` and is
+    # documented there. The Python side keeps the registry small and
+    # mostly read-only — the loader (``openrouter_keys.refresh_from_db``)
+    # pulls every enabled row on each refresh, the panel mutates one
+    # row per request. ``api_key`` material is NEVER returned by the
+    # list method (only a masked tail), and is only returned by
+    # ``get_openrouter_key_secret`` for the loader's eyes; the panel
+    # has no read path back to plaintext key material once it's
+    # stored.
+
+    async def list_openrouter_keys(
+        self,
+        *,
+        include_disabled: bool = True,
+    ) -> list[dict]:
+        """Return every registered OpenRouter API key (newest first).
+
+        The ``api_key`` column is intentionally **not** returned —
+        only a 4-char tail so the panel can render an identifier
+        like ``sk-or-…3a4b`` without leaking key material into the
+        operator's browser history / DOM dumps. The loader uses a
+        separate :meth:`get_openrouter_key_secret` call on the
+        returned ``id`` to fetch the plaintext for in-process use.
+        """
+        sql = """\
+            SELECT id, label,
+                   RIGHT(api_key, 4) AS api_key_tail,
+                   LENGTH(api_key)   AS api_key_len,
+                   enabled, created_at, last_used_at, notes
+              FROM openrouter_api_keys
+        """
+        params: tuple = ()
+        if not include_disabled:
+            sql += " WHERE enabled = TRUE"
+        sql += " ORDER BY enabled DESC, created_at DESC, id DESC"
+        rows = await self.pool.fetch(sql, *params)
+        return [
+            {
+                "id": int(r["id"]),
+                "label": r["label"],
+                "api_key_tail": r["api_key_tail"],
+                "api_key_len": int(r["api_key_len"]),
+                "enabled": bool(r["enabled"]),
+                "created_at": (
+                    r["created_at"].isoformat()
+                    if r["created_at"] is not None
+                    else None
+                ),
+                "last_used_at": (
+                    r["last_used_at"].isoformat()
+                    if r["last_used_at"] is not None
+                    else None
+                ),
+                "notes": r["notes"],
+            }
+            for r in rows
+        ]
+
+    async def list_enabled_openrouter_keys_with_secret(
+        self,
+    ) -> list[dict]:
+        """Loader-only: return enabled keys with plaintext ``api_key``.
+
+        Separate method so a casual call from the panel can't
+        accidentally surface the key material — the only call sites
+        are :func:`openrouter_keys.refresh_from_db` and the
+        regression tests for it.
+        """
+        rows = await self.pool.fetch(
+            """
+            SELECT id, label, api_key
+              FROM openrouter_api_keys
+             WHERE enabled = TRUE
+             ORDER BY id ASC
+            """
+        )
+        return [
+            {
+                "id": int(r["id"]),
+                "label": r["label"],
+                "api_key": r["api_key"],
+            }
+            for r in rows
+        ]
+
+    async def add_openrouter_key(
+        self,
+        *,
+        label: str,
+        api_key: str,
+        notes: str | None = None,
+    ) -> int:
+        """Insert a new key. Returns the new row's ``id``.
+
+        Raises ``ValueError`` if *label* / *api_key* is empty after
+        strip, or if *api_key* is already registered (UNIQUE
+        constraint hit). Length caps mirror sane operator behaviour:
+        labels up to 64 chars (operator-readable, indexable in the
+        panel), api_keys up to 200 chars (OpenRouter keys are <50
+        today, headroom for future formats), notes up to 500 chars.
+        """
+        label_clean = (label or "").strip()
+        api_key_clean = (api_key or "").strip()
+        if not label_clean:
+            raise ValueError("label must be a non-empty string")
+        if not api_key_clean:
+            raise ValueError("api_key must be a non-empty string")
+        if len(label_clean) > 64:
+            raise ValueError("label exceeds 64-char limit")
+        if len(api_key_clean) > 200:
+            raise ValueError("api_key exceeds 200-char limit")
+        notes_clean: str | None
+        if notes is None:
+            notes_clean = None
+        else:
+            notes_str = str(notes).strip()
+            if len(notes_str) > 500:
+                raise ValueError("notes exceeds 500-char limit")
+            notes_clean = notes_str or None
+        try:
+            row = await self.pool.fetchrow(
+                """
+                INSERT INTO openrouter_api_keys
+                    (label, api_key, notes)
+                VALUES ($1, $2, $3)
+                RETURNING id
+                """,
+                label_clean, api_key_clean, notes_clean,
+            )
+        except Exception as exc:
+            # asyncpg.UniqueViolationError surfaces here when the
+            # api_key is already registered. Translate to a
+            # ValueError so the panel can render a flash banner
+            # without import-coupling on asyncpg's exception
+            # hierarchy.
+            cls = type(exc).__name__
+            if cls == "UniqueViolationError":
+                raise ValueError(
+                    "api_key is already registered"
+                ) from exc
+            raise
+        return int(row["id"])
+
+    async def set_openrouter_key_enabled(
+        self, key_id: int, *, enabled: bool,
+    ) -> bool:
+        """Toggle the enabled flag. Returns ``True`` if a row was
+        updated (i.e. *key_id* exists)."""
+        result = await self.pool.execute(
+            "UPDATE openrouter_api_keys SET enabled = $2 "
+            "WHERE id = $1",
+            int(key_id), bool(enabled),
+        )
+        return _command_count(result) > 0
+
+    async def delete_openrouter_key(self, key_id: int) -> bool:
+        """Hard-delete a key. Returns ``True`` if a row was removed.
+
+        Hard delete is intentional: the row's only consumer is the
+        loader, which won't see a deleted key on its next refresh.
+        Audit history of "operator deleted key X at time Y" lives
+        in the ``admin_audit_log`` table (recorded by the panel),
+        not here.
+        """
+        result = await self.pool.execute(
+            "DELETE FROM openrouter_api_keys WHERE id = $1",
+            int(key_id),
+        )
+        return _command_count(result) > 0
+
+    async def mark_openrouter_key_used(self, key_id: int) -> None:
+        """Bump ``last_used_at`` to ``NOW()`` for *key_id*.
+
+        Best-effort and idempotent: missing row is a silent no-op
+        (the loader may have a snapshot id from before a delete).
+        Caller doesn't await success.
+        """
+        await self.pool.execute(
+            "UPDATE openrouter_api_keys "
+            "SET last_used_at = NOW() WHERE id = $1",
+            int(key_id),
+        )
 
     # ── system_settings: generic key/value overlay ────────────────
     #

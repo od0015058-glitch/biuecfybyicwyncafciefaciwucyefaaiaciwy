@@ -149,6 +149,27 @@ MAX_COOLDOWN_SECS: float = 3600.0
 _KEY_429_COUNTERS: dict[int, int] = {}
 _KEY_FALLBACK_COUNTERS: dict[int, int] = {}
 
+# ── Stage-15-Step-E #4 follow-up #2: per-key request counter ──────
+#
+# Bumped every time :func:`key_for_user` returns a key — both for
+# the sticky pick and the fallback walk. Lets the admin panel
+# answer "how much of today's traffic is hitting each key?" without
+# the heavier per-token / per-cost plumbing (a future PR can layer
+# that on top of ``usage_logs``). Reset on every ``load_keys()``
+# reload alongside the existing 429/fallback counters so a key
+# rotation doesn't carry stale meaning forward.
+_KEY_REQUEST_COUNTERS: dict[int, int] = {}
+
+# ── Stage-15-Step-E #4 follow-up #2: per-key metadata ─────────────
+#
+# Parallel-indexed metadata for ``_keys``: ``_KEY_META[i]`` describes
+# ``_keys[i]``. Populated by ``refresh_from_db`` (DB-loaded keys carry
+# a label / db_id / source="db"); env-loaded keys get a stub entry
+# ``{"source": "env"}``. This dict stays small (<= len(_keys)) and
+# is rebuilt from scratch on every load so no eviction policy is
+# needed.
+_KEY_META: dict[int, dict[str, object]] = {}
+
 
 def _increment_key_429(idx: int) -> None:
     """Bump the 429 counter for pool index *idx*.
@@ -186,8 +207,20 @@ def get_key_fallback_counters() -> dict[int, int]:
     return dict(_KEY_FALLBACK_COUNTERS)
 
 
+def _increment_key_request(idx: int) -> None:
+    """Bump the per-key request counter for pool index *idx*."""
+    if idx < 0:
+        return
+    _KEY_REQUEST_COUNTERS[idx] = _KEY_REQUEST_COUNTERS.get(idx, 0) + 1
+
+
+def get_key_request_counters() -> dict[int, int]:
+    """Read-only snapshot of the per-key request counters."""
+    return dict(_KEY_REQUEST_COUNTERS)
+
+
 def reset_key_counters_for_tests() -> None:
-    """Tests-only — wipe both counter dicts.
+    """Tests-only — wipe all per-key counter dicts.
 
     Production paths never call this; tests use it to start each
     case from a known zero state. Mirrors
@@ -195,6 +228,7 @@ def reset_key_counters_for_tests() -> None:
     """
     _KEY_429_COUNTERS.clear()
     _KEY_FALLBACK_COUNTERS.clear()
+    _KEY_REQUEST_COUNTERS.clear()
 
 
 def load_keys() -> None:
@@ -240,6 +274,12 @@ def load_keys() -> None:
     # are rare (tests, manual hot-reload).
     _KEY_429_COUNTERS.clear()
     _KEY_FALLBACK_COUNTERS.clear()
+    _KEY_REQUEST_COUNTERS.clear()
+    _KEY_META.clear()
+    # Tag every env-loaded slot so the panel can render a "source"
+    # column even on env-only deploys.
+    for i in range(len(_keys)):
+        _KEY_META[i] = {"source": "env"}
     # Bundled bug fix (Stage-15-Step-E #4 follow-up #2): drop any
     # cooldown entries whose api_key is no longer in the new pool.
     # Pre-fix, ``load_keys()`` left stale cooldown entries in
@@ -497,6 +537,7 @@ def key_for_user(telegram_id: int) -> str:
     n = len(_keys)
     sticky_idx = telegram_id % n
     if _keys[sticky_idx] not in _cooldowns:
+        _increment_key_request(sticky_idx)
         return _keys[sticky_idx]
     # Sticky key is hot — walk forward through the pool. ``range
     # (1, n)`` skips the sticky offset itself (already checked
@@ -511,6 +552,7 @@ def key_for_user(telegram_id: int) -> str:
             # — the pair lets the operator correlate sticky→fallback
             # routes if needed.
             _increment_key_fallback(idx)
+            _increment_key_request(idx)
             log.info(
                 "Routing user %d off cooldown'd sticky key "
                 "(idx=%d) to fallback idx=%d.",
@@ -531,7 +573,168 @@ def key_for_user(telegram_id: int) -> str:
         sticky_idx,
         telegram_id,
     )
+    _increment_key_request(sticky_idx)
     return _keys[sticky_idx]
+
+
+# ── Stage-15-Step-E #4 follow-up #2: DB-backed key registry ───────
+
+
+async def refresh_from_db(db) -> int:
+    """(Re-)load the pool from env + the DB-backed registry.
+
+    Reads the current env keys (via the same parser
+    :func:`load_keys` uses) plus every enabled row from the
+    ``openrouter_api_keys`` table, then computes the desired
+    pool. If the resulting pool *exactly matches* the current
+    in-process pool (same keys, same indices) the call is a
+    no-op — counters and cooldowns survive untouched. This is
+    what the admin GET path leans on so a page reload doesn't
+    wipe the per-key request / 429 counters between visits.
+
+    If the pool differs (a DB row was added / removed / a
+    label changed) the function rebuilds the pool from scratch
+    via :func:`load_keys` (which resets counters — matching the
+    discipline the existing 429/fallback counters already
+    follow on a key rotation) and then re-appends DB rows.
+
+    Returns the total pool size after the refresh.
+
+    *db* must expose
+    ``list_enabled_openrouter_keys_with_secret()`` returning a
+    list of ``{id, label, api_key}`` dicts. A ``None`` *db*
+    triggers a pure env load.
+
+    The whole call is wrapped so a transient DB error doesn't
+    blank the env-loaded pool: on failure the env pool stays in
+    place and the caller logs the exception.
+    """
+    global _keys, _loaded
+
+    if db is None:
+        load_keys()
+        return len(_keys)
+
+    try:
+        rows = await db.list_enabled_openrouter_keys_with_secret()
+    except Exception:
+        log.exception(
+            "openrouter_keys: refresh_from_db failed; keeping env pool"
+        )
+        if not _loaded:
+            load_keys()
+        return len(_keys)
+    if not isinstance(rows, list):
+        log.warning(
+            "openrouter_keys: list_enabled_openrouter_keys_with_secret "
+            "returned %r (not a list); keeping env pool",
+            type(rows).__name__,
+        )
+        if not _loaded:
+            load_keys()
+        return len(_keys)
+
+    # Build the desired pool: env keys (in current order) + DB
+    # keys (in id order, dedup'd against env).
+    env_keys = _read_env_keys()
+    desired: list[str] = list(env_keys)
+    desired_meta: list[dict[str, object]] = [
+        {"source": "env"} for _ in env_keys
+    ]
+    env_set = set(desired)
+    for row in rows:
+        if not isinstance(row, dict):
+            log.warning(
+                "openrouter_keys: skipping non-dict row %r",
+                type(row).__name__,
+            )
+            continue
+        api_key = row.get("api_key")
+        if not isinstance(api_key, str) or not api_key.strip():
+            log.warning(
+                "openrouter_keys: skipping DB row id=%r with empty api_key",
+                row.get("id"),
+            )
+            continue
+        api_key = api_key.strip()
+        if api_key in env_set:
+            log.warning(
+                "openrouter_keys: skipping DB row id=%r — its api_key "
+                "is already loaded from env.",
+                row.get("id"),
+            )
+            continue
+        env_set.add(api_key)
+        desired.append(api_key)
+        label = row.get("label")
+        db_id = row.get("id")
+        desired_meta.append(
+            {
+                "source": "db",
+                "label": str(label) if label is not None else None,
+                "db_id": int(db_id) if db_id is not None else None,
+            }
+        )
+
+    # No-op fast path: the in-process pool already matches.
+    # Preserves counters across page loads.
+    current_meta = [_KEY_META.get(i, {"source": "env"}) for i in range(len(_keys))]
+    if _loaded and _keys == desired and current_meta == desired_meta:
+        return len(_keys)
+
+    # Pool differs — rebuild from scratch. ``load_keys`` resets
+    # env-side state (and counters); we then append the DB tail.
+    load_keys()
+    for i, key in enumerate(desired[len(_keys):], start=len(_keys)):
+        _keys.append(key)
+        _KEY_META[i] = desired_meta[i]
+    log.info(
+        "openrouter_keys: refresh_from_db rebuilt pool to size=%d "
+        "(env=%d, db=%d)",
+        len(_keys),
+        len(env_keys),
+        len(desired) - len(env_keys),
+    )
+    return len(_keys)
+
+
+def _read_env_keys() -> list[str]:
+    """Return the env-configured key list in canonical order.
+
+    Mirrors the env-parsing branch of :func:`load_keys` but
+    without the side-effects (no global mutation, no counter
+    reset). Used by :func:`refresh_from_db` to compute the
+    "desired pool" before deciding whether a rebuild is needed.
+    """
+    keys: list[str] = []
+    primary = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if primary:
+        keys.append(primary)
+    for n in range(1, 11):
+        candidate = os.getenv(f"OPENROUTER_API_KEY_{n}", "").strip()
+        if candidate and candidate not in keys:
+            keys.append(candidate)
+    return keys
+
+
+def get_key_meta_snapshot() -> list[dict[str, object]]:
+    """Read-only copy of the per-pool-index metadata table.
+
+    Returns a list of length ``len(_keys)`` where index ``i``
+    matches ``_keys[i]``. Each entry is a dict with at least
+    ``source`` (``"env"`` or ``"db"``); DB-loaded entries also
+    have ``label`` and ``db_id``.
+
+    Defensive against a partially-populated meta table (e.g. a
+    test that monkeypatches ``_keys`` directly without going
+    through ``load_keys``): missing entries fall back to
+    ``{"source": "env"}``.
+    """
+    _ensure_loaded()
+    return [
+        dict(_KEY_META.get(i, {"source": "env"}))
+        for i in range(len(_keys))
+    ]
 
 
 def key_count() -> int:
