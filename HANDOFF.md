@@ -1707,8 +1707,117 @@ Files in this PR (Stage-15-Step-F follow-up #5):
 
 What remains for a follow-up PR:
 
-* **Per-loop manual "tick now" button on the panel** — the
-  next item in this stack.
+* **Per-loop manual "tick now" button on the panel**
+  *shipped in Stage-15-Step-F follow-up #6 (`web_admin.control_loop_tick_now_post`); see below.*
+* **Sparkline / trend column** — still deferred per the
+  trade-off in follow-up #4's notes.
+
+---
+
+#### Stage-15-Step-F follow-up #6: per-loop manual "tick now" button (queued 2026-05-02)
+
+The cadence-introspection PR (follow-up #4) surfaced each loop's
+heartbeat age but gave the operator no way to *poke* a loop without
+SSHing in. Operators verifying a freshly-deployed loop had to wait
+up to its cadence — 24 h for `catalog_refresh`, 6 h for
+`model_discovery` — before the panel proved the loop actually
+worked. This PR adds a "Tick now" button per loop row that runs a
+single iteration on demand.
+
+What this PR ships:
+
+* **`bot_health.LOOP_RUNNERS` registry** — a dict of
+  `name -> async (app) -> Awaitable[Any]` populated by the same
+  `@register_loop` decorator that already populates `LOOP_CADENCES`.
+  The decorator now accepts an optional `runner=` keyword. Each
+  runner gathers its own dependencies (the bot, env-derived config)
+  from the aiohttp `app` rather than relying on closures over
+  module-level state — which lets the panel call any registered
+  loop's "once" body uniformly.
+* **`bot_health.loop_runner(name)`** — public lookup. Returns
+  `None` for unregistered names so the POST handler can 302 with
+  a flash instead of 500-ing.
+* **All 8 production loops register a runner** —
+  `_tick_*_from_app` shims that mirror what the loop's main body
+  does once: `min_amount_refresh` calls
+  `refresh_min_amounts_once(SUPPORTED_PAY_CURRENCIES)`,
+  `pending_alert` allocates a fresh `state` set so the manual
+  tick bypasses the loop's hour-bucket dedupe (operator wants to
+  *see* the alert), `bot_health_alert` similarly uses a fresh
+  `AlertLoopState`, etc. Loops needing a bot raise a clear
+  `RuntimeError` if `APP_KEY_BOT` isn't wired up — better a
+  diagnosable error than a silent no-op.
+* **`POST /admin/control/loop/{name}/tick-now`** — new handler in
+  `web_admin.py`. CSRF-guarded, auth-required. Looks up the
+  runner via `bot_health.loop_runner`, audit-logs the action
+  *before* invoking, and runs the runner under
+  `asyncio.wait_for(_, timeout=60s)` so a wedged outbound
+  connection can't tie up the request worker. 302s back to
+  `/admin/control` with success/error/timeout flash. Heartbeat
+  metrics update through the runner's normal
+  `record_loop_tick(name)` path — the panel reads exactly as if
+  the loop had naturally fired, no separate "tick-now" gauge.
+* **Template button** — `templates/admin/control.html` grew an
+  "Action" column on the heartbeats table. Each row with
+  `has_runner=True` renders a small `btn-tick` form posting to
+  the new endpoint with the CSRF token. Loops without a runner
+  (e.g. a future loop in development) render a `—` placeholder.
+* **`_collect_control_signals` plumbing** — each loop dict now
+  carries `has_runner: bool` reflecting whether the registry has
+  a runner for that name, so the template can hide the button
+  for unconfigured loops without a 500.
+
+**Bundled bug fix:** the panel rendered "(overdue by Ns)" any
+time the loop's age passed its cadence — but the classifier's
+actual overdue threshold is ≈ 2× cadence + 60 s. So in the grace
+window between cadence and stale-threshold, the panel said
+"overdue" while the status badge said "fresh" and the gauge stayed
+green. Confusing for ops triaging the page during an actual
+incident — they couldn't tell which of the multiple "overdue"
+loops were genuinely degraded.
+
+Fix: `_collect_control_signals` now sets a separate
+`is_running_late` flag for the cadence-but-not-stale grace window,
+mutually exclusive with `is_overdue` (the more severe one wins).
+The template renders three distinct sub-text strings in priority
+order:
+* `is_overdue` → "(overdue by ~Ns)"
+* `is_running_late` → "(running late ~Ns)"
+* otherwise → "(next in ~Ns)"
+
+Pinned by 3 new tests in `tests/test_web_admin.py` covering each
+of the three states (`fresh_tick_not_running_late`,
+`running_late_distinct_from_overdue`, `overdue_tick_not_running_late`)
+so the grace-window classification can't drift back into
+"running late = overdue" again.
+
+Files in this PR (Stage-15-Step-F follow-up #6):
+* `bot_health.py` — `LOOP_RUNNERS` dict, `runner=` keyword on
+  `register_loop`, `loop_runner()` public accessor, updated
+  `reset_loop_registry_for_tests` to also clear runners.
+* `payments.py` / `fx_rates.py` / `model_discovery.py` /
+  `models_catalog.py` / `pending_alert.py` /
+  `pending_expiration.py` / `bot_health_alert.py` /
+  `zarinpal_backfill.py` — `_tick_*_from_app` shim per loop,
+  passed as `runner=` to `register_loop`.
+* `web_admin.py` — `control_loop_tick_now_post` handler,
+  `_TICK_NOW_TIMEOUT_SECONDS` constant, route registration in
+  `setup_admin_routes`, `has_runner` + `is_running_late` flags
+  in `_collect_control_signals`.
+* `templates/admin/control.html` — new `Action` column with
+  `btn-tick` form, three-way conditional render for the
+  next-tick sub-text.
+* `tests/test_bot_health.py` — 6 new tests covering the
+  `runner=` keyword (accept/omit/reject-non-callable/swap),
+  `loop_runner` lookup, and an "all 8 loops have runners" pin.
+* `tests/test_web_admin.py` — 12 new tests covering the new
+  signals shape (`has_runner`, `is_running_late`), the panel
+  rendering the new button per loop, and the POST handler's
+  CSRF / auth / unknown-loop / no-runner / happy / exception /
+  timeout paths.
+
+What remains for a follow-up PR:
+
 * **Sparkline / trend column** — still deferred per the
   trade-off in follow-up #4's notes.
 

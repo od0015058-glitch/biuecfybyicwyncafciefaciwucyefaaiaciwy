@@ -174,7 +174,34 @@ async def expire_pending_once(
     return len(rows)
 
 
-@register_loop("pending_reaper", cadence_seconds=15 * 60)
+async def _tick_pending_reaper_from_app(app) -> None:
+    """Run a single ``pending_reaper`` pass, deps from *app*.
+
+    Reads the same env vars the loop spawner does so a manual
+    tick respects whatever overrides the operator has set.
+    """
+    from web_admin import APP_KEY_BOT  # local: avoid import cycle
+
+    bot = app.get(APP_KEY_BOT)
+    if bot is None:
+        raise RuntimeError(
+            "pending_reaper tick-now: bot not in app state — "
+            "manual ticks require a bot to DM expired senders."
+        )
+    threshold_hours = _read_int_env("PENDING_EXPIRATION_HOURS", 24)
+    batch_limit = _read_int_env("PENDING_EXPIRATION_BATCH", 1000)
+    await expire_pending_once(
+        bot,
+        threshold_hours=threshold_hours,
+        batch_limit=batch_limit,
+    )
+
+
+@register_loop(
+    "pending_reaper",
+    cadence_seconds=15 * 60,
+    runner=_tick_pending_reaper_from_app,
+)
 async def _expiration_loop(
     bot: Bot,
     *,

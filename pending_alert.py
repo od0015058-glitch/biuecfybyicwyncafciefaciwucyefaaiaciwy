@@ -323,9 +323,37 @@ async def run_pending_alert_pass(
     return sent
 
 
+async def _tick_pending_alert_from_app(app) -> None:
+    """Run a single ``pending_alert`` pass, deps from *app*.
+
+    Uses a fresh dedupe ``state`` set per manual tick — that's
+    intentional. An operator hitting "Tick now" usually wants to
+    *see* the current alerts (the dedupe set is for the loop's
+    hour-bucket suppression, which a manual tick should bypass).
+    """
+    from web_admin import APP_KEY_BOT  # local: avoid import cycle
+
+    bot = app.get(APP_KEY_BOT)
+    if bot is None:
+        raise RuntimeError(
+            "pending_alert tick-now: bot not in app state — "
+            "manual ticks require a bot to DM admins."
+        )
+    threshold_hours = get_pending_alert_threshold_hours()
+    row_limit = get_pending_alert_row_limit()
+    fresh_state: set[tuple[int, int]] = set()
+    await run_pending_alert_pass(
+        bot,
+        threshold_hours=threshold_hours,
+        state=fresh_state,
+        row_limit=row_limit,
+    )
+
+
 @register_loop(
     "pending_alert",
     cadence_seconds=_PENDING_ALERT_INTERVAL_MIN_DEFAULT * 60,
+    runner=_tick_pending_alert_from_app,
 )
 async def _alert_loop(
     bot: Bot,

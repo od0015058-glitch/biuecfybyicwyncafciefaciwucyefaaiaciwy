@@ -327,8 +327,23 @@ async def refresh_threshold_overrides_from_db(db) -> dict[str, int]:
 # the decorator prevents it by construction).
 LOOP_CADENCES: dict[str, int] = {}
 
+# Stage-15-Step-F follow-up #6: per-loop "tick now" runners. Each
+# runner is an async callable ``(app: aiohttp.web.Application) ->
+# Awaitable[Any]`` that knows how to gather its dependencies (the
+# bot, env-derived config, etc.) from the aiohttp application state
+# and run a *single* iteration of the loop's work. Populated by
+# :func:`register_loop` calls that pass ``runner=``. Not every loop
+# has to register a runner — the manual "tick now" button is opt-in,
+# and a missing runner just hides the button for that loop.
+LOOP_RUNNERS: dict[str, Callable] = {}
 
-def register_loop(name: str, *, cadence_seconds: int):
+
+def register_loop(
+    name: str,
+    *,
+    cadence_seconds: int,
+    runner: Callable | None = None,
+):
     """Register a background loop's cadence + heartbeat metric name.
 
     Usable in two equivalent ways:
@@ -354,10 +369,18 @@ def register_loop(name: str, *, cadence_seconds: int):
     * Adds *name* to ``metrics._LOOP_METRIC_NAMES`` so the heartbeat
       gauge ``meowassist_<name>_last_run_epoch`` is exposed via
       ``/metrics`` and the panel can iterate every registered loop.
+    * If *runner* is supplied, registers it in :data:`LOOP_RUNNERS`
+      so the ``/admin/control`` "Tick now" button can drive a single
+      iteration of the loop on demand. ``runner`` MUST be an async
+      callable taking ``(app: aiohttp.web.Application)``; it should
+      gather its own dependencies (bot, DB, env) from ``app`` rather
+      than relying on closures over module-level state.
 
     Idempotent: calling twice with the same args is a no-op.
     Calling twice with mismatching cadence raises ``RuntimeError``
     so a stale literal in one place can't drift from the other.
+    Re-registering a different *runner* for the same name overrides
+    the previous one — useful for tests that swap in a stub.
     """
     if not isinstance(name, str) or not name:
         raise ValueError(
@@ -373,6 +396,11 @@ def register_loop(name: str, *, cadence_seconds: int):
             f"register_loop: cadence_seconds must be a positive int, "
             f"got {cadence_seconds!r}"
         )
+    if runner is not None and not callable(runner):
+        raise ValueError(
+            f"register_loop: runner must be callable or None, "
+            f"got {runner!r}"
+        )
 
     existing = LOOP_CADENCES.get(name)
     if existing is not None and existing != cadence_seconds:
@@ -383,6 +411,9 @@ def register_loop(name: str, *, cadence_seconds: int):
             f"Update the call site so both match."
         )
     LOOP_CADENCES[name] = cadence_seconds
+
+    if runner is not None:
+        LOOP_RUNNERS[name] = runner
 
     # Mirror to ``metrics._LOOP_METRIC_NAMES`` so the heartbeat
     # gauge is exposed and the panel iterates this loop. Local
@@ -402,6 +433,17 @@ def register_loop(name: str, *, cadence_seconds: int):
     return _decorator
 
 
+def loop_runner(name: str) -> Callable | None:
+    """Return the registered "tick now" runner for *name* or ``None``.
+
+    The ``/admin/control/loop/<name>/tick-now`` POST handler uses
+    this to look up the runner for a given loop name. ``None``
+    means "no manual tick available for this loop"; the panel
+    hides the button in that case.
+    """
+    return LOOP_RUNNERS.get(name)
+
+
 def reset_loop_registry_for_tests() -> None:
     """Clear the loop registry. Tests-only.
 
@@ -413,6 +455,7 @@ def reset_loop_registry_for_tests() -> None:
     would silently fall back to legacy thresholds for every loop.
     """
     LOOP_CADENCES.clear()
+    LOOP_RUNNERS.clear()
     import metrics
     metrics._LOOP_METRIC_NAMES = ()
 
@@ -841,9 +884,11 @@ __all__ = (
     "DEFAULT_LOGIN_THROTTLE_ATTACK_KEYS",
     "DEFAULT_LOOP_STALE_SECONDS",
     "LOOP_CADENCES",
+    "LOOP_RUNNERS",
     "compute_bot_status",
     "get_process_start_epoch",
     "loop_cadence_seconds",
+    "loop_runner",
     "loop_stale_threshold_seconds",
     "register_loop",
     "request_force_stop",

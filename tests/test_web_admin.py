@@ -10762,3 +10762,350 @@ async def test_control_thresholds_post_csrf_required(
     )
     assert resp.status == 302
     db.upsert_setting.assert_not_awaited()
+
+
+# =====================================================================
+# Stage-15-Step-F follow-up #6: per-loop manual "tick now" button
+# =====================================================================
+
+
+def test_collect_control_signals_attaches_has_runner_flag(monkeypatch):
+    """Every loop with a registered runner is marked
+    ``has_runner=True`` so the panel can render its "Tick now"
+    button. The bug-fix regression target is that the previous
+    panel had no per-loop manual trigger at all — the button is
+    new in PR #159."""
+    signals = _control_signals_for_test(monkeypatch)
+    by_name = {row["name"]: row for row in signals["loops"]}
+
+    # Every production loop registered a runner in PR #159.
+    for name in [
+        "fx_refresh",
+        "min_amount_refresh",
+        "model_discovery",
+        "catalog_refresh",
+        "pending_alert",
+        "pending_reaper",
+        "bot_health_alert",
+        "zarinpal_backfill",
+    ]:
+        assert name in by_name, f"loop {name!r} missing from signals"
+        assert by_name[name]["has_runner"] is True, (
+            f"loop {name!r} did not register a tick-now runner"
+        )
+
+
+def test_collect_control_signals_running_late_distinct_from_overdue(
+    monkeypatch,
+):
+    """Bug-fix regression (bundled in PR #159): pre-fix the panel
+    rendered "(overdue by Ns)" any time the loop's age passed its
+    cadence — but the classifier's actual overdue threshold is
+    ≈ 2× cadence + 60s. So in the grace window between cadence
+    and stale-threshold, the panel said "overdue" while the status
+    badge said "fresh". Now ``is_running_late`` flags that grace
+    window separately so the template can render "(running late)"
+    instead."""
+    import metrics
+    import time as _t
+
+    metrics.reset_loop_ticks_for_tests()
+    # fx_refresh: cadence 600s, threshold 1260s. A 700s-old tick
+    # is past cadence but still within threshold → running late
+    # but not overdue.
+    metrics.record_loop_tick("fx_refresh", ts=_t.time() - 700.0)
+    signals = _control_signals_for_test_with_existing_ticks(monkeypatch)
+    row = next(r for r in signals["loops"] if r["name"] == "fx_refresh")
+
+    assert row["is_overdue"] is False, (
+        "700s old tick must NOT trigger overdue (threshold is 1260s)"
+    )
+    assert row["is_running_late"] is True, (
+        "700s old tick must trigger running_late (cadence is 600s)"
+    )
+    assert row["next_tick_in_s"] is not None
+    assert row["next_tick_in_s"] < 0
+
+
+def test_collect_control_signals_fresh_tick_not_running_late(monkeypatch):
+    """A loop comfortably within its cadence is neither overdue nor
+    running late — the new ``is_running_late`` flag is False so the
+    template renders "(next in ~Ns)" rather than "(running late)"."""
+    import metrics
+    import time as _t
+
+    metrics.reset_loop_ticks_for_tests()
+    metrics.record_loop_tick("fx_refresh", ts=_t.time() - 120.0)
+    signals = _control_signals_for_test_with_existing_ticks(monkeypatch)
+    row = next(r for r in signals["loops"] if r["name"] == "fx_refresh")
+
+    assert row["is_overdue"] is False
+    assert row["is_running_late"] is False
+
+
+def test_collect_control_signals_overdue_tick_not_running_late(monkeypatch):
+    """An actually-overdue tick (past stale threshold) sets
+    ``is_overdue=True`` but ``is_running_late=False`` — the two
+    flags are mutually exclusive, the more severe one wins."""
+    import metrics
+    import time as _t
+
+    metrics.reset_loop_ticks_for_tests()
+    metrics.record_loop_tick("fx_refresh", ts=_t.time() - 5000.0)
+    signals = _control_signals_for_test_with_existing_ticks(monkeypatch)
+    row = next(r for r in signals["loops"] if r["name"] == "fx_refresh")
+
+    assert row["is_overdue"] is True
+    assert row["is_running_late"] is False, (
+        "is_running_late must be False once is_overdue fires — "
+        "the template renders only one badge"
+    )
+
+
+async def test_control_get_renders_tick_now_button_per_loop(
+    aiohttp_client, make_admin_app
+):
+    """End-to-end render: every loop row in the heartbeats table
+    has a "Tick now" form pointing at
+    ``/admin/control/loop/<name>/tick-now`` with the CSRF token."""
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/control")
+    body = await resp.text()
+
+    # Every production loop has a tick-now form.
+    for name in [
+        "fx_refresh",
+        "min_amount_refresh",
+        "pending_alert",
+        "pending_reaper",
+        "bot_health_alert",
+        "zarinpal_backfill",
+        "model_discovery",
+        "catalog_refresh",
+    ]:
+        assert (
+            f'/admin/control/loop/{name}/tick-now' in body
+        ), f"missing tick-now form for {name!r}"
+
+
+async def test_control_loop_tick_now_post_requires_csrf(
+    aiohttp_client, make_admin_app,
+):
+    """A POST without a CSRF token is refused with 302 + flash
+    and never invokes the runner."""
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False,
+    )
+
+    invoked: list[str] = []
+
+    async def fake_runner(_app):
+        invoked.append("called")
+
+    import bot_health
+
+    bot_health.LOOP_RUNNERS["fx_refresh"] = fake_runner
+    try:
+        resp = await client.post(
+            "/admin/control/loop/fx_refresh/tick-now",
+            data={},
+            allow_redirects=False,
+        )
+        assert resp.status == 302
+        assert invoked == [], (
+            "runner must NOT be invoked when CSRF is missing"
+        )
+    finally:
+        # Restore the real runner so other tests aren't affected.
+        from fx_rates import _tick_fx_refresh_from_app
+        bot_health.LOOP_RUNNERS["fx_refresh"] = _tick_fx_refresh_from_app
+
+
+async def test_control_loop_tick_now_post_unknown_loop(
+    aiohttp_client, make_admin_app,
+):
+    """A POST for a loop name that isn't in ``LOOP_CADENCES`` 302s
+    back with an error flash — never silently no-ops."""
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+
+    resp = await client.post(
+        "/admin/control/loop/not_a_real_loop/tick-now",
+        data={"csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    follow = await client.get("/admin/control")
+    body = await follow.text()
+    assert "unknown loop" in body.lower()
+
+
+async def test_control_loop_tick_now_post_no_runner_registered(
+    aiohttp_client, make_admin_app,
+):
+    """A POST for a loop whose runner has been temporarily
+    unregistered (e.g. a future loop in development) 302s back
+    with an error flash, no 500."""
+    import bot_health
+
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+
+    saved = bot_health.LOOP_RUNNERS.pop("fx_refresh", None)
+    try:
+        resp = await client.post(
+            "/admin/control/loop/fx_refresh/tick-now",
+            data={"csrf_token": csrf},
+            allow_redirects=False,
+        )
+        assert resp.status == 302
+        follow = await client.get("/admin/control")
+        body = await follow.text()
+        assert "no registered tick-now runner" in body.lower()
+    finally:
+        if saved is not None:
+            bot_health.LOOP_RUNNERS["fx_refresh"] = saved
+
+
+async def test_control_loop_tick_now_post_invokes_runner_and_flashes(
+    aiohttp_client, make_admin_app,
+):
+    """Happy path: with CSRF + a known loop name, the runner is
+    awaited and a success flash renders on the redirect target."""
+    import bot_health
+
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.record_admin_audit.reset_mock()
+
+    invoked: list[bool] = []
+
+    async def fake_runner(_app):
+        invoked.append(True)
+
+    saved = bot_health.LOOP_RUNNERS.get("fx_refresh")
+    bot_health.LOOP_RUNNERS["fx_refresh"] = fake_runner
+    try:
+        resp = await client.post(
+            "/admin/control/loop/fx_refresh/tick-now",
+            data={"csrf_token": csrf},
+            allow_redirects=False,
+        )
+        assert resp.status == 302
+        assert resp.headers["Location"] == "/admin/control"
+        assert invoked == [True]
+
+        follow = await client.get("/admin/control")
+        body = await follow.text()
+        assert "ticked successfully" in body.lower()
+
+        # Audit row written for the tick-now action.
+        db.record_admin_audit.assert_awaited()
+        actions = [
+            c.kwargs.get("action")
+            for c in db.record_admin_audit.await_args_list
+        ]
+        assert "control_loop_tick_now" in actions
+    finally:
+        if saved is not None:
+            bot_health.LOOP_RUNNERS["fx_refresh"] = saved
+
+
+async def test_control_loop_tick_now_post_runner_exception_flashes_error(
+    aiohttp_client, make_admin_app,
+):
+    """A runner that raises is caught — the panel 302s back with
+    an error flash quoting the exception class so the operator
+    can diagnose without checking server logs first."""
+    import bot_health
+
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+
+    async def boom_runner(_app):
+        raise RuntimeError("simulated upstream failure")
+
+    saved = bot_health.LOOP_RUNNERS.get("fx_refresh")
+    bot_health.LOOP_RUNNERS["fx_refresh"] = boom_runner
+    try:
+        resp = await client.post(
+            "/admin/control/loop/fx_refresh/tick-now",
+            data={"csrf_token": csrf},
+            allow_redirects=False,
+        )
+        assert resp.status == 302
+
+        follow = await client.get("/admin/control")
+        body = await follow.text()
+        assert "tick failed" in body.lower()
+        assert "RuntimeError" in body
+        assert "simulated upstream failure" in body
+    finally:
+        if saved is not None:
+            bot_health.LOOP_RUNNERS["fx_refresh"] = saved
+
+
+async def test_control_loop_tick_now_post_timeout_flashes_error(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """A runner that takes longer than ``_TICK_NOW_TIMEOUT_SECONDS``
+    is cancelled via ``asyncio.wait_for`` and the panel 302s back
+    with a timeout flash. We patch the timeout down to 0.05s so the
+    test runs fast."""
+    import asyncio
+    import bot_health
+    import web_admin
+
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+
+    monkeypatch.setattr(web_admin, "_TICK_NOW_TIMEOUT_SECONDS", 0.05)
+
+    async def slow_runner(_app):
+        await asyncio.sleep(5.0)
+
+    saved = bot_health.LOOP_RUNNERS.get("fx_refresh")
+    bot_health.LOOP_RUNNERS["fx_refresh"] = slow_runner
+    try:
+        resp = await client.post(
+            "/admin/control/loop/fx_refresh/tick-now",
+            data={"csrf_token": csrf},
+            allow_redirects=False,
+        )
+        assert resp.status == 302
+
+        follow = await client.get("/admin/control")
+        body = await follow.text()
+        assert "timeout" in body.lower()
+    finally:
+        if saved is not None:
+            bot_health.LOOP_RUNNERS["fx_refresh"] = saved
+
+
+async def test_control_loop_tick_now_post_requires_auth(
+    aiohttp_client, make_admin_app,
+):
+    """Unauthenticated POST is rejected with 302 to login — the
+    handler is wrapped in ``_require_auth`` and the runner never
+    fires."""
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+
+    resp = await client.post(
+        "/admin/control/loop/fx_refresh/tick-now",
+        data={"csrf_token": "anything"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert "/admin/login" in resp.headers["Location"]

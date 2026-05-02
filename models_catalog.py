@@ -43,7 +43,21 @@ FETCH_TIMEOUT_SECONDS = 15
 # refresh is TTL-gated inside :func:`get_catalog` rather than its
 # own forever-loop, so we register from module-level rather than via
 # a function decorator.
-register_loop("catalog_refresh", cadence_seconds=CATALOG_TTL_SECONDS)
+async def _tick_catalog_refresh_from_app(_app) -> None:
+    """Run a single ``catalog_refresh`` pass — bypasses the TTL.
+
+    The "Tick now" button calls this directly. ``_app`` is unused
+    (the catalog refresher has no per-bot dependencies) but the
+    runner shape is fixed by :func:`bot_health.register_loop`.
+    """
+    await force_refresh()
+
+
+register_loop(
+    "catalog_refresh",
+    cadence_seconds=CATALOG_TTL_SECONDS,
+    runner=_tick_catalog_refresh_from_app,
+)
 
 
 @dataclass(frozen=True)

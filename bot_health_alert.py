@@ -552,9 +552,29 @@ async def run_bot_health_alert_pass(
     return sent
 
 
+async def _tick_bot_health_alert_from_app(app) -> None:
+    """Run a single ``bot_health_alert`` pass, deps from *app*.
+
+    Uses a fresh ``AlertLoopState`` per manual tick — that way the
+    operator immediately sees a DM if the bot is currently in an
+    alert state, regardless of the loop's running dedupe state.
+    """
+    from web_admin import APP_KEY_BOT  # local: avoid import cycle
+
+    bot = app.get(APP_KEY_BOT)
+    if bot is None:
+        raise RuntimeError(
+            "bot_health_alert tick-now: bot not in app state — "
+            "manual ticks require a bot to DM admins."
+        )
+    fresh_state = AlertLoopState()
+    await run_bot_health_alert_pass(bot, state=fresh_state)
+
+
 @register_loop(
     "bot_health_alert",
     cadence_seconds=_BOT_HEALTH_ALERT_INTERVAL_SECONDS_DEFAULT,
+    runner=_tick_bot_health_alert_from_app,
 )
 async def _alert_loop(
     bot: Bot,

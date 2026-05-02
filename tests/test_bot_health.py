@@ -875,11 +875,14 @@ def _isolated_loop_registry():
     import metrics
 
     saved_cadences = dict(bh.LOOP_CADENCES)
+    saved_runners = dict(bh.LOOP_RUNNERS)
     saved_names = metrics._LOOP_METRIC_NAMES
     bh.reset_loop_registry_for_tests()
     yield
     bh.LOOP_CADENCES.clear()
     bh.LOOP_CADENCES.update(saved_cadences)
+    bh.LOOP_RUNNERS.clear()
+    bh.LOOP_RUNNERS.update(saved_runners)
     metrics._LOOP_METRIC_NAMES = saved_names
 
 
@@ -1017,3 +1020,118 @@ def test_all_eight_production_loops_registered():
             f"{bh.LOOP_CADENCES.get(name)!r}, expected {cadence}"
         )
         assert name in metrics._LOOP_METRIC_NAMES
+
+
+# ── Stage-15-Step-F follow-up #6: per-loop runner registration ───
+
+
+def test_register_loop_accepts_optional_runner(_isolated_loop_registry):
+    """Passing ``runner=`` registers the runner in
+    :data:`bh.LOOP_RUNNERS` so the panel's tick-now button has
+    something to invoke."""
+    async def my_runner(_app):
+        pass
+
+    bh.register_loop("my_loop", cadence_seconds=60, runner=my_runner)
+
+    assert bh.LOOP_RUNNERS.get("my_loop") is my_runner
+    assert bh.loop_runner("my_loop") is my_runner
+
+
+def test_register_loop_runner_omitted_means_no_runner(
+    _isolated_loop_registry,
+):
+    """A loop registered without a runner gets cadence + metric
+    plumbing but no entry in ``LOOP_RUNNERS`` — :func:`loop_runner`
+    returns None so the panel hides the button for that loop."""
+    bh.register_loop("loop_without_runner", cadence_seconds=60)
+
+    assert "loop_without_runner" in bh.LOOP_CADENCES
+    assert "loop_without_runner" not in bh.LOOP_RUNNERS
+    assert bh.loop_runner("loop_without_runner") is None
+
+
+def test_register_loop_rejects_non_callable_runner(_isolated_loop_registry):
+    """Passing a non-callable ``runner=`` is rejected at registration
+    time — the panel's POST handler shouldn't have to defend against
+    a misconfigured registry entry."""
+    import pytest
+
+    with pytest.raises(ValueError, match="runner must be callable"):
+        bh.register_loop(
+            "bad_loop",
+            cadence_seconds=60,
+            runner="not_callable",  # type: ignore[arg-type]
+        )
+
+    # And the registration must have rolled back — neither cadence
+    # nor metric name was added.
+    assert "bad_loop" not in bh.LOOP_CADENCES
+
+
+def test_register_loop_runner_can_be_swapped(_isolated_loop_registry):
+    """Re-registering with a new runner overrides the previous one
+    — useful for tests that want to inject a stub. Cadence is
+    still pinned so a mismatched cadence still raises."""
+    async def first_runner(_app):
+        pass
+
+    async def second_runner(_app):
+        pass
+
+    bh.register_loop("swap_test", cadence_seconds=60, runner=first_runner)
+    assert bh.LOOP_RUNNERS["swap_test"] is first_runner
+
+    bh.register_loop("swap_test", cadence_seconds=60, runner=second_runner)
+    assert bh.LOOP_RUNNERS["swap_test"] is second_runner
+
+
+def test_loop_runner_returns_none_for_unknown_name():
+    """Looking up a name that was never registered must return None
+    (not raise) — the panel iterates every registered loop and a
+    typo in a route should 302 with a flash, not 500."""
+    assert bh.loop_runner("definitely_not_a_real_loop") is None
+
+
+def test_reset_loop_registry_for_tests_clears_runners(
+    _isolated_loop_registry,
+):
+    """The reset helper must clear all three pieces of state
+    (cadences, runners, metric names) — otherwise a test that swaps
+    in a stub runner leaks across test boundaries."""
+    async def stub_runner(_app):
+        pass
+
+    bh.register_loop("temp", cadence_seconds=60, runner=stub_runner)
+    assert "temp" in bh.LOOP_RUNNERS
+
+    bh.reset_loop_registry_for_tests()
+    assert "temp" not in bh.LOOP_CADENCES
+    assert "temp" not in bh.LOOP_RUNNERS
+
+
+def test_all_eight_production_loops_have_runners():
+    """Every shipped loop must register a tick-now runner so the
+    panel can offer the "Tick now" button for all of them. A
+    missing runner is the common bug the registry prevents:
+    silently-no-op buttons in the panel."""
+    expected_runner_loops = [
+        "min_amount_refresh",
+        "fx_refresh",
+        "model_discovery",
+        "catalog_refresh",
+        "pending_alert",
+        "pending_reaper",
+        "bot_health_alert",
+        "zarinpal_backfill",
+    ]
+    for name in expected_runner_loops:
+        assert name in bh.LOOP_RUNNERS, (
+            f"{name}: no tick-now runner registered — "
+            f"the panel button will be hidden"
+        )
+        runner = bh.loop_runner(name)
+        assert callable(runner), (
+            f"{name}: runner is registered but not callable: "
+            f"{runner!r}"
+        )
