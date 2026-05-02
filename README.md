@@ -335,6 +335,37 @@ NowPayments crypto invoices.
   Non-positive entries (a typo like `ADMIN_USER_IDS=123,-456` or
   a chat-id paste) are dropped at parse time so the auto-promote
   never seeds an unmatchable row.
+  **Web-panel role gates + "view as <role>" toggle (Stage-15-
+  Step-E #5 follow-up #4)** — the web admin panel now mirrors
+  the Telegram-side per-handler floors via a new
+  `_require_role(required)` decorator that wraps `_require_auth`.
+  Per-route floors match the Telegram CLI: viewer-readable
+  list/detail/dashboard pages stay on `_require_auth`; broadcast
+  enqueue/cancel and gift / promo create+revoke require
+  `operator`; user-wallet adjust, user-field edit, transaction
+  refund, openrouter-keys add/toggle/delete, admin-roles
+  grant/revoke, AI-model + gateway toggles, and every
+  destructive `/admin/control/*` action require `super`.
+  Below-floor requests 302 to `/admin/` with a flash banner
+  ("That action requires super role — you are previewing as
+  viewer …") and a `view_as_deny` audit row capturing
+  path + method + required + view-as for forensic review. The
+  layout sidebar carries a "view as <role>" `<select>`
+  (`POST /admin/view-as`) that signs an HMAC-SHA256 cookie
+  carrying the previewed role and reloads the page; selecting
+  `super` deletes the cookie outright. Domain separation —
+  view-as cookies use the HMAC prefix `viewas:` while auth
+  cookies use no prefix — so a forged auth-cookie HMAC can't
+  replay as a view-as override and vice-versa. The middleware
+  fail-soft-degrades a malformed / tampered / unknown-role
+  cookie back to `super` rather than crashing, so a stale
+  cookie left in the browser after a session-secret rotation
+  doesn't lock the operator out. Per-user web auth (replacing
+  the single `ADMIN_PASSWORD` with telegram-id-keyed
+  credentials) is the multi-week redesign called out in the
+  Step-E table — out of scope for this follow-up; the toggle
+  is the interim story for verifying gates without
+  provisioning a second password.
 - **Telethon-driven live-bot integration test suite** —
   `tests/integration/` ships a Telethon-based suite that drives a
   *live* test bot via a real Telegram user account (MTProto, not

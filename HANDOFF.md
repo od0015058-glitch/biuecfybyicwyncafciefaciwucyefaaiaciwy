@@ -711,7 +711,7 @@ What remains (next AI's TODO):
 
 * ~~**Wire `role_at_least` into the existing admin command gates.**~~ ✅ **shipped in Stage-15-Step-E #5 follow-up #1 (role-gates wiring PR).** `admin._resolve_actor_role` (DB lookup → env-list fallback) + `admin._require_role(message, required)` now gate every Telegram-side admin handler. Per-handler floors: `/admin_metrics` and `/admin_balance` at `viewer`; `/admin_broadcast` at `operator`; `/admin_credit`, `/admin_debit`, and the entire `/admin_promo_*` family at `super`. The `/admin_role_*` handlers stay env-list-only (a DB-tracked super must NOT be able to self-promote out of the role table). The `/admin` hub message is rendered by `_render_admin_hub(role, is_env_admin=...)` and only lists rows the actor can actually drive — so a viewer typing `/admin` sees `/admin_metrics` and `/admin_balance` only, not `/admin_credit`. 17 new regression tests in `tests/test_admin.py`: the parametrised `test_admin_handlers_respect_role_floor` walks every (role × handler) cell of the matrix and pins both directions (the floor-and-above runs, every strictly-lower role silent-no-ops). Plus dedicated tests for the env-list backward-compat fallback when the DB pool fails (a transient pool error must NOT downgrade a legacy admin from super → None mid-incident), DB-role-wins-over-env-list, no-from-user defence in depth, and the role-CRUD-stays-env-list invariant.
 * ~~**Add `/admin/roles` web page** mirroring the Telegram CLI.~~ ✅ **shipped in Stage-15-Step-E #5 follow-up #2 (this PR).** Browser counterpart to the `/admin_role_*` triplet: `GET /admin/roles` lists every DB-tracked grant (telegram id, role badge, granted-at, granted-by, notes, revoke button); `POST /admin/roles` writes a grant via `Database.set_admin_role`; `POST /admin/roles/{telegram_id}/revoke` drops the row via `Database.delete_admin_role`. Same auth as the rest of the panel (`ADMIN_PASSWORD`-gated cookie). Both write paths CSRF-protected via `verify_csrf_token` and audit-logged via `_record_audit_safe` with the existing `role_grant` / `role_revoke` slugs (already in `AUDIT_ACTION_LABELS`, so they show up in the `/admin/audit` filter dropdown without a follow-up patch). Form validation rejects empty / non-positive telegram ids, invalid role names (via `admin_roles.normalize_role`), and notes longer than 500 characters; failures surface a flash banner instead of silently no-op-ing. Per-user web auth (telegram-id-keyed credentials) remains the larger redesign called out in `bullet below — not in scope. **Bundled bug fix:** `Database.set_admin_role` now strips U+0000 NUL bytes from the `notes` argument before INSERT, mirroring the Stage-15-Step-E #10 fix on `append_conversation_message` (PR #128). Postgres TEXT rejects `\x00` outright with `invalid byte sequence for encoding "UTF8": 0x00`; the new web textarea is the surface most likely to hit this (an admin pasting from a binary file), but `/admin_role_grant`'s Telegram path also benefits — a NUL-bearing note used to demote the whole grant to a misleading "DB write failed — see logs" error. Strip-and-warn at the DB layer keeps the rest of the note text and logs the strip count loud-and-once for ops triage. **24 new tests** (21 in `tests/test_web_admin.py` covering auth gate / empty state / row rendering / DB error / sidebar nav / happy-path grant + revoke / CSRF protection / every validation branch / DB-error surfacing / noop revoke audit; 3 in `tests/test_database_queries.py` covering NUL strip + log warn / non-NUL passthrough / None notes early-out).
-* **Wire role gates into the web admin panel.** The web side currently has a single `ADMIN_PASSWORD`; per-admin web auth is a larger redesign. As an interim, the web panel could read `effective_role` for the configured `ADMIN_PASSWORD` operator (today it's `super` by default) and surface a "view as <role>" toggle for testing the gates without provisioning a second password.
+* ~~**Wire role gates into the web admin panel.**~~ ✅ **shipped in Stage-15-Step-E #5 follow-up #4 (this PR).** The web panel now mirrors the Telegram-side role gates via a new `_require_role(required: str)` decorator factory that wraps `_require_auth` and reads a signed view-as cookie. Per-route floors match the Telegram side: viewer-readable list / detail / dashboard pages stay on `_require_auth`; `operator` floor on broadcast enqueue/cancel and gift / promo create+revoke; `super` floor on user-wallet adjust, user-field edit, transaction refund, openrouter-keys add/toggle/delete, admin-roles grant/revoke, AI-model + gateway toggles, and every destructive `/admin/control/*` action. Below-floor requests 302 to `/admin/` with a flash banner ("That action requires super role — you are previewing as viewer …") and a `view_as_deny` audit row capturing path + method + required + view-as for forensic review. **The "view as <role>" toggle:** new `sign_view_as_cookie()` / `verify_view_as_cookie()` HMAC-SHA256 helpers with domain separation (HMAC prefix `viewas:`) so a forged auth-cookie HMAC can't replay as a view-as override and vice-versa; `verify_view_as_cookie` mirrors `verify_cookie`'s fail-soft posture (malformed / tampered / unknown role → `None` → falls back to `super` rather than crashing on a stale cookie post-secret-rotation). New `POST /admin/view-as` endpoint (CSRF-protected, audit-logged, allow-listed `next=/admin/...` to prevent open-redirect abuse) sets the cookie via `set_cookie` (path=/admin/, HttpOnly, Lax, max-age = TTL hours); selecting `super` deletes the cookie outright so a session-secret rotation never leaves a stale signed value behind. The toggle widget renders on every page via a new `_template_globals` async context processor (registered after `admin_auth_middleware` so it can read the middleware-stamped `request[REQUEST_KEY_VIEW_AS]` — middleware-ordering pin in a comment). New audit slugs `view_as_change` / `view_as_deny` added to `AUDIT_ACTION_LABELS`. **Bundled bug fix:** `sign_cookie` now rejects timezone-naive `expires_at` outright. `datetime.astimezone(tz)` on a naive datetime silently coerces it via the deploy host's *system local time*, producing a cookie expiry that depends on the host's `TZ` env — same naive `datetime(2099, 1, 1)` becomes different ISO strings on a UTC vs. a UTC-7 box. Production callers always pass aware datetimes, but the writer-side guard closes the loop with `verify_cookie`'s naive-ISO rejection (already in place since Stage-8) so a future regression that drops `tzinfo=timezone.utc` at a callsite fails loudly instead of silently minting host-dependent cookies. **33 new tests** in `tests/test_web_admin.py`: round-trip per role, malformed/tampered/wrong-secret/unknown-role cookie rejection, domain-separation pin (auth-cookie HMAC ≠ view-as HMAC), open-redirect block, role-gate audit pins, layout-renders-widget pin, plus a module-level pin walking `setup_admin_routes` source to assert the highest-risk routes (user adjust/edit, transaction refund, control destructives, openrouter CRUD, roles CRUD) are wrapped in `_require_role(ROLE_SUPER)` so a regression that drops a gate fails immediately. **Per-user web auth** (replacing the single `ADMIN_PASSWORD` with telegram-id-keyed credentials) remains the larger redesign — see bullet below.
 * **Per-user web auth** — replace the single `ADMIN_PASSWORD` with per-admin Telegram-id-keyed credentials so the role system actually applies to the browser surface. This is the multi-week piece the original Step-E table row 5 calls out as "high effort"; it needs OAuth/SSO discussion with the operator first.
 * ~~**First-login auto-promote of `ADMIN_USER_IDS` admins to a real `admin_roles` row.**~~ ✅ **shipped in Stage-15-Step-E #5 follow-up #3 (this PR).** New helper `admin_roles.ensure_env_admins_have_roles(db, admin_ids)` runs from the boot path in `main.main()` after `db.init` and the disabled-toggle warmup. For each id in `parse_admin_user_ids(os.getenv("ADMIN_USER_IDS"))`, it checks `db.get_admin_role(id)`; if the row is absent it UPSERTs a `super` row with `granted_by=None` and `notes="auto-promoted from ADMIN_USER_IDS at boot"`. Defensive contract: never **downgrade** (an existing DB role for an env-list user — e.g. an `operator` left there by a super demoting them but keeping the env entry as a safety net — is preserved); never **escalate non-env users** (only ids in the env list are touched); never **block boot** (any DB error is logged and bypassed; the env-list fallback in `effective_role` keeps working until the next boot); never **auto-promote non-positive ids** (Telegram never issues 0 / negative user ids, so a typo there is silently dropped). Returns a counter dict `{promoted, skipped_existing, skipped_invalid, errors}` so the boot log surfaces "we promoted N admins this boot" without re-querying. **Idempotent:** the second boot finds the rows from the first and bumps `skipped_existing` instead of rewriting. **Bundled bug fix:** `parse_admin_user_ids` now drops non-positive integer entries with a logged WARN. Pre-fix, a typo (`ADMIN_USER_IDS=123,-456`) or accidental chat-id paste would silently put a never-matchable row in the admin set; with the new auto-promote layered on top, the same typo would also seed a bogus `admin_roles` row in the DB. Drop them at parse time so every downstream consumer (`is_admin`, `_resolve_actor_role`, the new auto-promote) sees a clean set. 11 new tests in `tests/test_admin_roles.py` covering: promote-missing happy path, **doesn't downgrade** an existing operator/viewer, idempotent on second call, skips non-positive (-5, 0), skips non-int (None, "not-a-number") + zero-coerce, get_admin_role failure isolation, set_admin_role failure isolation, dedupes input, empty-input no-op, custom-notes pass-through, plus the `parse_admin_user_ids` non-positive regression pin.
 
@@ -3058,7 +3058,67 @@ The user's process for this project — **do not deviate**:
     rewritten to pin the new pagination contract instead of
     the legacy single-file trim contract. Total suite: 2438 →
     2454 passing (+16 new).
-25. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+25. **Stage-15-Step-E #5 follow-up #4 OPENED** (PR-after-#161) —
+    web admin "view as <role>" toggle. The web panel now mirrors
+    the Telegram-side role gates (`/admin_metrics` viewer,
+    `/admin_broadcast` operator, `/admin_credit` super, etc.) on
+    every browser route via a new `_require_role(required: str)`
+    decorator factory that wraps `_require_auth` and reads a
+    signed view-as cookie. Per-route floors: viewer-readable
+    list/detail/dashboard pages stay on `_require_auth`;
+    `operator` floor on broadcast enqueue/cancel and gift /
+    promo create+revoke; `super` floor on user-wallet adjust,
+    user-field edit, transaction refund, openrouter-keys
+    add/toggle/delete, admin-roles grant/revoke, AI-model +
+    gateway toggles, and every destructive `/admin/control/*`
+    action. Below-floor requests 302 to `/admin/` with a flash
+    banner ("That action requires super role — you are
+    previewing as viewer …") and a `view_as_deny` audit row
+    capturing path + method + required + view-as for forensic
+    review. The "view as <role>" toggle: new
+    `sign_view_as_cookie()` / `verify_view_as_cookie()` HMAC-
+    SHA256 helpers with domain separation (HMAC prefix
+    `viewas:`) so a forged auth-cookie HMAC can't replay as a
+    view-as override and vice-versa; `verify_view_as_cookie`
+    mirrors `verify_cookie`'s fail-soft posture (malformed /
+    tampered / unknown role → `None` → falls back to `super`
+    rather than crashing post-secret-rotation). New
+    `POST /admin/view-as` endpoint (CSRF-protected, audit-
+    logged, allow-listed `next=/admin/...` to prevent open-
+    redirect abuse) sets the cookie via `set_cookie`
+    (path=/admin/, HttpOnly, Lax, max-age = TTL hours);
+    selecting `super` deletes the cookie outright so a
+    session-secret rotation never leaves a stale signed value
+    behind. The toggle widget renders on every page via a new
+    `_template_globals` async context processor (registered
+    after `admin_auth_middleware` so it can read the
+    middleware-stamped `request[REQUEST_KEY_VIEW_AS]` —
+    middleware-ordering pin in a comment). New audit slugs
+    `view_as_change` / `view_as_deny` added to
+    `AUDIT_ACTION_LABELS`. Bundled real bug fix: `sign_cookie`
+    now rejects timezone-naive `expires_at` outright.
+    `datetime.astimezone(tz)` on a naive datetime silently
+    coerces it via the deploy host's *system local time*,
+    producing a cookie expiry that depends on the host's `TZ`
+    env — same naive `datetime(2099, 1, 1)` becomes different
+    ISO strings on a UTC vs. a UTC-7 box. Production callers
+    always pass aware datetimes, but the writer-side guard
+    closes the loop with `verify_cookie`'s naive-ISO rejection
+    (already in place since Stage-8) so a future regression
+    that drops `tzinfo=timezone.utc` at a callsite fails loudly
+    instead of silently minting host-dependent cookies. 33 new
+    tests in `tests/test_web_admin.py`: round-trip per role,
+    malformed/tampered/wrong-secret/unknown-role cookie
+    rejection, domain-separation pin (auth-cookie HMAC ≠
+    view-as HMAC), open-redirect block, role-gate audit pins,
+    layout-renders-widget pin, plus a module-level pin walking
+    `setup_admin_routes` source to assert the highest-risk
+    routes (user adjust/edit, transaction refund, control
+    destructives, openrouter CRUD, roles CRUD) are wrapped in
+    `_require_role(ROLE_SUPER)` so a regression that drops a
+    gate fails immediately. Total suite: 2454 → 2487 passing
+    (+33 new).
+26. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-25. **Read the §11 working agreement before doing anything.**
+27. **Read the §11 working agreement before doing anything.**
