@@ -4037,3 +4037,474 @@ def test_decode_jsonb_str_list_unexpected_type_returns_none(caplog):
         "unexpected JSONB string-list value type" in r.message
         for r in caplog.records
     )
+
+
+# ---------------------------------------------------------------------
+# list_markup_history (Stage-15-Step-E #10b row 12)
+# ---------------------------------------------------------------------
+
+
+async def test_list_markup_history_filters_by_action():
+    """The query must only return ``monetization_markup_update`` rows
+    so the page never accidentally surfaces unrelated audit traffic
+    (e.g. ``user_adjust``) on the markup-history card."""
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.list_markup_history()
+    sql = conn.fetch.await_args.args[0]
+    normalized = " ".join(sql.split())
+    assert "FROM admin_audit_log" in normalized
+    assert (
+        "WHERE action = 'monetization_markup_update'" in normalized
+    )
+    assert "ORDER BY ts DESC" in normalized
+
+
+async def test_list_markup_history_decodes_meta_into_typed_fields():
+    """Happy path: a JSONB-string meta is decoded into the typed
+    ``before`` / ``after`` / ``before_source`` / ``after_source`` /
+    ``kind`` fields the template consumes."""
+    from datetime import datetime, timezone
+
+    ts = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[
+        {
+            "id": 7,
+            "ts": ts,
+            "actor": "web",
+            "ip": "203.0.113.10",
+            "meta": (
+                '{"action": "set", "before": 1.5, '
+                '"before_source": "default", "after": 1.7, '
+                '"after_source": "db"}'
+            ),
+        },
+    ])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    rows = await db.list_markup_history()
+    assert rows == [{
+        "id": 7,
+        "ts": ts.isoformat(),
+        "actor": "web",
+        "kind": "set",
+        "before": 1.5,
+        "before_source": "default",
+        "after": 1.7,
+        "after_source": "db",
+        "ip": "203.0.113.10",
+    }]
+
+
+async def test_list_markup_history_handles_clear_action():
+    """``meta.action == 'clear'`` is a known kind and surfaces as
+    ``kind=clear`` in the output."""
+    from datetime import datetime, timezone
+
+    ts = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[
+        {
+            "id": 8, "ts": ts, "actor": "web", "ip": None,
+            "meta": (
+                '{"action": "clear", "before": 1.7, '
+                '"before_source": "db", "after": 1.5, '
+                '"after_source": "default"}'
+            ),
+        },
+    ])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    rows = await db.list_markup_history()
+    assert rows[0]["kind"] == "clear"
+
+
+async def test_list_markup_history_demotes_unknown_action_to_unknown():
+    """An audit row whose ``meta.action`` is missing or unrecognised
+    must NOT crash the page — kind falls back to ``unknown``. This
+    is the surface that protects against schema drift in a future
+    PR that adds a third action verb."""
+    from datetime import datetime, timezone
+
+    ts = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[
+        {
+            "id": 9, "ts": ts, "actor": "web", "ip": None,
+            "meta": '{"action": "rename", "before": 1.5, "after": 1.6}',
+        },
+        {
+            "id": 10, "ts": ts, "actor": "web", "ip": None,
+            "meta": '{}',
+        },
+    ])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    rows = await db.list_markup_history()
+    assert rows[0]["kind"] == "unknown"
+    assert rows[1]["kind"] == "unknown"
+
+
+async def test_list_markup_history_handles_corrupt_meta_per_row():
+    """A poisoned JSON in one row must NOT blank the rest. Sibling
+    test to ``test_list_admin_audit_log_demotes_unparseable_meta_to_none``
+    — same fault-isolation invariant for the markup-history surface."""
+    from datetime import datetime, timezone
+
+    ts = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[
+        {
+            "id": 1, "ts": ts, "actor": "web", "ip": None,
+            "meta": "{not valid json",
+        },
+        {
+            "id": 2, "ts": ts, "actor": "web", "ip": None,
+            "meta": (
+                '{"action": "set", "before": 1.5, '
+                '"before_source": "env", "after": 2.0, '
+                '"after_source": "db"}'
+            ),
+        },
+    ])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    rows = await db.list_markup_history()
+    # Bad row -> None fields, no crash.
+    assert rows[0]["before"] is None and rows[0]["after"] is None
+    # Good row decodes cleanly.
+    assert rows[1]["before"] == 1.5
+    assert rows[1]["after"] == 2.0
+    assert rows[1]["before_source"] == "env"
+    assert rows[1]["after_source"] == "db"
+
+
+async def test_list_markup_history_drops_non_finite_before_after():
+    """A meta row with NaN / ±Inf in ``before`` / ``after`` must
+    surface as ``None`` rather than letting NaN propagate into the
+    template (which would render as ``nan×`` and crash float
+    comparisons in the per-era SQL)."""
+    from datetime import datetime, timezone
+
+    ts = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[
+        {
+            "id": 1, "ts": ts, "actor": "web", "ip": None,
+            "meta": (
+                '{"action": "set", "before": "NaN", '
+                '"after": "Infinity"}'
+            ),
+        },
+    ])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    rows = await db.list_markup_history()
+    assert rows[0]["before"] is None
+    assert rows[0]["after"] is None
+
+
+async def test_list_markup_history_empty_when_limit_zero_or_negative():
+    """A 0 / negative limit should short-circuit to an empty list
+    rather than dispatching a SQL query that postgres rejects."""
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    assert await db.list_markup_history(limit=0) == []
+    assert await db.list_markup_history(limit=-5) == []
+    conn.fetch.assert_not_awaited()
+
+
+async def test_list_markup_history_caps_limit_at_1000():
+    """Defence-in-depth: even if a caller passes a million rows
+    the DB query is bounded so we can't OOM the web worker."""
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.list_markup_history(limit=10_000_000)
+    assert conn.fetch.await_args.args[1] == 1000
+
+
+async def test_list_markup_history_rejects_non_int_limit():
+    db = database_module.Database()
+    db.pool = _PoolStub(_make_conn())
+    with pytest.raises(ValueError, match="must be an int"):
+        await db.list_markup_history(limit="seventeen")
+
+
+# ---------------------------------------------------------------------
+# get_markup_eras (Stage-15-Step-E #10b row 12)
+# ---------------------------------------------------------------------
+
+
+async def test_get_markup_eras_synthetic_when_no_history(monkeypatch):
+    """A fresh deploy with no markup audit rows yet should still
+    render the per-era card. Returns one synthetic "current" era at
+    the live markup spanning the entire ``usage_logs`` table."""
+    from datetime import datetime, timezone
+    import pricing
+
+    monkeypatch.setattr(pricing, "get_markup", lambda: 1.5)
+    monkeypatch.setattr(pricing, "get_markup_source", lambda: "default")
+
+    first_ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])  # no history rows
+    conn.fetchrow = AsyncMock(return_value={
+        "first_ts": first_ts,
+        "requests": 10,
+        "charged": 30.0,
+    })
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    eras = await db.get_markup_eras()
+    assert len(eras) == 1
+    era = eras[0]
+    assert era["from_ts"] == first_ts.isoformat()
+    assert era["to_ts"] is None
+    assert era["markup"] == 1.5
+    assert era["source"] == "default"
+    assert era["kind"] == "current"
+    assert era["requests"] == 10
+    assert era["charged_usd"] == 30.0
+    # OR cost = 30 / 1.5 = 20.0; margin = 30 - 20 = 10.0
+    assert era["openrouter_cost_usd"] == pytest.approx(20.0)
+    assert era["gross_margin_usd"] == pytest.approx(10.0)
+
+
+async def test_get_markup_eras_synthetic_when_no_usage_either(monkeypatch):
+    """No history rows AND no usage_logs at all should produce a
+    single zeroed-out current era rather than crashing on ``None``."""
+    import pricing
+    monkeypatch.setattr(pricing, "get_markup", lambda: 1.5)
+    monkeypatch.setattr(pricing, "get_markup_source", lambda: "default")
+
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    conn.fetchrow = AsyncMock(return_value={
+        "first_ts": None, "requests": 0, "charged": 0.0,
+    })
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    eras = await db.get_markup_eras()
+    assert len(eras) == 1
+    assert eras[0]["from_ts"] is None
+    assert eras[0]["requests"] == 0
+    assert eras[0]["charged_usd"] == 0.0
+
+
+async def test_get_markup_eras_builds_eras_from_history():
+    """With two markup-update rows in the audit log, the result is
+    1 "current" era (after the latest change) + 1 historical era
+    (between the two changes). Charged-USD aggregates per-era.
+    """
+    from datetime import datetime, timezone
+
+    ts_old = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    ts_new = datetime(2026, 2, 1, tzinfo=timezone.utc)
+
+    conn = _make_conn()
+    # First fetch (history): newest first.
+    history_rows = [
+        {
+            "id": 2, "ts": ts_new, "actor": "web", "ip": None,
+            "meta": (
+                '{"action": "set", "before": 1.5, '
+                '"before_source": "default", "after": 2.0, '
+                '"after_source": "db"}'
+            ),
+        },
+        {
+            "id": 1, "ts": ts_old, "actor": "web", "ip": None,
+            "meta": (
+                '{"action": "set", "before": 1.0, '
+                '"before_source": "default", "after": 1.5, '
+                '"after_source": "db"}'
+            ),
+        },
+    ]
+    # Second fetch (per-era aggregate). Bucket 0 = current era
+    # (markup 2.0, charged $40, 4 reqs); bucket 1 = previous era
+    # (markup 1.5, charged $30, 3 reqs).
+    agg_rows = [
+        {"bucket": 0, "requests": 4, "charged": 40.0},
+        {"bucket": 1, "requests": 3, "charged": 30.0},
+    ]
+    conn.fetch = AsyncMock(side_effect=[history_rows, agg_rows])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    eras = await db.get_markup_eras()
+    assert len(eras) == 2
+    # Current era (bucket 0).
+    assert eras[0]["from_ts"] == ts_new.isoformat()
+    assert eras[0]["to_ts"] is None
+    assert eras[0]["markup"] == 2.0
+    assert eras[0]["source"] == "db"
+    assert eras[0]["kind"] == "current"
+    assert eras[0]["requests"] == 4
+    assert eras[0]["charged_usd"] == 40.0
+    assert eras[0]["openrouter_cost_usd"] == pytest.approx(20.0)
+    assert eras[0]["gross_margin_usd"] == pytest.approx(20.0)
+    # Previous era (bucket 1).
+    assert eras[1]["from_ts"] == ts_old.isoformat()
+    assert eras[1]["to_ts"] == ts_new.isoformat()
+    assert eras[1]["markup"] == 1.5
+    assert eras[1]["source"] == "db"
+    assert eras[1]["kind"] == "set"
+    assert eras[1]["requests"] == 3
+    assert eras[1]["charged_usd"] == 30.0
+    assert eras[1]["openrouter_cost_usd"] == pytest.approx(20.0)
+    assert eras[1]["gross_margin_usd"] == pytest.approx(10.0)
+
+
+async def test_get_markup_eras_skips_row_with_unparseable_after():
+    """An audit row whose ``meta.after`` is unparseable (corrupt /
+    legacy / future schema) must NOT corrupt the era list — the
+    affected era is silently dropped, but the surrounding eras
+    still aggregate correctly."""
+    from datetime import datetime, timezone
+
+    ts_a = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    ts_b = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    ts_c = datetime(2026, 3, 1, tzinfo=timezone.utc)
+
+    conn = _make_conn()
+    history_rows = [
+        # Latest — good (current era).
+        {
+            "id": 3, "ts": ts_c, "actor": "web", "ip": None,
+            "meta": '{"action": "set", "after": 2.0, "after_source": "db"}',
+        },
+        # Middle — corrupt (no after key).
+        {
+            "id": 2, "ts": ts_b, "actor": "web", "ip": None,
+            "meta": '{"action": "set", "before": 1.5}',
+        },
+        # Oldest — good.
+        {
+            "id": 1, "ts": ts_a, "actor": "web", "ip": None,
+            "meta": '{"action": "set", "after": 1.5, "after_source": "db"}',
+        },
+    ]
+    agg_rows = [
+        {"bucket": 0, "requests": 1, "charged": 2.0},
+        {"bucket": 1, "requests": 1, "charged": 1.5},
+    ]
+    conn.fetch = AsyncMock(side_effect=[history_rows, agg_rows])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    eras = await db.get_markup_eras()
+    # 2 eras: current (markup 2.0) + the "1.5" one. Middle row dropped.
+    assert len(eras) == 2
+    assert eras[0]["markup"] == 2.0
+    assert eras[1]["markup"] == 1.5
+
+
+async def test_get_markup_eras_caps_limit():
+    """A massive caller-side ``limit`` should be capped at 100 so
+    the WHERE-CASE clause stays bounded."""
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    conn.fetchrow = AsyncMock(return_value={
+        "first_ts": None, "requests": 0, "charged": 0.0,
+    })
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_markup_eras(limit=1000)
+    # The first call was list_markup_history; check it was capped.
+    history_call = conn.fetch.await_args_list[0]
+    # list_markup_history queries with limit + 1 = 101 (since
+    # get_markup_eras passes limit+1).
+    assert history_call.args[1] == 101
+
+
+async def test_get_markup_eras_empty_when_limit_zero():
+    db = database_module.Database()
+    db.pool = _PoolStub(_make_conn())
+    assert await db.get_markup_eras(limit=0) == []
+
+
+async def test_get_markup_eras_rejects_non_int_limit():
+    db = database_module.Database()
+    db.pool = _PoolStub(_make_conn())
+    with pytest.raises(ValueError, match="must be an int"):
+        await db.get_markup_eras(limit="ten")
+
+
+async def test_get_markup_eras_clamps_zero_markup_defensive():
+    """A tampered audit row could persist a markup of 0 (the
+    coerce paths reject < 1.0 but a malicious DB write could
+    bypass that). The era's OR-cost computation must NOT divide
+    by zero — the row falls back to ``openrouter_cost_usd=0`` /
+    ``gross_margin_usd=charged`` rather than producing inf."""
+    from datetime import datetime, timezone
+
+    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    conn = _make_conn()
+    history_rows = [
+        {
+            "id": 1, "ts": ts, "actor": "web", "ip": None,
+            "meta": '{"action": "set", "after": 0, "after_source": "db"}',
+        },
+    ]
+    agg_rows = [
+        {"bucket": 0, "requests": 5, "charged": 10.0},
+    ]
+    conn.fetch = AsyncMock(side_effect=[history_rows, agg_rows])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    eras = await db.get_markup_eras()
+    assert len(eras) == 1
+    assert eras[0]["markup"] == 0.0
+    assert eras[0]["openrouter_cost_usd"] == 0.0
+    assert eras[0]["gross_margin_usd"] == 10.0
+
+
+# ---------------------------------------------------------------------
+# _finite_float_or_none (Stage-15-Step-E #10b row 12)
+# ---------------------------------------------------------------------
+
+
+def test_finite_float_or_none_passes_through_finite_floats():
+    assert database_module._finite_float_or_none(1.5) == 1.5
+    assert database_module._finite_float_or_none(0) == 0.0
+    assert database_module._finite_float_or_none(-3.14) == -3.14
+
+
+def test_finite_float_or_none_returns_none_for_none_or_invalid():
+    assert database_module._finite_float_or_none(None) is None
+    assert database_module._finite_float_or_none("not a number") is None
+    assert database_module._finite_float_or_none(object()) is None
+
+
+def test_finite_float_or_none_returns_none_for_nan_inf():
+    assert database_module._finite_float_or_none(float("nan")) is None
+    assert database_module._finite_float_or_none(float("inf")) is None
+    assert database_module._finite_float_or_none(float("-inf")) is None
+
+
+def test_finite_float_or_none_rejects_bool():
+    """``bool`` is a subclass of ``int`` — must be rejected explicitly
+    so ``True`` (which would coerce to 1.0) doesn't sneak through and
+    silently corrupt audit-log meta parsing."""
+    assert database_module._finite_float_or_none(True) is None
+    assert database_module._finite_float_or_none(False) is None
