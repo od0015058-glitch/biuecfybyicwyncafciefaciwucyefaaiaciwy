@@ -219,6 +219,179 @@ def get_key_request_counters() -> dict[int, int]:
     return dict(_KEY_REQUEST_COUNTERS)
 
 
+# ── Stage-15-Step-E #4 follow-up #3: per-key 24h usage tracker ────
+#
+# Rolling buffer of ``(timestamp, cost_usd)`` per pool index. Lets
+# the admin panel answer "how much traffic — and how much $ — is
+# this key handling right now?" without a Prometheus stack. The
+# existing ``_KEY_REQUEST_COUNTERS`` is process-start-relative
+# (resets on restart, no time window); this tracker maintains a
+# 24-hour window that survives normal runtime variation.
+#
+# Buffer shape: ``{idx: list[(timestamp_seconds, cost_usd)]}``.
+# Append on every ``record_key_usage`` call. Trim on every read
+# (lazy expiry — simpler than a background sweeper, and the panel
+# is the only reader so the trim cost is paid by the operator,
+# not the hot AI path). A safety cap of
+# ``_KEY_USAGE_MAX_ENTRIES`` per index protects against runaway
+# growth on a buggy caller (or a real, sustained 1000 RPS to a
+# single key for 24h, which wouldn't fit anyway).
+#
+# Reset on ``load_keys()`` alongside the existing counters so a
+# key rotation doesn't carry stale meaning forward — the new
+# pool member at index N has no history under that index.
+_KEY_USAGE_BUCKETS: dict[int, list[tuple[float, float]]] = {}
+_KEY_USAGE_WINDOW_SECONDS: float = 86_400.0
+_KEY_USAGE_MAX_ENTRIES: int = 100_000
+
+
+def _idx_for_api_key(api_key: str) -> int | None:
+    """Reverse-lookup ``_keys`` by api_key string, or ``None``.
+
+    O(N) walk (N ≤ 10 in practice) so no need for a separate
+    index. Returns ``None`` for an api_key that isn't in the
+    current pool — a stale reference (key rotated out between
+    request start and finish) won't poison the usage buffer
+    with a phantom index.
+    """
+    if not api_key:
+        return None
+    try:
+        return _keys.index(api_key)
+    except ValueError:
+        return None
+
+
+def _record_usage_at_idx(
+    idx: int, cost_usd: float, ts: float | None = None,
+) -> None:
+    """Append a usage entry for pool index *idx*.
+
+    Internal helper: callers go through :func:`record_key_usage`
+    so we always reverse-lookup from the api_key (keeps the
+    panel index-keyed; matches the existing 429/fallback
+    counters' discipline). Tolerates ``cost_usd`` being NaN /
+    -Inf / +Inf by coercing to 0.0 — a poisoned cost shouldn't
+    permanently corrupt the 24h sum the panel renders.
+    """
+    if idx < 0:
+        return
+    timestamp = time.time() if ts is None else ts
+    safe_cost: float = 0.0
+    try:
+        c = float(cost_usd)
+    except (TypeError, ValueError):
+        c = 0.0
+    if math.isfinite(c) and c >= 0.0:
+        safe_cost = c
+    bucket = _KEY_USAGE_BUCKETS.setdefault(idx, [])
+    bucket.append((timestamp, safe_cost))
+    # Safety cap: keep the most recent ``_KEY_USAGE_MAX_ENTRIES``
+    # entries. The window-trim in :func:`get_key_24h_usage` will
+    # also evict expired entries on read — the cap is just a
+    # defensive belt for the worst case where reads don't happen
+    # frequently enough to keep the list small.
+    if len(bucket) > _KEY_USAGE_MAX_ENTRIES:
+        # Drop the oldest 10% to amortise the eviction cost so
+        # we're not popping(0) on every append once we hit the cap.
+        drop = max(1, len(bucket) - _KEY_USAGE_MAX_ENTRIES + (
+            _KEY_USAGE_MAX_ENTRIES // 10
+        ))
+        del bucket[:drop]
+
+
+async def record_key_usage(
+    api_key: str, cost_usd: float, *, db=None,
+) -> None:
+    """Record one successful OpenRouter call against *api_key*.
+
+    Bumps the in-process 24h rolling buffer for the pool index
+    matching *api_key* (silently no-ops if the key isn't in the
+    current pool — see :func:`_idx_for_api_key`).
+
+    If *db* is supplied AND the key was loaded from the DB-backed
+    registry (``_KEY_META[idx]["source"] == "db"``), also bumps
+    ``last_used_at`` on the matching DB row via
+    ``db.mark_openrouter_key_used``. Pre-fix, the registry's
+    ``last_used_at`` column was never updated — the panel's
+    "Last used" column always rendered ``—`` even for actively-
+    used keys. Bundled bug fix.
+
+    DB error handling: a transient DB blip on the
+    ``mark_openrouter_key_used`` side is logged and swallowed so
+    the user-facing AI reply isn't blocked by a slow
+    ``last_used_at`` UPDATE. The in-memory 24h buffer is
+    populated regardless.
+    """
+    idx = _idx_for_api_key(api_key)
+    if idx is None:
+        return
+    _record_usage_at_idx(idx, cost_usd)
+
+    if db is None:
+        return
+    meta = _KEY_META.get(idx, {})
+    if meta.get("source") != "db":
+        return
+    db_id = meta.get("db_id")
+    if not isinstance(db_id, int):
+        return
+    try:
+        await db.mark_openrouter_key_used(db_id)
+    except Exception:
+        log.exception(
+            "openrouter_keys.record_key_usage: "
+            "mark_openrouter_key_used(%d) failed; in-memory 24h "
+            "buffer was still updated.",
+            db_id,
+        )
+
+
+def get_key_24h_usage() -> dict[int, dict[str, float]]:
+    """24h-windowed per-key usage snapshot.
+
+    Returns ``{idx: {"requests": int, "cost_usd": float}}`` for
+    every pool index that has at least one entry in the rolling
+    buffer. Indices with zero entries are omitted — callers
+    (the panel) default to zero for missing indices.
+
+    Side effect: trims expired entries (older than 24h) on each
+    call. Lazy expiry — see the buffer's docstring above.
+    Empty-but-stale buckets are also evicted so the dict stays
+    bounded by the active key set rather than the historical key
+    set.
+    """
+    cutoff = time.time() - _KEY_USAGE_WINDOW_SECONDS
+    result: dict[int, dict[str, float]] = {}
+    stale_idxs: list[int] = []
+    for idx, entries in _KEY_USAGE_BUCKETS.items():
+        # Locate the first non-expired entry. Buffer is append-only
+        # in monotonic-ish time order, so a simple scan from the
+        # front finds the cutoff. (We don't bisect because the
+        # safety cap already keeps the list bounded; bisect would
+        # only matter past 1M entries.)
+        keep_from = 0
+        for ts, _cost in entries:
+            if ts >= cutoff:
+                break
+            keep_from += 1
+        if keep_from > 0:
+            del entries[:keep_from]
+        if not entries:
+            stale_idxs.append(idx)
+            continue
+        total_cost = 0.0
+        for _ts, cost in entries:
+            total_cost += cost
+        result[idx] = {
+            "requests": float(len(entries)),
+            "cost_usd": total_cost,
+        }
+    for idx in stale_idxs:
+        _KEY_USAGE_BUCKETS.pop(idx, None)
+    return result
+
+
 def reset_key_counters_for_tests() -> None:
     """Tests-only — wipe all per-key counter dicts.
 
@@ -229,6 +402,7 @@ def reset_key_counters_for_tests() -> None:
     _KEY_429_COUNTERS.clear()
     _KEY_FALLBACK_COUNTERS.clear()
     _KEY_REQUEST_COUNTERS.clear()
+    _KEY_USAGE_BUCKETS.clear()
 
 
 def load_keys() -> None:
@@ -275,6 +449,7 @@ def load_keys() -> None:
     _KEY_429_COUNTERS.clear()
     _KEY_FALLBACK_COUNTERS.clear()
     _KEY_REQUEST_COUNTERS.clear()
+    _KEY_USAGE_BUCKETS.clear()
     _KEY_META.clear()
     # Tag every env-loaded slot so the panel can render a "source"
     # column even on env-only deploys.

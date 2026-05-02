@@ -10553,6 +10553,106 @@ async def test_openrouter_keys_delete_post_requires_auth(
     db.delete_openrouter_key.assert_not_called()
 
 
+# ── Stage-15-Step-E #4 follow-up #3: 24h usage panel rendering ─────
+
+
+async def test_openrouter_keys_get_renders_24h_columns(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """The page renders the new "24h reqs" / "24h cost" header
+    cells alongside the existing per-key cumulative counters."""
+    _setup_or_keys_pool(monkeypatch)
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+
+    resp = await client.get("/admin/openrouter-keys")
+    body = await resp.text()
+    assert resp.status == 200
+    assert "24h reqs" in body
+    assert "24h cost" in body
+
+
+async def test_openrouter_keys_get_renders_24h_usage_for_keys_with_traffic(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """When ``record_key_usage`` has been called against a key,
+    the panel surfaces the rolled-up 24h request count + dollar
+    spend in the matching row."""
+    import openrouter_keys
+
+    _setup_or_keys_pool(monkeypatch)
+    # idx 1 ("kwb") absorbs three calls totalling $0.075.
+    openrouter_keys._record_usage_at_idx(1, 0.025)
+    openrouter_keys._record_usage_at_idx(1, 0.030)
+    openrouter_keys._record_usage_at_idx(1, 0.020)
+
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+
+    resp = await client.get("/admin/openrouter-keys")
+    body = await resp.text()
+
+    # The 24h request count "3" appears in idx 1's row, and the
+    # rendered cost "$0.0750" appears (4-decimal float).
+    assert "$0.0750" in body
+    # The "3" appears in a counter cell (not e.g. as "k3").
+    import re
+    counter_cells = re.findall(
+        r'<span class="or-counter[^"]*">\s*([^<\s]+)\s*</span>', body
+    )
+    # "3" is the request count for idx 1; "$0.0750" is the cost
+    # for idx 1.
+    assert "3" in counter_cells
+    assert "$0.0750" in counter_cells
+
+
+async def test_openrouter_keys_get_zero_24h_traffic_renders_zero_dollar(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """A key with no 24h traffic renders ``0`` requests and
+    ``$0.0000`` cost — not a missing cell or an "—"."""
+    _setup_or_keys_pool(monkeypatch)
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+
+    resp = await client.get("/admin/openrouter-keys")
+    body = await resp.text()
+    # Three keys × $0.0000 each.
+    assert body.count("$0.0000") == 3
+
+
+async def test_openrouter_keys_get_24h_excludes_expired_entries(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """Bug-fix coverage: a 25h-old entry must not contribute to
+    the rendered 24h totals — the panel reads through
+    ``get_key_24h_usage`` which prunes on read."""
+    import time as _time
+
+    import openrouter_keys
+
+    _setup_or_keys_pool(monkeypatch)
+    now = _time.time()
+    # 25h ago: must be evicted on read.
+    openrouter_keys._record_usage_at_idx(0, 100.0, ts=now - 25 * 3600)
+    # 1s ago: must contribute.
+    openrouter_keys._record_usage_at_idx(0, 0.5, ts=now - 1)
+
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+
+    resp = await client.get("/admin/openrouter-keys")
+    body = await resp.text()
+    # The $100 expired entry must not appear in the rendered cost.
+    assert "$100" not in body
+    # The $0.5000 entry does appear.
+    assert "$0.5000" in body
+
+
 # ── Stage-15-Step-F follow-up: tunable thresholds ──────────────────
 
 

@@ -457,9 +457,18 @@ NowPayments crypto invoices.
   (sticky picks + fallback picks combined) so the panel answers
   "is this key actually being used?" without needing access to
   OpenRouter's dashboard. All mutations are CSRF-protected and
-  audit-logged via `record_admin_audit`. Cross-replica cooldown
-  coordination (Redis-backed) and per-model 429 tracking remain
-  follow-ups.
+  audit-logged via `record_admin_audit`. **Stage-15-Step-E #4
+  follow-up #3:** every successful AI completion now also bumps
+  a per-key **24h rolling buffer** (`record_key_usage`); the
+  panel renders two new "24h reqs" / "24h cost" columns that
+  answer "how much traffic — and how much $ — is this key
+  handling right now?" over a 24-hour window that survives
+  process restarts of the cumulative counters. The same hook
+  bumps `last_used_at` on the DB-backed registry row (a real
+  bug fix — pre-PR that column was only updated by tests, so
+  the panel's "Last used" column always rendered `—` even for
+  actively-used DB keys). Cross-replica cooldown coordination
+  (Redis-backed) and per-model 429 tracking remain follow-ups.
 - **Bot health & emergency control panel** — new `/admin/control`
   page surfaces a traffic-light status tile (idle / healthy /
   busy / degraded / under-attack / down) classified by

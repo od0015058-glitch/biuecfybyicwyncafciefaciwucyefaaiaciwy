@@ -6,7 +6,7 @@
 <style>
   .or-row {
     display: grid;
-    grid-template-columns: 50px 1fr 80px 110px 110px 90px 90px 90px;
+    grid-template-columns: 50px 1fr 80px 110px 110px 90px 90px 90px 90px 100px;
     align-items: center;
     padding: 10px 0;
     border-bottom: 1px solid var(--border);
@@ -125,9 +125,13 @@
   <code>OPENROUTER_API_KEY_1</code>..<code>_10</code>) appear with
   source <strong>env</strong>; keys added below are stored in the
   <code>openrouter_api_keys</code> table and appear with source
-  <strong>db</strong>. Per-key counters reset on every process
-  restart and on a deliberate <code>load_keys()</code> call.
-  Plaintext key material is never rendered — only a 4-char tail.
+  <strong>db</strong>. Per-key cumulative counters
+  (<em>Requests</em>, <em>429s</em>, <em>Fallbacks</em>) reset on
+  every process restart and on a deliberate
+  <code>load_keys()</code> call; <em>24h reqs</em> / <em>24h
+  cost</em> are a 24-hour rolling window so they survive normal
+  runtime variation. Plaintext key material is never rendered —
+  only a 4-char tail.
 </p>
 
 <h3 style="margin-top: 24px;">Live pool</h3>
@@ -142,6 +146,8 @@
     <span>Requests</span>
     <span>429s</span>
     <span>Fallbacks</span>
+    <span>24h reqs</span>
+    <span>24h cost</span>
   </div>
   {% for row in rows %}
   <div class="or-row">
@@ -155,6 +161,8 @@
     <span class="or-counter">{{ row.count_request }}</span>
     <span class="or-counter {% if row.count_429 %}hot{% endif %}">{{ row.count_429 }}</span>
     <span class="or-counter">{{ row.count_fallback }}</span>
+    <span class="or-counter">{{ row.requests_24h }}</span>
+    <span class="or-counter">${{ "%.4f"|format(row.cost_24h_usd) }}</span>
   </div>
   {% endfor %}
 </div>
