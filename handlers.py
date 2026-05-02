@@ -47,6 +47,7 @@ from payments import (
     create_crypto_invoice,
     effective_min_usd,
     find_cheaper_alternative,
+    get_min_topup_usd,
     get_min_amount_usd,
 )
 from pricing import apply_markup_to_price
@@ -2526,7 +2527,7 @@ async def process_toman_amount_request(callback: CallbackQuery, state: FSMContex
         await callback.answer()
         return
     await state.set_state(UserStates.waiting_toman_amount)
-    min_toman = GLOBAL_MIN_TOPUP_USD * snap.toman_per_usd
+    min_toman = get_min_topup_usd() * snap.toman_per_usd
     await callback.message.edit_text(
         t(
             lang, "charge_toman_prompt",
@@ -2665,7 +2666,7 @@ async def process_custom_amount_input(message: Message, state: FSMContext):
         await message.answer(t(lang, "charge_custom_invalid"))
         return
 
-    if amount < GLOBAL_MIN_TOPUP_USD:
+    if amount < get_min_topup_usd():
         await message.answer(t(lang, "charge_custom_min_error"))
         return
 
@@ -2747,8 +2748,8 @@ async def process_toman_amount_input(message: Message, state: FSMContext):
     # Reject fat-fingered entries below $2 equivalent using the same
     # threshold the USD path uses, but render the error in Toman so
     # the user sees what they actually typed.
-    if usd_amount < GLOBAL_MIN_TOPUP_USD:
-        min_toman = GLOBAL_MIN_TOPUP_USD * snap.toman_per_usd
+    if usd_amount < get_min_topup_usd():
+        min_toman = get_min_topup_usd() * snap.toman_per_usd
         await message.answer(
             t(
                 lang, "charge_toman_min_error",

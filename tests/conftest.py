@@ -35,3 +35,31 @@ import payments  # noqa: E402,F401
 import pending_alert  # noqa: E402,F401
 import pending_expiration  # noqa: E402,F401
 import zarinpal_backfill  # noqa: E402,F401
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _clear_admin_setting_overrides():
+    """Reset every DB-backed system_settings override between tests.
+
+    Stage-15-Step-E #10b ships a growing family of in-process override
+    caches (``pricing._MARKUP_OVERRIDE``, ``payments._MIN_TOPUP_USD_OVERRIDE``,
+    ``bot_health._THRESHOLD_OVERRIDES``…). Tests that exercise the admin
+    write paths SET those caches; if a later test in the same session
+    reads them, it inherits state it didn't ask for. The most expensive
+    instance: ``test_zarinpal_telegram_fsm`` enters $4 in Toman, but a
+    leftover MIN_TOPUP_USD override of e.g. $7.5 from a wallet-config
+    test causes the keyboard render path to short-circuit (below floor).
+
+    Cheap and idempotent — every reset is a no-op if no override is set,
+    so adding this autouse globally costs nothing in tests that don't
+    touch the override layer.
+    """
+    import pricing
+    import payments as _payments
+    pricing.clear_markup_override()
+    _payments.clear_min_topup_override()
+    yield
+    pricing.clear_markup_override()
+    _payments.clear_min_topup_override()

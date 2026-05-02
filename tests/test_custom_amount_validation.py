@@ -137,8 +137,18 @@ def test_handler_validation_matches_inline_helper():
         "Upper-bound check missing from handlers.py — the USD path "
         "would accept arbitrary amounts"
     )
-    assert "amount < GLOBAL_MIN_TOPUP_USD" in handlers_src or \
-           "usd_amount < GLOBAL_MIN_TOPUP_USD" in handlers_src, (
+    # Stage-15-Step-E #10b row 4: the lower-bound check now routes
+    # through ``get_min_topup_usd()`` so a runtime DB override
+    # (system_settings.MIN_TOPUP_USD) can move the floor without a
+    # redeploy. Accept either the legacy direct-constant spelling or
+    # the new function-call spelling so this drift guard doesn't
+    # whip-saw on the rename.
+    assert (
+        "amount < GLOBAL_MIN_TOPUP_USD" in handlers_src
+        or "usd_amount < GLOBAL_MIN_TOPUP_USD" in handlers_src
+        or "amount < get_min_topup_usd()" in handlers_src
+        or "usd_amount < get_min_topup_usd()" in handlers_src
+    ), (
         "Lower-bound check missing from handlers.py — the $2 floor "
         "would be bypassed"
     )
