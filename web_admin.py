@@ -3691,6 +3691,11 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     "audit_retention_update": "Audit retention policy updated",
     # Stage-15-Step-E #10b row 23: model discovery interval editor.
     "models_config_discovery_interval_update": "Model discovery interval updated",
+    # Stage-15-Step-E #10b row 22: I18N_LOCK toggle on /admin/strings.
+    "i18n_lock_set": "Bot text edits locked",
+    "i18n_lock_cleared": "Bot text edits unlocked",
+    "string_save_blocked_locked": "Bot text save refused (locked)",
+    "string_revert_blocked_locked": "Bot text revert refused (locked)",
 }
 
 
@@ -6716,6 +6721,8 @@ def _filter_compiled_strings(
 
 async def strings_get(request: web.Request) -> web.StreamResponse:
     """List every (lang, key) string with current value + override flag."""
+    import i18n_lock
+
     db = request.app.get(APP_KEY_DB)
     overrides_map: dict[tuple[str, str], str] = {}
     db_error: str | None = None
@@ -6725,6 +6732,10 @@ async def strings_get(request: web.Request) -> web.StreamResponse:
         except Exception:
             log.exception("strings_get: load_all_string_overrides failed")
             db_error = "Database query failed — see logs."
+        # Stage-15-Step-E #10b row 22: refresh the lock override on
+        # every page load so a sibling worker's flip lands on this
+        # process within one request, not after the next restart.
+        await i18n_lock.refresh_i18n_lock_override_from_db(db)
 
     lang_filter = request.query.get("lang") or None
     if lang_filter not in bot_strings_module.SUPPORTED_LANGUAGES:
@@ -6737,10 +6748,16 @@ async def strings_get(request: web.Request) -> web.StreamResponse:
         overrides_map=overrides_map,
     )
 
-    response = aiohttp_jinja2.render_template(
-        "strings.html",
-        request,
-        {
+    env_lock = os.getenv("I18N_LOCK", "")
+    lock_ctx = {
+        "is_locked": i18n_lock.is_i18n_locked(env_value=env_lock),
+        "lock_source": i18n_lock.get_i18n_lock_source(env_value=env_lock),
+        "lock_override": i18n_lock.get_i18n_lock_override(),
+        "env_lock_raw": env_lock or None,
+    }
+
+    def _ctx(flash):
+        return {
             "rows": rows,
             "lang_filter": lang_filter,
             "search": search or "",
@@ -6751,27 +6768,17 @@ async def strings_get(request: web.Request) -> web.StreamResponse:
             "db_error": db_error,
             "active_page": "strings",
             "csrf_token": csrf_token_for(request),
-            "flash": None,
-        },
+            "flash": flash,
+            **lock_ctx,
+        }
+
+    response = aiohttp_jinja2.render_template(
+        "strings.html", request, _ctx(None)
     )
     flash = pop_flash(request, response)
     if flash is not None:
         response = aiohttp_jinja2.render_template(
-            "strings.html",
-            request,
-            {
-                "rows": rows,
-                "lang_filter": lang_filter,
-                "search": search or "",
-                "supported_langs": list(
-                    bot_strings_module.SUPPORTED_LANGUAGES
-                ),
-                "override_count": sum(1 for r in rows if r["has_override"]),
-                "db_error": db_error,
-                "active_page": "strings",
-                "csrf_token": csrf_token_for(request),
-                "flash": flash,
-            },
+            "strings.html", request, _ctx(flash)
         )
         response.del_cookie(FLASH_COOKIE, path="/admin/")
     return response
@@ -6780,6 +6787,8 @@ async def strings_get(request: web.Request) -> web.StreamResponse:
 async def string_detail_get(request: web.Request) -> web.StreamResponse:
     """Single-string editor: shows compiled default, current override
     (if any), and a textarea pre-filled with the override-or-default."""
+    import i18n_lock
+
     lang = request.match_info["lang"]
     key = request.match_info["key"]
     if lang not in bot_strings_module.SUPPORTED_LANGUAGES:
@@ -6801,11 +6810,12 @@ async def string_detail_get(request: web.Request) -> web.StreamResponse:
         except Exception:
             log.exception("string_detail_get: load failed")
             db_error = "Database query failed — see logs."
+        await i18n_lock.refresh_i18n_lock_override_from_db(db)
 
-    response = aiohttp_jinja2.render_template(
-        "string_detail.html",
-        request,
-        {
+    is_locked = i18n_lock.is_i18n_locked(env_value=os.getenv("I18N_LOCK", ""))
+
+    def _ctx(flash):
+        return {
             "lang": lang,
             "key": key,
             "default": default,
@@ -6815,26 +6825,17 @@ async def string_detail_get(request: web.Request) -> web.StreamResponse:
             "db_error": db_error,
             "active_page": "strings",
             "csrf_token": csrf_token_for(request),
-            "flash": None,
-        },
+            "flash": flash,
+            "is_locked": is_locked,
+        }
+
+    response = aiohttp_jinja2.render_template(
+        "string_detail.html", request, _ctx(None)
     )
     flash = pop_flash(request, response)
     if flash is not None:
         response = aiohttp_jinja2.render_template(
-            "string_detail.html",
-            request,
-            {
-                "lang": lang,
-                "key": key,
-                "default": default,
-                "override": override,
-                "current": override if override is not None else default,
-                "max_chars": STRING_OVERRIDE_MAX_CHARS,
-                "db_error": db_error,
-                "active_page": "strings",
-                "csrf_token": csrf_token_for(request),
-                "flash": flash,
-            },
+            "string_detail.html", request, _ctx(flash)
         )
         response.del_cookie(FLASH_COOKIE, path="/admin/")
     return response
@@ -6856,6 +6857,8 @@ async def _refresh_overrides_cache(db) -> None:
 
 async def string_save_post(request: web.Request) -> web.StreamResponse:
     """POST /admin/strings/{lang}/{key} — upsert a single override."""
+    import i18n_lock
+
     lang = request.match_info["lang"]
     key = request.match_info["key"]
     secret = request.app.get(APP_KEY_SESSION_SECRET, "")
@@ -6878,6 +6881,38 @@ async def string_save_post(request: web.Request) -> web.StreamResponse:
             response,
             kind="error",
             message="Form submission was rejected (CSRF). Refresh and try again.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    # Stage-15-Step-E #10b row 22: refuse the save when the I18N_LOCK
+    # is on. Refresh from DB first so a sibling worker's flip applies
+    # immediately. We audit the rejection so a deploy retro can show
+    # which translator tried to land an edit during the lockout window.
+    db_for_lock = request.app.get(APP_KEY_DB)
+    if db_for_lock is not None:
+        await i18n_lock.refresh_i18n_lock_override_from_db(db_for_lock)
+    if i18n_lock.is_i18n_locked(env_value=os.getenv("I18N_LOCK", "")):
+        log.warning(
+            "string_save_post: blocked by I18N_LOCK (lang=%s key=%s, "
+            "source=%s, actor=%s)",
+            lang, key,
+            i18n_lock.get_i18n_lock_source(env_value=os.getenv("I18N_LOCK", "")),
+            request.remote,
+        )
+        await _record_audit_safe(
+            request,
+            "string_save_blocked_locked",
+            target=f"string:{lang}:{key}",
+        )
+        set_flash(
+            response,
+            kind="error",
+            message=(
+                "Bot text edits are locked — disable the lock on "
+                "/admin/strings before saving."
+            ),
             secret=secret,
             cookie_secure=cookie_secure,
         )
@@ -6978,6 +7013,8 @@ async def string_save_post(request: web.Request) -> web.StreamResponse:
 async def string_revert_post(request: web.Request) -> web.StreamResponse:
     """POST /admin/strings/{lang}/{key}/revert — drop the DB row so
     the compiled default takes effect again."""
+    import i18n_lock
+
     lang = request.match_info["lang"]
     key = request.match_info["key"]
     secret = request.app.get(APP_KEY_SESSION_SECRET, "")
@@ -7000,6 +7037,37 @@ async def string_revert_post(request: web.Request) -> web.StreamResponse:
             response,
             kind="error",
             message="Form submission was rejected (CSRF). Refresh and try again.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    # Stage-15-Step-E #10b row 22: refuse the revert when locked.
+    # Symmetric with the save path — a "revert" is still a string-table
+    # mutation that we want to gate during a deploy.
+    db_for_lock = request.app.get(APP_KEY_DB)
+    if db_for_lock is not None:
+        await i18n_lock.refresh_i18n_lock_override_from_db(db_for_lock)
+    if i18n_lock.is_i18n_locked(env_value=os.getenv("I18N_LOCK", "")):
+        log.warning(
+            "string_revert_post: blocked by I18N_LOCK (lang=%s key=%s, "
+            "source=%s, actor=%s)",
+            lang, key,
+            i18n_lock.get_i18n_lock_source(env_value=os.getenv("I18N_LOCK", "")),
+            request.remote,
+        )
+        await _record_audit_safe(
+            request,
+            "string_revert_blocked_locked",
+            target=f"string:{lang}:{key}",
+        )
+        set_flash(
+            response,
+            kind="error",
+            message=(
+                "Bot text edits are locked — disable the lock on "
+                "/admin/strings before reverting."
+            ),
             secret=secret,
             cookie_secure=cookie_secure,
         )
@@ -7052,6 +7120,158 @@ async def string_revert_post(request: web.Request) -> web.StreamResponse:
             secret=secret,
             cookie_secure=cookie_secure,
         )
+    return response
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 22: I18N_LOCK toggle (`/admin/strings/lock`)
+# ---------------------------------------------------------------------
+
+
+async def strings_lock_toggle_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """POST ``/admin/strings/lock`` — flip the i18n lock override.
+
+    Form payload:
+        * ``action`` — ``"lock"`` / ``"unlock"`` / ``"clear"``
+            ``"lock"``    → set the DB-backed override to ``True``
+            ``"unlock"``  → set the DB-backed override to ``False``
+                            (explicit unlock — beats a truthy env)
+            ``"clear"``   → drop the DB row, fall back to env / default
+        * ``csrf_token`` — the token rendered into the toggle form
+
+    Gated to ``ROLE_SUPER`` by the route registration. Audits the
+    flip and refreshes the in-process cache so the very next save /
+    revert handler call observes the new state without a restart.
+    """
+    import i18n_lock
+
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    response = web.HTTPFound(location="/admin/strings")
+
+    form = await request.post()
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning(
+            "strings_lock_toggle_post: CSRF token mismatch from %s",
+            request.remote,
+        )
+        set_flash(
+            response,
+            kind="error",
+            message="Form submission was rejected (CSRF). Refresh and try again.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    action = str(form.get("action", "")).strip().lower()
+    if action not in {"lock", "unlock", "clear"}:
+        set_flash(
+            response,
+            kind="error",
+            message="Unknown lock action — choose lock, unlock, or clear.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    db = request.app.get(APP_KEY_DB)
+    if db is None:
+        set_flash(
+            response,
+            kind="error",
+            message="No database wired up — cannot change the lock.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    previous_source = i18n_lock.get_i18n_lock_source(
+        env_value=os.getenv("I18N_LOCK", "")
+    )
+    previous_locked = i18n_lock.is_i18n_locked(
+        env_value=os.getenv("I18N_LOCK", "")
+    )
+
+    try:
+        if action == "clear":
+            # Drop the system_settings row entirely so the env / default
+            # takes over. We use the existing ``upsert_setting`` /
+            # ``delete_setting`` API on Database; deletion is the
+            # canonical "no override" state.
+            await db.delete_setting(i18n_lock.I18N_LOCK_SETTING_KEY)
+            i18n_lock.clear_i18n_lock_override()
+            new_value: bool | None = None
+        else:
+            target = action == "lock"
+            await db.upsert_setting(
+                i18n_lock.I18N_LOCK_SETTING_KEY,
+                i18n_lock.serialise_lock_for_db(target),
+            )
+            i18n_lock.set_i18n_lock_override(target)
+            new_value = target
+    except Exception:
+        log.exception(
+            "strings_lock_toggle_post: persistence failed (action=%s)",
+            action,
+        )
+        set_flash(
+            response,
+            kind="error",
+            message="Database write failed — see logs.",
+            secret=secret,
+            cookie_secure=cookie_secure,
+        )
+        return response
+
+    # Refresh from DB so the cache matches what's on disk (covers the
+    # delete-then-fall-through-to-env case where the env says locked).
+    await i18n_lock.refresh_i18n_lock_override_from_db(db)
+    new_locked = i18n_lock.is_i18n_locked(
+        env_value=os.getenv("I18N_LOCK", "")
+    )
+    new_source = i18n_lock.get_i18n_lock_source(
+        env_value=os.getenv("I18N_LOCK", "")
+    )
+
+    audit_slug = "i18n_lock_set" if new_locked else "i18n_lock_cleared"
+    await _record_audit_safe(
+        request,
+        audit_slug,
+        meta={
+            "action": action,
+            "previous_source": previous_source,
+            "previous_locked": previous_locked,
+            "new_source": new_source,
+            "new_locked": new_locked,
+            "override_value": new_value,
+        },
+    )
+    log.info(
+        "i18n lock changed action=%s prev=(%s,%s) new=(%s,%s)",
+        action,
+        previous_source, previous_locked,
+        new_source, new_locked,
+    )
+
+    if action == "lock":
+        msg = "Bot text edits are now locked. Save / revert will refuse."
+    elif action == "unlock":
+        msg = "Bot text edits are now unlocked."
+    else:
+        msg = (
+            f"Lock override cleared — falling through to "
+            f"{new_source} ({'locked' if new_locked else 'unlocked'})."
+        )
+    set_flash(
+        response,
+        kind="success",
+        message=msg,
+        secret=secret,
+        cookie_secure=cookie_secure,
+    )
     return response
 
 
@@ -12306,6 +12526,15 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/strings/{lang}/{key}/revert",
         _require_role(ROLE_SUPER)(string_revert_post),
+    )
+    # Stage-15-Step-E #10b row 22: I18N_LOCK toggle. Super-only
+    # because the lock gates a destructive admin action (writes /
+    # reverts to the runtime string table during a deploy) and
+    # we want only the same role that can edit strings to flip
+    # the gate.
+    app.router.add_post(
+        "/admin/strings/lock",
+        _require_role(ROLE_SUPER)(strings_lock_toggle_post),
     )
 
     # Stage-9-Step-2: user-field editor + audit-log viewer.

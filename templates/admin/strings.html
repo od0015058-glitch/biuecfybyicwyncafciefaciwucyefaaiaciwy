@@ -85,6 +85,61 @@
     color: var(--accent);
     font-size: 13px;
   }
+  .lock-banner {
+    border-radius: 6px;
+    padding: 12px 14px;
+    margin-bottom: 16px;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .lock-banner.locked {
+    background: rgba(255, 193, 7, 0.12);
+    border: 1px solid rgba(255, 193, 7, 0.35);
+    color: var(--text);
+  }
+  .lock-banner.unlocked {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+  }
+  .lock-banner .badge-source {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 11px;
+    padding: 1px 7px;
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    text-transform: uppercase;
+  }
+  .lock-toggle-form {
+    display: flex;
+    gap: 8px;
+    margin-left: auto;
+  }
+  .lock-toggle-form button {
+    padding: 6px 12px;
+    border-radius: 5px;
+    border: 0;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .lock-toggle-form button.lock-on {
+    background: rgba(255, 193, 7, 0.85);
+    color: #4a3500;
+  }
+  .lock-toggle-form button.lock-off {
+    background: var(--accent);
+    color: #fff;
+  }
+  .lock-toggle-form button.lock-clear {
+    background: transparent;
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+  }
 </style>
 {% endblock %}
 
@@ -98,6 +153,35 @@
 {% if db_error %}
 <div class="alert alert-warn">{{ db_error }}</div>
 {% endif %}
+
+{# Stage-15-Step-E #10b row 22: I18N_LOCK toggle. The lock gates the
+   string-save / string-revert handlers — when on, the per-string
+   editor's save / revert buttons return a flash error rather than
+   landing the change. Useful during a deploy or PO-roundtrip when
+   you don't want a translator to land a half-finished edit. #}
+<div class="lock-banner {{ 'locked' if is_locked else 'unlocked' }}">
+  <strong>{% if is_locked %}🔒 Bot text edits are LOCKED{% else %}🔓 Bot text edits are unlocked{% endif %}</strong>
+  <span class="badge-source">source: {{ lock_source }}</span>
+  {% if env_lock_raw %}
+  <span style="font-size: 12px; color: var(--text-muted);">
+    (<code>I18N_LOCK={{ env_lock_raw }}</code> in env)
+  </span>
+  {% endif %}
+  <form method="post" action="/admin/strings/lock" class="lock-toggle-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    {% if is_locked %}
+      <button type="submit" name="action" value="unlock" class="lock-off">Unlock</button>
+    {% else %}
+      <button type="submit" name="action" value="lock" class="lock-on">Lock now</button>
+    {% endif %}
+    {% if lock_override is not none %}
+      <button type="submit" name="action" value="clear" class="lock-clear"
+              title="Drop the DB override and fall back to the env / default.">
+        Clear DB override
+      </button>
+    {% endif %}
+  </form>
+</div>
 
 <div class="explainer">
   Every user-facing label in the bot is editable here. Type a search to filter

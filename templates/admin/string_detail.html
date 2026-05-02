@@ -118,6 +118,14 @@
 <div class="alert alert-warn">{{ db_error }}</div>
 {% endif %}
 
+{% if is_locked %}
+<div class="alert alert-warn">
+  🔒 Bot text edits are currently <strong>locked</strong>. The Save and
+  Revert buttons below will be refused. Disable the lock on
+  <a href="/admin/strings">the strings index</a> to make changes.
+</div>
+{% endif %}
+
 <div class="meta">
   <div>
     Status:
@@ -140,6 +148,18 @@
 
 <div class="panel" style="margin-top: 16px;">
   <h3>Override</h3>
+  {# Stage-15-Step-E #10b row 22 bundled fix: the prior layout nested
+     the revert <form> INSIDE the save <form>, which violates the HTML5
+     form-content model (forms cannot contain other forms). Per the
+     HTML parser spec, the inner <form> start tag is dropped — so the
+     revert button rendered inside the OUTER save form, with no
+     ``formaction`` attribute. Clicking "Revert to default" therefore
+     submitted to the SAVE endpoint with the textarea contents instead
+     of calling /revert. The user saw a green "Saved override" flash
+     and walked away thinking the slug had been reverted, while in
+     fact the override was still in place (just rewritten to the same
+     value). Splitting the two forms into siblings makes each button
+     submit to the action it advertises. #}
   <form method="post" action="/admin/strings/{{ lang }}/{{ key }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label for="value" style="display: block; margin-bottom: 6px; color: var(--text-muted); font-size: 13px;">
@@ -157,18 +177,28 @@
     </div>
 
     <div class="actions">
-      <button class="primary" type="submit">Save override</button>
-      {% if override is not none %}
-      <form class="inline" method="post"
-            action="/admin/strings/{{ lang }}/{{ key }}/revert"
-            onsubmit="return confirm('Revert {{ lang }}:{{ key }} to the compiled default?');">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button type="submit" class="danger">Revert to default</button>
-      </form>
-      {% else %}
-      <button class="danger" disabled title="No override exists yet">Revert to default</button>
-      {% endif %}
+      <button class="primary" type="submit"
+              {% if is_locked %}disabled title="Bot text edits are locked"{% endif %}>
+        Save override
+      </button>
     </div>
   </form>
+
+  {% if override is not none %}
+  <form method="post"
+        action="/admin/strings/{{ lang }}/{{ key }}/revert"
+        onsubmit="return confirm('Revert {{ lang }}:{{ key }} to the compiled default?');"
+        style="margin-top: 12px;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit" class="danger"
+            {% if is_locked %}disabled title="Bot text edits are locked"{% endif %}>
+      Revert to default
+    </button>
+  </form>
+  {% else %}
+  <div class="actions" style="margin-top: 12px;">
+    <button class="danger" disabled title="No override exists yet">Revert to default</button>
+  </div>
+  {% endif %}
 </div>
 {% endblock %}
