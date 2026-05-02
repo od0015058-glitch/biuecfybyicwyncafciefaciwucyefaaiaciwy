@@ -98,6 +98,17 @@ _STRINGS: dict[str, dict[str, str]] = {
         "memory_export_empty": "📭 تاریخچه‌ای برای دریافت وجود ندارد.",
         "memory_export_caption": "📥 تاریخچه گفتگو ({count} پیام)",
         "memory_export_done": "✅ {count} پیام به صورت فایل ارسال شد",
+        # Stage-15-Step-E #1 follow-up #2 — multi-part export
+        # (pagination for very long buffers). Only shown when the
+        # rendered .txt would exceed the per-part byte cap and gets
+        # split into multiple files.
+        "memory_export_caption_part": (
+            "📥 تاریخچه گفتگو — بخش {part_index}/{total_parts} "
+            "({count} پیام)"
+        ),
+        "memory_export_done_multipart": (
+            "✅ {count} پیام در {total_parts} فایل ارسال شد"
+        ),
         # ---- User spending analytics (Stage-15-Step-E #2 — first slice) ----
         "btn_my_stats": "📊 آمار مصرف من",
         # Stage-15-Step-E #2 follow-up — usage-log CSV export.
@@ -592,6 +603,17 @@ _STRINGS: dict[str, dict[str, str]] = {
         "memory_export_empty": "📭 No conversation history to export yet.",
         "memory_export_caption": "📥 Conversation history ({count} messages)",
         "memory_export_done": "✅ Sent {count} messages as a file",
+        # Stage-15-Step-E #1 follow-up #2 — multi-part export
+        # (pagination for very long buffers). Only shown when the
+        # rendered .txt would exceed the per-part byte cap and gets
+        # split into multiple files.
+        "memory_export_caption_part": (
+            "📥 Conversation history — part {part_index}/{total_parts} "
+            "({count} messages)"
+        ),
+        "memory_export_done_multipart": (
+            "✅ Sent {count} messages across {total_parts} files"
+        ),
         # ---- User spending analytics (Stage-15-Step-E #2 — first slice) ----
         "btn_my_stats": "📊 My usage stats",
         # Stage-15-Step-E #2 follow-up — usage-log CSV export.

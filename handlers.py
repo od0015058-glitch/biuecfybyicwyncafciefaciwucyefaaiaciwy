@@ -22,8 +22,8 @@ from admin_toggles import is_gateway_disabled, is_model_disabled
 from ai_engine import chat_with_model
 from amount_input import normalize_amount
 from conversation_export import (
-    export_filename_for,
-    format_history_as_text,
+    export_filename_for_part,
+    format_history_as_text_multipart,
 )
 from database import db
 from usage_csv_export import (
@@ -773,64 +773,114 @@ async def memory_reset_handler(callback: CallbackQuery, state: FSMContext):
     await _render_memory_screen(callback, lang)
 
 
-async def _build_history_export_document(
+def _history_export_caption(
+    lang: str, count: int, part_index: int, total_parts: int
+) -> str:
+    """Build the per-document caption for a history export.
+
+    Single-part exports use the legacy ``memory_export_caption``
+    string ("Conversation history (N messages)") so the user-
+    visible output for the common small-buffer case is unchanged.
+    Multi-part exports use ``memory_export_caption_part`` which
+    additionally shows ``Part N/M`` so the user can immediately
+    see which file in the sequence they're looking at when their
+    downloads list is sorted by name.
+
+    Stage-15-Step-E #1 follow-up #2.
+    """
+    if total_parts > 1:
+        return t(
+            lang,
+            "memory_export_caption_part",
+            count=count,
+            part_index=part_index,
+            total_parts=total_parts,
+        )
+    return t(lang, "memory_export_caption", count=count)
+
+
+async def _build_history_export_documents(
     user_id: int, username: str | None
-) -> tuple[BufferedInputFile, int] | None:
+) -> list[tuple[BufferedInputFile, int]] | None:
     """Pull + render the user's full conversation buffer.
 
-    Returns ``(document, kept_count)`` ready for ``answer_document``,
-    or ``None`` when the buffer is empty (caller decides how to
-    communicate the empty case — toast for the callback path,
-    chat bubble for the slash-command path).
+    Returns a non-empty list of ``(document, kept_count_in_part)``
+    pairs ready for ``answer_document``, or ``None`` when the
+    buffer is empty (caller decides how to communicate the empty
+    case — toast for the callback path, chat bubble for the
+    slash-command path).
 
-    ``kept_count`` is the count that actually landed in the file —
-    ``format_history_as_text`` may have trimmed the oldest
-    messages to stay under ``EXPORT_MAX_BYTES`` (1 MB). The
-    caller surfaces this count in the caption + toast so a heavy
-    user whose buffer just got rewritten doesn't see
-    "Conversation history (1500 messages)" while the .txt
-    actually only contains the most recent ~500.
+    Single-part exports return a one-element list — the legacy
+    common case, byte-for-byte identical to the pre-multipart
+    output (same filename, same header shape, no ``Part:`` line).
+    Long buffers split into up to ``EXPORT_MAX_PARTS`` parts of
+    up to ``EXPORT_PART_MAX_BYTES`` bytes each so a heavy user
+    with months of memory-on history still gets the full archive
+    instead of having the oldest content silently trimmed away.
+
+    The total of every ``kept_count_in_part`` value equals the
+    number of messages that survived any front-trim and made it
+    into the export — callers surface that total (and the part
+    count) in the caption / toast so the user sees what the file
+    actually contains rather than the raw input row count.
 
     Shared between :func:`memory_export_handler` (the wallet-menu
     callback) and :func:`cmd_history` (the slash-command alias)
     so the two surfaces can never drift on filename / encoding /
-    trim semantics. Stage-15-Step-E #1 follow-up.
+    trim semantics. Stage-15-Step-E #1 follow-up #2.
     """
     rows = await db.get_full_conversation(user_id)
     if not rows:
         return None
-    rendered, kept = format_history_as_text(
+    parts = format_history_as_text_multipart(
         rows, user_handle=username
     )
-    document = BufferedInputFile(
-        rendered.encode("utf-8"),
-        filename=export_filename_for(user_id),
-    )
-    return document, kept
+    total_parts = len(parts)
+    documents: list[tuple[BufferedInputFile, int]] = []
+    for part_index, (text, kept_in_part) in enumerate(parts, start=1):
+        documents.append(
+            (
+                BufferedInputFile(
+                    text.encode("utf-8"),
+                    filename=export_filename_for_part(
+                        user_id, part_index, total_parts
+                    ),
+                ),
+                kept_in_part,
+            )
+        )
+    return documents
 
 
 @router.callback_query(F.data == "mem_export")
 async def memory_export_handler(callback: CallbackQuery, state: FSMContext):
-    """Stage-15-Step-E #1 (started, not finished): export the
-    persisted conversation buffer as a ``.txt`` document.
+    """Stage-15-Step-E #1: export the persisted conversation buffer
+    as one or more ``.txt`` documents.
 
     Pulls the full history (with timestamps) from the DB, renders
-    it via :func:`conversation_export.format_history_as_text`, and
-    sends it back as a Telegram document. The original memory
-    screen is left in place so the user can hit "Back" or export
-    again. Empty-buffer case is communicated via toast — the
-    button stays visible so it's discoverable, but tapping it
-    when there's nothing to export yields a clear "no history"
-    message rather than an empty file.
+    it via :func:`conversation_export.format_history_as_text_multipart`,
+    and sends each part back as a Telegram document in order
+    (oldest first). The original memory screen is left in place so
+    the user can hit "Back" or export again. Empty-buffer case is
+    communicated via toast — the button stays visible so it's
+    discoverable, but tapping it when there's nothing to export
+    yields a clear "no history" message rather than an empty file.
+
+    Multi-part output (Stage-15-Step-E #1 follow-up #2): a buffer
+    that exceeds ``EXPORT_PART_MAX_BYTES`` is split into up to
+    ``EXPORT_MAX_PARTS`` parts. Each part is shipped as its own
+    document with a per-part caption (``Part N/M``) so the user
+    can immediately see which file they're looking at. The final
+    callback toast summarises the totals ("Sent N messages in M
+    files").
 
     Future work tracked in ``conversation_export.py``'s module
-    docstring: ``.pdf`` export, paginated multi-file export for
-    very long buffers (the ``/history`` command alias is shipped
-    in :func:`cmd_history`).
+    docstring: ``.pdf`` export. The ``/history`` command alias is
+    shipped in :func:`cmd_history`.
     """
     await state.clear()
     lang = await _get_user_language(callback.from_user.id)
-    result = await _build_history_export_document(
+    result = await _build_history_export_documents(
         callback.from_user.id, callback.from_user.username
     )
     if result is None:
@@ -838,15 +888,31 @@ async def memory_export_handler(callback: CallbackQuery, state: FSMContext):
             t(lang, "memory_export_empty"), show_alert=True
         )
         return
-    document, kept = result
+    total_parts = len(result)
+    total_kept = sum(kept for _, kept in result)
     # ``answer_document`` lives on Message, not on CallbackQuery —
     # send it via the bot itself so we can target the chat
     # without disturbing the memory-screen message above it.
-    await callback.message.answer_document(
-        document,
-        caption=t(lang, "memory_export_caption", count=kept),
-    )
-    await callback.answer(t(lang, "memory_export_done", count=kept))
+    for part_index, (document, kept) in enumerate(result, start=1):
+        await callback.message.answer_document(
+            document,
+            caption=_history_export_caption(
+                lang, kept, part_index, total_parts
+            ),
+        )
+    if total_parts > 1:
+        await callback.answer(
+            t(
+                lang,
+                "memory_export_done_multipart",
+                count=total_kept,
+                total_parts=total_parts,
+            )
+        )
+    else:
+        await callback.answer(
+            t(lang, "memory_export_done", count=total_kept)
+        )
 
 
 @router.message(Command("history"))
@@ -890,17 +956,20 @@ async def cmd_history(message: Message, state: FSMContext):
         )
         await message.answer(t(lang, "ai_local_rate_limited"))
         return
-    result = await _build_history_export_document(
+    result = await _build_history_export_documents(
         user_id, message.from_user.username
     )
     if result is None:
         await message.answer(t(lang, "memory_export_empty"))
         return
-    document, kept = result
-    await message.answer_document(
-        document,
-        caption=t(lang, "memory_export_caption", count=kept),
-    )
+    total_parts = len(result)
+    for part_index, (document, kept) in enumerate(result, start=1):
+        await message.answer_document(
+            document,
+            caption=_history_export_caption(
+                lang, kept, part_index, total_parts
+            ),
+        )
 
 
 @router.callback_query(F.data.startswith("set_lang_"))

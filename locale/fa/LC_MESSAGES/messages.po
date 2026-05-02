@@ -467,9 +467,17 @@ msgstr "🌍 زبان مورد نظر خود را انتخاب کنید:"
 msgid "memory_export_caption"
 msgstr "📥 تاریخچه گفتگو ({count} پیام)"
 
+#: strings.py:memory_export_caption_part
+msgid "memory_export_caption_part"
+msgstr "📥 تاریخچه گفتگو — بخش {part_index}/{total_parts} ({count} پیام)"
+
 #: strings.py:memory_export_done
 msgid "memory_export_done"
 msgstr "✅ {count} پیام به صورت فایل ارسال شد"
+
+#: strings.py:memory_export_done_multipart
+msgid "memory_export_done_multipart"
+msgstr "✅ {count} پیام در {total_parts} فایل ارسال شد"
 
 #: strings.py:memory_export_empty
 msgid "memory_export_empty"
