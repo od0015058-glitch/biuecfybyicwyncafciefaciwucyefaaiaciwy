@@ -1,0 +1,164 @@
+{% extends "_layout.html" %}
+
+{% block title %}Memory config{% endblock %}
+
+{% block main %}
+<h2 style="margin: 0 0 0.5em 0;">Memory config</h2>
+
+<p style="color: var(--text-muted); margin: 0 0 1em 0; font-size: 0.9em;">
+  Conversation memory caps. The context limit controls how many recent
+  messages are fed back as context on each turn. The content cap
+  truncates individual messages before they are persisted. Changes
+  take effect on the next request — no redeploy required.
+</p>
+
+{% if db_error %}
+<div class="alert alert-warn">{{ db_error }}</div>
+{% endif %}
+
+{% if flash %}
+<div class="alert alert-{{ flash.kind }}">{{ flash.message }}</div>
+{% endif %}
+
+{# ---- MEMORY_CONTEXT_LIMIT ---- #}
+<div class="panel">
+  <h3>Context limit (messages per turn)</h3>
+  <p style="margin: 0 0 0.75em 0;">
+    Effective:
+    <strong>{{ context_limit_view.effective }}</strong> messages
+    &nbsp;<span class="badge badge-{{ context_limit_view.source }}">source: {{ context_limit_view.source }}</span>
+  </p>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-muted); font-size: 0.9em;">
+      Edit context limit (operator+)
+    </summary>
+    <table style="margin: 0.75em 0; font-size: 0.9em; max-width: 36em;">
+      <tbody>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;">DB override</td>
+          <td>
+            {% if context_limit_view.override_value is not none %}
+              <strong>{{ context_limit_view.override_value }}</strong>
+            {% else %}
+              <span style="color: var(--text-muted);">(none — fall through to env / default)</span>
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;">Env (<code>MEMORY_CONTEXT_LIMIT</code>)</td>
+          <td>
+            {% if context_limit_view.env_value is not none %}
+              {{ context_limit_view.env_value }}
+            {% elif context_limit_view.env_raw %}
+              <span style="color: var(--text-warn);">{{ context_limit_view.env_raw }} (rejected — see logs)</span>
+            {% else %}
+              <span style="color: var(--text-muted);">(unset)</span>
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;">Compile-time default</td>
+          <td>{{ context_limit_view.default_value }}</td>
+        </tr>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;"><strong>Effective</strong></td>
+          <td><strong>{{ context_limit_view.effective }}</strong> (source: {{ context_limit_view.source }})</td>
+        </tr>
+      </tbody>
+    </table>
+    <form method="post"
+          action="/admin/memory-config/context-limit"
+          style="display: flex; gap: 0.75em; align-items: baseline; flex-wrap: wrap;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>
+        Messages
+        <input type="number"
+               name="memory_context_limit"
+               step="1"
+               min="{{ context_limit_view.minimum }}"
+               max="{{ context_limit_view.maximum }}"
+               value="{% if context_limit_view.override_value is not none %}{{ context_limit_view.override_value }}{% endif %}"
+               placeholder="leave blank to clear"
+               style="width: 10em;">
+      </label>
+      <button type="submit">Save</button>
+      <span style="color: var(--text-muted); font-size: 0.85em;">
+        Range: {{ context_limit_view.minimum }}–{{ context_limit_view.maximum }}.
+        Blank clears the override.
+      </span>
+    </form>
+  </details>
+</div>
+
+{# ---- MEMORY_CONTENT_MAX_CHARS ---- #}
+<div class="panel" style="margin-top: 1em;">
+  <h3>Content cap (chars per message)</h3>
+  <p style="margin: 0 0 0.75em 0;">
+    Effective:
+    <strong>{{ "{:,}".format(content_max_view.effective) }}</strong> chars
+    &nbsp;<span class="badge badge-{{ content_max_view.source }}">source: {{ content_max_view.source }}</span>
+  </p>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-muted); font-size: 0.9em;">
+      Edit content cap (operator+)
+    </summary>
+    <table style="margin: 0.75em 0; font-size: 0.9em; max-width: 36em;">
+      <tbody>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;">DB override</td>
+          <td>
+            {% if content_max_view.override_value is not none %}
+              <strong>{{ "{:,}".format(content_max_view.override_value) }}</strong>
+            {% else %}
+              <span style="color: var(--text-muted);">(none — fall through to env / default)</span>
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;">Env (<code>MEMORY_CONTENT_MAX_CHARS</code>)</td>
+          <td>
+            {% if content_max_view.env_value is not none %}
+              {{ "{:,}".format(content_max_view.env_value) }}
+            {% elif content_max_view.env_raw %}
+              <span style="color: var(--text-warn);">{{ content_max_view.env_raw }} (rejected — see logs)</span>
+            {% else %}
+              <span style="color: var(--text-muted);">(unset)</span>
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;">Compile-time default</td>
+          <td>{{ "{:,}".format(content_max_view.default_value) }}</td>
+        </tr>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;"><strong>Effective</strong></td>
+          <td><strong>{{ "{:,}".format(content_max_view.effective) }}</strong> (source: {{ content_max_view.source }})</td>
+        </tr>
+      </tbody>
+    </table>
+    <form method="post"
+          action="/admin/memory-config/content-max"
+          style="display: flex; gap: 0.75em; align-items: baseline; flex-wrap: wrap;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>
+        Max chars
+        <input type="number"
+               name="memory_content_max_chars"
+               step="100"
+               min="{{ content_max_view.minimum }}"
+               max="{{ content_max_view.maximum }}"
+               value="{% if content_max_view.override_value is not none %}{{ content_max_view.override_value }}{% endif %}"
+               placeholder="leave blank to clear"
+               style="width: 12em;">
+      </label>
+      <button type="submit">Save</button>
+      <span style="color: var(--text-muted); font-size: 0.85em;">
+        Range: {{ "{:,}".format(content_max_view.minimum) }}–{{ "{:,}".format(content_max_view.maximum) }}.
+        Blank clears the override.
+      </span>
+    </form>
+  </details>
+</div>
+{% endblock %}

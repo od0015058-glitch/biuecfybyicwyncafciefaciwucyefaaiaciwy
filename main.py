@@ -519,6 +519,59 @@ async def main():
             "from DB — falling through to env / cadence / default"
         )
 
+    # Stage-15-Step-E #10b row 8: warm the memory-config override
+    # caches so the very first ``append_conversation_message`` and
+    # ``get_recent_messages`` after boot see the operator's configured
+    # caps rather than the env / compile-time defaults. Both knobs
+    # affect every single memory-enabled chat turn, so a one-turn
+    # window where the wrong cap applies is visible to the user.
+    try:
+        import memory_config
+        loaded_ctx = await (
+            memory_config.refresh_memory_context_limit_override_from_db(db)
+        )
+        loaded_chars = await (
+            memory_config
+            .refresh_memory_content_max_chars_override_from_db(db)
+        )
+        log.info(
+            "loaded memory-config overrides from system_settings: "
+            "context_limit=%s (source=%s, effective=%d), "
+            "content_max_chars=%s (source=%s, effective=%d)",
+            loaded_ctx,
+            memory_config.get_memory_context_limit_source(),
+            memory_config.get_memory_context_limit(),
+            loaded_chars,
+            memory_config.get_memory_content_max_chars_source(),
+            memory_config.get_memory_content_max_chars(),
+        )
+    except Exception:
+        log.exception(
+            "failed to load memory-config overrides from DB — "
+            "falling through to env / compile-time defaults"
+        )
+
+    # Stage-15-Step-E #10b row 20: warm the audit retention days
+    # override so the first reaper tick uses the operator's saved
+    # retention window.
+    try:
+        import audit_retention
+        loaded_retention = await (
+            audit_retention.refresh_audit_retention_days_override_from_db(db)
+        )
+        log.info(
+            "loaded AUDIT_RETENTION_DAYS override from "
+            "system_settings: %s (source=%s, effective=%dd)",
+            loaded_retention,
+            audit_retention.get_audit_retention_days_source(),
+            audit_retention.get_audit_retention_days(),
+        )
+    except Exception:
+        log.exception(
+            "failed to load AUDIT_RETENTION_DAYS override from DB "
+            "— falling through to env / compile-time default"
+        )
+
     # Stage-15-Step-E #10b row 23: warm the model-discovery interval
     # override so the first discovery tick uses the operator's saved
     # cadence rather than the env / compile-time default.
@@ -622,6 +675,16 @@ async def main():
     # an hour anchor; the loop never crashes on a single tick error.
     # See bot_health_alert.py for the full contract.
     bot_health_alert_task = start_bot_health_alert_task(bot)
+
+    # Stage-15-Step-E #10b row 20: background audit-log retention reaper.
+    # Wakes every AUDIT_RETENTION_INTERVAL_HOURS (default 24) and
+    # batch-deletes admin_audit_log rows older than the resolved
+    # AUDIT_RETENTION_DAYS window. See audit_retention.py.
+    import audit_retention as _ar
+    audit_retention_task = asyncio.create_task(
+        _ar.audit_retention_loop(db),
+        name="audit-retention",
+    )
 
     # Background refresher for NowPayments per-currency min-amounts.
     # Keeps the in-memory cache warm so the checkout pre-flight check
@@ -740,6 +803,13 @@ async def main():
             pass
         except Exception:
             log.exception("bot-health-alert loop exited with error")
+        audit_retention_task.cancel()
+        try:
+            await audit_retention_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("audit-retention reaper exited with error")
         await runner.cleanup()
         await db.close()
         await bot.session.close()

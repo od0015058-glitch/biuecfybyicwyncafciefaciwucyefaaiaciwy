@@ -460,8 +460,10 @@ class Database:
                 content.count("\x00"), role, telegram_id,
             )
             content = stripped
-        if len(content) > self.MEMORY_CONTENT_MAX_CHARS:
-            content = content[: self.MEMORY_CONTENT_MAX_CHARS]
+        from memory_config import get_memory_content_max_chars
+        cap_chars = get_memory_content_max_chars()
+        if len(content) > cap_chars:
+            content = content[:cap_chars]
         # Empty image lists are normalised to NULL so the JSONB
         # column stays consistent with text-only turns. Defensive
         # type-check shields against a buggy caller that bypassed
@@ -521,7 +523,8 @@ class Database:
         assistant never produces images today; if a future model
         does, the read path already round-trips the column).
         """
-        cap = limit if limit is not None else self.MEMORY_CONTEXT_LIMIT
+        from memory_config import get_memory_context_limit
+        cap = limit if limit is not None else get_memory_context_limit()
         # Pull newest-first from the index-friendly side, then reverse
         # client-side so the oldest message comes first in the array.
         query = """
@@ -590,23 +593,36 @@ class Database:
         history that *was* recorded before the toggle was flipped
         off is a legitimate use case — the user owns the data
         even after they disable the feature).
+
+        Stage-15-Step-E #10b row 8 bundled fix: include
+        ``image_data_uris`` so vision turns are surfaced in the
+        export with a ``[image]`` marker.  Previously the column
+        was omitted — a user who exported after a vision turn got
+        just the text caption with no indication that an image was
+        part of that exchange.
         """
         query = """
-            SELECT role, content, created_at
+            SELECT role, content, created_at, image_data_uris
               FROM conversation_messages
              WHERE telegram_id = $1
              ORDER BY created_at ASC, id ASC
         """
         async with self.pool.acquire() as connection:
             rows = await connection.fetch(query, telegram_id)
-        return [
-            {
+        result: list[dict] = []
+        for r in rows:
+            entry: dict = {
                 "role": r["role"],
                 "content": r["content"],
                 "created_at": r["created_at"],
             }
-            for r in rows
-        ]
+            has_images = bool(
+                _decode_jsonb_str_list(r["image_data_uris"])
+            )
+            if has_images:
+                entry["has_images"] = True
+            result.append(entry)
+        return result
 
     async def set_active_model(self, telegram_id: int, model_id: str) -> bool:
         """Updates the user's active OpenRouter model id.
@@ -4881,7 +4897,14 @@ class Database:
         actor: str | None = None,
     ) -> list[dict]:
         """Most recent audit rows, newest first. Optional filters
-        narrow by action slug or actor."""
+        narrow by action slug or actor.
+
+        §10b row 20 bundled fix: cap ``limit`` to 10 000 so a future
+        caller can't pull every audit row and OOM the web worker.
+        ``list_markup_history`` already caps to 1 000 — this sibling
+        was missing the same guard.
+        """
+        limit = min(max(1, int(limit)), 10_000)
         clauses: list[str] = []
         params: list[object] = []
         if action:

@@ -63,6 +63,64 @@
 {% block main %}
 <h2>Audit log</h2>
 
+{% if flash %}
+<div class="alert alert-{{ flash.kind or 'info' }}" style="margin-bottom: 16px;">
+  {{ flash.message }}
+</div>
+{% endif %}
+
+{# ── Retention policy editor ─────────────────────────────────── #}
+{% if retention_view %}
+<details class="panel" style="margin-bottom: 16px; padding: 12px 14px;">
+  <summary style="cursor: pointer; font-weight: 600; font-size: 14px;">
+    🗑️ Retention policy
+    <span class="pill-action" style="margin-left: 8px;">
+      {{ retention_view.effective }} days
+      <span style="font-size: 10px; opacity: .7;">({{ retention_view.source }})</span>
+    </span>
+  </summary>
+  <div style="margin-top: 12px;">
+    <table style="width: auto; font-size: 13px; margin-bottom: 12px;">
+      <tr>
+        <td style="padding-right: 16px; color: var(--text-muted);">DB override</td>
+        <td>{% if retention_view.override_value is not none %}{{ retention_view.override_value }} days{% else %}—{% endif %}</td>
+      </tr>
+      <tr>
+        <td style="padding-right: 16px; color: var(--text-muted);">Env <code class="mono">AUDIT_RETENTION_DAYS</code></td>
+        <td>{% if retention_view.env_value is not none %}{{ retention_view.env_value }} days{% elif retention_view.env_raw %}{{ retention_view.env_raw }} <em>(invalid)</em>{% else %}—{% endif %}</td>
+      </tr>
+      <tr>
+        <td style="padding-right: 16px; color: var(--text-muted);">Default</td>
+        <td>{{ retention_view.default_value }} days</td>
+      </tr>
+      <tr>
+        <td style="padding-right: 16px; color: var(--text-muted);">Effective</td>
+        <td><strong>{{ retention_view.effective }} days</strong></td>
+      </tr>
+      <tr>
+        <td style="padding-right: 16px; color: var(--text-muted);">Reaper ticks</td>
+        <td>{{ retention_view.reaper_counters.ticks }} ({{ retention_view.reaper_counters.total_deleted }} rows deleted)</td>
+      </tr>
+    </table>
+    <form method="post" action="/admin/audit/retention" style="display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="field" style="margin-bottom: 0;">
+        <label for="audit_retention_days">Retention (days)</label>
+        <input type="number" id="audit_retention_days" name="audit_retention_days"
+               min="{{ retention_view.minimum }}" max="{{ retention_view.maximum }}"
+               value="{% if retention_view.override_value is not none %}{{ retention_view.override_value }}{% endif %}"
+               placeholder="{{ retention_view.effective }}"
+               style="width: 120px;">
+      </div>
+      <button type="submit" class="primary" style="padding: 9px 18px;">Save</button>
+      <span style="font-size: 12px; color: var(--text-muted);">
+        Range: {{ retention_view.minimum }}–{{ retention_view.maximum }}. Leave blank and save to clear the DB override.
+      </span>
+    </form>
+  </div>
+</details>
+{% endif %}
+
 <div class="explainer panel" style="margin-bottom: 16px; padding: 12px 14px; font-size: 13px; color: var(--text-muted);">
   Newest 200 admin actions, recorded by <code class="mono">record_admin_audit</code>.
   Web actor is recorded as <code class="mono">"web"</code>; per-admin
