@@ -917,6 +917,69 @@ async def test_vision_empty_list_treated_as_no_images(stub_db):
 
 
 # ---------------------------------------------------------------------
+# Stage-15-Step-E #10 follow-up #2: image-URI persistence
+# ---------------------------------------------------------------------
+# The append for the user role on a vision turn must include the
+# image data URIs as a keyword argument so they round-trip through
+# JSONB and the next memory replay reconstructs the multimodal shape.
+# Pre-fix the call dropped the URIs and the next turn's replay
+# silently went text-only — the model lost the visual thread even
+# though the conversational thread was preserved.
+# ---------------------------------------------------------------------
+
+
+async def test_memory_persist_includes_image_data_uris_for_vision_turn(stub_db):
+    """A memory-enabled vision turn must persist the image URIs
+    alongside the prompt text — keyword arg, not positional."""
+    stub_db.get_user.return_value = {
+        "free_messages_left": 0,
+        "balance_usd": 10.0,
+        "active_model": "openai/gpt-4o",  # vision-capable
+        "language_code": "en",
+        "memory_enabled": True,
+    }
+
+    with _patched_session(_StubResponse()):
+        reply = await ai_engine.chat_with_model(
+            42, "what is this?", image_data_uris=[_TINY_DATA_URI],
+        )
+
+    assert reply == "hello back"
+    # Two appends: user-row first (with image URIs), assistant second.
+    assert stub_db.append_conversation_message.await_count == 2
+    user_call = stub_db.append_conversation_message.await_args_list[0]
+    assert user_call.args[:3] == (42, "user", "what is this?")
+    assert user_call.kwargs == {"image_data_uris": [_TINY_DATA_URI]}
+    # Assistant turn: no image URIs (assistant doesn't emit images).
+    assistant_call = stub_db.append_conversation_message.await_args_list[1]
+    assert assistant_call.args[:3] == (42, "assistant", "hello back")
+    assert "image_data_uris" not in assistant_call.kwargs
+
+
+async def test_memory_persist_text_only_turn_no_image_kwarg(stub_db):
+    """A text-only turn must NOT pass the ``image_data_uris``
+    keyword (or pass it as None) — preserves the legacy INSERT
+    shape and keeps a clean signature for the persistence audit
+    log diff."""
+    stub_db.get_user.return_value = {
+        "free_messages_left": 0,
+        "balance_usd": 10.0,
+        "active_model": "test/m1",
+        "language_code": "en",
+        "memory_enabled": True,
+    }
+
+    with _patched_session(_StubResponse()):
+        await ai_engine.chat_with_model(42, "hi")  # no images
+
+    assert stub_db.append_conversation_message.await_count == 2
+    for call in stub_db.append_conversation_message.await_args_list:
+        # Either omitted entirely OR explicitly None — both are
+        # acceptable; the storage layer normalises None → NULL.
+        assert call.kwargs.get("image_data_uris") in (None,)
+
+
+# ---------------------------------------------------------------------
 # Stage-15-Step-E #10 (this PR) bundled fix: NUL-byte sanitisation
 # at the database layer (root cause of the previous-PR symptom).
 # ---------------------------------------------------------------------

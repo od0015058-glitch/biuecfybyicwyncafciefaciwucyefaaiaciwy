@@ -443,9 +443,22 @@ async def chat_with_model(
                 # context naturally because the *current* prompt
                 # they just paid for is the one that matters most.
                 if memory_enabled:
+                    # Stage-15-Step-E #10 follow-up #2: persist the
+                    # image refs alongside the prompt text for vision
+                    # turns. Pre-follow-up, the image was silently
+                    # dropped from the persisted row, so the next
+                    # memory replay surfaced as a text-only turn —
+                    # the model kept the conversational thread but
+                    # lost the visual context that drove the question.
+                    # Empty / None ``image_data_uris`` keeps the
+                    # text-only INSERT shape unchanged.
+                    persisted_uris = (
+                        list(image_data_uris) if image_data_uris else None
+                    )
                     try:
                         await db.append_conversation_message(
                             telegram_id, "user", user_prompt,
+                            image_data_uris=persisted_uris,
                         )
                         await db.append_conversation_message(
                             telegram_id, "assistant", reply_text,
