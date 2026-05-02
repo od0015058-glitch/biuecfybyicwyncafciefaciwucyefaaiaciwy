@@ -5858,12 +5858,34 @@ class Database:
         ``value`` is coerced to ``str`` to match the column type.
         Bumps ``last_updated`` on every write so an operator can see
         when the override was last touched.
+
+        Stage-15-Step-E #10b row 2 bundled bug fix: strip ``\\x00``
+        (NUL) bytes from both the key and the value before the
+        write. Postgres' UTF-8 codec rejects ``\\x00`` with
+        ``invalid byte sequence for encoding "UTF8": 0x00`` —
+        which would crash the upsert and bubble back as a 500 on
+        whichever admin form initiated the write. Every other
+        free-form admin write path (``upsert_string_override``,
+        ``set_admin_role`` notes) already strips NUL; the generic
+        ``system_settings`` overlay was the lone holdout. With
+        the COST_MARKUP editor landing in this PR, a fat-finger
+        paste from a corrupted clipboard becomes a real reach-able
+        path. Strip silently rather than ``ValueError``-ing —
+        operators don't know what NUL is and a flash banner
+        doesn't help; the column is already validated for length
+        and the validators that wrap this method (``set_markup_override``,
+        ``bot_health.set_threshold_override``) reject anything
+        non-numeric so NUL stripping cannot widen acceptance.
         """
         if not isinstance(setting_key, str) or not setting_key:
             raise ValueError("setting_key must be a non-empty string")
-        if len(setting_key) > 50:
+        sanitized_key = setting_key.replace("\x00", "")
+        if not sanitized_key:
+            raise ValueError("setting_key was empty after NUL strip")
+        if len(sanitized_key) > 50:
             raise ValueError("setting_key exceeds the 50-char column limit")
         coerced = "" if value is None else str(value)
+        coerced = coerced.replace("\x00", "")
         if len(coerced) > 255:
             raise ValueError(
                 "setting value exceeds the 255-char column limit"
@@ -5874,7 +5896,7 @@ class Database:
             "ON CONFLICT (setting_key) DO UPDATE "
             "SET setting_value = EXCLUDED.setting_value, "
             "    last_updated = CURRENT_TIMESTAMP",
-            setting_key, coerced,
+            sanitized_key, coerced,
         )
 
     async def delete_setting(self, setting_key: str) -> bool:

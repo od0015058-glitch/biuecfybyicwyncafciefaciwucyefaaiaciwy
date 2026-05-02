@@ -1018,12 +1018,24 @@ async def monetization(request: web.Request) -> web.StreamResponse:
     # the active state.
     window_days = _parse_monetization_window(request.query.get("window"))
 
+    # Stage-15-Step-E #10b row 2: refresh the in-process markup
+    # override cache from ``system_settings`` so a tweak made on a
+    # different replica is reflected on this page. Best-effort —
+    # a transient DB blip leaves the previous cache in place
+    # rather than silently reverting to env / default.
+    import pricing
+    try:
+        await pricing.refresh_markup_override_from_db(db)
+    except Exception:
+        log.exception(
+            "monetization: refresh_markup_override_from_db failed"
+        )
+
     # Read the markup once for the empty-fallback path so the page
     # still shows the operator their current pricing config even
     # when the DB is out. Cheap and stable.
     try:
-        from pricing import get_markup
-        markup_for_fallback = float(get_markup())
+        markup_for_fallback = float(pricing.get_markup())
     except Exception:
         log.exception("monetization: get_markup failed")
         markup_for_fallback = 1.0
@@ -1049,17 +1061,53 @@ async def monetization(request: web.Request) -> web.StreamResponse:
             )
             db_error = "Database query failed — see logs."
 
-    return aiohttp_jinja2.render_template(
-        "monetization.html",
-        request,
-        {
-            "summary": summary,
-            "db_error": db_error,
-            "active_page": "monetization",
-            "window_options": _MONETIZATION_WINDOW_OPTIONS,
-            "active_window": window_days,
-        },
+    markup_view = _build_markup_view()
+    ctx = {
+        "summary": summary,
+        "db_error": db_error,
+        "active_page": "monetization",
+        "window_options": _MONETIZATION_WINDOW_OPTIONS,
+        "active_window": window_days,
+        "markup_view": markup_view,
+        "csrf_token": csrf_token_for(request),
+        "flash": None,
+    }
+    response = aiohttp_jinja2.render_template(
+        "monetization.html", request, ctx,
     )
+    flash = pop_flash(request, response)
+    if flash is not None:
+        ctx["flash"] = flash
+        response = aiohttp_jinja2.render_template(
+            "monetization.html", request, ctx,
+        )
+    return response
+
+
+def _build_markup_view() -> dict:
+    """Snapshot of the resolved markup + per-source values for the panel.
+
+    Mirrors :func:`_build_thresholds_view` on the ``/admin/control``
+    page so an operator gets the same "effective / db / env / default"
+    breakdown they're already used to.
+    """
+    import pricing
+
+    override_value = pricing.get_markup_override()
+    env_raw = os.getenv("COST_MARKUP", "").strip()
+    env_value: float | None = None
+    if env_raw:
+        env_value = pricing._coerce_markup(env_raw)
+    return {
+        "effective": float(pricing.get_markup()),
+        "source": pricing.get_markup_source(),
+        "default_value": float(pricing.DEFAULT_MARKUP),
+        "env_value": env_value,
+        "env_raw": env_raw,
+        "override_value": override_value,
+        "minimum": float(pricing.MARKUP_MINIMUM),
+        "maximum_exclusive": float(pricing.MARKUP_OVERRIDE_MAXIMUM),
+    }
 
 
 # Stage-15-Step-E #9 follow-up #2: CSV export.
@@ -1363,6 +1411,231 @@ async def monetization_csv_get(request: web.Request) -> web.StreamResponse:
     return response
 
 
+def _monetization_csrf_guard(
+    request: web.Request, form,
+) -> web.StreamResponse | None:
+    """CSRF guard mirroring :func:`_control_csrf_guard`, redirecting to
+    ``/admin/monetization`` on failure rather than the control page."""
+    if verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        return None
+    log.warning(
+        "monetization: CSRF token mismatch from %s (path=%s)",
+        request.remote, request.path,
+    )
+    response = web.HTTPFound(location="/admin/monetization")
+    set_flash(
+        response, kind="error",
+        message="Form submission was rejected (CSRF). Refresh and try again.",
+        secret=request.app.get(APP_KEY_SESSION_SECRET, ""),
+        cookie_secure=request.app.get(APP_KEY_COOKIE_SECURE, True),
+    )
+    return response
+
+
+async def monetization_markup_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/monetization/markup`` — update the COST_MARKUP override.
+
+    Stage-15-Step-E #10b row 2. Operators were forced to redeploy the
+    bot to re-tune ``COST_MARKUP`` because it was env-only. This
+    handler writes the override to the ``system_settings`` overlay
+    (DB-backed), refreshes the in-process cache so the next call
+    to :func:`pricing.get_markup` sees the new value without a
+    restart, and audit-logs a row whose ``meta`` carries the diff.
+
+    Form keys:
+
+    * ``markup`` — the new effective value, or empty / blank to
+      clear the override (fall through to env / default).
+
+    Validation order:
+
+    1. CSRF.
+    2. Numeric parse.
+    3. ``MARKUP_MINIMUM <= value < MARKUP_OVERRIDE_MAXIMUM``.
+    4. ``set_markup_override`` defence-in-depth (re-runs the same
+       checks; any drift between the two is loud).
+    5. Persist via ``upsert_setting`` (NUL-stripped at the DB layer).
+    6. Audit row.
+    7. Redirect with a flash banner.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app.get(APP_KEY_DB)
+    form = await request.post()
+
+    guard = _monetization_csrf_guard(request, form)
+    if guard is not None:
+        return guard
+
+    if db is None:
+        response = web.HTTPFound(location="/admin/monetization")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Database is not configured — markup edits "
+                "require a live DB connection."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    import pricing
+
+    raw_value = str(form.get("markup", "")).strip()
+    previous_effective = float(pricing.get_markup())
+    previous_source = pricing.get_markup_source()
+
+    if not raw_value:
+        # Empty field == clear override and fall through to env / default.
+        try:
+            await db.delete_setting(pricing.MARKUP_SETTING_KEY)
+        except Exception:
+            log.exception(
+                "monetization_markup_post: delete_setting failed"
+            )
+            response = web.HTTPFound(location="/admin/monetization")
+            set_flash(
+                response, kind="error",
+                message=(
+                    "Failed to clear the override — see logs. "
+                    "The previous value is still in effect."
+                ),
+                secret=secret, cookie_secure=cookie_secure,
+            )
+            return response
+        pricing.clear_markup_override()
+        try:
+            await pricing.refresh_markup_override_from_db(db)
+        except Exception:
+            log.exception(
+                "monetization_markup_post: refresh after clear failed"
+            )
+        new_effective = float(pricing.get_markup())
+        await _record_audit_safe(
+            request, "monetization_markup_update",
+            target="cost_markup",
+            meta={
+                "action": "clear",
+                "before": previous_effective,
+                "before_source": previous_source,
+                "after": new_effective,
+                "after_source": pricing.get_markup_source(),
+            },
+        )
+        response = web.HTTPFound(location="/admin/monetization")
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Markup override cleared. Effective markup is now "
+                f"{new_effective:.4f}× "
+                f"(source: {pricing.get_markup_source()})."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    parsed = pricing._coerce_markup(raw_value)
+    if parsed is None:
+        response = web.HTTPFound(location="/admin/monetization")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Markup must be a finite number ≥ {pricing.MARKUP_MINIMUM:.2f}. "
+                f"Got: {raw_value!r}. No changes were made."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+    if parsed >= pricing.MARKUP_OVERRIDE_MAXIMUM:
+        response = web.HTTPFound(location="/admin/monetization")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Markup {parsed:.4f}× is at or above the override "
+                f"maximum {pricing.MARKUP_OVERRIDE_MAXIMUM:.0f}× "
+                "(guard against fat-fingered '150' for '1.50'). "
+                "No changes were made."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    # Persist + apply.
+    try:
+        await db.upsert_setting(pricing.MARKUP_SETTING_KEY, str(parsed))
+    except Exception:
+        log.exception(
+            "monetization_markup_post: upsert_setting failed value=%r",
+            parsed,
+        )
+        response = web.HTTPFound(location="/admin/monetization")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Failed to persist the new markup — see logs. "
+                "The previous value is still in effect."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        pricing.set_markup_override(parsed)
+    except ValueError:
+        log.exception(
+            "monetization_markup_post: set_markup_override rejected %r "
+            "after upsert succeeded — refreshing from DB",
+            parsed,
+        )
+
+    # Re-read whatever ended up in the DB so the cache reflects the
+    # truth (in case e.g. the upsert wrote a sanitised value that
+    # differs from what set_markup_override accepted).
+    try:
+        await pricing.refresh_markup_override_from_db(db)
+    except Exception:
+        log.exception(
+            "monetization_markup_post: refresh after upsert failed"
+        )
+
+    new_effective = float(pricing.get_markup())
+    await _record_audit_safe(
+        request, "monetization_markup_update",
+        target="cost_markup",
+        meta={
+            "action": "set",
+            "before": previous_effective,
+            "before_source": previous_source,
+            "after": new_effective,
+            "after_source": pricing.get_markup_source(),
+        },
+    )
+    response = web.HTTPFound(location="/admin/monetization")
+    if abs(new_effective - previous_effective) < 1e-9:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Markup unchanged ({new_effective:.4f}×). "
+                "The override is now persisted in the DB."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    else:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Markup updated: {previous_effective:.4f}× → "
+                f"{new_effective:.4f}×. The new value is live for "
+                f"every component (billing, model picker, "
+                f"monetization page)."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    return response
+
+
 # ---------------------------------------------------------------------
 # Admin audit helper (Stage-9-Step-2)
 # ---------------------------------------------------------------------
@@ -1455,6 +1728,15 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     # do" without scrolling the full feed.
     "view_as_change": "Role-preview toggled",
     "view_as_deny": "Role-preview gate denied",
+    # Stage-15-Step-F follow-up #4: bot-health threshold editor.
+    "control_threshold_update": "Bot-health threshold updated",
+    # Stage-15-Step-E #10b row 2: COST_MARKUP editor on
+    # ``/admin/monetization``. Recorded by
+    # :func:`monetization_markup_post`; the dropdown entry lets an
+    # operator filter the audit feed to "markup changes only"
+    # while answering "did revenue jump because we changed pricing
+    # on Tuesday or because traffic spiked".
+    "monetization_markup_update": "Markup multiplier updated",
 }
 
 
@@ -7623,6 +7905,15 @@ def setup_admin_routes(
     app.router.add_get(
         "/admin/monetization/export.csv",
         _require_auth(monetization_csv_get),
+    )
+    # Stage-15-Step-E #10b row 2: COST_MARKUP editor. Operator floor
+    # because changing the markup directly changes how much every
+    # paying user is charged on their next prompt — viewer-readonly
+    # callers can still see the panel, but only operators+ can
+    # POST a new value.
+    app.router.add_post(
+        "/admin/monetization/markup",
+        _require_role(ROLE_OPERATOR)(monetization_markup_post),
     )
 
     # Stage-8-Part-2: promo codes. Stage-15-Step-E #5 follow-up #4:

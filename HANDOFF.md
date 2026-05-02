@@ -2020,6 +2020,105 @@ assumption.
 
 ---
 
+#### Stage-15-Step-E #10b row 2: COST_MARKUP editor on /admin/monetization (queued 2026-05-02)
+
+The global price multiplier `COST_MARKUP` (default 1.5×) used to be
+env-only — an operator who wanted to retune it after a cost spike
+or a competitor undercut had to redeploy the bot. This follow-up
+applies the same DB-backed override pattern that landed in
+Stage-15-Step-F follow-up #4 for the bot-health thresholds:
+`system_settings` row keyed `COST_MARKUP`, in-process override
+cache, web admin editor on `/admin/monetization`, and an audit row
+that captures the old → new diff so an analyst can later answer
+"did revenue jump because we changed pricing on Tuesday or because
+traffic spiked".
+
+The plumbing:
+
+* `pricing.py` — module-level `_MARKUP_OVERRIDE: float | None`
+  cache, public `set_markup_override`, `clear_markup_override`,
+  `get_markup_override`, `refresh_markup_override_from_db`,
+  `get_markup_source` helpers, and `_coerce_markup` validator.
+  `get_markup()`'s resolution order is now: in-process override →
+  env → 1.5 default. The override layer rejects non-finite,
+  below-`MARKUP_MINIMUM=1.0`, at-or-above-`MARKUP_OVERRIDE_MAXIMUM=100.0`,
+  and `bool` values defensively so a malformed DB row or fat-finger
+  POST can't poison every paid request.
+
+* `web_admin.py` — `monetization()` calls
+  `refresh_markup_override_from_db` on every render so a tweak made
+  in another replica is reflected in the panel. New
+  `_build_markup_view()` helper produces the same "effective / db /
+  env / default" breakdown the bot-health thresholds card uses on
+  `/admin/control`. New `monetization_markup_post` handler does
+  full validation, writes the row via `upsert_setting` (or
+  `delete_setting` for blank fields = clear override), refreshes
+  the cache, and records a `monetization_markup_update` audit row
+  whose `meta` carries the diff. Route registered at
+  `POST /admin/monetization/markup` with the operator floor
+  (viewer-readonly callers see the form but can't submit) since a
+  markup change directly changes how much every paying user is
+  charged on their next prompt.
+
+* `templates/admin/monetization.html` — new collapsible "Edit
+  markup (operator+)" details element under the existing Pricing
+  panel, rendering a 4-row table (DB override / env / compile-time
+  default / effective) plus a number-input + Save button. Empty
+  field = clear override.
+
+* `main.py` — boot hook calls `pricing.refresh_markup_override_from_db`
+  after the admin-toggle cache warm-up so the very first paid
+  request sees the operator's configured markup rather than env /
+  default. Also added the same hook for `bot_health.refresh_threshold_overrides_from_db`
+  which had been missing since Stage-15-Step-F follow-up #4 — same
+  shape, same fail-soft handling.
+
+**Bundled bug fix.** Audit of `database.upsert_setting` while
+writing the markup persistence path surfaced a real reach-able
+crash: the method passed the raw key + value through to Postgres
+without stripping `\x00` bytes. Postgres' UTF-8 codec rejects NUL
+with `invalid byte sequence for encoding "UTF8": 0x00`, which would
+crash the upsert and bubble back as a 500 on whichever admin form
+initiated the write — the bot-health threshold form on
+`/admin/control` (already shipped), the new markup form here, and
+every future `system_settings`-backed editor. Every other free-form
+admin write path (`upsert_string_override`, `set_admin_role` notes)
+already strips NUL; the generic overlay was the lone holdout. With
+the markup editor opening up a new reach-able path (a fat-finger
+paste from a corrupted clipboard becomes a real risk), fixing it
+now is the smallest change that closes the regression. Strip
+silently rather than `ValueError`-ing — operators don't know what
+NUL is, and the column is already validated for length and the
+validators that wrap this method (`set_markup_override`,
+`bot_health.set_threshold_override`) reject anything non-numeric so
+NUL stripping cannot widen acceptance.
+
+Files in this PR (Stage-15-Step-E #10b row 2):
+
+* `pricing.py` — module-level override cache, public set/clear/
+  snapshot helpers, async refresh-from-DB helper, `get_markup`
+  resolution order update, `get_markup_source` helper.
+* `web_admin.py` — `_build_markup_view`, `monetization()` refresh
+  hook, `monetization_markup_post` handler, route wiring,
+  `monetization_markup_update` audit slug + dropdown label,
+  `_monetization_csrf_guard` helper.
+* `templates/admin/monetization.html` — Edit-markup details panel.
+* `main.py` — boot hooks for both `pricing.refresh_markup_override_from_db`
+  and `bot_health.refresh_threshold_overrides_from_db`.
+* `database.py` — `upsert_setting` NUL-strip bundled fix.
+* `tests/test_pricing.py` — 21 new tests covering the override
+  layer (set/clear semantics, validation rejects, source
+  reporting, refresh-from-DB happy path, db-error path, none-db
+  path, below-minimum rejection, end-to-end calculate_cost +
+  apply_markup_to_price honouring the override), plus an autouse
+  fixture that resets the module cache between tests.
+* `tests/test_web_admin.py` — 8 new tests covering form render,
+  auth gate, CSRF guard, happy-path POST + cache application,
+  blank-clears-override, parametrised invalid-value rejection,
+  above-maximum rejection, and DB-failure-keeps-previous-value.
+
+---
+
 ## 10b. Admin-panel feature gap roadmap (added 2026-05-01)
 
 User asked (2026-05-01) for a comprehensive audit of every
@@ -2032,8 +2131,8 @@ or unblock other work.
 
 | # | Gap | Today | Target panel surface | Priority | Status |
 |---|-----|-------|----------------------|----------|--------|
-| 1 | **OpenRouter API keys** — multi-key load balancer is configured by env (`OPENROUTER_API_KEY` comma-separated). | Read-only `/admin/openrouter-keys` shows usage. | New `/admin/openrouter-keys` add/remove/disable + per-key 24h usage / cost / 429-cooldown stats. Persist in DB (encrypted at rest). | P1 | Pending |
-| 2 | **`COST_MARKUP`** — global price multiplier. | Env-only, default 1.5×. | Editor on `/admin/monetization` with audit row + history table. | P1 | Pending |
+| 1 | **OpenRouter API keys** — multi-key load balancer is configured by env (`OPENROUTER_API_KEY` comma-separated). | Read-only `/admin/openrouter-keys` shows usage. | New `/admin/openrouter-keys` add/remove/disable + per-key 24h usage / cost / 429-cooldown stats. Persist in DB (encrypted at rest). | P1 | **Shipped** (PR #156 for the DB-backed registry; PR #160 added 24h usage/cost; PR #165 added per-(key, model) cooldown viewer) |
+| 2 | **`COST_MARKUP`** — global price multiplier. | Env-only, default 1.5×. | Editor on `/admin/monetization` with audit row + history table. | P1 | **Shipped** (this PR — editor + DB-backed override + audit row; history table is a separate row #12) |
 | 3 | **Bot-health severity thresholds** (`BOT_HEALTH_*`). | Env-only. | Editor on `/admin/control` with effective/source columns. | P1 | **Shipped** (Stage-15-Step-F follow-up #4 — this PR) |
 | 4 | **`MIN_TOPUP_USD` / `MIN_TOPUP_TOMAN`** — minimum allowed top-up amounts. | Env-only. | Editor on a new `/admin/wallet-config` page. | P2 | Pending |
 | 5 | **`REQUIRED_CHANNEL`** — force-join channel handle. | Env-only. | Editor on `/admin/control` (or new `/admin/access`). | P2 | Pending |
@@ -2044,13 +2143,13 @@ or unblock other work.
 | 10 | **Stuck-PENDING alert threshold** (`PENDING_ALERT_THRESHOLD_HOURS`). | Env-only. | Editor on `/admin/control`. | P3 | Pending |
 | 11 | **Per-loop cadence overrides** (`BOT_HEALTH_LOOP_STALE_<NAME>_SECONDS`). | Env-only. | Editor on `/admin/control` (one row per loop name). | P3 | Pending |
 | 12 | **`COST_MARKUP` history & analytics** — operator can see when markup last changed and the impact on revenue. | Not tracked. | Markup-history table + revenue-attribution chart on `/admin/monetization`. | P2 | Pending |
-| 13 | **Per-user revenue contribution panel** — top spenders. | Existed in `get_monetization_summary` aggregates but not surfaced. | New "Top users" tab on `/admin/monetization`. | P2 | Pending |
+| 13 | **Per-user revenue contribution panel** — top spenders. | Existed in `get_monetization_summary` aggregates but not surfaced. | New "Top users" tab on `/admin/monetization`. | P2 | **Shipped** (PR #166) |
 | 14 | **Disable individual gateways** (NowPayments / TetraPay / Zarinpal). | DB row in `disabled_gateways` (already wired via `/admin/gateways`). | Already exposed — but no per-currency granularity. Add per-crypto toggle. | P3 | Partial |
-| 15 | **OpenRouter rate-limit per (key, model)** — currently per-key only. | Code path exists in `openrouter_keys.py`. | Per-(key, model) cooldown viewer on `/admin/openrouter-keys`. | P3 | Pending |
+| 15 | **OpenRouter rate-limit per (key, model)** — currently per-key only. | Code path exists in `openrouter_keys.py`. | Per-(key, model) cooldown viewer on `/admin/openrouter-keys`. | P3 | **Shipped** (PR #165) |
 | 16 | **Conversation-export pagination** — `/conversation_export` cmd dumps full history; large convos OOM. | One-shot dump. | Multi-part export with offset cursor on `/admin/users/<id>/conversations`. | P3 | Pending |
 | 17 | **Stats bucketing** (weekly/monthly) — only daily today. | `get_user_daily_spending` only. | New `bucket=` param + buttons on `/admin/users/<id>/stats`. | P3 | Pending |
-| 18 | **JSONB conversation_messages** — vision turns can't store image refs. | `content TEXT` only. | Schema migration to JSONB + read/write paths preserve attachments. | P2 | Pending |
-| 19 | **"View as <role>" toggle** — operators can preview viewer/operator views. | None. | Top-bar dropdown on `/admin` that swaps the active role for the current request only. | P3 | Pending |
+| 18 | **JSONB conversation_messages** — vision turns can't store image refs. | `content TEXT` only. | Schema migration to JSONB + read/write paths preserve attachments. | P2 | **Shipped** (PR #163) |
+| 19 | **"View as <role>" toggle** — operators can preview viewer/operator views. | None. | Top-bar dropdown on `/admin` that swaps the active role for the current request only. | P3 | **Shipped** (PR #162) |
 | 20 | **Audit retention policy** — audit log grows forever. | No retention. | Editor on `/admin/audit` + nightly delete loop. | P2 | Pending |
 | 21 | **Bot-health alert cadence** — `BOT_HEALTH_ALERT_INTERVAL_SECONDS`. | Env-only. | Editor on `/admin/control`. | P3 | Pending |
 | 22 | **`I18N_LOCK`** — gate live string overrides during deploy. | Not implemented. | Toggle on `/admin/strings` that blocks the upsert form. | P3 | Pending |

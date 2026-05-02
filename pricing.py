@@ -9,7 +9,17 @@ The final cost charged to the user is:
     (prompt_tokens * input_price + completion_tokens * output_price) / 1_000_000
         * MARKUP
 
-MARKUP is read from the ``COST_MARKUP`` env var (default 1.5x).
+MARKUP defaults to 1.5x. The resolution order (Stage-15-Step-E #10b row 2):
+
+    1. DB override (``system_settings`` row keyed ``COST_MARKUP``).
+    2. ``COST_MARKUP`` env var.
+    3. Compile-time default of ``1.5``.
+
+The DB override is populated from the web admin ``/admin/monetization``
+markup-editor form; :func:`refresh_markup_override_from_db` is called at
+boot and after every write so the next call to :func:`get_markup` sees the
+new value without a process restart. Same shape as
+``bot_health._THRESHOLD_OVERRIDES`` so the two surfaces look familiar.
 """
 
 from __future__ import annotations
@@ -20,6 +30,147 @@ import os
 from dataclasses import dataclass
 
 log = logging.getLogger("bot.pricing")
+
+# ---------------------------------------------------------------------------
+# DB-backed markup override (Stage-15-Step-E #10b row 2)
+# ---------------------------------------------------------------------------
+#
+# Process-local cache populated from ``system_settings`` by
+# :func:`refresh_markup_override_from_db`. ``None`` means "no override
+# active" — fall through to env / default. Any non-``None`` value is
+# already validated (finite + ``>= 1.0``).
+_MARKUP_OVERRIDE: float | None = None
+
+# Compile-time default. Single source of truth so the env-fallback
+# branch in :func:`get_markup` and the "default" badge on
+# ``/admin/monetization`` agree on the number.
+DEFAULT_MARKUP: float = 1.5
+
+# Floor on any markup the operator can configure. A multiplier
+# below 1.0 means "charge less than cost" — a typo with that
+# shape would leak money on every paid request and the operator
+# would not notice until the wallet ran dry.
+MARKUP_MINIMUM: float = 1.0
+
+# Ceiling on the override side ONLY. Env / default callers are
+# already free to set arbitrarily large markups (the existing
+# behaviour — we don't want to accidentally cap a deliberate
+# 50x markup that worked yesterday). The ceiling exists to guard
+# against an admin-form fat-finger like ``150`` (intended ``1.5``)
+# that would 100x every charge silently. The web form refuses
+# anything ``>= MARKUP_OVERRIDE_MAXIMUM`` with a flash banner.
+MARKUP_OVERRIDE_MAXIMUM: float = 100.0
+
+# Setting key in the ``system_settings`` table. Public so the
+# web admin module + tests don't repeat the literal.
+MARKUP_SETTING_KEY: str = "COST_MARKUP"
+
+
+def _coerce_markup(value: object) -> float | None:
+    """Best-effort parse of a markup string.
+
+    Returns a finite ``>= MARKUP_MINIMUM`` float, or ``None`` for
+    anything malformed (empty / non-numeric / NaN / ±Inf / below
+    minimum). The shape mirrors ``bot_health._env_int`` so a future
+    refactor can extract a generic env-overlay helper.
+    """
+    if value is None:
+        return None
+    try:
+        coerced = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(coerced):
+        return None
+    if coerced < MARKUP_MINIMUM:
+        return None
+    return coerced
+
+
+def set_markup_override(value: float) -> None:
+    """Apply an in-process override for ``COST_MARKUP``.
+
+    Refuses non-finite / below-minimum / above-ceiling / non-numeric
+    inputs with ``ValueError``. The web admin form runs the same
+    checks before persisting; this guard is defence-in-depth so a
+    buggy direct caller can't poison the cache.
+    """
+    if isinstance(value, bool):
+        # bool is a subclass of int — refuse it explicitly so
+        # ``True`` doesn't sneak through as ``1.0`` (nonsense markup).
+        raise ValueError(
+            f"markup must be int|float, got bool ({value!r})"
+        )
+    try:
+        coerced = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"markup is not numeric: {value!r}") from exc
+    if not math.isfinite(coerced):
+        raise ValueError(f"markup is not finite: {value!r}")
+    if coerced < MARKUP_MINIMUM:
+        raise ValueError(
+            f"markup {coerced!r} is below minimum {MARKUP_MINIMUM}"
+        )
+    if coerced >= MARKUP_OVERRIDE_MAXIMUM:
+        raise ValueError(
+            f"markup {coerced!r} is at or above the override maximum "
+            f"{MARKUP_OVERRIDE_MAXIMUM}"
+        )
+    global _MARKUP_OVERRIDE
+    _MARKUP_OVERRIDE = coerced
+
+
+def clear_markup_override() -> bool:
+    """Drop the in-process override. Returns True if one existed."""
+    global _MARKUP_OVERRIDE
+    had_override = _MARKUP_OVERRIDE is not None
+    _MARKUP_OVERRIDE = None
+    return had_override
+
+
+def get_markup_override() -> float | None:
+    """Return the current override value, or ``None`` if unset."""
+    return _MARKUP_OVERRIDE
+
+
+async def refresh_markup_override_from_db(db) -> float | None:
+    """Reload the markup override from the ``system_settings`` table.
+
+    Same defensive shape as
+    ``bot_health.refresh_threshold_overrides_from_db``: a transient
+    DB error keeps the previous cache in place (so a pool blip
+    can't accidentally revert to env default mid-incident). A
+    malformed stored value clears the override (so a bad write
+    that somehow bypassed the validators doesn't permanently
+    poison the markup).
+    """
+    global _MARKUP_OVERRIDE
+    if db is None:
+        return _MARKUP_OVERRIDE
+    try:
+        raw = await db.get_setting(MARKUP_SETTING_KEY)
+    except Exception:
+        log.exception(
+            "pricing: refresh_markup_override_from_db failed; "
+            "keeping previous override cache"
+        )
+        return _MARKUP_OVERRIDE
+    if raw is None:
+        # Row absent — clear any stale process-local override.
+        _MARKUP_OVERRIDE = None
+        return None
+    parsed = _coerce_markup(raw)
+    if parsed is None:
+        log.warning(
+            "pricing: invalid stored COST_MARKUP override %r in "
+            "system_settings; clearing in-process override and "
+            "falling through to env / default",
+            raw,
+        )
+        _MARKUP_OVERRIDE = None
+        return None
+    _MARKUP_OVERRIDE = parsed
+    return parsed
 
 
 @dataclass(frozen=True)
@@ -52,28 +203,67 @@ MODEL_PRICES: dict[str, ModelPrice] = {
 
 
 def get_markup() -> float:
-    """Return the cost markup multiplier from env, default 1.5x.
+    """Return the cost markup multiplier with DB → env → default precedence.
 
-    Rejects ``NaN`` / ``±Infinity`` explicitly. ``float()`` accepts the
-    strings ``"nan"`` and ``"inf"`` (case-insensitive) so a typo or a
-    deliberately malicious ``COST_MARKUP=nan`` would otherwise slip
-    past the parse step. A NaN markup propagates through
-    :func:`_apply_markup` (every IEEE-754 op against NaN returns NaN)
-    and ultimately reaches ``database.deduct_balance``; the
-    ``_is_finite_amount`` guard there refuses the SQL but the user
-    still gets a free OpenRouter reply because ``log_usage`` records
-    ``cost=0``. Reject upstream so paid models stay paid even with a
-    deploy-time misconfiguration.
+    Resolution order (Stage-15-Step-E #10b row 2):
+
+    1. In-process DB override populated from ``system_settings`` by
+       :func:`refresh_markup_override_from_db`. The web admin
+       ``/admin/monetization`` markup-editor form writes the row +
+       refreshes the cache after every save.
+    2. ``COST_MARKUP`` env var.
+    3. :data:`DEFAULT_MARKUP` (``1.5``).
+
+    Rejects ``NaN`` / ``±Infinity`` at every layer. ``float()``
+    accepts the strings ``"nan"`` and ``"inf"`` (case-insensitive)
+    so a typo or a deliberately malicious ``COST_MARKUP=nan`` would
+    otherwise slip past the parse step. A NaN markup propagates
+    through :func:`_apply_markup` (every IEEE-754 op against NaN
+    returns NaN) and ultimately reaches ``database.deduct_balance``;
+    the ``_is_finite_amount`` guard there refuses the SQL but the
+    user still gets a free OpenRouter reply because ``log_usage``
+    records ``cost=0``. Reject upstream so paid models stay paid
+    even with a deploy-time misconfiguration.
     """
-    raw = os.getenv("COST_MARKUP", "1.5")
+    # Layer 1: DB override populated by refresh_markup_override_from_db.
+    # _coerce_markup defends against the rare case where ``set_markup_override``
+    # was bypassed by a future caller.
+    if _MARKUP_OVERRIDE is not None:
+        validated = _coerce_markup(_MARKUP_OVERRIDE)
+        if validated is not None:
+            return validated
+
+    # Layer 2: env var.
+    raw = os.getenv("COST_MARKUP", str(DEFAULT_MARKUP))
     try:
         markup = float(raw)
     except ValueError:
-        return 1.5
+        return DEFAULT_MARKUP
     if not math.isfinite(markup):
-        return 1.5
+        return DEFAULT_MARKUP
     # A markup below 1.0 would mean charging less than cost; guard against typos.
-    return max(markup, 1.0)
+    return max(markup, MARKUP_MINIMUM)
+
+
+def get_markup_source() -> str:
+    """Return where :func:`get_markup` resolved from (``db`` / ``env`` / ``default``).
+
+    Renders on ``/admin/monetization`` next to the effective markup so
+    operators see at a glance which knob is actually live. Mirrors
+    the ``source`` column on the bot-health threshold table.
+    """
+    if _MARKUP_OVERRIDE is not None and _coerce_markup(_MARKUP_OVERRIDE) is not None:
+        return "db"
+    raw = os.getenv("COST_MARKUP", "").strip()
+    if raw:
+        try:
+            parsed = float(raw)
+        except ValueError:
+            return "default"
+        if not math.isfinite(parsed):
+            return "default"
+        return "env"
+    return "default"
 
 
 def get_price(model: str) -> ModelPrice:

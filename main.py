@@ -274,6 +274,44 @@ async def main():
     await load_disabled_models(db)
     await load_disabled_gateways(db)
 
+    # Stage-15-Step-E #10b row 2: warm the COST_MARKUP override
+    # cache so the very first paid request sees the operator's
+    # configured markup rather than the env / compile-time default
+    # for the time window between boot and the first hit on
+    # ``/admin/monetization``. Best-effort — pricing.get_markup()
+    # falls through to env / default if the refresh raises.
+    try:
+        import pricing
+        await pricing.refresh_markup_override_from_db(db)
+        log.info(
+            "loaded COST_MARKUP override from system_settings: %s "
+            "(source=%s, effective=%.4fx)",
+            pricing.get_markup_override(),
+            pricing.get_markup_source(),
+            pricing.get_markup(),
+        )
+    except Exception:
+        log.exception(
+            "failed to load COST_MARKUP override from DB — "
+            "falling through to env / compile-time default"
+        )
+
+    # Stage-15-Step-F follow-up #4: warm the bot-health threshold
+    # override cache. Same shape as the markup load above.
+    try:
+        from bot_health import refresh_threshold_overrides_from_db
+        snapshot = await refresh_threshold_overrides_from_db(db)
+        if snapshot:
+            log.info(
+                "loaded BOT_HEALTH_* overrides from system_settings: %s",
+                sorted(snapshot.keys()),
+            )
+    except Exception:
+        log.exception(
+            "failed to load BOT_HEALTH_* overrides from DB — "
+            "falling through to env / compile-time default"
+        )
+
     # Overwrite BotFather's cached slash-command list with the
     # canonical one. Without this, Telegram shows whatever was last
     # typed into the BotFather "Edit Commands" panel — including

@@ -8,16 +8,41 @@ from __future__ import annotations
 
 import pytest
 
+import pricing
 from pricing import (
+    DEFAULT_MARKUP,
     FALLBACK_PRICE,
+    MARKUP_MINIMUM,
+    MARKUP_OVERRIDE_MAXIMUM,
+    MARKUP_SETTING_KEY,
     MODEL_PRICES,
     ModelPrice,
     _apply_markup,
     apply_markup_to_price,
     calculate_cost,
+    clear_markup_override,
     get_markup,
+    get_markup_override,
+    get_markup_source,
     get_price,
+    refresh_markup_override_from_db,
+    set_markup_override,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_markup_override_between_tests():
+    """Drop any process-local override set by a prior test.
+
+    Stage-15-Step-E #10b row 2 added a module-level
+    ``_MARKUP_OVERRIDE`` that, if leaked across tests, would shadow
+    ``monkeypatch.setenv("COST_MARKUP", ...)`` in the existing
+    suite — flipping their assertions silently. Autouse fixture so
+    every test in this module starts from "no override active".
+    """
+    clear_markup_override()
+    yield
+    clear_markup_override()
 
 
 def test_known_model_uses_table_price():
@@ -363,3 +388,222 @@ def test_apply_markup_nan_tokens_combined_with_nan_price_both_clamp(monkeypatch)
 
     assert _math.isfinite(cost)
     assert cost == 0.0
+
+
+# ---------------------------------------------------------------------
+# DB-backed markup override (Stage-15-Step-E #10b row 2)
+# ---------------------------------------------------------------------
+#
+# The override is a process-local cache populated by
+# ``refresh_markup_override_from_db`` from a ``system_settings`` row
+# keyed ``COST_MARKUP``. Resolution order is override → env → 1.5
+# default. The web admin form writes the row + refreshes the cache
+# after every save so a new value goes live without a restart.
+#
+# These tests use a stub ``Database`` so the suite stays sync /
+# stdlib-only. The real DB path is exercised in
+# ``tests/test_web_admin.py`` against the Postgres-backed harness.
+
+
+class _StubMarkupDB:
+    """Minimal in-memory stub of the Database settings surface."""
+
+    def __init__(self, *, value: str | None = None, raise_on_get: bool = False):
+        self._value = value
+        self._raise_on_get = raise_on_get
+
+    async def get_setting(self, key: str) -> str | None:
+        if self._raise_on_get:
+            raise RuntimeError("DB blip")
+        if key != MARKUP_SETTING_KEY:
+            return None
+        return self._value
+
+
+def test_set_markup_override_changes_get_markup(monkeypatch):
+    monkeypatch.setenv("COST_MARKUP", "2.0")
+    assert get_markup() == 2.0
+    set_markup_override(3.5)
+    assert get_markup() == 3.5
+    assert get_markup_override() == 3.5
+    assert get_markup_source() == "db"
+
+
+def test_clear_markup_override_falls_back_to_env(monkeypatch):
+    monkeypatch.setenv("COST_MARKUP", "2.0")
+    set_markup_override(3.5)
+    assert get_markup() == 3.5
+    assert clear_markup_override() is True
+    assert get_markup() == 2.0
+    assert get_markup_source() == "env"
+    # Second clear is a no-op.
+    assert clear_markup_override() is False
+
+
+def test_clear_markup_override_falls_back_to_default(monkeypatch):
+    monkeypatch.delenv("COST_MARKUP", raising=False)
+    set_markup_override(3.0)
+    assert get_markup() == 3.0
+    assert get_markup_source() == "db"
+    clear_markup_override()
+    assert get_markup() == DEFAULT_MARKUP
+    assert get_markup_source() == "default"
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        "not-a-number", "", "  ", "nan", "inf", "-inf",
+        # Below the minimum.
+        "0.5", "0.99", "-1",
+    ],
+)
+def test_set_markup_override_rejects_bad_values(bad_value):
+    with pytest.raises(ValueError):
+        set_markup_override(bad_value)
+    # Override must not have been polluted by the failed call.
+    assert get_markup_override() is None
+
+
+def test_set_markup_override_rejects_above_maximum():
+    with pytest.raises(ValueError):
+        set_markup_override(MARKUP_OVERRIDE_MAXIMUM)
+    with pytest.raises(ValueError):
+        set_markup_override(MARKUP_OVERRIDE_MAXIMUM + 1.0)
+    assert get_markup_override() is None
+
+
+def test_set_markup_override_rejects_bool():
+    """``True`` is a subclass of ``int`` in Python — so a buggy caller
+    posting ``True`` would otherwise sneak through as ``1.0``. Refuse
+    explicitly so a nonsense value can't poison the cache."""
+    with pytest.raises(ValueError):
+        set_markup_override(True)
+    with pytest.raises(ValueError):
+        set_markup_override(False)
+
+
+def test_set_markup_override_accepts_minimum():
+    set_markup_override(MARKUP_MINIMUM)
+    assert get_markup_override() == MARKUP_MINIMUM
+    assert get_markup() == MARKUP_MINIMUM
+
+
+def test_set_markup_override_accepts_just_below_maximum():
+    set_markup_override(MARKUP_OVERRIDE_MAXIMUM - 0.0001)
+    assert get_markup_override() == pytest.approx(MARKUP_OVERRIDE_MAXIMUM - 0.0001)
+
+
+def test_get_markup_source_handles_invalid_env(monkeypatch):
+    """An invalid env value should mark source as ``default``, not ``env``,
+    so the panel doesn't claim an env value is active when ``get_markup()``
+    is actually returning the default."""
+    monkeypatch.setenv("COST_MARKUP", "not-a-number")
+    assert get_markup() == DEFAULT_MARKUP
+    assert get_markup_source() == "default"
+
+
+def test_get_markup_source_handles_unset_env(monkeypatch):
+    monkeypatch.delenv("COST_MARKUP", raising=False)
+    assert get_markup_source() == "default"
+
+
+def test_get_markup_source_reports_env_when_set(monkeypatch):
+    monkeypatch.setenv("COST_MARKUP", "2.5")
+    assert get_markup_source() == "env"
+
+
+@pytest.mark.asyncio
+async def test_refresh_markup_override_from_db_loads_value(monkeypatch):
+    monkeypatch.setenv("COST_MARKUP", "2.0")
+    db = _StubMarkupDB(value="3.25")
+    result = await refresh_markup_override_from_db(db)
+    assert result == 3.25
+    assert get_markup_override() == 3.25
+    assert get_markup() == 3.25
+    assert get_markup_source() == "db"
+
+
+@pytest.mark.asyncio
+async def test_refresh_markup_override_from_db_clears_when_row_absent(monkeypatch):
+    monkeypatch.setenv("COST_MARKUP", "2.0")
+    set_markup_override(3.0)
+    db = _StubMarkupDB(value=None)
+    result = await refresh_markup_override_from_db(db)
+    assert result is None
+    assert get_markup_override() is None
+    assert get_markup() == 2.0
+
+
+@pytest.mark.asyncio
+async def test_refresh_markup_override_from_db_clears_on_invalid(monkeypatch):
+    """A malformed stored value (e.g. a hand-written DB row that bypasses
+    the validators) clears the override so the bot falls through to env /
+    default rather than charging based on garbage."""
+    monkeypatch.setenv("COST_MARKUP", "2.0")
+    set_markup_override(3.0)
+    db = _StubMarkupDB(value="not-a-number")
+    result = await refresh_markup_override_from_db(db)
+    assert result is None
+    assert get_markup_override() is None
+    assert get_markup() == 2.0
+
+
+@pytest.mark.asyncio
+async def test_refresh_markup_override_from_db_keeps_cache_on_error(monkeypatch):
+    """A transient DB error must keep the previous cache in place so a
+    pool blip can't accidentally revert to env / default mid-incident."""
+    monkeypatch.setenv("COST_MARKUP", "2.0")
+    set_markup_override(3.0)
+    db = _StubMarkupDB(raise_on_get=True)
+    result = await refresh_markup_override_from_db(db)
+    assert result == 3.0
+    assert get_markup_override() == 3.0
+    assert get_markup() == 3.0
+
+
+@pytest.mark.asyncio
+async def test_refresh_markup_override_from_db_no_db():
+    """``db is None`` (dev-mode) must not raise; just returns the cached value."""
+    set_markup_override(2.5)
+    result = await refresh_markup_override_from_db(None)
+    assert result == 2.5
+
+
+@pytest.mark.asyncio
+async def test_refresh_markup_override_strips_below_minimum(monkeypatch):
+    """Stored ``0.5`` (below MARKUP_MINIMUM) must not be applied.
+
+    A markup below 1.0 means charging less than cost. The override
+    layer refuses it, falling through to env / default. Without this
+    guard, an admin form fat-finger that bypassed the form-side
+    minimum would leak money on every paid request.
+    """
+    monkeypatch.setenv("COST_MARKUP", "1.5")
+    db = _StubMarkupDB(value="0.5")
+    result = await refresh_markup_override_from_db(db)
+    assert result is None
+    assert get_markup() == 1.5
+
+
+def test_apply_markup_uses_override(monkeypatch):
+    """End-to-end: setting an override changes what a paid request charges."""
+    monkeypatch.setenv("COST_MARKUP", "2.0")
+    base_cost = calculate_cost("openai/gpt-4o-mini", 1_000_000, 1_000_000)
+    # Raw cost for gpt-4o-mini at 1M input + 1M output: 0.75. * 2.0 = 1.5.
+    assert base_cost == pytest.approx(1.5)
+
+    set_markup_override(4.0)
+    overridden_cost = calculate_cost("openai/gpt-4o-mini", 1_000_000, 1_000_000)
+    assert overridden_cost == pytest.approx(3.0)
+
+
+def test_apply_markup_to_price_uses_override(monkeypatch):
+    """The model picker's ``apply_markup_to_price`` honours the DB override
+    just like the per-call billing path."""
+    monkeypatch.setenv("COST_MARKUP", "2.0")
+    price = MODEL_PRICES["openai/gpt-4o-mini"]
+    set_markup_override(4.0)
+    displayed = apply_markup_to_price(price)
+    assert displayed.input_per_1m_usd == pytest.approx(0.15 * 4.0)
+    assert displayed.output_per_1m_usd == pytest.approx(0.60 * 4.0)
