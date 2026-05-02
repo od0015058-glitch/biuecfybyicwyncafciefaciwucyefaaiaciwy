@@ -856,3 +856,164 @@ async def test_refresh_overrides_from_db_handles_non_dict_return(
     snap = await bh.refresh_threshold_overrides_from_db(_Db())
     # Cache unchanged — fail-safe behaviour.
     assert snap == {"BOT_HEALTH_BUSY_INFLIGHT": 7}
+
+
+# ── Stage-15-Step-F follow-up #5: register_loop decorator ─────────
+
+
+@pytest.fixture()
+def _isolated_loop_registry():
+    """Snapshot + restore the loop registry around a test.
+
+    :func:`bh.reset_loop_registry_for_tests` empties both
+    ``LOOP_CADENCES`` and ``metrics._LOOP_METRIC_NAMES``, so this
+    fixture saves the current state, hands the test a clean slate,
+    and restores afterwards. Without this, a test that registers a
+    fake loop name leaks into every later test that iterates the
+    registry.
+    """
+    import metrics
+
+    saved_cadences = dict(bh.LOOP_CADENCES)
+    saved_names = metrics._LOOP_METRIC_NAMES
+    bh.reset_loop_registry_for_tests()
+    yield
+    bh.LOOP_CADENCES.clear()
+    bh.LOOP_CADENCES.update(saved_cadences)
+    metrics._LOOP_METRIC_NAMES = saved_names
+
+
+def test_register_loop_populates_both_registries(_isolated_loop_registry):
+    """A bare ``register_loop`` call adds the name to both
+    ``LOOP_CADENCES`` and ``metrics._LOOP_METRIC_NAMES``."""
+    import metrics
+
+    assert "fake_loop" not in bh.LOOP_CADENCES
+    assert "fake_loop" not in metrics._LOOP_METRIC_NAMES
+
+    bh.register_loop("fake_loop", cadence_seconds=42)
+
+    assert bh.LOOP_CADENCES["fake_loop"] == 42
+    assert "fake_loop" in metrics._LOOP_METRIC_NAMES
+
+
+def test_register_loop_decorator_returns_function_unchanged(
+    _isolated_loop_registry,
+):
+    """Decorator usage: the wrapped function must come through
+    unchanged — name, qualname, signature, and the function object
+    itself."""
+    import inspect
+
+    async def _orig(arg):
+        return arg
+
+    decorated = bh.register_loop(
+        "decorated_loop", cadence_seconds=7,
+    )(_orig)
+
+    assert bh.LOOP_CADENCES["decorated_loop"] == 7
+    # Decorator is a true no-op on the function: same identity,
+    # name, signature, and ``async def`` shape.
+    assert decorated is _orig
+    assert decorated.__name__ == "_orig"
+    assert inspect.iscoroutinefunction(decorated)
+    assert (
+        list(inspect.signature(decorated).parameters)
+        == list(inspect.signature(_orig).parameters)
+    )
+
+
+def test_register_loop_idempotent_on_same_args(_isolated_loop_registry):
+    """Re-registering the same ``(name, cadence)`` pair is a no-op."""
+    bh.register_loop("dup", cadence_seconds=10)
+    bh.register_loop("dup", cadence_seconds=10)  # no error
+    assert bh.LOOP_CADENCES["dup"] == 10
+    import metrics
+    # Not duplicated in the metric tuple.
+    assert metrics._LOOP_METRIC_NAMES.count("dup") == 1
+
+
+def test_register_loop_raises_on_cadence_mismatch(
+    _isolated_loop_registry,
+):
+    """Two registrations of the same name with different cadences
+    is a hard error — the decorator's whole point is to keep the
+    cadence and the name in lockstep, and a silent override would
+    paper over a real configuration bug."""
+    bh.register_loop("mismatch", cadence_seconds=10)
+    with pytest.raises(RuntimeError, match="cadence mismatch"):
+        bh.register_loop("mismatch", cadence_seconds=11)
+
+
+def test_register_loop_rejects_empty_name(_isolated_loop_registry):
+    with pytest.raises(ValueError, match="non-empty string"):
+        bh.register_loop("", cadence_seconds=10)
+
+
+def test_register_loop_rejects_non_str_name(_isolated_loop_registry):
+    with pytest.raises(ValueError, match="non-empty string"):
+        bh.register_loop(None, cadence_seconds=10)  # type: ignore[arg-type]
+
+
+def test_register_loop_rejects_non_positive_cadence(
+    _isolated_loop_registry,
+):
+    with pytest.raises(ValueError, match="positive int"):
+        bh.register_loop("bad", cadence_seconds=0)
+    with pytest.raises(ValueError, match="positive int"):
+        bh.register_loop("bad", cadence_seconds=-1)
+
+
+def test_register_loop_rejects_bool_cadence(_isolated_loop_registry):
+    """``True`` is technically a positive int in Python (``True == 1``)
+    but accepting it would let a typo (``cadence_seconds=True``)
+    through with a 1-second threshold. Reject explicitly."""
+    with pytest.raises(ValueError, match="positive int"):
+        bh.register_loop("bad", cadence_seconds=True)  # type: ignore[arg-type]
+
+
+def test_register_loop_rejects_non_int_cadence(_isolated_loop_registry):
+    with pytest.raises(ValueError, match="positive int"):
+        bh.register_loop("bad", cadence_seconds=10.5)  # type: ignore[arg-type]
+
+
+def test_register_loop_used_via_decorator_threshold_matches(
+    _isolated_loop_registry,
+):
+    """End-to-end: registering via decorator wires up the cadence-
+    derived stale threshold correctly. ``2 × N + 60`` per the
+    convention documented in ``bot_health.py``."""
+
+    @bh.register_loop("e2e", cadence_seconds=200)
+    async def _loop_fn():
+        return None
+
+    assert bh.loop_stale_threshold_seconds("e2e") == 200 * 2 + 60
+
+
+def test_all_eight_production_loops_registered():
+    """Every shipped loop must register itself at module import.
+
+    Catches a refactor that drops a ``@register_loop`` line — the
+    test imports each module and pins the (name, cadence) pair.
+    Conftest already imports each module so registrations have
+    fired by the time this test runs."""
+    import metrics
+
+    expected = {
+        "min_amount_refresh": 900,
+        "fx_refresh": 600,
+        "model_discovery": 21_600,
+        "catalog_refresh": 86_400,
+        "pending_alert": 1_800,
+        "pending_reaper": 900,
+        "bot_health_alert": 60,
+        "zarinpal_backfill": 300,
+    }
+    for name, cadence in expected.items():
+        assert bh.LOOP_CADENCES.get(name) == cadence, (
+            f"{name}: registry has "
+            f"{bh.LOOP_CADENCES.get(name)!r}, expected {cadence}"
+        )
+        assert name in metrics._LOOP_METRIC_NAMES

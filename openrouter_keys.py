@@ -705,16 +705,34 @@ def _read_env_keys() -> list[str]:
     without the side-effects (no global mutation, no counter
     reset). Used by :func:`refresh_from_db` to compute the
     "desired pool" before deciding whether a rebuild is needed.
+
+    Bug fix (Stage-15-Step-F follow-up #5): the prior implementation
+    differed from :func:`load_keys` when *both* the bare
+    ``OPENROUTER_API_KEY`` *and* numbered slots were set —
+    ``load_keys`` ignores the bare value (and logs a warning) and
+    uses only the numbered slots, but ``_read_env_keys`` was
+    pushing the bare value into the desired pool first and then
+    appending each numbered slot dedup'd against it. Result: the
+    "desired pool" computed here had ``len(numbered) + 1`` entries
+    while the post-``load_keys`` ``_keys`` had ``len(numbered)``
+    entries, so :func:`refresh_from_db`'s no-op fast path NEVER
+    fired even when the env was unchanged, and the rebuild branch
+    then duplicated the last numbered slot into the pool (because
+    the slice ``desired[len(_keys):]`` over-shot by one). The fix
+    matches ``load_keys`` exactly: numbered slots win, the bare
+    value is honoured only when no numbered slot is set.
     """
-    keys: list[str] = []
-    primary = os.getenv("OPENROUTER_API_KEY", "").strip()
-    if primary:
-        keys.append(primary)
+    numbered: list[str] = []
     for n in range(1, 11):
         candidate = os.getenv(f"OPENROUTER_API_KEY_{n}", "").strip()
-        if candidate and candidate not in keys:
-            keys.append(candidate)
-    return keys
+        if candidate and candidate not in numbered:
+            numbered.append(candidate)
+    if numbered:
+        return numbered
+    primary = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if primary:
+        return [primary]
+    return []
 
 
 def get_key_meta_snapshot() -> list[dict[str, object]]:

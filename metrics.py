@@ -61,16 +61,15 @@ _LOOP_LAST_TICK: dict[str, float] = {}
 # Loop names → metric-name fragment. Kept as an ordered tuple so the
 # rendered output is stable (helpful for grep-friendly diffs of
 # ``curl /metrics`` output across deploys).
-_LOOP_METRIC_NAMES: tuple[str, ...] = (
-    "min_amount_refresh",
-    "fx_refresh",
-    "model_discovery",
-    "catalog_refresh",
-    "pending_alert",
-    "pending_reaper",
-    "bot_health_alert",
-    "zarinpal_backfill",
-)
+#
+# Stage-15-Step-F follow-up #5: this tuple is populated at import
+# time by each loop module's :func:`bot_health.register_loop` call —
+# the decorator/registration appends to the tuple in registration
+# order. Production code (``main.py``) imports every loop module at
+# startup so the tuple is fully populated before the first scrape
+# of ``/metrics``. Order in the rendered output mirrors the import
+# order of the loop modules.
+_LOOP_METRIC_NAMES: tuple[str, ...] = ()
 
 
 # Track which unknown loop names we've already warned about so a

@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 
 import aiohttp
 
+from bot_health import register_loop
 from pricing import FALLBACK_PRICE, MODEL_PRICES, ModelPrice
 
 log = logging.getLogger("bot.models_catalog")
@@ -36,6 +37,13 @@ log = logging.getLogger("bot.models_catalog")
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 CATALOG_TTL_SECONDS = 24 * 60 * 60
 FETCH_TIMEOUT_SECONDS = 15
+
+# Register the heartbeat at module import. Unlike the timer-driven
+# loops (``fx_refresh``, ``min_amount_refresh``…), the catalog
+# refresh is TTL-gated inside :func:`get_catalog` rather than its
+# own forever-loop, so we register from module-level rather than via
+# a function decorator.
+register_loop("catalog_refresh", cadence_seconds=CATALOG_TTL_SECONDS)
 
 
 @dataclass(frozen=True)

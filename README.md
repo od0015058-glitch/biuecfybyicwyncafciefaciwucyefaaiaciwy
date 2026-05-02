@@ -540,6 +540,24 @@ NowPayments crypto invoices.
   cadence with a 660 s threshold; pinned by a regression test
   that asserts every name in `metrics._LOOP_METRIC_NAMES` has a
   matching `LOOP_CADENCES` entry. Stage-15-Step-F follow-up #4.
+- **Cadence registration via `@register_loop` decorator** — the
+  hand-maintained `bot_health.LOOP_CADENCES` dict and the
+  hand-maintained `metrics._LOOP_METRIC_NAMES` tuple are now
+  populated by a single decorator at each loop's definition site,
+  e.g. `@register_loop("fx_refresh", cadence_seconds=600)` on
+  `refresh_usd_to_toman_loop`. The two registries can no longer
+  drift — adding a new loop touches one place, not two. Mismatch
+  protection: re-registering the same name with a *different*
+  cadence raises `RuntimeError`. Bundled bug fix:
+  `openrouter_keys._read_env_keys` did not mirror `load_keys`'s
+  "numbered slots win, bare ignored" semantics — with both
+  `OPENROUTER_API_KEY` *and* `OPENROUTER_API_KEY_1..N` set, the
+  helper returned `[BARE, *numbered]` while `load_keys`
+  produced just `[*numbered]`, breaking the no-op fast path in
+  `refresh_from_db` and (in the rebuild branch) duplicating the
+  last numbered slot into the in-process pool. Now matches
+  `load_keys` exactly, pinned by 5 new tests. Stage-15-Step-F
+  follow-up #5.
 - **Proactive bot-health Telegram DMs** — new `bot_health_alert.py`
   background loop wakes every `BOT_HEALTH_ALERT_INTERVAL_SECONDS`
   (default 60), runs the same `bot_health.compute_bot_status`

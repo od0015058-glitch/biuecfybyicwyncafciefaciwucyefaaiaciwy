@@ -34,6 +34,7 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 import strings
+from bot_health import register_loop
 from database import db
 
 
@@ -173,6 +174,7 @@ async def expire_pending_once(
     return len(rows)
 
 
+@register_loop("pending_reaper", cadence_seconds=15 * 60)
 async def _expiration_loop(
     bot: Bot,
     *,

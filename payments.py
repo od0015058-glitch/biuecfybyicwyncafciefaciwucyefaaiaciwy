@@ -10,6 +10,7 @@ import aiohttp
 from aiogram import Bot
 from aiohttp import web
 
+from bot_health import register_loop
 from database import db
 from strings import t
 
@@ -468,6 +469,7 @@ async def refresh_min_amounts_once(
     await asyncio.gather(*(_one(t) for t in tickers))
 
 
+@register_loop("min_amount_refresh", cadence_seconds=900)
 async def refresh_min_amounts_loop(
     tickers: "list[str]",
     *,
