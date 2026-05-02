@@ -2326,6 +2326,277 @@ async def test_monetization_db_error_path_renders_correct_margin_pct(
 
 
 # ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 2: COST_MARKUP editor on /admin/monetization
+# ---------------------------------------------------------------------
+
+
+async def _login_and_get_monetization_csrf(
+    client, password: str = "letmein",
+) -> str:
+    """Log in, fetch /admin/monetization, scrape its CSRF token."""
+    await client.post(
+        "/admin/login", data={"password": password}, allow_redirects=False
+    )
+    resp = await client.get("/admin/monetization")
+    body = await resp.text()
+    import re
+
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+    assert m, "Expected CSRF token on /admin/monetization markup form"
+    return m.group(1)
+
+
+def _stub_db_for_markup_editor(
+    summary: dict | None = None,
+    *,
+    upsert_setting_result: object | Exception = None,
+    delete_setting_result: bool | Exception = True,
+    get_setting_result: str | None | Exception = None,
+):
+    """Stub DB pre-wired with the monetization summary + setting CRUD
+    needed by the markup editor."""
+    db = _stub_db_with_monetization(
+        summary or _sample_monetization_summary()
+    )
+    if isinstance(upsert_setting_result, Exception):
+        db.upsert_setting = AsyncMock(side_effect=upsert_setting_result)
+    else:
+        db.upsert_setting = AsyncMock(return_value=upsert_setting_result)
+    if isinstance(delete_setting_result, Exception):
+        db.delete_setting = AsyncMock(side_effect=delete_setting_result)
+    else:
+        db.delete_setting = AsyncMock(return_value=delete_setting_result)
+    if isinstance(get_setting_result, Exception):
+        db.get_setting = AsyncMock(side_effect=get_setting_result)
+    else:
+        db.get_setting = AsyncMock(return_value=get_setting_result)
+    return db
+
+
+async def test_monetization_renders_markup_editor_form(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """The page renders the editor section with a CSRF token + the
+    "effective / db / env / default" breakdown."""
+    monkeypatch.setenv("COST_MARKUP", "2.0")
+    import pricing
+    pricing.clear_markup_override()
+    db = _stub_db_for_markup_editor()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert 'action="/admin/monetization/markup"' in body
+    assert 'name="csrf_token"' in body
+    assert 'name="markup"' in body
+    # Source badge surfaces "env" since COST_MARKUP is set + no override.
+    assert "source: env" in body
+
+
+async def test_monetization_markup_post_requires_auth(
+    aiohttp_client, make_admin_app,
+):
+    client = await aiohttp_client(make_admin_app(password="letmein"))
+    resp = await client.post(
+        "/admin/monetization/markup",
+        data={"markup": "3.0", "csrf_token": "x"},
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303), resp.status
+    assert resp.headers.get("Location", "").startswith("/admin/login")
+
+
+async def test_monetization_markup_post_rejects_csrf_mismatch(
+    aiohttp_client, make_admin_app,
+):
+    db = _stub_db_for_markup_editor()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.post(
+        "/admin/monetization/markup",
+        data={"markup": "3.0", "csrf_token": "wrong"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/monetization"
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+
+
+async def test_monetization_markup_post_persists_value_and_refreshes_cache(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """Happy path: a valid value goes through ``upsert_setting`` AND
+    updates the in-process override so the next ``get_markup()``
+    sees it without a process restart."""
+    monkeypatch.setenv("COST_MARKUP", "2.0")
+    import pricing
+    pricing.clear_markup_override()
+
+    # ``get_setting`` returns the just-saved value so the post-write
+    # refresh re-loads the cache deterministically.
+    saved = {"value": None}
+
+    async def _upsert(key: str, value: str) -> None:
+        if key == pricing.MARKUP_SETTING_KEY:
+            saved["value"] = value
+
+    async def _get(key: str):
+        if key == pricing.MARKUP_SETTING_KEY:
+            return saved["value"]
+        return None
+
+    db = _stub_db_for_markup_editor()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_monetization_csrf(client)
+
+    resp = await client.post(
+        "/admin/monetization/markup",
+        data={"markup": "3.5", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302, await resp.text()
+    assert resp.headers["Location"] == "/admin/monetization"
+
+    db.upsert_setting.assert_awaited_once_with(
+        pricing.MARKUP_SETTING_KEY, "3.5",
+    )
+    db.delete_setting.assert_not_awaited()
+    # In-process cache reflects the new value.
+    assert pricing.get_markup_override() == 3.5
+    assert pricing.get_markup() == 3.5
+    # Audit row was recorded.
+    audit_calls = db.record_admin_audit.await_args_list
+    matching = [
+        c for c in audit_calls
+        if c.kwargs.get("action") == "monetization_markup_update"
+    ]
+    assert matching, audit_calls
+
+
+async def test_monetization_markup_post_blank_value_clears_override(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """Empty form value drops the override; falls through to env / default."""
+    monkeypatch.setenv("COST_MARKUP", "2.0")
+    import pricing
+    pricing.clear_markup_override()
+    pricing.set_markup_override(3.5)
+    assert pricing.get_markup() == 3.5
+
+    db = _stub_db_for_markup_editor(
+        delete_setting_result=True, get_setting_result=None,
+    )
+
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_monetization_csrf(client)
+
+    resp = await client.post(
+        "/admin/monetization/markup",
+        data={"markup": "", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.delete_setting.assert_awaited_once_with(pricing.MARKUP_SETTING_KEY)
+    db.upsert_setting.assert_not_awaited()
+    assert pricing.get_markup_override() is None
+    assert pricing.get_markup() == 2.0  # falls through to env
+
+
+@pytest.mark.parametrize(
+    "bad_value", ["not-a-number", "0.5", "0.99", "nan", "inf", "-1"],
+)
+async def test_monetization_markup_post_rejects_invalid_value(
+    aiohttp_client, make_admin_app, monkeypatch, bad_value,
+):
+    """Anything below MARKUP_MINIMUM or non-finite is rejected without
+    touching the DB / cache."""
+    monkeypatch.setenv("COST_MARKUP", "2.0")
+    import pricing
+    pricing.clear_markup_override()
+
+    db = _stub_db_for_markup_editor()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_monetization_csrf(client)
+
+    resp = await client.post(
+        "/admin/monetization/markup",
+        data={"markup": bad_value, "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+    assert pricing.get_markup_override() is None
+
+
+async def test_monetization_markup_post_rejects_above_maximum(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """A fat-fingered ``150`` (intended ``1.5``) is rejected by the
+    web form rather than 100x-ing every charge silently."""
+    import pricing
+    pricing.clear_markup_override()
+
+    db = _stub_db_for_markup_editor()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_monetization_csrf(client)
+
+    resp = await client.post(
+        "/admin/monetization/markup",
+        data={
+            "markup": str(pricing.MARKUP_OVERRIDE_MAXIMUM),
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+    assert pricing.get_markup_override() is None
+
+
+async def test_monetization_markup_post_db_failure_keeps_previous_value(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """A DB write failure must NOT poison the in-process cache;
+    the previous override stays in effect and the page renders an
+    error banner."""
+    monkeypatch.setenv("COST_MARKUP", "2.0")
+    import pricing
+    pricing.clear_markup_override()
+
+    # Stub returns "3.0" from get_setting so the GET-render that
+    # ``_login_and_get_monetization_csrf`` does keeps the override
+    # at 3.0 — that's what the test wants to assert is *preserved*
+    # when the upsert fails.
+    db = _stub_db_for_markup_editor(
+        upsert_setting_result=RuntimeError("DB down"),
+        get_setting_result="3.0",
+    )
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_monetization_csrf(client)
+    assert pricing.get_markup_override() == 3.0  # warmed via GET-render
+
+    resp = await client.post(
+        "/admin/monetization/markup",
+        data={"markup": "4.0", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    # Cache untouched — the previous override is still active.
+    assert pricing.get_markup_override() == 3.0
+    assert pricing.get_markup() == 3.0
+
+
+# ---------------------------------------------------------------------
 # Stage-15-Step-E #9 follow-up #2: monetization CSV export
 # ---------------------------------------------------------------------
 
