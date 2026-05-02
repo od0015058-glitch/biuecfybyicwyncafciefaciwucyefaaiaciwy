@@ -26,10 +26,17 @@ from bot_health import BotStatus, BotStatusLevel
 
 @pytest.fixture(autouse=True)
 def _reset_module_state():
-    """Each test starts from a clean module-level cache."""
+    """Each test starts from a clean module-level cache.
+
+    Also clears the Stage-15-Step-E #10b row 21 alert-interval
+    override slot so a test that monkeypatches env doesn't see a
+    leaked override from a previous test.
+    """
     bha.reset_latest_state_for_tests()
+    bha.reset_alert_interval_override_for_tests()
     yield
     bha.reset_latest_state_for_tests()
+    bha.reset_alert_interval_override_for_tests()
 
 
 def _make_bot() -> MagicMock:
@@ -657,3 +664,291 @@ async def test_latest_observed_recent_drops_returns_loop_value(monkeypatch):
     state = bha.AlertLoopState(previous_ipn_drops_total=10)
     await bha.run_bot_health_alert_pass(bot, state=state)
     assert bha.latest_observed_recent_drops() == 7
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 21 — DB-backed alert-interval override.
+# ---------------------------------------------------------------------
+
+
+class _StubDB:
+    """Minimal DB stub — only what the override layer touches.
+
+    Mirrors the stubs used in ``test_referral.py`` /
+    ``test_force_join.py``: ``get_setting`` / ``upsert_setting`` /
+    ``delete_setting`` answer from a dict; ``raise_on_get`` /
+    ``raise_on_upsert`` simulate transient pool blips so the
+    fail-soft branches can be exercised.
+    """
+
+    def __init__(
+        self,
+        initial: dict[str, str] | None = None,
+        *,
+        raise_on_get: BaseException | None = None,
+        raise_on_upsert: BaseException | None = None,
+        raise_on_delete: BaseException | None = None,
+    ) -> None:
+        self.rows: dict[str, str] = dict(initial or {})
+        self.raise_on_get = raise_on_get
+        self.raise_on_upsert = raise_on_upsert
+        self.raise_on_delete = raise_on_delete
+        self.upserts: list[tuple[str, str]] = []
+        self.deletes: list[str] = []
+
+    async def get_setting(self, key: str):
+        if self.raise_on_get is not None:
+            raise self.raise_on_get
+        return self.rows.get(key)
+
+    async def upsert_setting(self, key: str, value: str):
+        if self.raise_on_upsert is not None:
+            raise self.raise_on_upsert
+        self.upserts.append((key, value))
+        self.rows[key] = value
+
+    async def delete_setting(self, key: str):
+        if self.raise_on_delete is not None:
+            raise self.raise_on_delete
+        self.deletes.append(key)
+        return self.rows.pop(key, None) is not None
+
+
+def test_coerce_alert_interval_accepts_int():
+    assert bha._coerce_alert_interval(60) == 60
+
+
+def test_coerce_alert_interval_accepts_string():
+    assert bha._coerce_alert_interval("90") == 90
+
+
+def test_coerce_alert_interval_strips_string():
+    assert bha._coerce_alert_interval("  120  ") == 120
+
+
+def test_coerce_alert_interval_rejects_bool():
+    # True is an int subclass — must be rejected explicitly.
+    assert bha._coerce_alert_interval(True) is None
+    assert bha._coerce_alert_interval(False) is None
+
+
+def test_coerce_alert_interval_rejects_zero():
+    assert bha._coerce_alert_interval(0) is None
+
+
+def test_coerce_alert_interval_rejects_negative():
+    assert bha._coerce_alert_interval(-5) is None
+
+
+def test_coerce_alert_interval_rejects_above_max():
+    assert (
+        bha._coerce_alert_interval(bha.INTERVAL_OVERRIDE_MAXIMUM + 1)
+        is None
+    )
+
+
+def test_coerce_alert_interval_accepts_max():
+    assert (
+        bha._coerce_alert_interval(bha.INTERVAL_OVERRIDE_MAXIMUM)
+        == bha.INTERVAL_OVERRIDE_MAXIMUM
+    )
+
+
+def test_coerce_alert_interval_rejects_non_numeric():
+    assert bha._coerce_alert_interval("notanint") is None
+
+
+def test_coerce_alert_interval_rejects_float_string():
+    assert bha._coerce_alert_interval("60.5") is None
+
+
+def test_coerce_alert_interval_rejects_blank_string():
+    assert bha._coerce_alert_interval("") is None
+    assert bha._coerce_alert_interval("   ") is None
+
+
+def test_coerce_alert_interval_rejects_other_types():
+    assert bha._coerce_alert_interval(None) is None
+    assert bha._coerce_alert_interval(1.5) is None
+    assert bha._coerce_alert_interval([60]) is None
+    assert bha._coerce_alert_interval({"value": 60}) is None
+
+
+def test_set_alert_interval_override_applies():
+    bha.set_alert_interval_override(120)
+    assert bha.get_alert_interval_override() == 120
+
+
+def test_set_alert_interval_override_idempotent():
+    bha.set_alert_interval_override(120)
+    bha.set_alert_interval_override(120)
+    assert bha.get_alert_interval_override() == 120
+
+
+def test_set_alert_interval_override_rejects_zero():
+    with pytest.raises(ValueError):
+        bha.set_alert_interval_override(0)
+
+
+def test_set_alert_interval_override_rejects_negative():
+    with pytest.raises(ValueError):
+        bha.set_alert_interval_override(-1)
+
+
+def test_set_alert_interval_override_rejects_above_max():
+    with pytest.raises(ValueError):
+        bha.set_alert_interval_override(bha.INTERVAL_OVERRIDE_MAXIMUM + 1)
+
+
+def test_set_alert_interval_override_rejects_bool():
+    with pytest.raises(ValueError):
+        bha.set_alert_interval_override(True)  # type: ignore[arg-type]
+
+
+def test_clear_alert_interval_override_returns_true_when_set():
+    bha.set_alert_interval_override(120)
+    assert bha.clear_alert_interval_override() is True
+    assert bha.get_alert_interval_override() is None
+
+
+def test_clear_alert_interval_override_returns_false_when_unset():
+    assert bha.clear_alert_interval_override() is False
+
+
+def test_get_alert_interval_override_returns_none_by_default():
+    assert bha.get_alert_interval_override() is None
+
+
+def test_get_interval_seconds_prefers_override(monkeypatch):
+    """Override beats env beats default."""
+    monkeypatch.setenv("BOT_HEALTH_ALERT_INTERVAL_SECONDS", "30")
+    bha.set_alert_interval_override(180)
+    assert bha.get_bot_health_alert_interval_seconds() == 180
+
+
+def test_get_interval_seconds_falls_through_when_override_cleared(monkeypatch):
+    monkeypatch.setenv("BOT_HEALTH_ALERT_INTERVAL_SECONDS", "30")
+    bha.set_alert_interval_override(180)
+    bha.clear_alert_interval_override()
+    assert bha.get_bot_health_alert_interval_seconds() == 30
+
+
+def test_get_source_returns_db_when_override_set():
+    bha.set_alert_interval_override(120)
+    assert bha.get_bot_health_alert_interval_source() == "db"
+
+
+def test_get_source_returns_env_when_only_env_set(monkeypatch):
+    monkeypatch.setenv("BOT_HEALTH_ALERT_INTERVAL_SECONDS", "30")
+    assert bha.get_bot_health_alert_interval_source() == "env"
+
+
+def test_get_source_returns_default_with_blank_env():
+    assert bha.get_bot_health_alert_interval_source() == "default"
+
+
+def test_get_source_returns_default_with_invalid_env(monkeypatch):
+    monkeypatch.setenv("BOT_HEALTH_ALERT_INTERVAL_SECONDS", "notanint")
+    # Falls through to default because env doesn't parse as an int.
+    assert bha.get_bot_health_alert_interval_source() == "default"
+
+
+@pytest.mark.asyncio
+async def test_refresh_from_db_with_no_row_clears_override():
+    bha.set_alert_interval_override(120)
+    db = _StubDB()  # no rows
+    result = await bha.refresh_alert_interval_override_from_db(db)
+    assert result is None
+    assert bha.get_alert_interval_override() is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_from_db_loads_valid_row():
+    db = _StubDB({bha.ALERT_INTERVAL_SETTING_KEY: "240"})
+    result = await bha.refresh_alert_interval_override_from_db(db)
+    assert result == 240
+    assert bha.get_alert_interval_override() == 240
+
+
+@pytest.mark.asyncio
+async def test_refresh_from_db_keeps_cache_on_get_error(caplog):
+    bha.set_alert_interval_override(120)
+    db = _StubDB(raise_on_get=RuntimeError("pool blip"))
+    with caplog.at_level(logging.ERROR, logger="bot.bot_health_alert"):
+        result = await bha.refresh_alert_interval_override_from_db(db)
+    assert result == 120
+    # Cache must not have been wiped by the transient error.
+    assert bha.get_alert_interval_override() == 120
+    assert any("get_setting" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_refresh_from_db_clears_on_malformed_value(caplog):
+    bha.set_alert_interval_override(120)
+    db = _StubDB({bha.ALERT_INTERVAL_SETTING_KEY: "notanint"})
+    with caplog.at_level(logging.WARNING, logger="bot.bot_health_alert"):
+        result = await bha.refresh_alert_interval_override_from_db(db)
+    assert result is None
+    assert bha.get_alert_interval_override() is None
+    assert any(
+        "rejected stored" in r.message for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_from_db_clears_on_above_max(caplog):
+    bha.set_alert_interval_override(60)
+    db = _StubDB(
+        {bha.ALERT_INTERVAL_SETTING_KEY: str(
+            bha.INTERVAL_OVERRIDE_MAXIMUM + 1
+        )}
+    )
+    with caplog.at_level(logging.WARNING, logger="bot.bot_health_alert"):
+        result = await bha.refresh_alert_interval_override_from_db(db)
+    assert result is None
+    assert bha.get_alert_interval_override() is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_from_db_with_none_db_returns_cache():
+    bha.set_alert_interval_override(120)
+    result = await bha.refresh_alert_interval_override_from_db(None)
+    assert result == 120
+    assert bha.get_alert_interval_override() == 120
+
+
+# ---------------------------------------------------------------------
+# bundled bug fix: panel cadence sync via update_loop_cadence.
+# ---------------------------------------------------------------------
+
+
+def test_sync_registered_cadence_updates_loop_cadences():
+    """The loop's resolved cadence must be reflected in
+    ``bot_health.LOOP_CADENCES`` so the ``/admin/control`` panel's
+    "stale threshold" doesn't show 180s while the loop ticks every
+    600s.
+    """
+    import bot_health
+    # Register the loop name with the compile-time default so the
+    # production-time decorator's effect is in place even if a
+    # previous test cleared it.
+    bot_health.LOOP_CADENCES["bot_health_alert"] = (
+        bha._BOT_HEALTH_ALERT_INTERVAL_SECONDS_DEFAULT
+    )
+
+    bha._sync_registered_cadence(600)
+    assert bot_health.LOOP_CADENCES["bot_health_alert"] == 600
+
+
+def test_sync_registered_cadence_swallows_unknown_loop(caplog):
+    """If the registry is empty (test harness),
+    ``update_loop_cadence`` raises KeyError. The sync helper logs +
+    swallows it so a flaky test doesn't take down the loop.
+    """
+    import bot_health
+    bot_health.LOOP_CADENCES.pop("bot_health_alert", None)
+    with caplog.at_level(logging.ERROR, logger="bot.bot_health_alert"):
+        bha._sync_registered_cadence(120)
+    assert any(
+        "update_loop_cadence" in r.message for r in caplog.records
+    )

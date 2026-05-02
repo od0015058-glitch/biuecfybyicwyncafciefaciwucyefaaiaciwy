@@ -444,6 +444,64 @@ def loop_runner(name: str) -> Callable | None:
     return LOOP_RUNNERS.get(name)
 
 
+def update_loop_cadence(name: str, cadence_seconds: int) -> int:
+    """Replace a loop's published cadence at runtime.
+
+    Stage-15-Step-E #10b row 21 bundled bug fix. :func:`register_loop`
+    is invariant-checked: a literal mismatch raises ``RuntimeError``
+    so a stale ``cadence_seconds=`` literal at the call site can't
+    drift from the loop's actual ``await asyncio.sleep(...)``.
+
+    But some loops legitimately tune their cadence at runtime — the
+    bot-health alert loop reads ``BOT_HEALTH_ALERT_INTERVAL_SECONDS``
+    from env / DB on every iteration, and an operator who sets that
+    to anything other than the compile-time default would otherwise
+    leave the panel showing the *old* "stale threshold" (``2 × 60 +
+    60 = 180s``) even though the loop is actually ticking every,
+    say, 600 s. The panel marks the loop overdue at 180 s, the
+    Prometheus heartbeat shows the loop is fine, the operator gets
+    a confusing red badge for a healthy loop.
+
+    This helper is the legitimate runtime-update path:
+
+    * Refuses unknown / never-registered loop names with
+      :class:`KeyError` (the loop must opt in by registering at
+      module import).
+    * Refuses non-positive / non-int / boolean cadence values with
+      :class:`ValueError` (same shape as :func:`register_loop`).
+    * Updates :data:`LOOP_CADENCES` in place.
+    * Returns the new cadence so the caller can log it.
+    * Idempotent: repeat calls with the same value are a no-op.
+
+    The loop's ``runner`` and ``metrics._LOOP_METRIC_NAMES`` membership
+    are NOT touched — only the cadence value the panel reads. Callers
+    are expected to call :func:`register_loop` first (typically as a
+    decorator at module import) to wire the runner / metric.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError(
+            f"update_loop_cadence: name must be a non-empty string, "
+            f"got {name!r}"
+        )
+    if (
+        isinstance(cadence_seconds, bool)
+        or not isinstance(cadence_seconds, int)
+        or cadence_seconds < 1
+    ):
+        raise ValueError(
+            f"update_loop_cadence: cadence_seconds must be a positive "
+            f"int, got {cadence_seconds!r}"
+        )
+    if name not in LOOP_CADENCES:
+        raise KeyError(
+            f"update_loop_cadence: {name!r} is not registered. "
+            f"Call register_loop({name!r}, ...) at module import "
+            f"first."
+        )
+    LOOP_CADENCES[name] = cadence_seconds
+    return cadence_seconds
+
+
 def reset_loop_registry_for_tests() -> None:
     """Clear the loop registry. Tests-only.
 
@@ -894,4 +952,5 @@ __all__ = (
     "request_force_stop",
     "reset_loop_registry_for_tests",
     "status_score",
+    "update_loop_cadence",
 )

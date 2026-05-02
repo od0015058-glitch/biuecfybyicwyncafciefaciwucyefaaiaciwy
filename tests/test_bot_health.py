@@ -1135,3 +1135,92 @@ def test_all_eight_production_loops_have_runners():
             f"{name}: runner is registered but not callable: "
             f"{runner!r}"
         )
+
+
+# ── Stage-15-Step-E #10b row 21: update_loop_cadence ──────────────
+
+
+def test_update_loop_cadence_updates_in_place(_isolated_loop_registry):
+    """The new public helper must replace the cadence value in
+    :data:`LOOP_CADENCES` without raising.
+    """
+    bh.register_loop("dyn", cadence_seconds=60)
+    assert bh.update_loop_cadence("dyn", 120) == 120
+    assert bh.LOOP_CADENCES["dyn"] == 120
+
+
+def test_update_loop_cadence_idempotent_on_same_value(_isolated_loop_registry):
+    bh.register_loop("dyn", cadence_seconds=60)
+    bh.update_loop_cadence("dyn", 60)
+    bh.update_loop_cadence("dyn", 60)
+    assert bh.LOOP_CADENCES["dyn"] == 60
+
+
+def test_update_loop_cadence_does_not_touch_runner_or_metric(
+    _isolated_loop_registry,
+):
+    """Updating the cadence must not drop the runner or the metric
+    name registration.
+    """
+    import metrics
+
+    async def stub(_app):
+        return None
+
+    bh.register_loop("dyn", cadence_seconds=60, runner=stub)
+    bh.update_loop_cadence("dyn", 600)
+    assert bh.LOOP_RUNNERS["dyn"] is stub
+    assert "dyn" in metrics._LOOP_METRIC_NAMES
+
+
+def test_update_loop_cadence_rejects_unknown_name(_isolated_loop_registry):
+    with pytest.raises(KeyError):
+        bh.update_loop_cadence("never_registered", 60)
+
+
+def test_update_loop_cadence_rejects_empty_name(_isolated_loop_registry):
+    with pytest.raises(ValueError):
+        bh.update_loop_cadence("", 60)
+
+
+def test_update_loop_cadence_rejects_non_str_name(_isolated_loop_registry):
+    with pytest.raises(ValueError):
+        bh.update_loop_cadence(None, 60)  # type: ignore[arg-type]
+
+
+def test_update_loop_cadence_rejects_zero(_isolated_loop_registry):
+    bh.register_loop("dyn", cadence_seconds=60)
+    with pytest.raises(ValueError):
+        bh.update_loop_cadence("dyn", 0)
+
+
+def test_update_loop_cadence_rejects_negative(_isolated_loop_registry):
+    bh.register_loop("dyn", cadence_seconds=60)
+    with pytest.raises(ValueError):
+        bh.update_loop_cadence("dyn", -1)
+
+
+def test_update_loop_cadence_rejects_bool(_isolated_loop_registry):
+    bh.register_loop("dyn", cadence_seconds=60)
+    with pytest.raises(ValueError):
+        bh.update_loop_cadence("dyn", True)  # type: ignore[arg-type]
+
+
+def test_update_loop_cadence_rejects_float(_isolated_loop_registry):
+    bh.register_loop("dyn", cadence_seconds=60)
+    with pytest.raises(ValueError):
+        bh.update_loop_cadence("dyn", 60.5)  # type: ignore[arg-type]
+
+
+def test_update_loop_cadence_changes_stale_threshold(_isolated_loop_registry):
+    """The bundled bug fix: the panel's stale threshold (``2× cadence
+    + margin``) must follow a cadence update so an operator who tunes
+    the loop interval doesn't see the loop forever marked overdue.
+    """
+    bh.register_loop("dyn", cadence_seconds=60)
+    initial = bh.loop_stale_threshold_seconds("dyn")
+    bh.update_loop_cadence("dyn", 600)
+    new_threshold = bh.loop_stale_threshold_seconds("dyn")
+    assert new_threshold > initial
+    # 2 × 600 + 60 (the margin) = 1260.
+    assert new_threshold == 1260

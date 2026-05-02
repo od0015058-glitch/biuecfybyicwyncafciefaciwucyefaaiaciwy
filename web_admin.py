@@ -2576,6 +2576,14 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     # investigation can pin the cause to a knob tweak vs. organic
     # invite-traffic growth.
     "wallet_config_referral_update": "Referral payouts updated",
+    # Stage-15-Step-E #10b row 21: BOT_HEALTH_ALERT_INTERVAL_SECONDS
+    # editor on ``/admin/control``. Recorded by
+    # :func:`control_alert_interval_post`; the dropdown entry lets
+    # an operator filter the audit feed to "alert-cadence changes
+    # only" so an "why are we getting fewer / more alerts?"
+    # investigation can pin the cause to a knob tweak vs. unrelated
+    # incident-rate changes.
+    "control_alert_interval_update": "Bot-health alert interval updated",
 }
 
 
@@ -7730,6 +7738,21 @@ async def control_get(request: web.Request) -> web.StreamResponse:
                 "control: refresh_required_channel_override_from_db failed"
             )
 
+    # Stage-15-Step-E #10b row 21: refresh the bot-health alert
+    # interval override so the panel + the loop agree on the current
+    # cadence. Best-effort — a transient DB blip leaves the previous
+    # cache in place.
+    if db is not None:
+        try:
+            import bot_health_alert
+            await (
+                bot_health_alert.refresh_alert_interval_override_from_db(db)
+            )
+        except Exception:
+            log.exception(
+                "control: refresh_alert_interval_override_from_db failed"
+            )
+
     # Read the bot-health alert loop's most-recent rate-windowed drop
     # count so the panel + the loop + Prometheus all classify
     # identically. The panel can't observe a rate-of-drops on its own
@@ -7756,6 +7779,7 @@ async def control_get(request: web.Request) -> web.StreamResponse:
 
     thresholds_view = _build_thresholds_view()
     required_channel_view = _build_required_channel_view()
+    alert_interval_view = _build_alert_interval_view()
 
     ctx = {
         "active_page": "control",
@@ -7765,6 +7789,7 @@ async def control_get(request: web.Request) -> web.StreamResponse:
         "signals": signals,
         "thresholds": thresholds_view,
         "required_channel": required_channel_view,
+        "alert_interval": alert_interval_view,
     }
     response = aiohttp_jinja2.render_template("control.html", request, ctx)
     flash = pop_flash(request, response)
@@ -7879,6 +7904,57 @@ def _build_required_channel_view() -> dict:
         "env_value": env_value,
         "env_raw": env_raw,
         "max_length": force_join.REQUIRED_CHANNEL_MAX_LENGTH,
+    }
+
+
+def _build_alert_interval_view() -> dict:
+    """Snapshot of the bot-health alert-loop interval for the panel.
+
+    Mirrors :func:`_build_required_channel_view`'s shape (single dict,
+    one knob) so ``control.html`` can re-use the existing
+    "effective / source / override / env" badge pattern.
+
+    Stage-15-Step-E #10b row 21. The override slot is bounded by
+    :data:`bot_health_alert.INTERVAL_OVERRIDE_MAXIMUM` (24 h cap) so
+    a fat-finger like ``86400000`` (intended ``60``) can't silently
+    stop alerting for a month.
+    """
+    import bot_health_alert
+
+    override_value = bot_health_alert.get_alert_interval_override()
+    env_raw = os.getenv("BOT_HEALTH_ALERT_INTERVAL_SECONDS", "").strip()
+    env_value: int | None = None
+    if env_raw:
+        try:
+            parsed = int(env_raw)
+        except ValueError:
+            env_value = None
+        else:
+            if parsed >= bot_health_alert.INTERVAL_MINIMUM:
+                env_value = parsed
+            elif parsed >= 1:
+                # ``_read_int_env`` clamps below the minimum; surface
+                # the *clamped* value so the panel doesn't lie about
+                # what's live. ``INTERVAL_MINIMUM`` is currently 1 so
+                # this branch is unreachable today, but kept defensive
+                # so a future minimum bump doesn't desync the panel.
+                env_value = bot_health_alert.INTERVAL_MINIMUM
+            # else: env_raw was 0 / negative → falls back to default;
+            # leave env_value None so the source resolver returns
+            # "default".
+    effective = bot_health_alert.get_bot_health_alert_interval_seconds()
+    source = bot_health_alert.get_bot_health_alert_interval_source()
+    return {
+        "effective": effective,
+        "source": source,
+        "override_value": override_value,
+        "env_value": env_value,
+        "env_raw": env_raw,
+        "default_value": (
+            bot_health_alert._BOT_HEALTH_ALERT_INTERVAL_SECONDS_DEFAULT
+        ),
+        "minimum": bot_health_alert.INTERVAL_MINIMUM,
+        "maximum": bot_health_alert.INTERVAL_OVERRIDE_MAXIMUM,
     }
 
 
@@ -8794,6 +8870,249 @@ async def control_required_channel_post(
     return response
 
 
+async def control_alert_interval_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/control/alert-interval`` — update the alert cadence.
+
+    Stage-15-Step-E #10b row 21. ``BOT_HEALTH_ALERT_INTERVAL_SECONDS``
+    was env-only, so an operator who wanted to slow down or speed up
+    the alert-loop cadence had to redeploy. This handler writes the
+    override to the ``system_settings`` overlay (DB-backed), refreshes
+    the in-process cache so :func:`bot_health_alert._alert_loop`
+    picks up the change on its next iteration without a restart, and
+    audit-logs a row whose ``meta`` carries the diff.
+
+    Form keys:
+
+    * ``alert_interval_seconds`` — new cadence in seconds. Must
+      coerce to an integer in
+      ``[INTERVAL_MINIMUM, INTERVAL_OVERRIDE_MAXIMUM]``. Empty means
+      "use whatever default action is selected".
+    * ``action`` — explicit operator intent. ``set`` writes the
+      value; ``clear`` drops the DB row and falls through to env.
+      Two distinct submit buttons so the user can't accidentally
+      blank the field and trigger an unintended clear.
+
+    Validation order (mirrors :func:`control_required_channel_post`):
+
+    1. CSRF.
+    2. Action allowlist (``set`` / ``clear``).
+    3. Coerce + range-check via
+       :func:`bot_health_alert._coerce_alert_interval`.
+    4. ``set_alert_interval_override`` defence-in-depth.
+    5. Persist via ``upsert_setting`` / ``delete_setting``.
+    6. Audit row.
+    7. Redirect with a flash banner.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app.get(APP_KEY_DB)
+    form = await request.post()
+
+    guard = _control_csrf_guard(request, form)
+    if guard is not None:
+        return guard
+
+    if db is None:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Database is not configured — "
+                "BOT_HEALTH_ALERT_INTERVAL_SECONDS edits require a "
+                "live DB connection."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    import bot_health_alert
+
+    action = str(form.get("action", "set")).strip().lower()
+    if action not in {"set", "clear"}:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Unknown alert-interval action {action!r}. "
+                "Expected 'set' or 'clear'. No changes were made."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    raw_value = str(form.get("alert_interval_seconds", "")).strip()
+    previous_effective = (
+        bot_health_alert.get_bot_health_alert_interval_seconds()
+    )
+    previous_source = (
+        bot_health_alert.get_bot_health_alert_interval_source()
+    )
+
+    if action == "clear":
+        # Drop the DB override and fall through to env / default.
+        try:
+            await db.delete_setting(
+                bot_health_alert.ALERT_INTERVAL_SETTING_KEY
+            )
+        except Exception:
+            log.exception(
+                "control_alert_interval_post: delete_setting failed"
+            )
+            response = web.HTTPFound(location="/admin/control")
+            set_flash(
+                response, kind="error",
+                message=(
+                    "Failed to clear the BOT_HEALTH_ALERT_INTERVAL_SECONDS "
+                    "override — see logs. The previous value is still "
+                    "in effect."
+                ),
+                secret=secret, cookie_secure=cookie_secure,
+            )
+            return response
+        bot_health_alert.clear_alert_interval_override()
+        try:
+            await (
+                bot_health_alert.refresh_alert_interval_override_from_db(db)
+            )
+        except Exception:
+            log.exception(
+                "control_alert_interval_post: refresh after clear failed"
+            )
+        new_effective = (
+            bot_health_alert.get_bot_health_alert_interval_seconds()
+        )
+        new_source = (
+            bot_health_alert.get_bot_health_alert_interval_source()
+        )
+        await _record_audit_safe(
+            request, "control_alert_interval_update",
+            target="bot_health_alert_interval_seconds",
+            meta={
+                "action": "clear",
+                "before": previous_effective,
+                "before_source": previous_source,
+                "after": new_effective,
+                "after_source": new_source,
+            },
+        )
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Alert-interval override cleared. The loop cadence is "
+                f"now {new_effective}s (source: {new_source})."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    # action == "set". Validate + persist + apply.
+    if not raw_value:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Alert interval cannot be blank when applying a "
+                "'set'. Use 'Clear DB override' to drop the override."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    coerced = bot_health_alert._coerce_alert_interval(raw_value)
+    if coerced is None:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"BOT_HEALTH_ALERT_INTERVAL_SECONDS must be an integer "
+                f"in [{bot_health_alert.INTERVAL_MINIMUM}, "
+                f"{bot_health_alert.INTERVAL_OVERRIDE_MAXIMUM}] "
+                f"(got {raw_value!r}). No changes were made."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        await db.upsert_setting(
+            bot_health_alert.ALERT_INTERVAL_SETTING_KEY, str(coerced),
+        )
+    except Exception:
+        log.exception(
+            "control_alert_interval_post: upsert_setting failed value=%r",
+            coerced,
+        )
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Failed to persist the new alert interval — see logs. "
+                "The previous value is still in effect."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        bot_health_alert.set_alert_interval_override(coerced)
+    except ValueError:
+        log.exception(
+            "control_alert_interval_post: set_alert_interval_override "
+            "rejected %r after upsert succeeded — refreshing from DB",
+            coerced,
+        )
+
+    # Re-read whatever ended up in the DB so the cache reflects the
+    # truth.
+    try:
+        await bot_health_alert.refresh_alert_interval_override_from_db(db)
+    except Exception:
+        log.exception(
+            "control_alert_interval_post: refresh after upsert failed"
+        )
+
+    new_effective = (
+        bot_health_alert.get_bot_health_alert_interval_seconds()
+    )
+    new_source = bot_health_alert.get_bot_health_alert_interval_source()
+    await _record_audit_safe(
+        request, "control_alert_interval_update",
+        target="bot_health_alert_interval_seconds",
+        meta={
+            "action": "set",
+            "before": previous_effective,
+            "before_source": previous_source,
+            "after": new_effective,
+            "after_source": new_source,
+        },
+    )
+
+    response = web.HTTPFound(location="/admin/control")
+    if new_effective == previous_effective:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Alert interval unchanged ({new_effective}s). "
+                "The override is now persisted in the DB."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    else:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Alert interval updated: {previous_effective}s → "
+                f"{new_effective}s. The new cadence is live for the "
+                f"next tick of the bot-health alert loop."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    return response
+
+
 # ---------------------------------------------------------------------
 # Stage-15-Step-E #5 follow-up #4: per-template globals.
 # ---------------------------------------------------------------------
@@ -9292,6 +9611,15 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/control/required-channel",
         _require_role(ROLE_SUPER)(control_required_channel_post),
+    )
+    # Stage-15-Step-E #10b row 21: BOT_HEALTH_ALERT_INTERVAL_SECONDS
+    # editor on /admin/control. Lets an operator re-tune the alert
+    # cadence without a redeploy. The bot-health alert loop re-reads
+    # the resolved cadence on every iteration so the new value takes
+    # effect on the next tick.
+    app.router.add_post(
+        "/admin/control/alert-interval",
+        _require_role(ROLE_SUPER)(control_alert_interval_post),
     )
     # Stage-15-Step-F follow-up #6: per-loop manual "tick now" button.
     app.router.add_post(

@@ -2151,7 +2151,7 @@ or unblock other work.
 | 18 | **JSONB conversation_messages** — vision turns can't store image refs. | `content TEXT` only. | Schema migration to JSONB + read/write paths preserve attachments. | P2 | **Shipped** (PR #163) |
 | 19 | **"View as <role>" toggle** — operators can preview viewer/operator views. | None. | Top-bar dropdown on `/admin` that swaps the active role for the current request only. | P3 | **Shipped** (PR #162) |
 | 20 | **Audit retention policy** — audit log grows forever. | No retention. | Editor on `/admin/audit` + nightly delete loop. | P2 | Pending |
-| 21 | **Bot-health alert cadence** — `BOT_HEALTH_ALERT_INTERVAL_SECONDS`. | Env-only. | Editor on `/admin/control`. | P3 | Pending |
+| 21 | **Bot-health alert cadence** — `BOT_HEALTH_ALERT_INTERVAL_SECONDS`. | Env-only. | Editor on `/admin/control`. | P3 | **Shipped** (PR #173) |
 | 22 | **`I18N_LOCK`** — gate live string overrides during deploy. | Not implemented. | Toggle on `/admin/strings` that blocks the upsert form. | P3 | Pending |
 | 23 | **`MODEL_DISCOVERY_INTERVAL_SECONDS`** — catalog refresh cadence. | Env-only. | Editor on a new `/admin/models-config` page. | P3 | Pending |
 | 24 | **`FX_REFRESH_INTERVAL_SECONDS`** — USD→Toman refresh cadence. | Env-only. | Editor on `/admin/wallet-config`. | P3 | Pending |
@@ -2423,6 +2423,118 @@ for any DB-backed override editor that gates TWO coupled knobs:**
   not one per knob. The audit `meta` dict carries before / after /
   source for BOTH knobs so a future investigation can answer "what
   did the operator change at 14:32?" with one row.
+
+---
+
+### §10b.4 — Row #21 (BOT_HEALTH_ALERT_INTERVAL_SECONDS web surface) — shipped
+
+The §10b row #21 ship (PR #173) lifts the bot-health alert-loop
+cadence into a `system_settings` overlay so an operator can re-tune
+how often the alert loop wakes up to classify the bot's health and
+DM the operator on a bad-state transition — without a redeploy. The
+loop re-reads the resolved cadence on every iteration so a saved
+override is live within at most one tick.
+
+Pattern: same as §10b.2 (REQUIRED_CHANNEL) and §10b.3
+(REFERRAL_BONUS_*) — env-knob → DB-backed override layer →
+boot warm-up → editor card on the existing `/admin/control` page.
+
+Module-level surface added in `bot_health_alert.py`:
+
+- `_INTERVAL_OVERRIDE` cache + `_coerce_alert_interval` validator
+  with explicit `bool` rejection (`isinstance(value, bool)` BEFORE
+  `int` check — `True` is an int subclass).
+- Bounds: `INTERVAL_MINIMUM = 1` (mirrors the env-side minimum),
+  `INTERVAL_OVERRIDE_MAXIMUM = 86_400` (24h cap so a fat-finger like
+  `86400000` intended `60` can't silently disable alerting for a
+  month).
+- Public accessors `set_alert_interval_override` /
+  `clear_alert_interval_override` /
+  `get_alert_interval_override` /
+  `refresh_alert_interval_override_from_db` /
+  `reset_alert_interval_override_for_tests`.
+- Source resolver `get_bot_health_alert_interval_source` returns
+  `db` / `env` / `default` exactly like the other knobs, so the
+  panel can re-use the existing badge.
+
+Loop integration:
+
+- `_alert_loop` re-reads `get_bot_health_alert_interval_seconds()`
+  at the bottom of every iteration so a saved override takes effect
+  on the next tick. The very first tick after boot uses the value
+  from the `main.py` warm-up (see below).
+- `_sync_registered_cadence(cadence_seconds)` pushes the resolved
+  cadence into `bot_health.LOOP_CADENCES` after every change so the
+  panel's per-loop "stale threshold" calculation tracks the loop's
+  actual sleep duration.
+
+Bundled bug fix (`bot_health.py`):
+
+- New public helper `update_loop_cadence(name, cadence_seconds) ->
+  int` (Stage-15-Step-E #10b row 21). Pre-fix, the panel computed
+  the stale threshold as `2 × cadence + 60` from the **registered**
+  cadence (set once at decorator-time), so an operator who tuned
+  `BOT_HEALTH_ALERT_INTERVAL_SECONDS` to 600 would see the alert
+  loop forever flagged "running late" or "overdue" because the
+  panel still believed cadence was the compile-time default. The
+  helper validates name + cadence (rejects empty / non-str / bool /
+  non-positive / non-int), updates `LOOP_CADENCES` in place, and
+  raises `KeyError` for unknown loop names so a typo at the call
+  site doesn't silently no-op. `_sync_registered_cadence` calls it
+  on every cadence change. Reusable for any future per-loop cadence
+  knob (rows §10b row #11 will use it too).
+
+`main.py` warm-up:
+
+- New `try/except` block that calls
+  `bot_health_alert.refresh_alert_interval_override_from_db(db)` so
+  the very first tick of the alert loop uses the operator's
+  configured cadence rather than the env / compile-time default.
+  Fail-soft; falls through to env / default on a transient DB blip.
+
+`web_admin.py`:
+
+- New `_build_alert_interval_view()` returns a single dict with
+  `effective` / `source` / `override_value` / `env_value` /
+  `env_raw` / `default_value` / `minimum` / `maximum`.
+- `control_get` calls
+  `bot_health_alert.refresh_alert_interval_override_from_db(db)`
+  on every render and threads `alert_interval` through the
+  template ctx.
+- `control_alert_interval_post` handles both `action=set` (validate
+  + upsert + apply) and `action=clear` (drop the DB row + clear the
+  in-process cache). Audit slug `control_alert_interval_update`
+  records the diff. Route registered as
+  `POST /admin/control/alert-interval` with `_require_role(ROLE_SUPER)`.
+- New `AUDIT_ACTION_LABELS` entry
+  `"control_alert_interval_update": "Bot-health alert interval updated"`
+  so the `/admin/audit` filter dropdown surfaces alert-cadence
+  changes.
+
+`templates/admin/control.html`:
+
+- New "⏱ Alert-loop cadence" card under the "📢 Required channel"
+  card. Same effective / db / env / default rows; HTML5 `number`
+  input with `min` / `max` set from
+  `INTERVAL_MINIMUM` / `INTERVAL_OVERRIDE_MAXIMUM` for client-side
+  validation. Two submit buttons ("Save cadence" / "Clear DB
+  override") so the operator can't accidentally blank the field
+  and trigger an unintended clear.
+
+Tests added:
+
+- `tests/test_bot_health_alert.py` — 27 new tests covering coerce
+  / set / clear / get / refresh-from-DB (happy path + DB-blip +
+  malformed-row branches), source resolver across all
+  db/env/default combinations, and `_sync_registered_cadence`
+  cadence-update + unknown-loop fail-safe.
+- `tests/test_bot_health.py` — 10 new tests covering
+  `update_loop_cadence` validation matrix + the bundled bug-fix
+  regression (`test_update_loop_cadence_changes_stale_threshold`).
+- `tests/test_web_admin.py` — 12 new tests covering the new POST
+  handler (auth / CSRF / persist / clear / below-minimum /
+  above-max / non-int / blank-set / unknown-action / DB-blip),
+  the GET-render card, and the audit-slug regression.
 
 ---
 
