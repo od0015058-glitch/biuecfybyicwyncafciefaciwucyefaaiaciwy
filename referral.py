@@ -51,6 +51,43 @@ log = logging.getLogger(__name__)
 _DEFAULT_REFERRAL_BONUS_PERCENT = 10.0
 _DEFAULT_REFERRAL_BONUS_MAX_USD = 5.0
 
+# ----------------------------------------------------------------------
+# Stage-15-Step-E #10b row 7: DB-backed override layer.
+#
+# Both knobs follow the COST_MARKUP / MIN_TOPUP_USD / REQUIRED_CHANNEL
+# recipe (env-only → in-process override cache → boot warm-up → audit-
+# logged web editor on ``/admin/wallet-config``). Resolution order:
+#
+# 1. ``_REFERRAL_*_OVERRIDE`` — process-local cache, populated from
+#    ``system_settings.<KEY>`` via :func:`refresh_*_override_from_db`
+#    at boot and on every editor render.
+# 2. ``REFERRAL_BONUS_PERCENT`` / ``REFERRAL_BONUS_MAX_USD`` env var.
+# 3. ``_DEFAULT_REFERRAL_BONUS_*`` compile-time fallback.
+#
+# Validation cap mirrors the existing helper: percent must be finite
+# AND positive, max-USD must be finite AND positive. We deliberately
+# refuse zero (would silently disable the feature) so the only path
+# to "no referral bonus" is to either (a) NOT set the override, or
+# (b) clear the override AND unset the env var so we land on the
+# defaults — a deliberate operator action, not a fat-finger.
+# ----------------------------------------------------------------------
+
+REFERRAL_BONUS_PERCENT_SETTING_KEY: str = "REFERRAL_BONUS_PERCENT"
+REFERRAL_BONUS_MAX_USD_SETTING_KEY: str = "REFERRAL_BONUS_MAX_USD"
+
+# Hard upper-bound caps so a fat-finger can't lock the feature in a
+# state where every paid top-up grants $1M to the inviter. Operators
+# tweak the percent/max for product reasons; nothing reasonable goes
+# above these caps.
+REFERRAL_BONUS_PERCENT_MAXIMUM: float = 100.0  # exclusive — 100% bonus
+# is not a sane referral structure.
+REFERRAL_BONUS_MAX_USD_MAXIMUM: float = 1_000.0  # exclusive — anything
+# bigger is a bug. The maximum-PERCENT cap applies first; this
+# secondary cap is the absolute ceiling per side.
+
+_REFERRAL_BONUS_PERCENT_OVERRIDE: float | None = None
+_REFERRAL_BONUS_MAX_USD_OVERRIDE: float | None = None
+
 
 def _safe_float_env(name: str, default: float) -> float:
     """Read *name* from ``os.environ`` as float, falling back to
@@ -78,19 +115,231 @@ def _safe_float_env(name: str, default: float) -> float:
     return value
 
 
-def get_referral_bonus_percent() -> float:
-    """Lazy env-var read so tests can monkeypatch ``os.environ``
-    between cases without re-importing the module.
+def _coerce_referral_bonus_percent(value: object) -> float | None:
+    """Strict validator for the percent knob: returns the float on
+    success, ``None`` on any rejection. Refuses bool (``True == 1.0``
+    sneaks through ``float()``), non-finite, non-positive,
+    or above-cap values."""
+    if isinstance(value, bool):
+        return None
+    try:
+        coerced = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(coerced):
+        return None
+    if coerced <= 0:
+        return None
+    if coerced >= REFERRAL_BONUS_PERCENT_MAXIMUM:
+        return None
+    return coerced
+
+
+def _coerce_referral_bonus_max_usd(value: object) -> float | None:
+    """Strict validator for the max-USD knob; same rules as
+    :func:`_coerce_referral_bonus_percent` but with the USD cap."""
+    if isinstance(value, bool):
+        return None
+    try:
+        coerced = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(coerced):
+        return None
+    if coerced <= 0:
+        return None
+    if coerced >= REFERRAL_BONUS_MAX_USD_MAXIMUM:
+        return None
+    return coerced
+
+
+# ---------- override: percent ----------
+
+
+def set_referral_bonus_percent_override(value: float) -> None:
+    """Replace the in-process referral-percent override.
+
+    Validates against the same rules as
+    :func:`_coerce_referral_bonus_percent`. Refuses ``bool``."""
+    global _REFERRAL_BONUS_PERCENT_OVERRIDE
+    if isinstance(value, bool):
+        raise ValueError(
+            "referral-percent override must be numeric, not bool"
+        )
+    coerced = _coerce_referral_bonus_percent(value)
+    if coerced is None:
+        raise ValueError(
+            f"referral-percent override {value!r} must be a finite, "
+            f"positive number in (0, {REFERRAL_BONUS_PERCENT_MAXIMUM})"
+        )
+    _REFERRAL_BONUS_PERCENT_OVERRIDE = coerced
+
+
+def clear_referral_bonus_percent_override() -> bool:
+    """Drop the in-process percent override. Returns True if one was
+    active."""
+    global _REFERRAL_BONUS_PERCENT_OVERRIDE
+    had = _REFERRAL_BONUS_PERCENT_OVERRIDE is not None
+    _REFERRAL_BONUS_PERCENT_OVERRIDE = None
+    return had
+
+
+def get_referral_bonus_percent_override() -> float | None:
+    """Return the current in-process percent override (or ``None``)."""
+    return _REFERRAL_BONUS_PERCENT_OVERRIDE
+
+
+async def refresh_referral_bonus_percent_override_from_db(
+    db,
+) -> float | None:
+    """Reload the percent override from the ``system_settings`` overlay.
+
+    Mirrors :func:`payments.refresh_min_topup_override_from_db`: a
+    transient DB error keeps the previous cache in place. A malformed
+    stored value (non-finite / non-positive / above-cap) is treated as
+    "no override" rather than crashing the bot.
     """
+    global _REFERRAL_BONUS_PERCENT_OVERRIDE
+    if db is None:
+        return _REFERRAL_BONUS_PERCENT_OVERRIDE
+    try:
+        raw = await db.get_setting(REFERRAL_BONUS_PERCENT_SETTING_KEY)
+    except Exception:
+        log.exception(
+            "refresh_referral_bonus_percent_override_from_db: "
+            "get_setting failed; keeping previous cache value=%s",
+            _REFERRAL_BONUS_PERCENT_OVERRIDE,
+        )
+        return _REFERRAL_BONUS_PERCENT_OVERRIDE
+    if raw is None:
+        _REFERRAL_BONUS_PERCENT_OVERRIDE = None
+        return None
+    coerced = _coerce_referral_bonus_percent(raw)
+    if coerced is None:
+        log.warning(
+            "refresh_referral_bonus_percent_override_from_db: rejected "
+            "stored value %r; clearing override",
+            raw,
+        )
+        _REFERRAL_BONUS_PERCENT_OVERRIDE = None
+        return None
+    _REFERRAL_BONUS_PERCENT_OVERRIDE = coerced
+    return coerced
+
+
+# ---------- override: max-USD ----------
+
+
+def set_referral_bonus_max_usd_override(value: float) -> None:
+    """Replace the in-process referral-max-USD override."""
+    global _REFERRAL_BONUS_MAX_USD_OVERRIDE
+    if isinstance(value, bool):
+        raise ValueError(
+            "referral-max-USD override must be numeric, not bool"
+        )
+    coerced = _coerce_referral_bonus_max_usd(value)
+    if coerced is None:
+        raise ValueError(
+            f"referral-max-USD override {value!r} must be a finite, "
+            f"positive number in (0, {REFERRAL_BONUS_MAX_USD_MAXIMUM})"
+        )
+    _REFERRAL_BONUS_MAX_USD_OVERRIDE = coerced
+
+
+def clear_referral_bonus_max_usd_override() -> bool:
+    """Drop the in-process max-USD override. Returns True if one was
+    active."""
+    global _REFERRAL_BONUS_MAX_USD_OVERRIDE
+    had = _REFERRAL_BONUS_MAX_USD_OVERRIDE is not None
+    _REFERRAL_BONUS_MAX_USD_OVERRIDE = None
+    return had
+
+
+def get_referral_bonus_max_usd_override() -> float | None:
+    """Return the current in-process max-USD override (or ``None``)."""
+    return _REFERRAL_BONUS_MAX_USD_OVERRIDE
+
+
+async def refresh_referral_bonus_max_usd_override_from_db(
+    db,
+) -> float | None:
+    """Reload the max-USD override from the ``system_settings`` overlay.
+    Same fail-soft semantics as the percent variant."""
+    global _REFERRAL_BONUS_MAX_USD_OVERRIDE
+    if db is None:
+        return _REFERRAL_BONUS_MAX_USD_OVERRIDE
+    try:
+        raw = await db.get_setting(REFERRAL_BONUS_MAX_USD_SETTING_KEY)
+    except Exception:
+        log.exception(
+            "refresh_referral_bonus_max_usd_override_from_db: "
+            "get_setting failed; keeping previous cache value=%s",
+            _REFERRAL_BONUS_MAX_USD_OVERRIDE,
+        )
+        return _REFERRAL_BONUS_MAX_USD_OVERRIDE
+    if raw is None:
+        _REFERRAL_BONUS_MAX_USD_OVERRIDE = None
+        return None
+    coerced = _coerce_referral_bonus_max_usd(raw)
+    if coerced is None:
+        log.warning(
+            "refresh_referral_bonus_max_usd_override_from_db: rejected "
+            "stored value %r; clearing override",
+            raw,
+        )
+        _REFERRAL_BONUS_MAX_USD_OVERRIDE = None
+        return None
+    _REFERRAL_BONUS_MAX_USD_OVERRIDE = coerced
+    return coerced
+
+
+# ---------- public lookup ----------
+
+
+def get_referral_bonus_percent() -> float:
+    """Return the resolved referral bonus percent.
+
+    Resolution order: in-process override → ``REFERRAL_BONUS_PERCENT``
+    env → ``_DEFAULT_REFERRAL_BONUS_PERCENT`` (10.0). Always returns
+    a finite, positive value.
+    """
+    if _REFERRAL_BONUS_PERCENT_OVERRIDE is not None:
+        return _REFERRAL_BONUS_PERCENT_OVERRIDE
     return _safe_float_env(
         "REFERRAL_BONUS_PERCENT", _DEFAULT_REFERRAL_BONUS_PERCENT
     )
 
 
 def get_referral_bonus_max_usd() -> float:
+    """Return the resolved referral bonus cap in USD.
+
+    Resolution order: in-process override → ``REFERRAL_BONUS_MAX_USD``
+    env → ``_DEFAULT_REFERRAL_BONUS_MAX_USD`` (5.0)."""
+    if _REFERRAL_BONUS_MAX_USD_OVERRIDE is not None:
+        return _REFERRAL_BONUS_MAX_USD_OVERRIDE
     return _safe_float_env(
         "REFERRAL_BONUS_MAX_USD", _DEFAULT_REFERRAL_BONUS_MAX_USD
     )
+
+
+def get_referral_bonus_percent_source() -> str:
+    """Return ``db`` / ``env`` / ``default`` for the resolved percent."""
+    if _REFERRAL_BONUS_PERCENT_OVERRIDE is not None:
+        return "db"
+    raw = os.getenv("REFERRAL_BONUS_PERCENT")
+    if raw is not None and _coerce_referral_bonus_percent(raw) is not None:
+        return "env"
+    return "default"
+
+
+def get_referral_bonus_max_usd_source() -> str:
+    """Return ``db`` / ``env`` / ``default`` for the resolved max-USD."""
+    if _REFERRAL_BONUS_MAX_USD_OVERRIDE is not None:
+        return "db"
+    raw = os.getenv("REFERRAL_BONUS_MAX_USD")
+    if raw is not None and _coerce_referral_bonus_max_usd(raw) is not None:
+        return "env"
+    return "default"
 
 
 # ----------------------------------------------------------------------
@@ -218,11 +467,25 @@ async def grant_referral_after_credit(
 
 
 __all__ = [
+    "REFERRAL_BONUS_MAX_USD_MAXIMUM",
+    "REFERRAL_BONUS_MAX_USD_SETTING_KEY",
+    "REFERRAL_BONUS_PERCENT_MAXIMUM",
+    "REFERRAL_BONUS_PERCENT_SETTING_KEY",
     "build_share_url",
+    "clear_referral_bonus_max_usd_override",
+    "clear_referral_bonus_percent_override",
     "get_bot_username",
     "get_referral_bonus_max_usd",
+    "get_referral_bonus_max_usd_override",
+    "get_referral_bonus_max_usd_source",
     "get_referral_bonus_percent",
+    "get_referral_bonus_percent_override",
+    "get_referral_bonus_percent_source",
     "grant_referral_after_credit",
     "parse_referral_payload",
     "parse_start_payload",
+    "refresh_referral_bonus_max_usd_override_from_db",
+    "refresh_referral_bonus_percent_override_from_db",
+    "set_referral_bonus_max_usd_override",
+    "set_referral_bonus_percent_override",
 ]

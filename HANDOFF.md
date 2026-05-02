@@ -2137,7 +2137,7 @@ or unblock other work.
 | 4 | **`MIN_TOPUP_USD` / `MIN_TOPUP_TOMAN`** — minimum allowed top-up amounts. | Env-only. | Editor on a new `/admin/wallet-config` page. | P2 | **Shipped** — PR-2a (PR #169) added the DB-backed override layer in `payments.py` + boot warm-up; PR-2b (this PR) added the `/admin/wallet-config` page with the MIN_TOPUP_USD editor, audit row (`wallet_config_min_topup_update`), 13 web tests, and sidebar nav link. `MIN_TOPUP_TOMAN` is not a separate knob — it's derived from MIN_TOPUP_USD × FX rate at request time, and the page renders that derived figure inline. |
 | 5 | **`REQUIRED_CHANNEL`** — force-join channel handle. | Env-only. | Editor on `/admin/control` (or new `/admin/access`). | P2 | **Shipped** (this PR — DB-backed override layer in `force_join.py` + boot warm-up + `/admin/control` editor card with set / clear / force-OFF actions, audit row `control_required_channel_update`, sidebar source badge). |
 | 6 | **`FREE_MESSAGES_PER_USER`** — initial free-trial messages. | Env-only. | Editor on `/admin/wallet-config`. | P2 | Pending |
-| 7 | **`REFERRAL_BONUS_USD` + `REFERRAL_PERCENT`** — referral payouts. | Env-only. | Editor on `/admin/wallet-config`. | P2 | Pending |
+| 7 | **`REFERRAL_BONUS_PERCENT` + `REFERRAL_BONUS_MAX_USD`** — referral payouts. (Earlier drafts of this row called these `REFERRAL_BONUS_USD` / `REFERRAL_PERCENT`; the actual env-var names in `referral.py` are `REFERRAL_BONUS_PERCENT` and `REFERRAL_BONUS_MAX_USD`.) | Env-only. | Editor on `/admin/wallet-config`. | P2 | **Shipped** (this PR — DB-backed override layer in `referral.py` for both knobs + boot warm-up + `/admin/wallet-config` editor card with combined Save form / per-knob Clear form, audit row `wallet_config_referral_update`). |
 | 8 | **`MEMORY_CONTEXT_LIMIT` / `MEMORY_CONTENT_MAX_CHARS`** — conversation memory caps. | Env-only. | Editor on a new `/admin/memory-config` page. | P3 | Pending |
 | 9 | **Pending-PENDING expiration window** (`PENDING_EXPIRATION_HOURS_DEFAULT`). | Env-only. | Editor on `/admin/control` or `/admin/payments`. | P3 | Pending |
 | 10 | **Stuck-PENDING alert threshold** (`PENDING_ALERT_THRESHOLD_HOURS`). | Env-only. | Editor on `/admin/control`. | P3 | Pending |
@@ -2316,6 +2316,113 @@ DB-backed override editor whose key is a STRING (not a number):**
   `<input maxlength=…>`. The DB column is `TEXT` so unbounded
   values *would* persist; an explicit ceiling is defence in depth
   matching the `set_admin_role` notes pattern.
+
+---
+
+### §10b.3 — Row #7 (REFERRAL_BONUS_* web surface) — shipped
+
+**Context (closed 2026-05-02):** Row #7 covers two coupled knobs —
+`REFERRAL_BONUS_PERCENT` (default `10.0`) and `REFERRAL_BONUS_MAX_USD`
+(default `5.0`) — that gate the per-side payout when an invitee's
+first paid top-up triggers a referral grant. Both were env-only
+(`_safe_float_env` in `referral.py`), forcing a redeploy to retune
+payouts. This PR shipped both knobs in one swing because (a) they
+share a single product decision (a percent change typically goes
+hand-in-hand with a cap re-check) and (b) the editor card hosts
+them together so an operator sees the combined effective payout
+("X% capped at $Y") at a glance.
+
+**Why this row over #6 / #8 / #9 / #10 / #11:** Row #6
+(`FREE_MESSAGES_PER_USER`) is mis-labelled in the table — there is
+no env knob for it today; the default is hardcoded as `INT DEFAULT
+10` in the baseline migration. Lifting it would be a NEW knob, not
+an env-to-DB lift, and the wallet-economy module that should host
+the override doesn't exist yet — bigger surface than rows #5 / #7.
+Rows #8, #9, #10, #11 each share that "host module doesn't exist"
+or "no panel real estate yet" friction. Row #7 reuses the
+already-shipped `/admin/wallet-config` page and the existing
+`referral.py` module — same cost / effort as row #5 (one PR,
+one card, one audit slug).
+
+**What's wired:**
+
+- `referral.py`
+  - `REFERRAL_BONUS_PERCENT_SETTING_KEY` /
+    `REFERRAL_BONUS_MAX_USD_SETTING_KEY` — the
+    `system_settings.key` slugs the override layer reads / writes.
+  - `REFERRAL_BONUS_PERCENT_MAXIMUM` (`100.0`, exclusive) /
+    `REFERRAL_BONUS_MAX_USD_MAXIMUM` (`1000.0`, exclusive) — hard
+    upper-bound caps so a fat-finger can't lock the feature in a
+    state where every paid top-up grants a runaway payout.
+  - `_coerce_referral_bonus_percent(value)` /
+    `_coerce_referral_bonus_max_usd(value)` — strict validators.
+    Refuse `bool`, non-numeric, non-finite, non-positive, or
+    above-cap values. Return `None` on rejection (same shape as
+    `payments._coerce_min_topup`).
+  - `set_referral_bonus_percent_override` /
+    `clear_referral_bonus_percent_override` /
+    `get_referral_bonus_percent_override` /
+    `refresh_referral_bonus_percent_override_from_db(db)` — full
+    mirror of the COST_MARKUP / MIN_TOPUP_USD surface.
+  - `set_referral_bonus_max_usd_override` /
+    `clear_referral_bonus_max_usd_override` /
+    `get_referral_bonus_max_usd_override` /
+    `refresh_referral_bonus_max_usd_override_from_db(db)` — same
+    for the cap.
+  - `get_referral_bonus_percent()` /
+    `get_referral_bonus_max_usd()` now consult the override slot
+    first; the env var stays the second-tier fallback. Existing
+    callers (`grant_referral_after_credit` ⇒
+    `Database._grant_referral_in_tx`) pick up the override
+    automatically because they already route through these
+    helpers.
+  - `get_referral_bonus_percent_source` /
+    `get_referral_bonus_max_usd_source` — return `db` / `env` /
+    `default` for the panel badges.
+- `main.py`
+  - Two boot warm-up calls right after the `REQUIRED_CHANNEL`
+    warm-up, in independent `try/except` blocks so a malformed
+    row in one knob doesn't poison the other.
+- `web_admin.py`
+  - `_build_referral_view()` returns the per-source breakdown for
+    both knobs, mirroring `_build_min_topup_view` / `_build_markup_view`.
+  - `wallet_config_get` now refreshes both referral overrides on
+    every render (in addition to the existing min-topup refresh)
+    and threads `referral_view` through the template ctx.
+  - `wallet_config_referral_post` handles both `action=set`
+    (validate + persist + refresh both knobs independently) and
+    `action=clear` (drop the DB row(s) listed in the multi-select
+    `targets` field). Audit slug `wallet_config_referral_update`
+    records the diff (`before_*`, `after_*`, plus the
+    `submitted_*` raw values for "set" or `cleared` list for
+    "clear").
+- `templates/admin/wallet_config.html`
+  - New "🎁 Referral payouts" card under the existing minimum
+    top-up card. Two-column table for percent / cap with the
+    same effective / db / env / default rows. Two forms — one for
+    "Save", one for "Clear selected" with multi-checkboxes for
+    which knob(s) to drop.
+
+**Reusable patterns this shipment adds (on top of §10b.1 / §10b.2)
+for any DB-backed override editor that gates TWO coupled knobs:**
+
+- One module hosts both override caches with parallel
+  `set_*` / `clear_*` / `get_*_override` / `refresh_*_from_db`
+  surfaces (no shared state between them) so a malformed row in
+  one knob doesn't poison the other. Both warm-up `try/except`
+  blocks in `main.py` are also independent.
+- One editor card hosts both knobs with shared header
+  ("Effective: X% capped at $Y") so the operator can sanity-check
+  the combined effect before submitting.
+- One **Save** form (per-input "leave blank to keep this knob
+  alone" semantics) plus one **Clear** form with multi-checkbox
+  targets. This avoids the "blank means clear" footgun from
+  §10b.1 while still letting the operator drop the override on
+  either knob independently.
+- One audit slug per editor card (`wallet_config_referral_update`),
+  not one per knob. The audit `meta` dict carries before / after /
+  source for BOTH knobs so a future investigation can answer "what
+  did the operator change at 14:32?" with one row.
 
 ---
 

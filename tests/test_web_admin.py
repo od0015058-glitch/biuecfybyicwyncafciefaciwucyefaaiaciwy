@@ -2921,6 +2921,425 @@ async def test_wallet_config_renders_when_db_unavailable(
 
 
 # ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 7: REFERRAL_BONUS_* editor on
+# /admin/wallet-config.
+# ---------------------------------------------------------------------
+
+
+def _stub_db_for_referral_editor(
+    *,
+    upsert_setting_result: object | Exception = None,
+    delete_setting_result: bool | Exception = True,
+    get_setting_result: dict | Exception | None = None,
+    get_fx_snapshot_result: object | None | Exception = None,
+):
+    """Stub DB pre-wired with the system_settings CRUD + FX snapshot
+    accessor needed by both wallet-config editors (min-topup AND
+    referral). ``get_setting_result`` accepts a dict mapping setting
+    key → value so the same stub can answer both editors' refresh
+    calls during a single test.
+    """
+    db = _stub_db()
+    if isinstance(upsert_setting_result, Exception):
+        db.upsert_setting = AsyncMock(side_effect=upsert_setting_result)
+    else:
+        db.upsert_setting = AsyncMock(return_value=upsert_setting_result)
+    if isinstance(delete_setting_result, Exception):
+        db.delete_setting = AsyncMock(side_effect=delete_setting_result)
+    else:
+        db.delete_setting = AsyncMock(return_value=delete_setting_result)
+    if isinstance(get_setting_result, Exception):
+        db.get_setting = AsyncMock(side_effect=get_setting_result)
+    elif isinstance(get_setting_result, dict):
+        async def _get(key: str):
+            return get_setting_result.get(key)
+        db.get_setting = AsyncMock(side_effect=_get)
+    else:
+        db.get_setting = AsyncMock(return_value=get_setting_result)
+    if isinstance(get_fx_snapshot_result, Exception):
+        db.get_fx_snapshot = AsyncMock(side_effect=get_fx_snapshot_result)
+    else:
+        db.get_fx_snapshot = AsyncMock(return_value=get_fx_snapshot_result)
+    return db
+
+
+def _reset_referral_overrides_for_web():
+    """Helper: scrub the in-process referral override caches so each
+    test sees a clean baseline. Tests that need a specific env value
+    set it via monkeypatch.
+    """
+    import referral
+    referral.clear_referral_bonus_percent_override()
+    referral.clear_referral_bonus_max_usd_override()
+
+
+async def test_wallet_config_renders_referral_editor_form(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """The page renders the referral editor card alongside min-topup,
+    with both knobs' "effective / db / env / default" breakdown and a
+    CSRF token on the Save form."""
+    monkeypatch.setenv("REFERRAL_BONUS_PERCENT", "12.5")
+    monkeypatch.setenv("REFERRAL_BONUS_MAX_USD", "7.5")
+    _reset_referral_overrides_for_web()
+
+    db = _stub_db_for_referral_editor()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/wallet-config")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert 'action="/admin/wallet-config/referral"' in body
+    assert 'name="referral_bonus_percent"' in body
+    assert 'name="referral_bonus_max_usd"' in body
+    # Effective figures from env are rendered.
+    assert "12.50%" in body
+    assert "$7.50" in body
+
+
+async def test_wallet_config_referral_post_requires_auth(
+    aiohttp_client, make_admin_app,
+):
+    client = await aiohttp_client(make_admin_app(password="letmein"))
+    resp = await client.post(
+        "/admin/wallet-config/referral",
+        data={
+            "action": "set",
+            "referral_bonus_percent": "15",
+            "csrf_token": "x",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303), resp.status
+    assert resp.headers.get("Location", "").startswith("/admin/login")
+
+
+async def test_wallet_config_referral_post_rejects_csrf_mismatch(
+    aiohttp_client, make_admin_app,
+):
+    _reset_referral_overrides_for_web()
+    db = _stub_db_for_referral_editor()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.post(
+        "/admin/wallet-config/referral",
+        data={
+            "action": "set",
+            "referral_bonus_percent": "15",
+            "csrf_token": "wrong",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/wallet-config"
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+
+
+async def test_wallet_config_referral_post_rejects_unknown_action(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    _reset_referral_overrides_for_web()
+    db = _stub_db_for_referral_editor()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/referral",
+        data={
+            "action": "sneaky",
+            "referral_bonus_percent": "15",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/wallet-config"
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+
+
+async def test_wallet_config_referral_post_set_persists_both_knobs(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """Happy path: filling both fields updates BOTH DB rows AND
+    refreshes both in-process caches."""
+    monkeypatch.setenv("REFERRAL_BONUS_PERCENT", "10")
+    monkeypatch.setenv("REFERRAL_BONUS_MAX_USD", "5")
+    _reset_referral_overrides_for_web()
+
+    saved = {}
+
+    async def _upsert(key: str, value: str) -> None:
+        saved[key] = value
+
+    async def _get(key: str):
+        return saved.get(key)
+
+    db = _stub_db_for_referral_editor()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/referral",
+        data={
+            "action": "set",
+            "referral_bonus_percent": "15",
+            "referral_bonus_max_usd": "7.5",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302, await resp.text()
+    assert resp.headers["Location"] == "/admin/wallet-config"
+
+    import referral
+    assert saved == {
+        referral.REFERRAL_BONUS_PERCENT_SETTING_KEY: "15.0",
+        referral.REFERRAL_BONUS_MAX_USD_SETTING_KEY: "7.5",
+    }
+    assert referral.get_referral_bonus_percent() == 15.0
+    assert referral.get_referral_bonus_max_usd() == 7.5
+    audit_calls = db.record_admin_audit.await_args_list
+    matching = [
+        c for c in audit_calls
+        if c.kwargs.get("action") == "wallet_config_referral_update"
+    ]
+    assert matching, audit_calls
+    meta = matching[0].kwargs.get("meta", {})
+    assert meta.get("action") == "set"
+    assert meta.get("after_percent") == 15.0
+    assert meta.get("after_max_usd") == 7.5
+
+
+async def test_wallet_config_referral_post_set_with_only_percent(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """Filling only percent leaves max-USD untouched (env / default)."""
+    monkeypatch.setenv("REFERRAL_BONUS_PERCENT", "10")
+    monkeypatch.setenv("REFERRAL_BONUS_MAX_USD", "5")
+    _reset_referral_overrides_for_web()
+
+    saved = {}
+
+    async def _upsert(key: str, value: str) -> None:
+        saved[key] = value
+
+    async def _get(key: str):
+        return saved.get(key)
+
+    db = _stub_db_for_referral_editor()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/referral",
+        data={
+            "action": "set",
+            "referral_bonus_percent": "20",
+            "referral_bonus_max_usd": "",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    import referral
+    assert (
+        referral.REFERRAL_BONUS_PERCENT_SETTING_KEY in saved
+        and referral.REFERRAL_BONUS_MAX_USD_SETTING_KEY not in saved
+    )
+    assert referral.get_referral_bonus_percent() == 20.0
+    assert referral.get_referral_bonus_max_usd() == 5.0  # env-sourced
+
+
+async def test_wallet_config_referral_post_set_rejects_blank_both(
+    aiohttp_client, make_admin_app,
+):
+    """Both fields blank on action=set is a no-op warning, not a
+    silent persistence."""
+    _reset_referral_overrides_for_web()
+    db = _stub_db_for_referral_editor()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/referral",
+        data={
+            "action": "set",
+            "referral_bonus_percent": "",
+            "referral_bonus_max_usd": "",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+
+
+async def test_wallet_config_referral_post_set_rejects_invalid_percent(
+    aiohttp_client, make_admin_app,
+):
+    _reset_referral_overrides_for_web()
+    db = _stub_db_for_referral_editor()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/referral",
+        data={
+            "action": "set",
+            "referral_bonus_percent": "not-a-number",
+            "referral_bonus_max_usd": "5",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    # Bad input rejected — neither knob persisted.
+    db.upsert_setting.assert_not_awaited()
+
+
+async def test_wallet_config_referral_post_set_rejects_above_cap_percent(
+    aiohttp_client, make_admin_app,
+):
+    _reset_referral_overrides_for_web()
+    db = _stub_db_for_referral_editor()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/referral",
+        data={
+            "action": "set",
+            "referral_bonus_percent": "150",  # above 100% cap
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+
+
+async def test_wallet_config_referral_post_set_rejects_above_cap_max_usd(
+    aiohttp_client, make_admin_app,
+):
+    _reset_referral_overrides_for_web()
+    db = _stub_db_for_referral_editor()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/referral",
+        data={
+            "action": "set",
+            "referral_bonus_max_usd": "5000",  # above $1000 cap
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+
+
+async def test_wallet_config_referral_post_clear_drops_targeted_overrides(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """action=clear with a target list deletes the matching DB rows
+    and falls through to env / default."""
+    monkeypatch.setenv("REFERRAL_BONUS_PERCENT", "10")
+    monkeypatch.setenv("REFERRAL_BONUS_MAX_USD", "5")
+    _reset_referral_overrides_for_web()
+    import referral
+    referral.set_referral_bonus_percent_override(50)
+    referral.set_referral_bonus_max_usd_override(8)
+    assert referral.get_referral_bonus_percent() == 50.0
+
+    db = _stub_db_for_referral_editor(get_setting_result=None)
+
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/referral",
+        data=[
+            ("action", "clear"),
+            ("targets", "percent"),
+            ("targets", "max_usd"),
+            ("csrf_token", csrf),
+        ],
+        allow_redirects=False,
+    )
+    assert resp.status == 302, await resp.text()
+    deleted_keys = [
+        c.args[0] for c in db.delete_setting.await_args_list
+    ]
+    assert referral.REFERRAL_BONUS_PERCENT_SETTING_KEY in deleted_keys
+    assert referral.REFERRAL_BONUS_MAX_USD_SETTING_KEY in deleted_keys
+    # Both fell back to env.
+    assert referral.get_referral_bonus_percent() == 10.0
+    assert referral.get_referral_bonus_max_usd() == 5.0
+
+
+async def test_wallet_config_referral_post_clear_with_no_targets(
+    aiohttp_client, make_admin_app,
+):
+    """action=clear without selecting any target is a no-op warn, not
+    a silent delete-all."""
+    _reset_referral_overrides_for_web()
+    db = _stub_db_for_referral_editor()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/referral",
+        data={"action": "clear", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.delete_setting.assert_not_awaited()
+
+
+async def test_wallet_config_referral_post_db_failure_keeps_previous_value(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """Upsert failure on percent leaves the cache untouched (previous
+    value still in effect)."""
+    monkeypatch.setenv("REFERRAL_BONUS_PERCENT", "10")
+    _reset_referral_overrides_for_web()
+
+    db = _stub_db_for_referral_editor(
+        upsert_setting_result=RuntimeError("boom"),
+    )
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/referral",
+        data={
+            "action": "set",
+            "referral_bonus_percent": "20",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    import referral
+    # Previous env value still effective.
+    assert referral.get_referral_bonus_percent() == 10.0
+
+
+# ---------------------------------------------------------------------
 # Stage-15-Step-E #9 follow-up #2: monetization CSV export
 # ---------------------------------------------------------------------
 

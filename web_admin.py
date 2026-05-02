@@ -1681,6 +1681,61 @@ def _build_min_topup_view(toman_per_usd: float | None) -> dict:
     }
 
 
+def _build_referral_view() -> dict:
+    """Snapshot of the resolved REFERRAL_BONUS_* knobs + per-source
+    breakdown.
+
+    Stage-15-Step-E #10b row 7. Same shape as
+    :func:`_build_min_topup_view` so the wallet-config page renders one
+    consistent breakdown for every DB-backed override (effective / db /
+    env / default) instead of inventing a new layout per knob.
+    """
+    import referral
+
+    pct_override = referral.get_referral_bonus_percent_override()
+    pct_env_raw = os.getenv("REFERRAL_BONUS_PERCENT", "").strip()
+    pct_env_value: float | None = None
+    if pct_env_raw:
+        pct_env_value = referral._coerce_referral_bonus_percent(pct_env_raw)
+    pct_effective = float(referral.get_referral_bonus_percent())
+
+    max_override = referral.get_referral_bonus_max_usd_override()
+    max_env_raw = os.getenv("REFERRAL_BONUS_MAX_USD", "").strip()
+    max_env_value: float | None = None
+    if max_env_raw:
+        max_env_value = referral._coerce_referral_bonus_max_usd(max_env_raw)
+    max_effective = float(referral.get_referral_bonus_max_usd())
+
+    return {
+        "percent": {
+            "effective": pct_effective,
+            "source": referral.get_referral_bonus_percent_source(),
+            "default_value": float(
+                referral._DEFAULT_REFERRAL_BONUS_PERCENT
+            ),
+            "env_value": pct_env_value,
+            "env_raw": pct_env_raw,
+            "override_value": pct_override,
+            "maximum_exclusive": float(
+                referral.REFERRAL_BONUS_PERCENT_MAXIMUM
+            ),
+        },
+        "max_usd": {
+            "effective": max_effective,
+            "source": referral.get_referral_bonus_max_usd_source(),
+            "default_value": float(
+                referral._DEFAULT_REFERRAL_BONUS_MAX_USD
+            ),
+            "env_value": max_env_value,
+            "env_raw": max_env_raw,
+            "override_value": max_override,
+            "maximum_exclusive": float(
+                referral.REFERRAL_BONUS_MAX_USD_MAXIMUM
+            ),
+        },
+    }
+
+
 async def _read_toman_per_usd_from_db(db) -> float | None:
     """Pull the latest USD→Toman rate from the request-scoped DB.
 
@@ -1736,6 +1791,7 @@ async def wallet_config_get(request: web.Request) -> web.StreamResponse:
     db_error: str | None = None
 
     import payments
+    import referral
 
     if db is not None:
         try:
@@ -1745,12 +1801,34 @@ async def wallet_config_get(request: web.Request) -> web.StreamResponse:
                 "wallet_config_get: refresh_min_topup_override_from_db failed"
             )
             db_error = "Database query failed — see logs."
+        # Stage-15-Step-E #10b row 7: refresh both referral overrides
+        # on every render so a tweak made on a different replica is
+        # reflected here. Independent try-blocks: a malformed row in
+        # one knob shouldn't poison the other.
+        try:
+            await referral.refresh_referral_bonus_percent_override_from_db(db)
+        except Exception:
+            log.exception(
+                "wallet_config_get: "
+                "refresh_referral_bonus_percent_override_from_db failed"
+            )
+            db_error = "Database query failed — see logs."
+        try:
+            await referral.refresh_referral_bonus_max_usd_override_from_db(db)
+        except Exception:
+            log.exception(
+                "wallet_config_get: "
+                "refresh_referral_bonus_max_usd_override_from_db failed"
+            )
+            db_error = "Database query failed — see logs."
 
     toman_per_usd = await _read_toman_per_usd_from_db(db)
     min_topup_view = _build_min_topup_view(toman_per_usd)
+    referral_view = _build_referral_view()
 
     ctx = {
         "min_topup_view": min_topup_view,
+        "referral_view": referral_view,
         "db_error": db_error,
         "active_page": "wallet_config",
         "csrf_token": csrf_token_for(request),
@@ -1987,6 +2065,395 @@ async def wallet_config_min_topup_post(
 
 
 # ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 7: /admin/wallet-config — REFERRAL_BONUS_*
+# editor (percent + max-USD).
+# ---------------------------------------------------------------------
+
+
+async def wallet_config_referral_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/wallet-config/referral`` — update the referral
+    payout knobs.
+
+    Stage-15-Step-E #10b row 7. Both knobs are tweaked together via a
+    single form because they have a tight product coupling: a tweak to
+    the percent typically goes hand-in-hand with a tweak to the cap
+    (otherwise an operator who bumps the percent without re-checking
+    the cap can ship a worse-not-better payout structure). The form
+    has two text inputs and two submit buttons:
+
+    * ``action=set`` — read both ``referral_bonus_percent`` and
+      ``referral_bonus_max_usd``, validate, upsert ONLY the inputs
+      that were filled in. An empty input means "do not touch this
+      knob"; the operator wants to flip percent without touching max.
+    * ``action=clear`` — drop the override row(s) listed in the
+      ``targets`` form field (multi-checkbox). Allows an operator to
+      revert the percent to env / default while keeping a custom
+      max in place.
+
+    Validation order:
+
+    1. CSRF.
+    2. Action whitelist (``set`` or ``clear``).
+    3. Per-knob validate-and-persist with independent error paths so
+       a malformed percent doesn't silently kill the (valid) max
+       update.
+    4. Refresh both override caches.
+    5. Audit row carries the diff for both knobs.
+    6. Flash + redirect.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app.get(APP_KEY_DB)
+    form = await request.post()
+
+    guard = _wallet_config_csrf_guard(request, form)
+    if guard is not None:
+        return guard
+
+    if db is None:
+        response = web.HTTPFound(location="/admin/wallet-config")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Database is not configured — referral edits "
+                "require a live DB connection."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    import referral
+
+    action = str(form.get("action", "")).strip().lower()
+    if action not in ("set", "clear"):
+        response = web.HTTPFound(location="/admin/wallet-config")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Unknown action — submit either 'Save' or 'Clear'."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    previous_pct = float(referral.get_referral_bonus_percent())
+    previous_pct_source = referral.get_referral_bonus_percent_source()
+    previous_max = float(referral.get_referral_bonus_max_usd())
+    previous_max_source = referral.get_referral_bonus_max_usd_source()
+
+    if action == "clear":
+        # ``targets`` is a multi-checkbox: getall returns a list. An
+        # empty list means "clear nothing" → no-op redirect with a
+        # warning so operators don't think the form silently failed.
+        # ``form.getall`` raises ``KeyError`` if the field is absent
+        # (the operator submitted the Clear form without ticking any
+        # checkbox). Catch that case explicitly so we can render the
+        # "select at least one knob" warning instead of 500.
+        try:
+            raw_targets = form.getall("targets")
+        except KeyError:
+            raw_targets = []
+        targets = [
+            str(t).strip().lower() for t in raw_targets
+            if str(t).strip()
+        ]
+        if not targets:
+            response = web.HTTPFound(location="/admin/wallet-config")
+            set_flash(
+                response, kind="warn",
+                message=(
+                    "Select at least one knob to clear."
+                ),
+                secret=secret, cookie_secure=cookie_secure,
+            )
+            return response
+
+        cleared: list[str] = []
+        for target in targets:
+            if target == "percent":
+                try:
+                    await db.delete_setting(
+                        referral.REFERRAL_BONUS_PERCENT_SETTING_KEY,
+                    )
+                except Exception:
+                    log.exception(
+                        "wallet_config_referral_post: "
+                        "delete_setting (percent) failed"
+                    )
+                    response = web.HTTPFound(
+                        location="/admin/wallet-config",
+                    )
+                    set_flash(
+                        response, kind="error",
+                        message=(
+                            "Failed to clear the percent override — "
+                            "see logs. The previous values are still "
+                            "in effect."
+                        ),
+                        secret=secret, cookie_secure=cookie_secure,
+                    )
+                    return response
+                referral.clear_referral_bonus_percent_override()
+                try:
+                    await (
+                        referral
+                        .refresh_referral_bonus_percent_override_from_db(db)
+                    )
+                except Exception:
+                    log.exception(
+                        "wallet_config_referral_post: "
+                        "refresh percent after clear failed"
+                    )
+                cleared.append("percent")
+            elif target == "max_usd":
+                try:
+                    await db.delete_setting(
+                        referral.REFERRAL_BONUS_MAX_USD_SETTING_KEY,
+                    )
+                except Exception:
+                    log.exception(
+                        "wallet_config_referral_post: "
+                        "delete_setting (max_usd) failed"
+                    )
+                    response = web.HTTPFound(
+                        location="/admin/wallet-config",
+                    )
+                    set_flash(
+                        response, kind="error",
+                        message=(
+                            "Failed to clear the max-USD override — "
+                            "see logs. The previous values are still "
+                            "in effect."
+                        ),
+                        secret=secret, cookie_secure=cookie_secure,
+                    )
+                    return response
+                referral.clear_referral_bonus_max_usd_override()
+                try:
+                    await (
+                        referral
+                        .refresh_referral_bonus_max_usd_override_from_db(db)
+                    )
+                except Exception:
+                    log.exception(
+                        "wallet_config_referral_post: "
+                        "refresh max_usd after clear failed"
+                    )
+                cleared.append("max_usd")
+            # Unknown target slug — silently skip rather than 400 the
+            # whole submit. The form HTML is the source of truth for
+            # the allowed list; rendering bug would otherwise hide
+            # the legitimate clear that came alongside it.
+
+        new_pct = float(referral.get_referral_bonus_percent())
+        new_max = float(referral.get_referral_bonus_max_usd())
+        await _record_audit_safe(
+            request, "wallet_config_referral_update",
+            target="referral_bonus",
+            meta={
+                "action": "clear",
+                "cleared": sorted(cleared),
+                "before_percent": previous_pct,
+                "before_percent_source": previous_pct_source,
+                "after_percent": new_pct,
+                "after_percent_source": (
+                    referral.get_referral_bonus_percent_source()
+                ),
+                "before_max_usd": previous_max,
+                "before_max_usd_source": previous_max_source,
+                "after_max_usd": new_max,
+                "after_max_usd_source": (
+                    referral.get_referral_bonus_max_usd_source()
+                ),
+            },
+        )
+        response = web.HTTPFound(location="/admin/wallet-config")
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Referral override(s) cleared: {', '.join(cleared)}. "
+                f"Effective payouts are now {new_pct:.2f}% capped at "
+                f"${new_max:.2f}."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    # action == "set" — validate-and-persist each filled-in knob
+    # independently. An empty input means "leave this knob alone";
+    # only blank-AND-blank is rejected as a "what did you intend?"
+    # no-op.
+    raw_pct = str(form.get("referral_bonus_percent", "")).strip()
+    raw_max = str(form.get("referral_bonus_max_usd", "")).strip()
+
+    if not raw_pct and not raw_max:
+        response = web.HTTPFound(location="/admin/wallet-config")
+        set_flash(
+            response, kind="warn",
+            message=(
+                "Fill in at least one field to update, or use the "
+                "'Clear override' form to revert to env / default."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    parsed_pct: float | None = None
+    parsed_max: float | None = None
+    if raw_pct:
+        parsed_pct = referral._coerce_referral_bonus_percent(raw_pct)
+        if parsed_pct is None:
+            response = web.HTTPFound(location="/admin/wallet-config")
+            set_flash(
+                response, kind="error",
+                message=(
+                    f"Referral percent must be a finite number in (0, "
+                    f"{referral.REFERRAL_BONUS_PERCENT_MAXIMUM:.0f}). "
+                    f"Got: {raw_pct!r}. No changes were made."
+                ),
+                secret=secret, cookie_secure=cookie_secure,
+            )
+            return response
+    if raw_max:
+        parsed_max = referral._coerce_referral_bonus_max_usd(raw_max)
+        if parsed_max is None:
+            response = web.HTTPFound(location="/admin/wallet-config")
+            set_flash(
+                response, kind="error",
+                message=(
+                    f"Referral max-USD must be a finite number in (0, "
+                    f"{referral.REFERRAL_BONUS_MAX_USD_MAXIMUM:.0f}). "
+                    f"Got: {raw_max!r}. No changes were made."
+                ),
+                secret=secret, cookie_secure=cookie_secure,
+            )
+            return response
+
+    # Persist both knobs — if either upsert fails, the other still
+    # commits. The cache refresh after each upsert keeps the
+    # in-process view consistent with what's actually in the DB.
+    if parsed_pct is not None:
+        try:
+            await db.upsert_setting(
+                referral.REFERRAL_BONUS_PERCENT_SETTING_KEY,
+                str(parsed_pct),
+            )
+        except Exception:
+            log.exception(
+                "wallet_config_referral_post: upsert_setting "
+                "(percent) failed value=%r", parsed_pct,
+            )
+            response = web.HTTPFound(location="/admin/wallet-config")
+            set_flash(
+                response, kind="error",
+                message=(
+                    "Failed to persist the new percent — see logs. "
+                    "The previous value is still in effect."
+                ),
+                secret=secret, cookie_secure=cookie_secure,
+            )
+            return response
+        try:
+            referral.set_referral_bonus_percent_override(parsed_pct)
+        except ValueError:
+            log.exception(
+                "wallet_config_referral_post: "
+                "set_referral_bonus_percent_override rejected %r "
+                "after upsert succeeded — refreshing from DB",
+                parsed_pct,
+            )
+        try:
+            await (
+                referral
+                .refresh_referral_bonus_percent_override_from_db(db)
+            )
+        except Exception:
+            log.exception(
+                "wallet_config_referral_post: "
+                "refresh percent after upsert failed"
+            )
+
+    if parsed_max is not None:
+        try:
+            await db.upsert_setting(
+                referral.REFERRAL_BONUS_MAX_USD_SETTING_KEY,
+                str(parsed_max),
+            )
+        except Exception:
+            log.exception(
+                "wallet_config_referral_post: upsert_setting "
+                "(max_usd) failed value=%r", parsed_max,
+            )
+            response = web.HTTPFound(location="/admin/wallet-config")
+            set_flash(
+                response, kind="error",
+                message=(
+                    "Failed to persist the new max-USD — see logs. "
+                    "The percent (if any) was already applied."
+                ),
+                secret=secret, cookie_secure=cookie_secure,
+            )
+            return response
+        try:
+            referral.set_referral_bonus_max_usd_override(parsed_max)
+        except ValueError:
+            log.exception(
+                "wallet_config_referral_post: "
+                "set_referral_bonus_max_usd_override rejected %r "
+                "after upsert succeeded — refreshing from DB",
+                parsed_max,
+            )
+        try:
+            await (
+                referral
+                .refresh_referral_bonus_max_usd_override_from_db(db)
+            )
+        except Exception:
+            log.exception(
+                "wallet_config_referral_post: "
+                "refresh max_usd after upsert failed"
+            )
+
+    new_pct = float(referral.get_referral_bonus_percent())
+    new_max = float(referral.get_referral_bonus_max_usd())
+    await _record_audit_safe(
+        request, "wallet_config_referral_update",
+        target="referral_bonus",
+        meta={
+            "action": "set",
+            "submitted_percent": parsed_pct,
+            "submitted_max_usd": parsed_max,
+            "before_percent": previous_pct,
+            "before_percent_source": previous_pct_source,
+            "after_percent": new_pct,
+            "after_percent_source": (
+                referral.get_referral_bonus_percent_source()
+            ),
+            "before_max_usd": previous_max,
+            "before_max_usd_source": previous_max_source,
+            "after_max_usd": new_max,
+            "after_max_usd_source": (
+                referral.get_referral_bonus_max_usd_source()
+            ),
+        },
+    )
+    response = web.HTTPFound(location="/admin/wallet-config")
+    set_flash(
+        response, kind="success",
+        message=(
+            f"Referral payouts updated: {previous_pct:.2f}% → "
+            f"{new_pct:.2f}%, cap ${previous_max:.2f} → "
+            f"${new_max:.2f}. New rates apply to the next paid "
+            f"top-up that triggers a referral grant."
+        ),
+        secret=secret, cookie_secure=cookie_secure,
+    )
+    return response
+
+
+# ---------------------------------------------------------------------
 # Admin audit helper (Stage-9-Step-2)
 # ---------------------------------------------------------------------
 
@@ -2101,6 +2568,14 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     # only" so a "why did support tickets jump?" investigation
     # can pin the cause to a floor change vs. unrelated activity.
     "wallet_config_min_topup_update": "Minimum top-up updated",
+    # Stage-15-Step-E #10b row 7: REFERRAL_BONUS_PERCENT and
+    # REFERRAL_BONUS_MAX_USD editor on ``/admin/wallet-config``.
+    # Recorded by :func:`wallet_config_referral_post`; the dropdown
+    # entry lets an operator filter the audit feed to "referral
+    # payout changes only" so a "why did inviter payouts spike?"
+    # investigation can pin the cause to a knob tweak vs. organic
+    # invite-traffic growth.
+    "wallet_config_referral_update": "Referral payouts updated",
 }
 
 
@@ -8572,6 +9047,15 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/wallet-config/min-topup",
         _require_role(ROLE_OPERATOR)(wallet_config_min_topup_post),
+    )
+    # Stage-15-Step-E #10b row 7: REFERRAL_BONUS_* editor on
+    # ``/admin/wallet-config``. Operator-floored because changing the
+    # referral payouts directly affects the bot's per-paid-top-up
+    # spend; an unintended fat-finger here can torch the margin
+    # before anyone notices.
+    app.router.add_post(
+        "/admin/wallet-config/referral",
+        _require_role(ROLE_OPERATOR)(wallet_config_referral_post),
     )
 
     # Stage-8-Part-2: promo codes. Stage-15-Step-E #5 follow-up #4:
