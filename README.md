@@ -831,6 +831,27 @@ NowPayments crypto invoices.
   load and reverting every other override; the refresh now coerces
   via `_coerce_setting_to_str` so a single garbage row only drops
   itself. Stage-15-Step-E #10b row 11.
+- **Markup history & per-era revenue attribution on
+  `/admin/monetization`** — the page used to apply *today's*
+  `COST_MARKUP` uniformly to every historical `usage_logs` row when
+  computing implied OpenRouter cost, which lied about lifetime
+  margin if you'd ever changed the markup. Two new cards now
+  surface the missing breakdown. **"Markup change history"** lists
+  the most recent `monetization_markup_update` audit rows with
+  timestamp / actor / kind / before / after / IP, decoded from
+  `admin_audit_log.meta`. **"Markup eras — revenue attribution"**
+  splits charged-USD into eras at each markup change and divides
+  each era by *its own* markup, so changing `1.5×` → `2.0×` and
+  back tells you honestly which week was more profitable. Both
+  cards fail-soft to empty placeholder text on a DB blip — the
+  headline summary still renders. Bundled bug fix: a new
+  `_finite_float_or_none` helper rejects `bool` (so a `True`
+  meta value can't sneak through as `1.0` and corrupt the markup
+  column) and treats `NaN` / `±Inf` as `None` rather than letting
+  them propagate into the per-era SQL where they'd render as
+  `nan×`; `get_markup_eras` clamps a tampered `markup=0` audit row
+  to `openrouter_cost_usd=0` rather than dividing by zero.
+  Stage-15-Step-E #10b row 12.
 
 For the full project history, file map, and roadmap **read [HANDOFF.md](./HANDOFF.md)**.
 

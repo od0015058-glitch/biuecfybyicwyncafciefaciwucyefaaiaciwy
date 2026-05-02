@@ -1063,6 +1063,28 @@ async def monetization(request: web.Request) -> web.StreamResponse:
             db_error = "Database query failed — see logs."
 
     markup_view = _build_markup_view()
+
+    # Stage-15-Step-E #10b row 12: markup history & era attribution.
+    # Best-effort — a DB blip on these reads must NOT 500 the page;
+    # the headline summary is still useful even if the history card
+    # is empty. The "no DB wired up" branch above already returned
+    # before this point only via fall-through, so re-check ``db``.
+    markup_history: list[dict] = []
+    markup_eras: list[dict] = []
+    if db is not None:
+        try:
+            markup_history = await db.list_markup_history(
+                limit=_MARKUP_HISTORY_LIMIT,
+            )
+        except Exception:
+            log.exception("monetization: list_markup_history failed")
+        try:
+            markup_eras = await db.get_markup_eras(
+                limit=_MARKUP_ERAS_LIMIT,
+            )
+        except Exception:
+            log.exception("monetization: get_markup_eras failed")
+
     ctx = {
         "summary": summary,
         "db_error": db_error,
@@ -1070,6 +1092,8 @@ async def monetization(request: web.Request) -> web.StreamResponse:
         "window_options": _MONETIZATION_WINDOW_OPTIONS,
         "active_window": window_days,
         "markup_view": markup_view,
+        "markup_history": markup_history,
+        "markup_eras": markup_eras,
         "csrf_token": csrf_token_for(request),
         "flash": None,
     }
@@ -1083,6 +1107,15 @@ async def monetization(request: web.Request) -> web.StreamResponse:
             "monetization.html", request, ctx,
         )
     return response
+
+
+# Stage-15-Step-E #10b row 12: caps on the on-screen history /
+# era cards. Hoisted to module constants so tests can pin them
+# without copy-pasting magic numbers, and so a future PR that
+# wants a second surface (e.g. a per-tab JSON dump) can share
+# the same caps.
+_MARKUP_HISTORY_LIMIT = 25
+_MARKUP_ERAS_LIMIT = 10
 
 
 def _build_markup_view() -> dict:

@@ -2597,6 +2597,224 @@ async def test_monetization_markup_post_db_failure_keeps_previous_value(
 
 
 # ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 12: markup history & era attribution on
+# /admin/monetization
+# ---------------------------------------------------------------------
+
+
+def _summary_for_history_tests() -> dict:
+    """Minimal monetization summary shape so the history-card tests
+    don't have to redeclare the whole rollup. Mirrors what the page
+    expects when no usage has been recorded yet — values don't
+    matter for the new card assertions."""
+    return {
+        "markup": 1.5,
+        "lifetime": {
+            "revenue_usd": 0.0, "charged_usd": 0.0,
+            "openrouter_cost_usd": 0.0, "gross_margin_usd": 0.0,
+            "gross_margin_pct": 0.0, "net_profit_usd": 0.0,
+        },
+        "window": {
+            "days": 30,
+            "revenue_usd": 0.0, "charged_usd": 0.0,
+            "openrouter_cost_usd": 0.0, "gross_margin_usd": 0.0,
+            "gross_margin_pct": 0.0, "net_profit_usd": 0.0,
+        },
+        "by_model": [], "top_users": [],
+    }
+
+
+async def test_monetization_renders_markup_history_card(
+    aiohttp_client, make_admin_app,
+):
+    """The markup-history card renders one row per audit entry,
+    with actor, kind, before / after values, and IP."""
+    db = _stub_db_with_monetization(_summary_for_history_tests())
+    db.list_markup_history = AsyncMock(return_value=[
+        {
+            "id": 1,
+            "ts": "2026-05-01T12:00:00+00:00",
+            "actor": "web",
+            "kind": "set",
+            "before": 1.5,
+            "before_source": "default",
+            "after": 1.7,
+            "after_source": "db",
+            "ip": "203.0.113.10",
+        },
+    ])
+    db.get_markup_eras = AsyncMock(return_value=[])
+
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Markup change history" in body
+    assert "203.0.113.10" in body
+    assert "2026-05-01T12:00:00+00:00" in body
+    # Both source labels surface as muted captions.
+    assert "(default)" in body
+    assert "(db)" in body
+
+
+async def test_monetization_renders_markup_history_empty_state(
+    aiohttp_client, make_admin_app,
+):
+    """When the audit log has zero markup-update rows, the card
+    renders the placeholder text rather than an empty table."""
+    db = _stub_db_with_monetization(_summary_for_history_tests())
+    db.list_markup_history = AsyncMock(return_value=[])
+    db.get_markup_eras = AsyncMock(return_value=[])
+
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization")
+    body = await resp.text()
+    assert "No markup changes recorded yet" in body
+
+
+async def test_monetization_renders_markup_eras_card(
+    aiohttp_client, make_admin_app,
+):
+    """The eras card renders one row per era with the era's own
+    markup applied to the era's charged-USD subtotal."""
+    db = _stub_db_with_monetization(_summary_for_history_tests())
+    db.list_markup_history = AsyncMock(return_value=[])
+    db.get_markup_eras = AsyncMock(return_value=[
+        {
+            "from_ts": "2026-02-01T00:00:00+00:00",
+            "to_ts": None,
+            "markup": 2.0,
+            "source": "db",
+            "kind": "current",
+            "actor": "web",
+            "requests": 4,
+            "charged_usd": 40.0,
+            "openrouter_cost_usd": 20.0,
+            "gross_margin_usd": 20.0,
+        },
+        {
+            "from_ts": "2026-01-01T00:00:00+00:00",
+            "to_ts": "2026-02-01T00:00:00+00:00",
+            "markup": 1.5,
+            "source": "default",
+            "kind": "set",
+            "actor": "web",
+            "requests": 3,
+            "charged_usd": 30.0,
+            "openrouter_cost_usd": 20.0,
+            "gross_margin_usd": 10.0,
+        },
+    ])
+
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization")
+    body = await resp.text()
+    assert "Markup eras" in body
+    # Era 0 = current (no end timestamp).
+    assert "<em>now</em>" in body
+    # Markups rendered with 4-decimal precision.
+    assert "2.0000" in body
+    assert "1.5000" in body
+    # Charged subtotals.
+    assert "$40.0000" in body
+    assert "$30.0000" in body
+
+
+async def test_monetization_renders_markup_eras_empty_state(
+    aiohttp_client, make_admin_app,
+):
+    """A fresh deploy with no eras yet should render the placeholder
+    instead of an empty table."""
+    db = _stub_db_with_monetization(_summary_for_history_tests())
+    db.list_markup_history = AsyncMock(return_value=[])
+    db.get_markup_eras = AsyncMock(return_value=[])
+
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization")
+    body = await resp.text()
+    assert "No markup history recorded yet" in body
+
+
+async def test_monetization_swallows_history_query_failure(
+    aiohttp_client, make_admin_app,
+):
+    """A DB blip on the history query must NOT 500 the page — the
+    main summary card still renders, the history card just shows
+    its empty placeholder."""
+    db = _stub_db_with_monetization(_summary_for_history_tests())
+    db.list_markup_history = AsyncMock(side_effect=RuntimeError("kaboom"))
+    db.get_markup_eras = AsyncMock(return_value=[])
+
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization")
+    assert resp.status == 200
+    body = await resp.text()
+    # Main summary still renders.
+    assert "Lifetime" in body
+    # History card empty-state surfaces.
+    assert "No markup changes recorded yet" in body
+
+
+async def test_monetization_swallows_eras_query_failure(
+    aiohttp_client, make_admin_app,
+):
+    """Sibling to the history-query failure test — a DB blip on
+    ``get_markup_eras`` must fall back to the empty-state placeholder
+    rather than 500-ing the whole page."""
+    db = _stub_db_with_monetization(_summary_for_history_tests())
+    db.list_markup_history = AsyncMock(return_value=[])
+    db.get_markup_eras = AsyncMock(side_effect=RuntimeError("kaboom"))
+
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "No markup history recorded yet" in body
+
+
+async def test_monetization_passes_history_limit_to_db(
+    aiohttp_client, make_admin_app,
+):
+    """The page must request the on-screen cap (25), not the raw
+    DB cap (1000) — pinning so a future refactor doesn't accidentally
+    pull a million rows for the rendered card."""
+    from web_admin import _MARKUP_HISTORY_LIMIT, _MARKUP_ERAS_LIMIT
+    assert _MARKUP_HISTORY_LIMIT == 25
+    assert _MARKUP_ERAS_LIMIT == 10
+
+    db = _stub_db_with_monetization(_summary_for_history_tests())
+    db.list_markup_history = AsyncMock(return_value=[])
+    db.get_markup_eras = AsyncMock(return_value=[])
+
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    await client.get("/admin/monetization")
+
+    db.list_markup_history.assert_awaited_once_with(limit=25)
+    db.get_markup_eras.assert_awaited_once_with(limit=10)
+
+
+# ---------------------------------------------------------------------
 # Stage-15-Step-E #10b row 4 part 2/2: /admin/wallet-config
 # (MIN_TOPUP_USD editor)
 # ---------------------------------------------------------------------

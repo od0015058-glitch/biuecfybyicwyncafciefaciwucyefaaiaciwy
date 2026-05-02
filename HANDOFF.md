@@ -2142,7 +2142,7 @@ or unblock other work.
 | 9 | **Pending-PENDING expiration window** (`PENDING_EXPIRATION_HOURS_DEFAULT`; the actual env-var name in `pending_expiration.py` is `PENDING_EXPIRATION_HOURS`). | Env-only. | Editor on `/admin/control` or `/admin/payments`. | P3 | **Shipped** (this PR — DB-backed override layer in `pending_expiration.py` + boot warm-up + `/admin/control` editor card with set / clear actions, audit row `control_expiration_hours_update`, source badge, audit `meta` carries `threshold_hours_used`). |
 | 10 | **Stuck-PENDING alert threshold** (`PENDING_ALERT_THRESHOLD_HOURS`). | Env-only. | Editor on `/admin/control`. | P3 | **Shipped** (this PR — DB-backed override layer in `pending_alert.py` + boot warm-up + `/admin/control` editor card with set / clear actions, audit row `control_alert_threshold_update`, source badge, iteration-time re-read in `_alert_loop` so a saved override is live on the next tick). |
 | 11 | **Per-loop cadence overrides** (`BOT_HEALTH_LOOP_STALE_<NAME>_SECONDS`). | Env-only. | Editor on `/admin/control` (one row per loop name). | P3 | **Shipped** (this PR — DB-backed `_LOOP_STALE_OVERRIDES` cache in `bot_health.py` + `refresh_loop_stale_overrides_from_db` + `_stale_threshold_seconds` consults DB before env, panel `_build_loop_stale_view` per-loop card with cadence / cadence-derived / env / DB / effective / source columns + per-row Save/Clear forms, `control_loop_stale_post` validates against `metrics._LOOP_METRIC_NAMES` so a typo can't write a row no real loop reads, audit slug `control_loop_stale_update`, boot warm-up in `main.py`. **Bundled bug fix:** `refresh_threshold_overrides_from_db` previously raised `AttributeError` on a non-string-non-None row in `system_settings` (e.g. an int from a future schema change), poisoning the whole load and reverting every other override; the refresh now coerces via `_coerce_setting_to_str` so a single garbage row only drops itself.) |
-| 12 | **`COST_MARKUP` history & analytics** — operator can see when markup last changed and the impact on revenue. | Not tracked. | Markup-history table + revenue-attribution chart on `/admin/monetization`. | P2 | Pending |
+| 12 | **`COST_MARKUP` history & analytics** — operator can see when markup last changed and the impact on revenue. | Not tracked. | Markup-history table + revenue-attribution chart on `/admin/monetization`. | P2 | **Shipped** (this PR — `Database.list_markup_history` reads `monetization_markup_update` rows from `admin_audit_log` and decodes the `meta` JSONB into typed `before` / `after` / `before_source` / `after_source` / `kind` fields; `Database.get_markup_eras` derives per-era revenue attribution by bucketing `usage_logs.cost_deducted_usd` between consecutive markup changes (so changing `1.5×` → `2.0×` and back tells you honestly which era was more profitable instead of applying today's markup to historical rows); two new cards on `/admin/monetization` — "Markup eras — revenue attribution" and "Markup change history" — both fail-soft to empty placeholder text on a DB blip rather than 500-ing the page. **Bundled bug fix:** added `_finite_float_or_none` helper that explicitly rejects `bool` (a `True` value sneaking through as `1.0` would silently corrupt the markup column in audit-log meta) and treats `NaN` / `±Inf` as `None` rather than letting them propagate into the per-era SQL where they'd render as `nan×`. Defence-in-depth: `get_markup_eras` clamps a tampered `markup=0` audit row to `openrouter_cost_usd=0` rather than dividing by zero.) |
 | 13 | **Per-user revenue contribution panel** — top spenders. | Existed in `get_monetization_summary` aggregates but not surfaced. | New "Top users" tab on `/admin/monetization`. | P2 | **Shipped** (PR #166) |
 | 14 | **Disable individual gateways** (NowPayments / TetraPay / Zarinpal). | DB row in `disabled_gateways` (already wired via `/admin/gateways`). | Already exposed — but no per-currency granularity. Add per-crypto toggle. | P3 | Partial |
 | 15 | **OpenRouter rate-limit per (key, model)** — currently per-key only. | Code path exists in `openrouter_keys.py`. | Per-(key, model) cooldown viewer on `/admin/openrouter-keys`. | P3 | **Shipped** (PR #165) |
@@ -2877,6 +2877,132 @@ through to env / default for that load. The fix:
   above-max / unknown-loop / blank-set / unknown-action / DB-blip
   / requires-super), the GET-render card, the source-badge
   rendering, and the audit-slug regression.
+
+---
+
+### §10b.8 — Row #12 (COST_MARKUP history & analytics) — shipped
+
+**Symptom (pre-shipment).** The `/admin/monetization` lifetime /
+window cards apply *today's* `COST_MARKUP` uniformly to every
+historical `usage_logs` row when computing the "implied OpenRouter
+cost". The page footnotes the assumption ("if you've changed
+`COST_MARKUP` recently the lifetime number drifts; the
+rolling-window numbers are more reliable") but the operator had
+no way to actually answer the question the markup editor was
+designed for: *did the last markup change pay for itself?* The
+audit log was already capturing every `monetization_markup_update`
+POST with `meta = {action, before, before_source, after,
+after_source}`, but nothing read it back.
+
+**Diagnosis.** The data was already there — we just needed two
+new read paths:
+
+1. A flat history table for "when did the markup change and who
+   did it?" — sourced directly from
+   `admin_audit_log WHERE action = 'monetization_markup_update'`.
+2. A per-era revenue-attribution rollup for "did each era pay for
+   itself at *its own* markup?" — sourced from the same audit-log
+   timestamps used as bucket boundaries against `usage_logs`.
+
+**Surface (DB).** Two new methods in `database.py`:
+
+* `Database.list_markup_history(limit=50)` — returns a list of
+  `{id, ts, actor, kind, before, before_source, after,
+  after_source, ip}` rows newest-first. The `meta` JSONB column
+  is decoded via the existing `_decode_jsonb_meta` helper, which
+  already isolates a single corrupt row from blanking the entire
+  feed (the `_finite_float_or_none` coercion below extends that
+  fault-isolation to the typed numeric fields).
+* `Database.get_markup_eras(limit=10)` — derives one synthetic
+  "current" era + N historical eras from the markup-update audit
+  rows, then in a single SQL pass aggregates
+  `cost_deducted_usd` / `COUNT(*)` from `usage_logs` per era via
+  a `CASE` expression that buckets each row into its
+  containing-era index. Each era's implied OpenRouter cost is
+  computed against *that era's* markup (not today's). A fresh
+  deploy with no audit rows yet produces a single synthetic
+  current era spanning the entire `usage_logs` table at the live
+  markup, via the `_single_current_era` helper.
+
+**Surface (web).** `web_admin.monetization` reads
+`list_markup_history` + `get_markup_eras` after the existing
+`get_monetization_summary` call, threading `markup_history` and
+`markup_eras` into the template context. Both queries are
+wrapped in `try/except` blocks that demote DB failures to empty
+lists with a logged exception — the headline summary is still
+useful even if the new cards are empty. `_MARKUP_HISTORY_LIMIT`
+(25) and `_MARKUP_ERAS_LIMIT` (10) are hoisted to module
+constants so the on-screen caps are pin-able from tests.
+
+**Surface (template).** Two new panels in
+`templates/admin/monetization.html` rendered between the
+existing "Top users by revenue" panel and the "How to read these
+numbers" panel:
+
+* **Markup eras — revenue attribution.** Eight columns: `From`,
+  `To` (`now` for the currently-running era), `Markup` (4-decimal
+  precision), `Source` (badge), `Requests`, `Charged (USD)`,
+  `Implied OR cost (USD)`, `Gross margin (USD)`. Empty state
+  copy: *"No markup history recorded yet. Save a markup change
+  above and it will start populating here on the next page
+  render."*
+* **Markup change history.** Six columns: `When`, `Actor`,
+  `Action` (badge: `set` / `clear` / `unknown`), `Before` (with
+  source caption), `After` (with source caption), `IP`. Empty
+  state copy: *"No markup changes recorded yet. Every save /
+  clear above is audit-logged and will appear here."*
+
+The "How to read these numbers" footer panel also got a new
+sentence pointing operators at the eras table for the
+"did the markup change pay for itself?" question.
+
+**Bundled bug fix.** The audit-log meta column is a JSONB blob
+written by every admin handler — and the `before` / `after`
+fields for `monetization_markup_update` arrive there as floats.
+The decoder needs to handle:
+
+* `None` (a row written before the field was populated, or a
+  legacy schema variant) → `None` (so the template renders "—").
+* `NaN` / `±Inf` (the existing `_finite_float_or_zero` helper
+  would silently turn them into `0.0`, which lies — a markup of
+  exactly zero would crash `get_markup_eras`'s
+  `charged / markup` divide if it passed through).
+* `bool` (a subclass of `int` — `True` would coerce to `1.0` via
+  the implicit `float(value)` cast, silently corrupting the
+  markup column with a nonsense value).
+* Strings that look like numbers (a future writer using `str()`
+  instead of the raw float, or a legacy row written by a
+  different version of the handler).
+
+`_finite_float_or_none` is the new helper that does this
+defensively — paired with a unit test that pins the bool
+rejection so a future "simplify by removing the isinstance
+check" refactor can't sneak through.
+
+`get_markup_eras` also clamps `markup <= 0` to
+`openrouter_cost_usd = 0` rather than dividing by zero — defence
+in depth for a future tampered audit row that bypasses the
+`set_markup_override` validation paths.
+
+**Tests.** All running, all green (2999 passed, 9 skipped — was
+2971 baseline post-row-11, +28 new):
+
+- `tests/test_database_queries.py` — 16 new tests covering
+  `list_markup_history` (action filter, set / clear kind, unknown
+  action demotion, per-row meta corruption tolerance, NaN/Inf
+  drop, zero / negative / non-int limit handling, default-cap),
+  `get_markup_eras` (synthetic-era for empty history, synthetic
+  for empty usage_logs, two-era construction, corrupt-after-row
+  skip, limit cap, empty-on-zero-limit, non-int limit rejection,
+  zero-markup defence), and `_finite_float_or_none` (finite
+  passthrough, None / invalid / NaN / Inf rejection, bool
+  rejection).
+- `tests/test_web_admin.py` — 7 new tests covering the
+  monetization page renders (history card with one row,
+  history empty-state, eras card with two rows, eras
+  empty-state, history-query failure swallowed, eras-query
+  failure swallowed, page passes the on-screen caps to the DB
+  helpers).
 
 ---
 

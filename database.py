@@ -197,6 +197,35 @@ def _finite_float_or_zero(value) -> float:
     return f
 
 
+def _finite_float_or_none(value) -> float | None:
+    """Coerce ``value`` to a finite float, fallback ``None``.
+
+    Sibling to :func:`_finite_float_or_zero`. ``0.0`` is the right
+    fallback for an aggregate column where "no data" semantically
+    means "no money" — but for an audit-log meta field where a
+    missing key carries information ("we don't know what the
+    previous markup was"), ``0.0`` would silently lie. ``None``
+    propagates the absence of information instead, and the
+    template / caller can render it as "—".
+
+    Used by :meth:`Database.list_markup_history` for
+    ``meta.before`` / ``meta.after`` parsing.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        # bool is a subclass of int — refuse it explicitly so
+        # ``True`` doesn't sneak through as ``1.0`` (nonsense markup).
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not _is_finite_amount(f):
+        return None
+    return f
+
+
 def _coerce_usage_log_row(r) -> dict:
     """Per-row mapper for ``usage_logs`` query results.
 
@@ -4308,6 +4337,345 @@ class Database:
             "by_model": by_model,
             "top_users": top_users,
         }
+
+    # ---- markup history & era attribution (Stage-15-Step-E #10b row 12) ----
+
+    async def list_markup_history(
+        self,
+        *,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Recent ``COST_MARKUP`` change events from ``admin_audit_log``.
+
+        Stage-15-Step-E #10b row 12. The audit log already records
+        every ``monetization_markup_update`` POST with
+        ``meta = {action, before, before_source, after, after_source}``,
+        so the history surface on ``/admin/monetization`` is just a
+        filtered query against that table — no new schema needed.
+
+        Returns rows shaped like::
+
+            {
+              "id": int,
+              "ts": str | None,                 # ISO 8601, newest first
+              "actor": str | None,              # ``ADMIN_USER_IDS`` actor
+              "kind": "set" | "clear" | "unknown",
+              "before": float | None,
+              "before_source": str | None,
+              "after": float | None,
+              "after_source": str | None,
+              "ip": str | None,                 # if recorded
+            }
+
+        ``before`` / ``after`` are best-effort floats — a malformed
+        meta row (missing keys, wrong types, JSON decode failure,
+        a row written by a future schema where the keys move) leaves
+        the affected fields as ``None`` rather than crashing the
+        whole list. The audit log is append-only, so a single bad
+        row from a different deploy version must not blank the
+        admin's view of every other history entry.
+        """
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"limit must be an int; got {limit!r}"
+            ) from exc
+        if limit <= 0:
+            return []
+        # Defence-in-depth cap. The on-screen card stays under 50;
+        # a malicious caller can't pull a million rows and OOM the
+        # web worker.
+        limit = min(limit, 1000)
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT id, ts, actor, ip, meta
+                  FROM admin_audit_log
+                 WHERE action = 'monetization_markup_update'
+                 ORDER BY ts DESC, id DESC
+                 LIMIT $1
+                """,
+                limit,
+            )
+        out: list[dict] = []
+        for r in rows:
+            meta = _decode_jsonb_meta(r["meta"]) or {}
+            kind_raw = meta.get("action")
+            if kind_raw in ("set", "clear"):
+                kind = kind_raw
+            else:
+                kind = "unknown"
+            out.append({
+                "id": int(r["id"]),
+                "ts": (
+                    r["ts"].isoformat() if r["ts"] is not None else None
+                ),
+                "actor": r["actor"],
+                "kind": kind,
+                "before": _finite_float_or_none(meta.get("before")),
+                "before_source": (
+                    str(meta.get("before_source"))
+                    if meta.get("before_source") is not None else None
+                ),
+                "after": _finite_float_or_none(meta.get("after")),
+                "after_source": (
+                    str(meta.get("after_source"))
+                    if meta.get("after_source") is not None else None
+                ),
+                "ip": r["ip"],
+            })
+        return out
+
+    async def get_markup_eras(
+        self,
+        *,
+        limit: int = 10,
+    ) -> list[dict]:
+        """Per-markup-era revenue attribution.
+
+        Stage-15-Step-E #10b row 12. The lifetime / window figures in
+        :meth:`get_monetization_summary` apply the *current* markup
+        uniformly — the page footnotes that "if you've changed
+        ``COST_MARKUP`` recently the lifetime number drifts". Row #12
+        adds the missing breakdown: split history into eras at each
+        ``monetization_markup_update`` audit row, then sum
+        ``cost_deducted_usd`` from ``usage_logs`` *within each era*
+        and divide by the era's *own* markup to get the era-correct
+        implied OpenRouter cost. The "currently-running" era extends
+        from the latest change up to ``NOW()``.
+
+        Returns rows shaped like::
+
+            [
+              {
+                "from_ts": str,                 # ISO 8601, era start
+                "to_ts": str | None,            # ISO 8601, era end
+                                                # (None = currently running)
+                "markup": float,                # markup-in-effect during era
+                "source": str,                  # "db" / "env" / "default"
+                "kind": "set" | "clear" | "current",
+                "actor": str | None,
+                "charged_usd": float,           # SUM cost_deducted_usd
+                "requests": int,                # COUNT(*) usage_logs in era
+                "openrouter_cost_usd": float,   # charged / markup
+                "gross_margin_usd": float,      # charged - openrouter_cost
+              },
+              ...                               # newest era first
+            ]
+
+        Caveats:
+
+        * If no markup changes have ever been recorded (a fresh
+          deploy), the result is one synthetic "current" era spanning
+          the entire ``usage_logs`` history at the live markup. This
+          matches the operator's mental model: "we've always charged
+          1.5×".
+        * If a row's ``meta.after`` is unparseable (legacy / corrupt
+          / future schema), that era is skipped — but the next era
+          boundary still moves forward, so a single bad row only
+          drops one era from the table rather than corrupting the
+          attribution of every later era.
+        * The very first era starts at the timestamp of the *oldest*
+          included audit row and goes back to the beginning of time
+          (``-infinity``); the era's ``charged_usd`` therefore
+          includes every row from before the bot started recording
+          markup changes. That's the most useful framing for an
+          operator: "before we changed it, here's how much we
+          charged at the default 1.5×".
+        """
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"limit must be an int; got {limit!r}"
+            ) from exc
+        if limit <= 0:
+            return []
+        limit = min(limit, 100)
+        # Pull the most recent ``limit`` markup changes from the
+        # audit log. We fetch ``limit + 1`` so the oldest row in
+        # the result has an "after_value" we can use as the
+        # *previous-era* markup if we want to extend further; keep
+        # it simple for now and just return ``limit`` eras + 1
+        # current era (so the on-screen table shows ``limit + 1``
+        # rows total).
+        history = await self.list_markup_history(limit=limit + 1)
+        if not history:
+            # No changes ever recorded — single synthetic "current"
+            # era at the live markup.
+            return await self._single_current_era()
+
+        # Build the era list. ``history`` is newest-first.
+        eras: list[dict] = []
+        # Era 0 = currently running. Starts at the latest audit row's
+        # timestamp; ends at NOW. Markup = ``after`` of the latest
+        # row, source = ``after_source``.
+        latest = history[0]
+        if latest.get("after") is not None and latest.get("ts") is not None:
+            eras.append({
+                "from_ts": latest["ts"],
+                "to_ts": None,
+                "markup": float(latest["after"]),
+                "source": latest.get("after_source") or "default",
+                "kind": "current",
+                "actor": latest.get("actor"),
+            })
+        # Era N (N >= 1) = previous markup, ran from ``history[N]``'s
+        # ts up to ``history[N - 1]``'s ts. Markup = ``after`` of
+        # ``history[N]``.
+        for i in range(1, len(history)):
+            row = history[i]
+            prev_row = history[i - 1]
+            if row.get("after") is None or row.get("ts") is None:
+                continue
+            eras.append({
+                "from_ts": row["ts"],
+                "to_ts": prev_row["ts"],
+                "markup": float(row["after"]),
+                "source": row.get("after_source") or "default",
+                "kind": row.get("kind") or "set",
+                "actor": row.get("actor"),
+            })
+
+        if not eras:
+            return await self._single_current_era()
+
+        # Now compute per-era charged + requests in a single SQL pass.
+        # We use a CASE expression to bucket each ``usage_logs`` row
+        # into one of the eras. This is O(N rows × E eras) but E is
+        # small (<=100) and asyncpg can stream the aggregation.
+        # Alternative: one SELECT per era — that's 100 round trips
+        # in the worst case, which is worse for the typical ~10-era
+        # operator.
+        ranges: list[tuple[int, str | None, str | None]] = [
+            (i, era["from_ts"], era["to_ts"])
+            for i, era in enumerate(eras)
+        ]
+        # Build the SQL:
+        #   SELECT bucket, COUNT(*) AS requests,
+        #          COALESCE(SUM(cost_deducted_usd), 0) AS charged
+        #   FROM (
+        #     SELECT
+        #       cost_deducted_usd,
+        #       CASE
+        #         WHEN created_at >= $1 AND ($2::timestamptz IS NULL OR created_at < $2) THEN 0
+        #         ...
+        #       END AS bucket
+        #     FROM usage_logs
+        #   ) sub
+        #   WHERE bucket IS NOT NULL
+        #   GROUP BY bucket
+        params: list[object] = []
+        case_clauses: list[str] = []
+        for i, from_ts, to_ts in ranges:
+            params.append(from_ts)
+            from_idx = len(params)
+            params.append(to_ts)
+            to_idx = len(params)
+            case_clauses.append(
+                f"WHEN created_at >= ${from_idx}::timestamptz "
+                f"AND (${to_idx}::timestamptz IS NULL "
+                f"OR created_at < ${to_idx}::timestamptz) "
+                f"THEN {i}"
+            )
+        sql = f"""
+            SELECT bucket,
+                   COUNT(*) AS requests,
+                   COALESCE(SUM(cost_deducted_usd), 0) AS charged
+              FROM (
+                SELECT
+                  cost_deducted_usd,
+                  CASE
+                    {chr(10).join(case_clauses)}
+                  END AS bucket
+                FROM usage_logs
+              ) sub
+             WHERE bucket IS NOT NULL
+             GROUP BY bucket
+        """
+        async with self.pool.acquire() as connection:
+            agg_rows = await connection.fetch(sql, *params)
+        agg = {int(r["bucket"]): r for r in agg_rows}
+
+        for i, era in enumerate(eras):
+            row = agg.get(i)
+            charged = (
+                _finite_float_or_zero(row["charged"]) if row is not None else 0.0
+            )
+            requests = int(row["requests"]) if row is not None else 0
+            markup_val = era["markup"]
+            if markup_val <= 0:
+                # Defence-in-depth — should never happen because the
+                # set / coerce paths reject markup < 1.0, but a
+                # tampered audit row could store 0.5 and then the
+                # division below would turn into a real OOM if used
+                # as a denominator on a hot path. Force a no-op.
+                openrouter_cost = 0.0
+                gross_margin = charged
+            else:
+                openrouter_cost = charged / markup_val
+                gross_margin = charged - openrouter_cost
+            era["charged_usd"] = round(charged, 6)
+            era["requests"] = requests
+            era["openrouter_cost_usd"] = round(openrouter_cost, 6)
+            era["gross_margin_usd"] = round(gross_margin, 6)
+
+        return eras
+
+    async def _single_current_era(self) -> list[dict]:
+        """Synthetic single-era list for deploys that have never
+        recorded a ``monetization_markup_update`` audit row.
+
+        Helper for :meth:`get_markup_eras`. Returns a one-element list
+        whose era spans the entire ``usage_logs`` table at the live
+        markup. We can't infer historical markup changes without the
+        audit trail, so this is the most useful approximation.
+        """
+        from pricing import get_markup, get_markup_source
+
+        try:
+            markup_val = float(get_markup())
+        except Exception:
+            markup_val = 1.0
+        try:
+            source = str(get_markup_source())
+        except Exception:
+            source = "default"
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT MIN(created_at) AS first_ts,
+                       COUNT(*) AS requests,
+                       COALESCE(SUM(cost_deducted_usd), 0) AS charged
+                  FROM usage_logs
+                """
+            )
+        first_ts = row["first_ts"] if row is not None else None
+        requests = int(row["requests"] or 0) if row is not None else 0
+        charged = (
+            _finite_float_or_zero(row["charged"]) if row is not None else 0.0
+        )
+        if markup_val <= 0:
+            openrouter_cost = 0.0
+            gross_margin = charged
+        else:
+            openrouter_cost = charged / markup_val
+            gross_margin = charged - openrouter_cost
+        return [{
+            "from_ts": (
+                first_ts.isoformat() if first_ts is not None else None
+            ),
+            "to_ts": None,
+            "markup": markup_val,
+            "source": source,
+            "kind": "current",
+            "actor": None,
+            "charged_usd": round(charged, 6),
+            "requests": requests,
+            "openrouter_cost_usd": round(openrouter_cost, 6),
+            "gross_margin_usd": round(gross_margin, 6),
+        }]
 
     # ---- bot_strings (Stage-9-Step-1.6) ---------------------------
     # Per-(lang, key) overrides for the compiled string table in

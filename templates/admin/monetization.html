@@ -265,6 +265,122 @@
   {% endif %}
 </div>
 
+{# Stage-15-Step-E #10b row 12: per-era revenue attribution.
+   The lifetime / window figures above apply *today's* markup
+   uniformly to every historical row — useful for "what's the
+   bot earning right now?" but misleading for "did the markup
+   change pay for itself?". This card splits charged-USD into
+   eras between markup changes and re-divides each era by *its
+   own* markup, so changing 1.5× → 1.7× and back tells you
+   honestly which week was more profitable. #}
+<div class="panel">
+  <h3>Markup eras — revenue attribution</h3>
+  {% if markup_eras %}
+  <table>
+    <thead>
+      <tr>
+        <th>From</th>
+        <th>To</th>
+        <th>Markup</th>
+        <th>Source</th>
+        <th>Requests</th>
+        <th>Charged (USD)</th>
+        <th>Implied OR cost (USD)</th>
+        <th>Gross margin (USD)</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for era in markup_eras %}
+      <tr>
+        <td>
+          {% if era.from_ts %}{{ era.from_ts }}{% else %}—{% endif %}
+        </td>
+        <td>
+          {% if era.to_ts %}{{ era.to_ts }}{% else %}<em>now</em>{% endif %}
+        </td>
+        <td><strong>{{ "{:,.4f}".format(era.markup) }}×</strong></td>
+        <td><span class="badge badge-{{ era.source }}">{{ era.source }}</span></td>
+        <td>{{ "{:,}".format(era.requests) }}</td>
+        <td>${{ "{:,.4f}".format(era.charged_usd) }}</td>
+        <td>${{ "{:,.4f}".format(era.openrouter_cost_usd) }}</td>
+        <td>${{ "{:,.4f}".format(era.gross_margin_usd) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p style="color: var(--text-muted); margin: 0.5em 0 0; font-size: 0.85em;">
+    Each row aggregates <code>cost_deducted_usd</code> from
+    <code>usage_logs</code> for the era's window, then divides
+    by <em>that era's</em> markup (not today's). The "now" era
+    extends from the most recent change up to right now.
+  </p>
+  {% else %}
+  <p style="color: var(--text-muted); margin: 0;">
+    No markup history recorded yet. Save a markup change above
+    and it will start populating here on the next page render.
+  </p>
+  {% endif %}
+</div>
+
+{# Stage-15-Step-E #10b row 12: markup-change history table.
+   Pulled directly from ``admin_audit_log`` (action =
+   ``monetization_markup_update``) so every change is timestamped,
+   actor-attributed, and IP-stamped. The per-row before/after
+   pairs are best-effort — a corrupt audit row leaves those cells
+   blank rather than blanking the whole table. #}
+<div class="panel">
+  <h3>Markup change history</h3>
+  {% if markup_history %}
+  <table>
+    <thead>
+      <tr>
+        <th>When</th>
+        <th>Actor</th>
+        <th>Action</th>
+        <th>Before</th>
+        <th>After</th>
+        <th>IP</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in markup_history %}
+      <tr>
+        <td>{% if row.ts %}{{ row.ts }}{% else %}—{% endif %}</td>
+        <td>{% if row.actor %}{{ row.actor }}{% else %}—{% endif %}</td>
+        <td>
+          <span class="badge badge-{{ row.kind }}">{{ row.kind }}</span>
+        </td>
+        <td>
+          {% if row.before is not none %}
+            {{ "{:,.4f}".format(row.before) }}×
+            {% if row.before_source %}
+              <span style="color: var(--text-muted); font-size: 0.85em;">({{ row.before_source }})</span>
+            {% endif %}
+          {% else %}—{% endif %}
+        </td>
+        <td>
+          {% if row.after is not none %}
+            <strong>{{ "{:,.4f}".format(row.after) }}×</strong>
+            {% if row.after_source %}
+              <span style="color: var(--text-muted); font-size: 0.85em;">({{ row.after_source }})</span>
+            {% endif %}
+          {% else %}—{% endif %}
+        </td>
+        <td>
+          {% if row.ip %}<code>{{ row.ip }}</code>{% else %}—{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p style="color: var(--text-muted); margin: 0;">
+    No markup changes recorded yet. Every save / clear above is
+    audit-logged and will appear here.
+  </p>
+  {% endif %}
+</div>
+
 <div class="panel">
   <h3>How to read these numbers</h3>
   <ul style="margin: 0.5em 0; padding-left: 1.25em; color: var(--text-muted); font-size: 0.9em;">
@@ -285,7 +401,10 @@
       OpenRouter cost, so this is a derived figure that assumes the
       historical rows were charged at today's markup. If you've
       changed <code>COST_MARKUP</code> recently the lifetime number
-      drifts; the rolling-window numbers are more reliable.
+      drifts; the rolling-window numbers are more reliable. The
+      <strong>Markup eras</strong> table above re-attributes
+      historical rows to their own era's markup — use that for
+      "did the markup change pay for itself?" questions.
     </li>
     <li>
       <strong>Net profit</strong> assumes every dollar credited will
