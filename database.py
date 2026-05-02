@@ -67,6 +67,69 @@ def _decode_jsonb_meta(value: object) -> dict | None:
     return None
 
 
+def _decode_jsonb_str_list(value: object) -> list[str] | None:
+    """Coerce an asyncpg-fetched JSONB column value into a ``list[str]``.
+
+    Sibling helper to :func:`_decode_jsonb_meta` for columns whose
+    payload is a JSON array of strings (e.g.
+    ``conversation_messages.image_data_uris`` — the per-turn list of
+    ``data:image/...;base64,...`` URIs from Stage-15-Step-E #10
+    follow-up #2). Same fail-soft posture: a single poisoned row
+    must not blank the entire memory buffer, and a future schema
+    evolution that switches the column to ``list[dict]`` should
+    surface a logged warning rather than crashing the LLM call.
+
+    Accepts the union of shapes asyncpg / future codecs might
+    return:
+
+    * ``None`` → ``None`` (the column was NULL — text-only turn).
+    * ``list`` (a future ``set_type_codec`` registration would
+      produce this directly) → defensive shallow copy with each
+      element validated as a non-empty ``str``. Non-string
+      entries get logged and dropped; an entirely non-string
+      list returns ``None``.
+    * ``str`` / ``bytes`` / ``bytearray`` (asyncpg's default) →
+      ``json.loads`` then the same list-of-string validation.
+    * Anything else → ``None`` with a logged WARNING.
+    """
+    if value is None:
+        return None
+    if isinstance(value, list):
+        decoded: list = value
+    elif isinstance(value, (str, bytes, bytearray)):
+        try:
+            decoded = json.loads(value)
+        except (ValueError, TypeError) as exc:
+            log.warning(
+                "could not decode JSONB string-list value: %s", exc,
+            )
+            return None
+        if not isinstance(decoded, list):
+            log.warning(
+                "JSONB string-list value decoded to non-list (%s); "
+                "treating as null",
+                type(decoded).__name__,
+            )
+            return None
+    else:
+        log.warning(
+            "unexpected JSONB string-list value type %s; treating as null",
+            type(value).__name__,
+        )
+        return None
+    cleaned: list[str] = []
+    for entry in decoded:
+        if isinstance(entry, str) and entry:
+            cleaned.append(entry)
+        else:
+            log.warning(
+                "JSONB string-list contained non-string / empty entry "
+                "(%s); dropping",
+                type(entry).__name__,
+            )
+    return cleaned or None
+
+
 def _is_finite_amount(value) -> bool:
     """Defense-in-depth: return ``True`` iff *value* is a finite real
     number (not ``NaN``, ``+Infinity``, or ``-Infinity``).
@@ -291,13 +354,32 @@ class Database:
         return result is not None
 
     async def append_conversation_message(
-        self, telegram_id: int, role: str, content: str
+        self,
+        telegram_id: int,
+        role: str,
+        content: str,
+        *,
+        image_data_uris: list[str] | None = None,
     ) -> None:
         """Persist one turn (user prompt or assistant reply).
 
         Caller is responsible for only invoking this when memory is
         enabled — we don't re-check the flag here so the FK violation
         (no users row) is the only thing the DB will reject.
+
+        Stage-15-Step-E #10 follow-up #2: ``image_data_uris`` is the
+        keyword-only optional list of ``data:image/...;base64,...``
+        URIs from a vision turn. NULL by default so text-only turns
+        keep their existing INSERT shape (the JSONB column is
+        nullable; no row-shape change for the overwhelming majority
+        of writes). When supplied, the list is JSON-encoded and
+        cast to ``jsonb`` server-side via ``$N::jsonb`` — same
+        pattern as :meth:`record_payment_status_transition` and
+        :meth:`record_audit_event`. Callers should validate the
+        shape via ``vision.build_multimodal_user_message`` before
+        calling so we don't store malformed URIs that
+        :meth:`get_recent_messages` would have to defend against
+        on every read.
 
         Stage-15-Step-E #10 root-cause fix: strip the U+0000 NUL byte
         before INSERT. Postgres TEXT rejects ``\\x00`` outright with
@@ -335,12 +417,41 @@ class Database:
             content = stripped
         if len(content) > self.MEMORY_CONTENT_MAX_CHARS:
             content = content[: self.MEMORY_CONTENT_MAX_CHARS]
+        # Empty image lists are normalised to NULL so the JSONB
+        # column stays consistent with text-only turns. Defensive
+        # type-check shields against a buggy caller that bypassed
+        # ``vision.build_multimodal_user_message`` and passed a
+        # non-list — we'd rather a clear TypeError here than a
+        # ``json.dumps`` that silently encodes the wrong shape.
+        image_uris_json: str | None = None
+        if image_data_uris is not None:
+            if not isinstance(image_data_uris, list):
+                raise TypeError(
+                    "image_data_uris must be list[str] | None, "
+                    f"got {type(image_data_uris).__name__}",
+                )
+            if image_data_uris:
+                # Validate every entry is a non-empty str — same
+                # contract as ``vision.build_multimodal_user_message``
+                # rejects but enforced again at the DB boundary so
+                # a future caller that bypasses the helper still
+                # writes a clean row.
+                for idx, uri in enumerate(image_data_uris):
+                    if not isinstance(uri, str) or not uri:
+                        raise ValueError(
+                            f"image_data_uris[{idx}] must be a "
+                            f"non-empty str, got {type(uri).__name__}",
+                        )
+                image_uris_json = json.dumps(list(image_data_uris))
         query = """
-            INSERT INTO conversation_messages (telegram_id, role, content)
-            VALUES ($1, $2, $3)
+            INSERT INTO conversation_messages
+                (telegram_id, role, content, image_data_uris)
+            VALUES ($1, $2, $3, $4::jsonb)
         """
         async with self.pool.acquire() as connection:
-            await connection.execute(query, telegram_id, role, content)
+            await connection.execute(
+                query, telegram_id, role, content, image_uris_json,
+            )
 
     async def get_recent_messages(
         self, telegram_id: int, limit: int | None = None
@@ -350,12 +461,26 @@ class Database:
         Returns an empty list if memory is disabled OR the buffer is
         empty. The list is ready to drop into an OpenAI-style
         ``messages`` array (each element has ``role`` and ``content``).
+
+        Stage-15-Step-E #10 follow-up #2: rows whose
+        ``image_data_uris`` JSONB column is non-null are reconstructed
+        into the OpenAI/OpenRouter multimodal user-message shape
+        (``content`` is a list of ``{"type": "text", ...}`` /
+        ``{"type": "image_url", ...}`` parts) so a memory-enabled
+        user's vision turn replays *with* the visual context on the
+        next turn — pre-fix, the image was silently dropped and the
+        model lost the visual thread. Text-only turns return the
+        legacy plain-string content shape so the existing prompt
+        path is unchanged. Assistant rows always render as text-
+        only (the schema column exists for both roles, but the
+        assistant never produces images today; if a future model
+        does, the read path already round-trips the column).
         """
         cap = limit if limit is not None else self.MEMORY_CONTEXT_LIMIT
         # Pull newest-first from the index-friendly side, then reverse
         # client-side so the oldest message comes first in the array.
         query = """
-            SELECT role, content
+            SELECT role, content, image_data_uris
               FROM conversation_messages
              WHERE telegram_id = $1
              ORDER BY created_at DESC, id DESC
@@ -363,7 +488,28 @@ class Database:
         """
         async with self.pool.acquire() as connection:
             rows = await connection.fetch(query, telegram_id, cap)
-        return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+        messages: list[dict] = []
+        for r in reversed(rows):
+            uris = _decode_jsonb_str_list(r["image_data_uris"])
+            if uris and r["role"] == "user":
+                # Reconstruct the multimodal shape. Text part comes
+                # first by convention (matches
+                # ``vision.build_multimodal_user_message`` so a
+                # round-tripped row is byte-for-byte identical to
+                # what the live encoder would have produced).
+                parts: list[dict] = []
+                if r["content"]:
+                    parts.append({"type": "text", "text": r["content"]})
+                for uri in uris:
+                    parts.append(
+                        {"type": "image_url", "image_url": {"url": uri}},
+                    )
+                messages.append({"role": "user", "content": parts})
+            else:
+                messages.append(
+                    {"role": r["role"], "content": r["content"]},
+                )
+        return messages
 
     async def clear_conversation(self, telegram_id: int) -> int:
         """Delete every conversation_message for the user.

@@ -19,7 +19,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from admin_toggles import is_gateway_disabled, is_model_disabled
-from ai_engine import chat_with_model
+from ai_engine import _resolve_active_model, chat_with_model
 from amount_input import normalize_amount
 from conversation_export import (
     export_filename_for_part,
@@ -3637,8 +3637,25 @@ async def process_photo(message: Message):
         if user_row is None:
             await message.answer(t(DEFAULT_LANGUAGE, "ai_no_account"))
             return
-        active_model = (user_row.get("active_model") or "").strip()
-        if active_model and not is_vision_capable_model(active_model):
+        # Stage-15-Step-E #10 follow-up #2 bundled bug fix: pre-flight
+        # vision check must use the SAME ``active_model`` resolution
+        # as ``chat_with_model``. Pre-fix, the local
+        # ``(user_row.get("active_model") or "").strip()`` produced
+        # ``""`` for a NULL / blank / whitespace-only row, the
+        # ``if active_model and ...`` short-circuited to False, and
+        # the photo passed the pre-flight gate even though
+        # ``chat_with_model`` would shortly reject the same call —
+        # ``_resolve_active_model`` falls back to ``openai/gpt-3.5-
+        # turbo`` (text-only) for a corrupted row, so the user pays
+        # the cost of a wasted Telegram CDN download + base64
+        # encoding before getting the same ``ai_model_no_vision``
+        # rejection. Routing the pre-flight through
+        # ``_resolve_active_model`` keeps the two checks in lockstep
+        # and surfaces the rejection BEFORE the expensive
+        # round-trip — operators with corrupted ``active_model``
+        # rows now see the actionable error immediately.
+        active_model = _resolve_active_model(user_row.get("active_model"))
+        if not is_vision_capable_model(active_model):
             log.info(
                 "vision pre-flight: user %d active_model=%r not "
                 "vision-capable; sending ai_model_no_vision",

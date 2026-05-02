@@ -619,3 +619,49 @@ async def test_download_photo_to_bytes_happy_path_returns_bytes():
     msg = _make_photo_message()
     out = await handlers._download_photo_to_bytes(msg)
     assert out == _TINY_JPEG
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10 follow-up #2 bundled bug fix:
+# Pre-flight vision check uses ``_resolve_active_model`` so a NULL /
+# blank / whitespace-only ``active_model`` row resolves to the same
+# fallback ``chat_with_model`` would use (``openai/gpt-3.5-turbo`` —
+# text-only) and the photo is rejected at the pre-flight gate
+# rather than after a wasted Telegram CDN download + base64 encode.
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("active_model", [None, "", "   "])
+@pytest.mark.asyncio
+async def test_process_photo_blank_active_model_rejected_at_preflight(
+    active_model,
+):
+    """Pre-fix the empty / blank / whitespace-only branch fell
+    through the ``if active_model and ...`` guard and the photo
+    was downloaded + base64-encoded before ``chat_with_model``
+    rejected it as ``ai_model_no_vision``. Post-fix the same
+    rejection lands at the pre-flight gate (no CDN round-trip)."""
+    import handlers
+
+    msg = _make_photo_message()
+    user_row = {
+        "active_model": active_model,
+        "language_code": "en",
+    }
+    chat_mock = AsyncMock()
+    with (
+        patch("handlers.consume_chat_token", AsyncMock(return_value=True)),
+        patch("handlers.chat_with_model", chat_mock),
+        patch("handlers._get_user_language", AsyncMock(return_value="en")),
+        patch("handlers.db.get_user", AsyncMock(return_value=user_row)),
+    ):
+        await handlers.process_photo(msg)
+
+    # The rejection landed at the pre-flight gate — NO CDN
+    # download was attempted.
+    msg.bot.get_file.assert_not_awaited()
+    msg.bot.download_file.assert_not_awaited()
+    chat_mock.assert_not_awaited()
+    msg.answer.assert_awaited_once()
+    sent = msg.answer.await_args.args[0]
+    assert "vision" in sent.lower()

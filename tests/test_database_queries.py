@@ -3387,3 +3387,382 @@ async def test_set_openrouter_key_enabled_handles_double_digit_count():
     db = database_module.Database()
     db.pool = pool
     assert await db.set_openrouter_key_enabled(7, enabled=False) is True
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10 follow-up #2: JSONB-backed image refs on
+# conversation_messages — append + read paths round-trip the image
+# data URIs so a memory-enabled user's vision turn replays *with*
+# the visual context on the next turn.
+# ---------------------------------------------------------------------
+
+
+_DATA_URI_RED_DOT = (
+    # 1×1 transparent PNG inline as a representative data URI.
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgAAIAAAUAAeImBZsAAAAASUVORK5CYII="
+)
+_DATA_URI_BLUE_DOT = (
+    "data:image/jpeg;base64,"
+    "/9j/4AAQSkZJRgABAQEAYABgAAD//gA8Q1JFQVRPUjogZ2QtanBlZyB2MS4wICh1c2luZyBJSkcgSlBFRyB2NjIp"
+)
+
+
+async def test_append_conversation_message_text_only_writes_null_image_uris():
+    """Text-only turns must keep their existing INSERT shape — the
+    new ``image_data_uris`` JSONB column is NULL by default so the
+    overwhelming majority of writes don't change shape."""
+    conn = _make_conn()
+    conn.execute = AsyncMock()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.append_conversation_message(42, "user", "plain text only")
+
+    args = conn.execute.await_args.args
+    # ``execute(query, telegram_id, role, content, image_uris_json)``
+    assert args[1] == 42
+    assert args[2] == "user"
+    assert args[3] == "plain text only"
+    assert args[4] is None  # JSONB column is NULL for text-only turns
+
+
+async def test_append_conversation_message_writes_image_data_uris():
+    """A vision turn must JSON-encode the image list and pass it as
+    the ``$N::jsonb`` parameter so Postgres stores the structured
+    payload rather than a stringified blob."""
+    import json
+    conn = _make_conn()
+    conn.execute = AsyncMock()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.append_conversation_message(
+        42, "user", "describe this please",
+        image_data_uris=[_DATA_URI_RED_DOT, _DATA_URI_BLUE_DOT],
+    )
+
+    args = conn.execute.await_args.args
+    # The SQL must cast the param to JSONB (pin the cast so a future
+    # refactor doesn't silently regress to a TEXT INSERT).
+    sql = args[0]
+    assert "$4::jsonb" in sql
+    assert "image_data_uris" in sql
+    # The Python-side payload is a JSON-encoded list of strings.
+    assert isinstance(args[4], str)
+    decoded = json.loads(args[4])
+    assert decoded == [_DATA_URI_RED_DOT, _DATA_URI_BLUE_DOT]
+
+
+async def test_append_conversation_message_empty_image_list_writes_null():
+    """An explicitly empty list normalises to NULL so the column
+    stays consistent with the text-only path. Pre-fix, an empty
+    list would have written ``[]`` JSONB, which downstream readers
+    would have to special-case."""
+    conn = _make_conn()
+    conn.execute = AsyncMock()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.append_conversation_message(
+        42, "user", "no images here", image_data_uris=[],
+    )
+
+    args = conn.execute.await_args.args
+    assert args[4] is None
+
+
+async def test_append_conversation_message_rejects_non_list_image_data_uris():
+    """A buggy caller passing a non-list (e.g. a single string) must
+    surface a clear ``TypeError`` rather than silently
+    JSON-encoding the wrong shape."""
+    conn = _make_conn()
+    conn.execute = AsyncMock()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    with pytest.raises(TypeError, match="image_data_uris must be"):
+        await db.append_conversation_message(
+            42, "user", "x",
+            image_data_uris=_DATA_URI_RED_DOT,  # type: ignore[arg-type]
+        )
+    # The INSERT must NOT have fired — the type-check rejects before
+    # we waste a DB round-trip.
+    conn.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize("bad_uri", [None, "", 42, 3.14, b"bytes"])
+async def test_append_conversation_message_rejects_invalid_uri_entry(bad_uri):
+    """A single bad entry in the image list must reject the whole
+    INSERT — partial writes leave inconsistent state in the
+    memory buffer that's hard to debug."""
+    conn = _make_conn()
+    conn.execute = AsyncMock()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    with pytest.raises(ValueError, match="must be a non-empty str"):
+        await db.append_conversation_message(
+            42, "user", "x",
+            image_data_uris=[_DATA_URI_RED_DOT, bad_uri],
+        )
+    conn.execute.assert_not_awaited()
+
+
+async def test_append_conversation_message_image_uris_after_nul_strip():
+    """The strip step still runs for the content even when the
+    image list is supplied — ordering matters; a NUL-bearing
+    prompt with a valid image list must surface a clean row, not
+    a Postgres-level rejection."""
+    conn = _make_conn()
+    conn.execute = AsyncMock()
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.append_conversation_message(
+        42, "user", "hello\x00world",
+        image_data_uris=[_DATA_URI_RED_DOT],
+    )
+
+    args = conn.execute.await_args.args
+    assert args[3] == "helloworld"
+    assert args[4] is not None  # JSONB written
+
+
+async def test_get_recent_messages_text_only_returns_legacy_shape():
+    """Rows with NULL ``image_data_uris`` (the overwhelming
+    majority — every text turn) must return the legacy
+    ``{"role": ..., "content": <str>}`` shape so the existing
+    prompt-assembly path is unchanged."""
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[
+        {"role": "user", "content": "hi", "image_data_uris": None},
+        {"role": "assistant", "content": "hello", "image_data_uris": None},
+    ])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    rows = await db.get_recent_messages(42)
+    # Newest-first DB → reversed → oldest-first array. The fixture
+    # already returns the in-display order to keep the test simple,
+    # but the reversal still flips it; pin both elements.
+    assert rows == [
+        {"role": "assistant", "content": "hello"},
+        {"role": "user", "content": "hi"},
+    ]
+
+
+async def test_get_recent_messages_vision_turn_reconstructs_multimodal():
+    """A user-row with non-null ``image_data_uris`` must reconstruct
+    the OpenAI/OpenRouter multimodal shape (``content`` is a list
+    of ``{type, ...}`` parts) so a memory-enabled vision turn
+    replays *with* the visual context on the next turn."""
+    import json
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[
+        {
+            "role": "user", "content": "what is in this picture?",
+            "image_data_uris": json.dumps([_DATA_URI_RED_DOT]),
+        },
+    ])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    rows = await db.get_recent_messages(42)
+    assert rows == [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "what is in this picture?"},
+            {"type": "image_url",
+             "image_url": {"url": _DATA_URI_RED_DOT}},
+        ],
+    }]
+
+
+async def test_get_recent_messages_vision_turn_preserves_uri_order():
+    """Multi-image turns must preserve the original URI order —
+    most providers treat ordering as informative ("image 1 vs.
+    image 2"), and a future user-feedback regression that
+    silently re-ordered the images would be hard to attribute
+    without this pin."""
+    import json
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[
+        {
+            "role": "user", "content": "compare these:",
+            "image_data_uris": json.dumps(
+                [_DATA_URI_RED_DOT, _DATA_URI_BLUE_DOT],
+            ),
+        },
+    ])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    rows = await db.get_recent_messages(42)
+    parts = rows[0]["content"]
+    assert parts[0] == {"type": "text", "text": "compare these:"}
+    assert parts[1]["image_url"]["url"] == _DATA_URI_RED_DOT
+    assert parts[2]["image_url"]["url"] == _DATA_URI_BLUE_DOT
+
+
+async def test_get_recent_messages_vision_turn_with_empty_text():
+    """Image-only turn (caption was empty / image-only attach)
+    must round-trip without an empty text part — pre-fix, an
+    empty-string text part would still be added, which some
+    providers reject as an empty content block."""
+    import json
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[
+        {"role": "user", "content": "",
+         "image_data_uris": json.dumps([_DATA_URI_RED_DOT])},
+    ])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    rows = await db.get_recent_messages(42)
+    parts = rows[0]["content"]
+    assert all(p.get("type") != "text" for p in parts)
+    assert parts == [
+        {"type": "image_url", "image_url": {"url": _DATA_URI_RED_DOT}},
+    ]
+
+
+async def test_get_recent_messages_assistant_image_uris_ignored():
+    """Defence-in-depth: the schema column applies to BOTH roles
+    but assistant rows never carry image refs today. If a row
+    somehow lands with role=assistant and non-null URIs (a manual
+    SQL fix, a future model that emits images), keep the legacy
+    plain-string shape rather than fabricating a multimodal
+    content array — the assistant row's text reply is still the
+    primary signal, and treating it as multimodal would change
+    the wire shape sent to OpenRouter for replay."""
+    import json
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[
+        {"role": "assistant", "content": "I see a red dot",
+         "image_data_uris": json.dumps([_DATA_URI_RED_DOT])},
+    ])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    rows = await db.get_recent_messages(42)
+    assert rows == [{"role": "assistant", "content": "I see a red dot"}]
+
+
+async def test_get_recent_messages_malformed_json_falls_back_to_text(caplog):
+    """A poisoned row (``image_data_uris`` JSONB cell that doesn't
+    decode) must NOT blank the entire memory buffer. Fail-soft:
+    log loud-and-once for ops, return the legacy text shape so
+    the user keeps their conversational thread."""
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[
+        {"role": "user", "content": "hi",
+         "image_data_uris": "{not valid json"},
+    ])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    with caplog.at_level("WARNING"):
+        rows = await db.get_recent_messages(42)
+
+    assert rows == [{"role": "user", "content": "hi"}]
+    assert any(
+        "could not decode" in r.message for r in caplog.records
+    )
+
+
+async def test_get_recent_messages_query_selects_image_data_uris_column():
+    """Pin the SELECT list — a future refactor that drops
+    ``image_data_uris`` from the projection would silently
+    surface text-only memory replays for vision turns, the very
+    bug this PR fixes. Cheap belt-and-braces against drift."""
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_recent_messages(42)
+
+    sql = conn.fetch.await_args.args[0]
+    assert "image_data_uris" in sql
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10 follow-up #2: _decode_jsonb_str_list helper
+# ---------------------------------------------------------------------
+
+
+def test_decode_jsonb_str_list_none_returns_none():
+    assert database_module._decode_jsonb_str_list(None) is None
+
+
+def test_decode_jsonb_str_list_accepts_list_directly():
+    """A future asyncpg codec registration would yield a Python
+    list straight away — the helper must accept that shape too."""
+    raw = ["a", "b", "c"]
+    assert database_module._decode_jsonb_str_list(raw) == ["a", "b", "c"]
+
+
+def test_decode_jsonb_str_list_decodes_json_string():
+    assert database_module._decode_jsonb_str_list(
+        '["a", "b"]'
+    ) == ["a", "b"]
+
+
+def test_decode_jsonb_str_list_decodes_bytes():
+    assert database_module._decode_jsonb_str_list(
+        b'["a", "b"]'
+    ) == ["a", "b"]
+
+
+def test_decode_jsonb_str_list_malformed_returns_none(caplog):
+    with caplog.at_level("WARNING"):
+        assert database_module._decode_jsonb_str_list(
+            "{not json"
+        ) is None
+    assert any("could not decode" in r.message for r in caplog.records)
+
+
+def test_decode_jsonb_str_list_non_list_json_returns_none(caplog):
+    """A JSON object / string / number is structurally wrong for
+    this column — log and return None so the read path falls back
+    to the text-only shape."""
+    with caplog.at_level("WARNING"):
+        assert database_module._decode_jsonb_str_list(
+            '{"oops": true}'
+        ) is None
+    assert any(
+        "decoded to non-list" in r.message for r in caplog.records
+    )
+
+
+def test_decode_jsonb_str_list_drops_non_string_entries(caplog):
+    """A list with a mix of valid + invalid entries surfaces only
+    the valid strings — and logs a warning for each dropped
+    entry so the source row is identifiable."""
+    with caplog.at_level("WARNING"):
+        result = database_module._decode_jsonb_str_list(
+            '["valid", 42, null, "also-valid", ""]'
+        )
+    assert result == ["valid", "also-valid"]
+
+
+def test_decode_jsonb_str_list_all_invalid_returns_none():
+    """Every entry rejected → return None so the caller falls
+    back to text-only rather than producing an empty-list shape
+    the multimodal payload assembler would reject as
+    ``empty_message``."""
+    assert database_module._decode_jsonb_str_list(
+        '[42, null, true]'
+    ) is None
+
+
+def test_decode_jsonb_str_list_unexpected_type_returns_none(caplog):
+    """An int / float / dict landing here means a future codec
+    or an upstream caller invariant broke. Log + return None."""
+    with caplog.at_level("WARNING"):
+        assert database_module._decode_jsonb_str_list(42) is None
+    assert any(
+        "unexpected JSONB string-list value type" in r.message
+        for r in caplog.records
+    )
