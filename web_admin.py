@@ -2916,6 +2916,8 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     # cause to a knob tweak vs. a real change in the loop's actual
     # ticking cadence.
     "control_loop_stale_update": "Per-loop stale threshold updated",
+    # Stage-15-Step-E #10b row 20: audit retention policy editor.
+    "audit_retention_update": "Audit retention policy updated",
 }
 
 
@@ -6591,6 +6593,28 @@ async def user_edit_post(request: web.Request) -> web.StreamResponse:
     return response
 
 
+def _build_audit_retention_view() -> dict:
+    """Snapshot of the resolved AUDIT_RETENTION_DAYS + per-source values."""
+    import audit_retention as ar
+
+    override_value = ar.get_audit_retention_days_override()
+    env_raw = os.getenv("AUDIT_RETENTION_DAYS", "").strip()
+    env_value: int | None = None
+    if env_raw:
+        env_value = ar._coerce_audit_retention_days(env_raw)
+    return {
+        "effective": ar.get_audit_retention_days(),
+        "source": ar.get_audit_retention_days_source(),
+        "default_value": ar.DEFAULT_AUDIT_RETENTION_DAYS,
+        "env_value": env_value,
+        "env_raw": env_raw,
+        "override_value": override_value,
+        "minimum": ar.AUDIT_RETENTION_DAYS_MINIMUM,
+        "maximum": ar.AUDIT_RETENTION_DAYS_MAXIMUM,
+        "reaper_counters": ar.get_reaper_counters(),
+    }
+
+
 async def audit_get(request: web.Request) -> web.StreamResponse:
     """GET /admin/audit — read-only feed of admin activity.
 
@@ -6615,6 +6639,17 @@ async def audit_get(request: web.Request) -> web.StreamResponse:
         except Exception:
             log.exception("audit_get: list_admin_audit_log failed")
             db_error = "Database query failed — see logs."
+        # Stage-15-Step-E #10b row 20: refresh the retention override
+        # on every render so a tweak made on a different replica is
+        # reflected here.
+        import audit_retention as ar
+        try:
+            await ar.refresh_audit_retention_days_override_from_db(db)
+        except Exception:
+            log.exception(
+                "audit_get: "
+                "refresh_audit_retention_days_override_from_db failed"
+            )
 
     context = {
         "rows": rows,
@@ -6624,10 +6659,183 @@ async def audit_get(request: web.Request) -> web.StreamResponse:
         "action_labels": AUDIT_ACTION_LABELS,
         "selected_action": (request.query.get("action") or "").strip(),
         "selected_actor": (request.query.get("actor") or "").strip(),
+        "retention_view": _build_audit_retention_view(),
+        "flash": None,
     }
-    return aiohttp_jinja2.render_template(
-        "audit.html", request, context
+    response = aiohttp_jinja2.render_template(
+        "audit.html", request, context,
     )
+    flash = pop_flash(request, response)
+    if flash is not None:
+        context["flash"] = flash
+        response = aiohttp_jinja2.render_template(
+            "audit.html", request, context,
+        )
+    return response
+
+
+async def audit_retention_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/audit/retention`` — update
+    ``AUDIT_RETENTION_DAYS``."""
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app.get(APP_KEY_DB)
+    form = await request.post()
+
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning(
+            "audit_retention_post: CSRF token mismatch from %s",
+            request.remote,
+        )
+        response = web.HTTPFound(location="/admin/audit")
+        set_flash(
+            response, kind="error",
+            message="CSRF token mismatch — please reload and try again.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    if db is None:
+        response = web.HTTPFound(location="/admin/audit")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Database is not configured — retention edits "
+                "require a live DB connection."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    import audit_retention as ar
+
+    raw_value = str(form.get("audit_retention_days", "")).strip()
+    previous_effective = ar.get_audit_retention_days()
+    previous_source = ar.get_audit_retention_days_source()
+
+    if not raw_value:
+        try:
+            await db.delete_setting(ar.AUDIT_RETENTION_DAYS_SETTING_KEY)
+        except Exception:
+            log.exception(
+                "audit_retention_post: delete_setting failed"
+            )
+            response = web.HTTPFound(location="/admin/audit")
+            set_flash(
+                response, kind="error",
+                message=(
+                    "Failed to clear the override — see logs. "
+                    "The previous value is still in effect."
+                ),
+                secret=secret, cookie_secure=cookie_secure,
+            )
+            return response
+        ar.clear_audit_retention_days_override()
+        try:
+            await ar.refresh_audit_retention_days_override_from_db(db)
+        except Exception:
+            log.exception(
+                "audit_retention_post: refresh after clear failed"
+            )
+        new_effective = ar.get_audit_retention_days()
+        await _record_audit_safe(
+            request, "audit_retention_update",
+            target="audit_retention_days",
+            meta={
+                "action": "clear",
+                "before": previous_effective,
+                "before_source": previous_source,
+                "after": new_effective,
+                "after_source": ar.get_audit_retention_days_source(),
+            },
+        )
+        response = web.HTTPFound(location="/admin/audit")
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Retention override cleared. Effective retention "
+                f"is now {new_effective} days "
+                f"(source: {ar.get_audit_retention_days_source()})."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    parsed = ar._coerce_audit_retention_days(raw_value)
+    if parsed is None:
+        response = web.HTTPFound(location="/admin/audit")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Retention days must be an integer in "
+                f"[{ar.AUDIT_RETENTION_DAYS_MINIMUM}, "
+                f"{ar.AUDIT_RETENTION_DAYS_MAXIMUM}]. "
+                f"Got: {raw_value!r}. No changes were made."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        await db.upsert_setting(
+            ar.AUDIT_RETENTION_DAYS_SETTING_KEY, str(parsed),
+        )
+    except Exception:
+        log.exception(
+            "audit_retention_post: upsert_setting failed value=%r",
+            parsed,
+        )
+        response = web.HTTPFound(location="/admin/audit")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Failed to persist the new retention — see logs. "
+                "The previous value is still in effect."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        ar.set_audit_retention_days_override(parsed)
+    except ValueError:
+        log.exception(
+            "audit_retention_post: "
+            "set_audit_retention_days_override rejected %r",
+            parsed,
+        )
+
+    try:
+        await ar.refresh_audit_retention_days_override_from_db(db)
+    except Exception:
+        log.exception(
+            "audit_retention_post: refresh after upsert failed"
+        )
+
+    new_effective = ar.get_audit_retention_days()
+    await _record_audit_safe(
+        request, "audit_retention_update",
+        target="audit_retention_days",
+        meta={
+            "action": "set",
+            "before": previous_effective,
+            "before_source": previous_source,
+            "after": new_effective,
+            "after_source": ar.get_audit_retention_days_source(),
+        },
+    )
+    response = web.HTTPFound(location="/admin/audit")
+    set_flash(
+        response, kind="success",
+        message=(
+            f"Retention updated: {previous_effective} → "
+            f"{new_effective} days."
+        ),
+        secret=secret, cookie_secure=cookie_secure,
+    )
+    return response
 
 
 # ---------------------------------------------------------------------
@@ -10813,6 +11021,11 @@ def setup_admin_routes(
         _require_role(ROLE_SUPER)(user_edit_post),
     )
     app.router.add_get("/admin/audit", _require_auth(audit_get))
+    # Stage-15-Step-E #10b row 20: audit retention policy editor.
+    app.router.add_post(
+        "/admin/audit/retention",
+        _require_role(ROLE_OPERATOR)(audit_retention_post),
+    )
 
     # Stage-9-Step-3: TOTP / 2FA enrolment helper. Always behind the
     # admin login. Operators who haven't configured ADMIN_2FA_SECRET

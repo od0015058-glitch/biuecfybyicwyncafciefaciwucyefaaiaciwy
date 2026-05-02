@@ -4881,7 +4881,14 @@ class Database:
         actor: str | None = None,
     ) -> list[dict]:
         """Most recent audit rows, newest first. Optional filters
-        narrow by action slug or actor."""
+        narrow by action slug or actor.
+
+        §10b row 20 bundled fix: cap ``limit`` to 10 000 so a future
+        caller can't pull every audit row and OOM the web worker.
+        ``list_markup_history`` already caps to 1 000 — this sibling
+        was missing the same guard.
+        """
+        limit = min(max(1, int(limit)), 10_000)
         clauses: list[str] = []
         params: list[object] = []
         if action:

@@ -519,6 +519,27 @@ async def main():
             "from DB — falling through to env / cadence / default"
         )
 
+    # Stage-15-Step-E #10b row 20: warm the audit retention days
+    # override so the first reaper tick uses the operator's saved
+    # retention window.
+    try:
+        import audit_retention
+        loaded_retention = await (
+            audit_retention.refresh_audit_retention_days_override_from_db(db)
+        )
+        log.info(
+            "loaded AUDIT_RETENTION_DAYS override from "
+            "system_settings: %s (source=%s, effective=%dd)",
+            loaded_retention,
+            audit_retention.get_audit_retention_days_source(),
+            audit_retention.get_audit_retention_days(),
+        )
+    except Exception:
+        log.exception(
+            "failed to load AUDIT_RETENTION_DAYS override from DB "
+            "— falling through to env / compile-time default"
+        )
+
     # Overwrite BotFather's cached slash-command list with the
     # canonical one. Without this, Telegram shows whatever was last
     # typed into the BotFather "Edit Commands" panel — including
@@ -601,6 +622,16 @@ async def main():
     # an hour anchor; the loop never crashes on a single tick error.
     # See bot_health_alert.py for the full contract.
     bot_health_alert_task = start_bot_health_alert_task(bot)
+
+    # Stage-15-Step-E #10b row 20: background audit-log retention reaper.
+    # Wakes every AUDIT_RETENTION_INTERVAL_HOURS (default 24) and
+    # batch-deletes admin_audit_log rows older than the resolved
+    # AUDIT_RETENTION_DAYS window. See audit_retention.py.
+    import audit_retention as _ar
+    audit_retention_task = asyncio.create_task(
+        _ar.audit_retention_loop(db),
+        name="audit-retention",
+    )
 
     # Background refresher for NowPayments per-currency min-amounts.
     # Keeps the in-memory cache warm so the checkout pre-flight check
@@ -719,6 +750,13 @@ async def main():
             pass
         except Exception:
             log.exception("bot-health-alert loop exited with error")
+        audit_retention_task.cancel()
+        try:
+            await audit_retention_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("audit-retention reaper exited with error")
         await runner.cleanup()
         await db.close()
         await bot.session.close()
