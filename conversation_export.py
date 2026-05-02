@@ -160,10 +160,16 @@ def _format_one_message(row: dict) -> str:
     label = _ROLE_LABELS.get(role, role.capitalize())
     timestamp = _format_timestamp(row.get("created_at"))
     content = _coerce_text_field(row.get("content")).rstrip()
+    # Stage-15-Step-E #10b row 8 bundled fix: surface a [image]
+    # tag for vision turns so the export shows that an image was
+    # part of the exchange.  The actual base64 data is omitted
+    # (too large for a .txt export) but the marker prevents the
+    # silent loss that pre-fix exports suffered.
+    image_tag = " [image]" if row.get("has_images") else ""
     # A blank-line separator between role-header and body keeps
     # the file readable when the assistant's reply spans many
     # paragraphs of code or markdown.
-    return f"[{timestamp}] {label}:\n{content}\n"
+    return f"[{timestamp}] {label}{image_tag}:\n{content}\n"
 
 
 def _build_header_lines(

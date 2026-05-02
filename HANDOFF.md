@@ -2138,7 +2138,7 @@ or unblock other work.
 | 5 | **`REQUIRED_CHANNEL`** — force-join channel handle. | Env-only. | Editor on `/admin/control` (or new `/admin/access`). | P2 | **Shipped** (this PR — DB-backed override layer in `force_join.py` + boot warm-up + `/admin/control` editor card with set / clear / force-OFF actions, audit row `control_required_channel_update`, sidebar source badge). |
 | 6 | **`FREE_MESSAGES_PER_USER`** — initial free-trial messages. | Env-only. | Editor on `/admin/wallet-config`. | P2 | **Shipped** (this PR — DB-backed override layer in new `free_trial.py` + boot warm-up + `/admin/wallet-config` editor card with set / clear actions, audit row `wallet_config_free_messages_update`, source badge, `Database.create_user` now binds the resolved allowance to the `free_messages_left` parameter so a saved override applies to brand-new registrants without a process restart. Bounds `[0, 10_000]`; the explicit-zero "pay-to-play" path is allowed; existing users are unaffected — `ON CONFLICT (telegram_id) DO NOTHING`.) |
 | 7 | **`REFERRAL_BONUS_PERCENT` + `REFERRAL_BONUS_MAX_USD`** — referral payouts. (Earlier drafts of this row called these `REFERRAL_BONUS_USD` / `REFERRAL_PERCENT`; the actual env-var names in `referral.py` are `REFERRAL_BONUS_PERCENT` and `REFERRAL_BONUS_MAX_USD`.) | Env-only. | Editor on `/admin/wallet-config`. | P2 | **Shipped** (this PR — DB-backed override layer in `referral.py` for both knobs + boot warm-up + `/admin/wallet-config` editor card with combined Save form / per-knob Clear form, audit row `wallet_config_referral_update`). |
-| 8 | **`MEMORY_CONTEXT_LIMIT` / `MEMORY_CONTENT_MAX_CHARS`** — conversation memory caps. | Env-only. | Editor on a new `/admin/memory-config` page. | P3 | Pending |
+| 8 | **`MEMORY_CONTEXT_LIMIT` / `MEMORY_CONTENT_MAX_CHARS`** — conversation memory caps. | Env-only. | Editor on a new `/admin/memory-config` page. | P3 | **Shipped** (this PR — DB-backed override layer in new `memory_config.py` + boot warm-up + `/admin/memory-config` page with two editor cards (context-limit `[1, 500]` and content-max-chars `[100, 100_000]`), each with set / clear actions, audit rows `memory_config_context_limit_update` / `memory_config_content_max_update`, source badges, sidebar nav link. `database.py` now calls `get_memory_context_limit()` / `get_memory_content_max_chars()` instead of hardcoded class attributes. Bundled bug fix: `get_full_conversation` now includes `image_data_uris` — vision turns surface a `[image]` marker in the `.txt` export instead of being silently dropped.) |
 | 9 | **Pending-PENDING expiration window** (`PENDING_EXPIRATION_HOURS_DEFAULT`; the actual env-var name in `pending_expiration.py` is `PENDING_EXPIRATION_HOURS`). | Env-only. | Editor on `/admin/control` or `/admin/payments`. | P3 | **Shipped** (this PR — DB-backed override layer in `pending_expiration.py` + boot warm-up + `/admin/control` editor card with set / clear actions, audit row `control_expiration_hours_update`, source badge, audit `meta` carries `threshold_hours_used`). |
 | 10 | **Stuck-PENDING alert threshold** (`PENDING_ALERT_THRESHOLD_HOURS`). | Env-only. | Editor on `/admin/control`. | P3 | **Shipped** (this PR — DB-backed override layer in `pending_alert.py` + boot warm-up + `/admin/control` editor card with set / clear actions, audit row `control_alert_threshold_update`, source badge, iteration-time re-read in `_alert_loop` so a saved override is live on the next tick). |
 | 11 | **Per-loop cadence overrides** (`BOT_HEALTH_LOOP_STALE_<NAME>_SECONDS`). | Env-only. | Editor on `/admin/control` (one row per loop name). | P3 | **Shipped** (this PR — DB-backed `_LOOP_STALE_OVERRIDES` cache in `bot_health.py` + `refresh_loop_stale_overrides_from_db` + `_stale_threshold_seconds` consults DB before env, panel `_build_loop_stale_view` per-loop card with cadence / cadence-derived / env / DB / effective / source columns + per-row Save/Clear forms, `control_loop_stale_post` validates against `metrics._LOOP_METRIC_NAMES` so a typo can't write a row no real loop reads, audit slug `control_loop_stale_update`, boot warm-up in `main.py`. **Bundled bug fix:** `refresh_threshold_overrides_from_db` previously raised `AttributeError` on a non-string-non-None row in `system_settings` (e.g. an int from a future schema change), poisoning the whole load and reverting every other override; the refresh now coerces via `_coerce_setting_to_str` so a single garbage row only drops itself.) |
@@ -4201,7 +4201,21 @@ The user's process for this project — **do not deviate**:
     `_require_role(ROLE_SUPER)` so a regression that drops a
     gate fails immediately. Total suite: 2454 → 2487 passing
     (+33 new).
-26. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+26. **Stage-15-Step-E #10b row 8 OPENED** — MEMORY_CONTEXT_LIMIT +
+    MEMORY_CONTENT_MAX_CHARS editor on new `/admin/memory-config` page.
+    New `memory_config.py` module (DB-backed override layer, same
+    pattern as `free_trial.py`). `database.py` now calls
+    `get_memory_context_limit()` / `get_memory_content_max_chars()`
+    instead of hardcoded class attributes. Two editor cards (context-
+    limit `[1, 500]`, content-max-chars `[100, 100_000]`), set/clear
+    actions, audit rows, source badges, sidebar nav link, boot warm-up
+    in `main.py`. Env vars `MEMORY_CONTEXT_LIMIT` /
+    `MEMORY_CONTENT_MAX_CHARS` documented in `.env.example`. Bundled
+    bug fix: `get_full_conversation` now includes `image_data_uris` —
+    vision turns surface a `[image]` marker in the `.txt` export
+    instead of being silently dropped. 72 new tests in
+    `tests/test_memory_config.py`. Total suite: 3144 passing.
+27. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-27. **Read the §11 working agreement before doing anything.**
+28. **Read the §11 working agreement before doing anything.**
