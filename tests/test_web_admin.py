@@ -12556,6 +12556,341 @@ async def test_control_required_channel_post_db_failure_keeps_previous(
 
 
 # =====================================================================
+# Stage-15-Step-E #10b row 21: BOT_HEALTH_ALERT_INTERVAL_SECONDS editor
+# =====================================================================
+
+
+async def test_control_alert_interval_post_requires_auth(
+    aiohttp_client, make_admin_app
+):
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    resp = await client.post(
+        "/admin/control/alert-interval",
+        data={
+            "alert_interval_seconds": "120",
+            "action": "set",
+            "csrf_token": "x",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303), resp.status
+    assert resp.headers.get("Location", "").startswith("/admin/login")
+
+
+async def test_control_alert_interval_post_csrf_required(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False,
+    )
+    db.upsert_setting.reset_mock()
+    resp = await client.post(
+        "/admin/control/alert-interval",
+        data={"alert_interval_seconds": "120", "action": "set"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/control"
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+
+
+async def test_control_alert_interval_post_persists_value_and_refreshes(
+    aiohttp_client, make_admin_app
+):
+    """Happy path: a valid integer is upserted to system_settings AND
+    pushed into the in-process override cache."""
+    import bot_health_alert
+
+    bot_health_alert.clear_alert_interval_override()
+    saved: dict[str, str | None] = {"value": None}
+
+    async def _upsert(key: str, value: str) -> None:
+        if key == bot_health_alert.ALERT_INTERVAL_SETTING_KEY:
+            saved["value"] = value
+
+    async def _get(key: str):
+        if key == bot_health_alert.ALERT_INTERVAL_SETTING_KEY:
+            return saved["value"]
+        return None
+
+    db = _stub_toggle_db()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/alert-interval",
+        data={
+            "alert_interval_seconds": "240",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302, await resp.text()
+    assert resp.headers["Location"] == "/admin/control"
+
+    db.upsert_setting.assert_awaited_once_with(
+        bot_health_alert.ALERT_INTERVAL_SETTING_KEY, "240",
+    )
+    # In-process cache reflects the new value (no restart needed).
+    assert bot_health_alert.get_alert_interval_override() == 240
+    assert bot_health_alert.get_bot_health_alert_interval_seconds() == 240
+    # Audit row was recorded.
+    matching = [
+        c for c in db.record_admin_audit.await_args_list
+        if c.kwargs.get("action") == "control_alert_interval_update"
+    ]
+    assert matching, db.record_admin_audit.await_args_list
+    bot_health_alert.clear_alert_interval_override()
+
+
+async def test_control_alert_interval_post_clear_drops_db_row(
+    aiohttp_client, make_admin_app
+):
+    """``action=clear`` deletes the DB row and clears the in-process
+    override so the env var (or default) takes effect again."""
+    import bot_health_alert
+
+    bot_health_alert.set_alert_interval_override(120)
+
+    async def _get(key: str):
+        return None  # row already deleted
+
+    db = _stub_toggle_db()
+    db.delete_setting = AsyncMock(return_value=True)
+    db.get_setting = AsyncMock(side_effect=_get)
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    # After the GET-render refresh ran with our stubbed get_setting
+    # returning None, the cache may have been cleared. Re-set so the
+    # POST has something to clear.
+    bot_health_alert.set_alert_interval_override(120)
+    db.delete_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/alert-interval",
+        data={
+            "alert_interval_seconds": "",
+            "action": "clear",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.delete_setting.assert_awaited_once_with(
+        bot_health_alert.ALERT_INTERVAL_SETTING_KEY,
+    )
+    assert bot_health_alert.get_alert_interval_override() is None
+    bot_health_alert.clear_alert_interval_override()
+
+
+async def test_control_alert_interval_post_rejects_below_minimum(
+    aiohttp_client, make_admin_app
+):
+    import bot_health_alert
+
+    bot_health_alert.clear_alert_interval_override()
+
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/alert-interval",
+        data={
+            "alert_interval_seconds": "0",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+    assert bot_health_alert.get_alert_interval_override() is None
+
+
+async def test_control_alert_interval_post_rejects_above_max(
+    aiohttp_client, make_admin_app
+):
+    """The 24h cap on the override slot prevents a fat-finger like
+    ``86400000`` (intended ``60``) silently disabling alerting for
+    a month."""
+    import bot_health_alert
+
+    bot_health_alert.clear_alert_interval_override()
+
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/alert-interval",
+        data={
+            "alert_interval_seconds": str(
+                bot_health_alert.INTERVAL_OVERRIDE_MAXIMUM + 1
+            ),
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+    assert bot_health_alert.get_alert_interval_override() is None
+
+
+async def test_control_alert_interval_post_rejects_non_int(
+    aiohttp_client, make_admin_app
+):
+    import bot_health_alert
+
+    bot_health_alert.clear_alert_interval_override()
+
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/alert-interval",
+        data={
+            "alert_interval_seconds": "abc",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+
+
+async def test_control_alert_interval_post_rejects_blank_set(
+    aiohttp_client, make_admin_app
+):
+    """A blank input on action=set must be rejected so the operator
+    doesn't accidentally try to "set blank" instead of clicking
+    "Clear DB override"."""
+    import bot_health_alert
+
+    bot_health_alert.clear_alert_interval_override()
+
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/alert-interval",
+        data={
+            "alert_interval_seconds": "",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+
+
+async def test_control_alert_interval_post_rejects_unknown_action(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/alert-interval",
+        data={
+            "alert_interval_seconds": "60",
+            "action": "delete_everything",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+
+
+async def test_control_alert_interval_post_db_failure_keeps_previous(
+    aiohttp_client, make_admin_app
+):
+    """A transient DB blip on upsert keeps the previous override in
+    place."""
+    import bot_health_alert
+
+    bot_health_alert.clear_alert_interval_override()
+
+    db = _stub_toggle_db()
+    db.upsert_setting = AsyncMock(side_effect=RuntimeError("DB down"))
+    db.get_setting = AsyncMock(return_value="180")
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    # GET-render refresh loaded "180" into the cache.
+    assert bot_health_alert.get_alert_interval_override() == 180
+
+    resp = await client.post(
+        "/admin/control/alert-interval",
+        data={
+            "alert_interval_seconds": "240",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    # Override unchanged after a failed write.
+    assert bot_health_alert.get_alert_interval_override() == 180
+    bot_health_alert.clear_alert_interval_override()
+
+
+def test_audit_action_labels_includes_alert_interval_update():
+    """Regression: ``control_alert_interval_update`` must be listed
+    in ``AUDIT_ACTION_LABELS`` so the ``/admin/audit`` filter
+    dropdown surfaces alert-cadence changes."""
+    from web_admin import AUDIT_ACTION_LABELS
+
+    assert "control_alert_interval_update" in AUDIT_ACTION_LABELS
+    assert AUDIT_ACTION_LABELS["control_alert_interval_update"] == (
+        "Bot-health alert interval updated"
+    )
+
+
+async def test_control_get_renders_alert_interval_card(
+    aiohttp_client, make_admin_app
+):
+    """The /admin/control panel renders the new alert-interval card
+    with the current effective value, source badge, and the form."""
+    import bot_health_alert
+
+    bot_health_alert.clear_alert_interval_override()
+
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/control")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Alert-loop cadence" in body
+    assert "/admin/control/alert-interval" in body
+    assert 'name="alert_interval_seconds"' in body
+
+
+# =====================================================================
 # Stage-15-Step-F follow-up #6: per-loop manual "tick now" button
 # =====================================================================
 

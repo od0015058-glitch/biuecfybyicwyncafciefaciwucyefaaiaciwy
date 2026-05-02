@@ -60,6 +60,7 @@ from bot_health import (
     BotStatusLevel,
     compute_bot_status,
     register_loop,
+    update_loop_cadence,
 )
 
 
@@ -81,6 +82,149 @@ _BAD_LEVELS: frozenset[BotStatusLevel] = frozenset(
         BotStatusLevel.DOWN,
     )
 )
+
+
+# Stage-15-Step-E #10b row 21: DB-backed override layer for
+# ``BOT_HEALTH_ALERT_INTERVAL_SECONDS``. Same overlay shape COST_MARKUP
+# / MIN_TOPUP_USD / REQUIRED_CHANNEL / REFERRAL_BONUS_* already use:
+#
+# 1. ``_INTERVAL_OVERRIDE`` — process-local cache, populated from
+#    ``system_settings.BOT_HEALTH_ALERT_INTERVAL_SECONDS`` via
+#    :func:`refresh_alert_interval_override_from_db` at boot and on
+#    every ``/admin/control`` render. The web admin form writes this
+#    row so an operator can re-tune the alert cadence without a
+#    redeploy.
+# 2. ``BOT_HEALTH_ALERT_INTERVAL_SECONDS`` env var — same shape as
+#    before; remains the fallback for env-only deploys.
+# 3. :data:`_BOT_HEALTH_ALERT_INTERVAL_SECONDS_DEFAULT` (``60``) —
+#    compile-time fallback.
+#
+# Live pickup: :func:`_alert_loop` calls
+# :func:`get_bot_health_alert_interval_seconds` *each* iteration, so
+# a saved override takes effect on the next tick — no restart required.
+ALERT_INTERVAL_SETTING_KEY: str = "BOT_HEALTH_ALERT_INTERVAL_SECONDS"
+INTERVAL_MINIMUM: int = 1
+# Cap on the override slot only (env / default callers retain their
+# pre-existing freedom). A 24h ceiling prevents an admin-form
+# fat-finger like ``86400000`` (intended ``60``) that would silently
+# stop alerting for a month — yet still allows "alert once a day"
+# semantics for low-volume deployments where an hourly tick would be
+# noise.
+INTERVAL_OVERRIDE_MAXIMUM: int = 86_400
+_INTERVAL_OVERRIDE: int | None = None
+
+
+def _coerce_alert_interval(value: object) -> int | None:
+    """Validate an interval candidate for the override slot.
+
+    Returns the canonical ``int`` on success, or ``None`` if the value
+    is unusable (non-integer / non-positive / above the ceiling /
+    boolean). Never raises — the caller (the web admin form, the DB
+    warm-up, the ``set_*`` helper) decides how to surface a rejection.
+
+    Strings are stripped + parsed so a row written via
+    :meth:`Database.upsert_setting` (which always stores ``str``)
+    round-trips cleanly.
+    """
+    # bool is a subclass of int — refuse explicitly so ``True``
+    # doesn't sneak through as ``1`` (nonsense interval).
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        candidate = value
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            candidate = int(stripped)
+        except ValueError:
+            return None
+    else:
+        return None
+    if candidate < INTERVAL_MINIMUM:
+        return None
+    if candidate > INTERVAL_OVERRIDE_MAXIMUM:
+        return None
+    return candidate
+
+
+def set_alert_interval_override(value: int) -> None:
+    """Apply an in-process override for the alert interval.
+
+    Refuses non-int / out-of-range / boolean inputs with
+    :class:`ValueError`. The web admin form runs the same checks
+    before persisting; this guard is defence-in-depth so a buggy
+    direct caller can't poison the cache.
+    """
+    coerced = _coerce_alert_interval(value)
+    if coerced is None:
+        raise ValueError(
+            f"BOT_HEALTH_ALERT_INTERVAL_SECONDS override {value!r} must "
+            f"be an int in [{INTERVAL_MINIMUM}, {INTERVAL_OVERRIDE_MAXIMUM}]"
+        )
+    global _INTERVAL_OVERRIDE
+    _INTERVAL_OVERRIDE = coerced
+
+
+def clear_alert_interval_override() -> bool:
+    """Drop the in-process override. Returns True if one was active."""
+    global _INTERVAL_OVERRIDE
+    had = _INTERVAL_OVERRIDE is not None
+    _INTERVAL_OVERRIDE = None
+    return had
+
+
+def get_alert_interval_override() -> int | None:
+    """Return the current in-process override (or ``None``)."""
+    return _INTERVAL_OVERRIDE
+
+
+async def refresh_alert_interval_override_from_db(db) -> int | None:
+    """Reload the override from the ``system_settings`` overlay.
+
+    Mirrors :func:`force_join.refresh_required_channel_override_from_db`
+    and :func:`pricing.refresh_markup_override_from_db`: a transient
+    DB error keeps the previous cache in place so a pool blip can't
+    accidentally revert to env / default mid-incident. A malformed
+    stored value (non-int / out-of-range) clears the override
+    (so a bad write that somehow bypassed the validators doesn't
+    permanently poison the cadence).
+    """
+    global _INTERVAL_OVERRIDE
+    if db is None:
+        return _INTERVAL_OVERRIDE
+    try:
+        raw = await db.get_setting(ALERT_INTERVAL_SETTING_KEY)
+    except Exception:
+        log.exception(
+            "refresh_alert_interval_override_from_db: get_setting "
+            "failed; keeping previous cache value=%r",
+            _INTERVAL_OVERRIDE,
+        )
+        return _INTERVAL_OVERRIDE
+    if raw is None:
+        _INTERVAL_OVERRIDE = None
+        return None
+    coerced = _coerce_alert_interval(raw)
+    if coerced is None:
+        log.warning(
+            "refresh_alert_interval_override_from_db: rejected stored "
+            "value %r; clearing override",
+            raw,
+        )
+        _INTERVAL_OVERRIDE = None
+        return None
+    _INTERVAL_OVERRIDE = coerced
+    return coerced
+
+
+def reset_alert_interval_override_for_tests() -> None:
+    """Test-only: drop the override cache. Mirrors
+    :func:`reset_latest_state_for_tests` so a test that doesn't touch
+    the override directly still starts from a clean slate."""
+    global _INTERVAL_OVERRIDE
+    _INTERVAL_OVERRIDE = None
 
 
 def _read_int_env(name: str, default: int, *, minimum: int = 1) -> int:
@@ -113,17 +257,56 @@ def _read_int_env(name: str, default: int, *, minimum: int = 1) -> int:
 
 
 def get_bot_health_alert_interval_seconds() -> int:
-    """Read ``BOT_HEALTH_ALERT_INTERVAL_SECONDS`` with the canonical
-    floor.
+    """Resolve the alert-loop cadence with DB → env → default precedence.
 
-    Exposed so the next AI / a future panel can echo the configured
+    Resolution order (Stage-15-Step-E #10b row 21):
+
+    1. In-process DB override populated from ``system_settings`` by
+       :func:`refresh_alert_interval_override_from_db`. The web admin
+       ``/admin/control`` editor form writes the row + refreshes the
+       cache after every save.
+    2. ``BOT_HEALTH_ALERT_INTERVAL_SECONDS`` env var.
+    3. :data:`_BOT_HEALTH_ALERT_INTERVAL_SECONDS_DEFAULT` (``60``).
+
+    The loop calls this on *every* iteration, so a saved override
+    takes effect on the next tick — no restart required.
+
+    Exposed so the next AI / the panel can echo the configured
     interval back to the operator without duplicating the env-parse
     logic.
     """
+    if _INTERVAL_OVERRIDE is not None:
+        return _INTERVAL_OVERRIDE
     return _read_int_env(
         "BOT_HEALTH_ALERT_INTERVAL_SECONDS",
         _BOT_HEALTH_ALERT_INTERVAL_SECONDS_DEFAULT,
     )
+
+
+def get_bot_health_alert_interval_source() -> str:
+    """Return ``db`` / ``env`` / ``default`` for the resolved interval.
+
+    Mirrors :func:`pricing.get_markup_source` and
+    :func:`force_join.get_required_channel_source` — the
+    ``/admin/control`` panel uses this badge to show operators where
+    the live cadence is coming from.
+
+    ``"env"`` is returned when there's no DB row and the env var is
+    a *valid* parseable integer (negative or non-numeric env values
+    fall through to ``"default"``). The shape mirrors how
+    :func:`get_bot_health_alert_interval_seconds` resolves so the
+    badge never disagrees with the effective number.
+    """
+    if _INTERVAL_OVERRIDE is not None:
+        return "db"
+    raw = os.getenv("BOT_HEALTH_ALERT_INTERVAL_SECONDS", "").strip()
+    if not raw:
+        return "default"
+    try:
+        int(raw)
+    except ValueError:
+        return "default"
+    return "env"
 
 
 # ---------------------------------------------------------------------
@@ -552,6 +735,27 @@ async def run_bot_health_alert_pass(
     return sent
 
 
+def _sync_registered_cadence(cadence_seconds: int) -> None:
+    """Push *cadence_seconds* into ``bot_health.LOOP_CADENCES`` so the
+    ``/admin/control`` panel's stale threshold tracks the loop's
+    actual sleep duration.
+
+    Best-effort: a refusal from :func:`update_loop_cadence` (e.g. the
+    test harness cleared the registry between iterations) is logged
+    and swallowed; the loop's actual cadence already matches the
+    resolved value, so the worst case is the panel showing a stale
+    threshold for one extra tick.
+    """
+    try:
+        update_loop_cadence("bot_health_alert", cadence_seconds)
+    except Exception:
+        log.exception(
+            "bot_health_alert: update_loop_cadence(%d) failed; "
+            "panel stale threshold may show the previous cadence",
+            cadence_seconds,
+        )
+
+
 async def _tick_bot_health_alert_from_app(app) -> None:
     """Run a single ``bot_health_alert`` pass, deps from *app*.
 
@@ -586,12 +790,32 @@ async def _alert_loop(
 
     One iteration that raises is logged and the loop keeps going — we
     don't let a transient blip take the alert plumbing off the air.
+
+    Stage-15-Step-E #10b row 21: each iteration re-reads the cadence
+    via :func:`get_bot_health_alert_interval_seconds` so an operator
+    saving a new value at ``/admin/control`` takes effect on the next
+    tick without a restart. The ``interval_seconds`` argument is kept
+    only as the *initial* sleep duration so existing callers /
+    integration tests that pass an explicit cadence still see their
+    first tick at the requested time. The first iteration always
+    runs immediately (matches the legacy "tick on start" behaviour).
     """
     state = AlertLoopState()
     log.info(
-        "bot-health-alert loop started (interval=%ds)",
+        "bot-health-alert loop started (interval=%ds, "
+        "live-pickup from system_settings on every tick)",
         interval_seconds,
     )
+    next_sleep = interval_seconds
+    # Sync the registered cadence with the resolved value so the
+    # ``/admin/control`` panel's "stale threshold" matches the loop's
+    # actual sleep duration. Without this, an operator who set the
+    # env var (or saved a DB override) to anything other than the
+    # compile-time default of 60s saw the loop continuously marked
+    # "overdue" because the panel computed the threshold from the
+    # registered cadence (60). See ``bot_health.update_loop_cadence``
+    # for the bundled bug fix rationale.
+    _sync_registered_cadence(interval_seconds)
     try:
         while True:
             try:
@@ -607,7 +831,23 @@ async def _alert_loop(
                 from metrics import record_loop_tick
 
                 record_loop_tick("bot_health_alert")
-            await asyncio.sleep(interval_seconds)
+            await asyncio.sleep(next_sleep)
+            # Re-read the interval AFTER the sleep so the next tick
+            # picks up any operator change saved during the previous
+            # window. Falls back to ``interval_seconds`` only on the
+            # implausible case where the resolver itself raises.
+            try:
+                next_sleep = get_bot_health_alert_interval_seconds()
+            except Exception:
+                log.exception(
+                    "get_bot_health_alert_interval_seconds raised; "
+                    "keeping previous cadence %ds",
+                    next_sleep,
+                )
+            else:
+                # Re-sync the registered cadence too so a saved
+                # override picks up on the panel as well.
+                _sync_registered_cadence(next_sleep)
     except asyncio.CancelledError:
         log.info("bot-health-alert loop cancelled; exiting cleanly")
         raise
@@ -620,8 +860,15 @@ def start_bot_health_alert_task(bot: Bot) -> asyncio.Task:
     awaiting the task during shutdown so the asyncio.run() loop
     closes cleanly. Mirrors
     :func:`pending_alert.start_pending_alert_task`.
+
+    Stage-15-Step-E #10b row 21: the resolved cadence is also pushed
+    into ``bot_health.LOOP_CADENCES`` so the ``/admin/control`` panel
+    shows the correct "stale threshold" for the very first render
+    after boot — the loop's first iteration would otherwise need to
+    happen before :func:`_sync_registered_cadence` is called.
     """
     interval_seconds = get_bot_health_alert_interval_seconds()
+    _sync_registered_cadence(interval_seconds)
     return asyncio.create_task(
         _alert_loop(bot, interval_seconds=interval_seconds),
         name="bot-health-alert-loop",

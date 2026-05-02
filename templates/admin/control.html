@@ -507,6 +507,91 @@
   </p>
 </div>
 
+<div class="control-card">
+  <h3>⏱ Alert-loop cadence</h3>
+  <p>
+    How often the <code>bot_health_alert</code> background loop wakes
+    up to classify the bot's health and DM the operator on a bad-state
+    transition. Save here to override the
+    <code>BOT_HEALTH_ALERT_INTERVAL_SECONDS</code> env var without a
+    redeploy; the new cadence takes effect on the loop's next tick.
+  </p>
+  <p style="margin-top: 4px; color: var(--text-muted); font-size: 12px;">
+    The "source" badge below shows where the currently-applied cadence
+    comes from. <code>db</code> = saved here, <code>env</code> =
+    process env var, <code>default</code> =
+    {{ alert_interval.default_value }}s. Override range:
+    <code>{{ alert_interval.minimum }}</code>–<code>{{ alert_interval.maximum }}</code>
+    seconds (24h cap on the override slot prevents a fat-finger that
+    silently disables alerting for a month). The loop re-reads the
+    cadence on every iteration so a saved override is live within at
+    most one tick — no restart required.
+  </p>
+  <table class="signals-table" style="margin-top: 12px;">
+    <thead>
+      <tr>
+        <td class="label">Field</td>
+        <td class="label">Value</td>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="label">Effective</td>
+        <td class="value">{{ "{:,}".format(alert_interval.effective) }}s</td>
+      </tr>
+      <tr>
+        <td class="label">Source</td>
+        <td class="value">
+          {% if alert_interval.source == 'db' %}
+            <span style="color: var(--success);">db</span>
+          {% elif alert_interval.source == 'env' %}
+            <span style="color: var(--warn, #f9e2af);">env</span>
+          {% else %}
+            <span style="color: var(--text-muted);">default</span>
+          {% endif %}
+        </td>
+      </tr>
+      <tr>
+        <td class="label">DB override</td>
+        <td class="value">
+          {% if alert_interval.override_value is none %}
+            <span style="color: var(--text-muted);">(not set)</span>
+          {% else %}
+            <code>{{ "{:,}".format(alert_interval.override_value) }}s</code>
+          {% endif %}
+        </td>
+      </tr>
+      <tr>
+        <td class="label">Env value</td>
+        <td class="value">
+          {% if alert_interval.env_value is not none %}
+            <code>{{ "{:,}".format(alert_interval.env_value) }}s</code>
+          {% else %}
+            <span style="color: var(--text-muted);">(unset)</span>
+          {% endif %}
+        </td>
+      </tr>
+    </tbody>
+  </table>
+  <form method="post" action="/admin/control/alert-interval"
+        style="margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="number" name="alert_interval_seconds"
+           min="{{ alert_interval.minimum }}"
+           max="{{ alert_interval.maximum }}"
+           value="{% if alert_interval.override_value is not none %}{{ alert_interval.override_value }}{% endif %}"
+           placeholder="seconds (e.g. 60)"
+           style="width: 160px;">
+    <button type="submit" name="action" value="set" class="btn-confirm">
+      Save cadence
+    </button>
+    <button type="submit" name="action" value="clear" class="btn-secondary"
+            style="background: transparent; border: 1px solid var(--border, #444); color: var(--text);">
+      Clear DB override
+    </button>
+  </form>
+</div>
+
 <div class="control-card danger-zone">
   <h3>🛑 Force-stop bot</h3>
   <p>

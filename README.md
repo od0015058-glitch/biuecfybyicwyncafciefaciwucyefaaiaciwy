@@ -758,6 +758,19 @@ NowPayments crypto invoices.
   panel + the gauge + the loop classify identically and
   long-uptime deploys no longer self-trip. Stage-15-Step-F
   follow-up #1.
+- **Tunable bot-health alert cadence** — the
+  `BOT_HEALTH_ALERT_INTERVAL_SECONDS` knob is now editable from
+  `/admin/control` instead of being env-only. The alert loop
+  re-reads its resolved cadence every iteration so a saved
+  override takes effect on the next tick (no restart). Override
+  range is bounded to `[1, 86_400]` seconds — the 24h cap on the
+  override slot prevents a fat-finger like `86400000` (intended
+  `60`) from silently disabling alerting for a month. Bundled
+  bug fix: the panel's per-loop "stale threshold" calculation
+  now follows runtime cadence updates via a new
+  `bot_health.update_loop_cadence()` helper, so retuning the
+  cadence at runtime no longer leaves the panel forever showing
+  the alert loop as "running late". Stage-15-Step-E #10b row 21.
 
 For the full project history, file map, and roadmap **read [HANDOFF.md](./HANDOFF.md)**.
 

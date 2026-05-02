@@ -397,6 +397,31 @@ async def main():
             "falling through to env / compile-time default"
         )
 
+    # Stage-15-Step-E #10b row 21: warm the bot-health alert interval
+    # override cache so the very first tick of the alert loop after
+    # boot uses the operator's configured cadence rather than the
+    # env / compile-time default. The loop itself re-reads on every
+    # iteration (so a saved override always takes effect on the next
+    # tick), but the very first tick happens before that re-read —
+    # hence the boot warm-up.
+    try:
+        import bot_health_alert
+        loaded_int = await (
+            bot_health_alert.refresh_alert_interval_override_from_db(db)
+        )
+        log.info(
+            "loaded BOT_HEALTH_ALERT_INTERVAL_SECONDS override from "
+            "system_settings: %s (source=%s, effective=%ds)",
+            loaded_int,
+            bot_health_alert.get_bot_health_alert_interval_source(),
+            bot_health_alert.get_bot_health_alert_interval_seconds(),
+        )
+    except Exception:
+        log.exception(
+            "failed to load BOT_HEALTH_ALERT_INTERVAL_SECONDS override "
+            "from DB — falling through to env / compile-time default"
+        )
+
     # Overwrite BotFather's cached slash-command list with the
     # canonical one. Without this, Telegram shows whatever was last
     # typed into the BotFather "Edit Commands" panel — including
