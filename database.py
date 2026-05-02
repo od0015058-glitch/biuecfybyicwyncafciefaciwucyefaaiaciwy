@@ -4019,6 +4019,7 @@ class Database:
         *,
         window_days: int = 30,
         top_models_limit: int = 10,
+        top_users_limit: int = 10,
     ) -> dict:
         """Stage-15-Step-E #9 — bot monetization rollup.
 
@@ -4093,6 +4094,12 @@ class Database:
                  "gross_margin_usd": float},
                 ...  # up to top_models_limit, sorted by charged DESC
               ],
+              "top_users": [
+                {"telegram_id": int, "username": str | None,
+                 "revenue_usd": float, "topup_count": int,
+                 "charged_usd": float},
+                ...  # up to top_users_limit, sorted by revenue DESC
+              ],
             }
 
         ``by_model`` rows are sorted by ``charged_usd`` descending —
@@ -4100,6 +4107,18 @@ class Database:
         most-frequently-called (which ``get_system_metrics.top_models``
         already shows). A model with 1 expensive call beats 1000
         cheap ones for "where is the margin coming from".
+
+        ``top_users`` rows (Stage-15-Step-E #9 follow-up — "top users
+        by revenue" panel) are scoped to the same trailing
+        ``window_days`` as ``by_model``, sorted by ``revenue_usd``
+        descending. Same gateway filter as the scope-level revenue
+        rollup (``status IN ('SUCCESS', 'PARTIAL')`` and ``gateway
+        NOT IN ('admin', 'gift')``) so the per-user breakdown sums
+        to (≤) the window's ``revenue_usd``. The per-user
+        ``charged_usd`` is the same user's wallet-charge sum over the
+        same window — operators reading the panel get the "are big
+        spenders also big consumers?" cross-reference at a glance
+        without having to click through to the per-user usage page.
         """
         if not isinstance(window_days, int) or window_days <= 0:
             raise ValueError(
@@ -4109,6 +4128,11 @@ class Database:
             raise ValueError(
                 "top_models_limit must be a positive integer; "
                 f"got {top_models_limit!r}"
+            )
+        if not isinstance(top_users_limit, int) or top_users_limit <= 0:
+            raise ValueError(
+                "top_users_limit must be a positive integer; "
+                f"got {top_users_limit!r}"
             )
 
         # Imported lazily to avoid a circular import at module-load
@@ -4169,6 +4193,49 @@ class Database:
                 window_interval,
                 int(top_models_limit),
             )
+            # Top users by gateway revenue over the same window. The
+            # outer LEFT JOIN to ``users`` lets us surface the
+            # username (handy in the panel) without dropping rows for
+            # accounts whose ``users`` row was deleted while
+            # transactions were retained — a real edge case in the
+            # admin "delete user" flow which leaves ``transactions``
+            # behind for the audit trail. The correlated subquery for
+            # ``charged_usd`` is the same window's wallet-charge sum
+            # for that user; we join it to the user via a LEFT JOIN
+            # so a top-revenue user with zero consumption still shows
+            # up (their ``charged_usd`` lands as 0). Sorted
+            # ``revenue_usd DESC`` then ``telegram_id ASC`` for
+            # deterministic ordering when two users tie at the same
+            # revenue (matters for the test pin and for operators
+            # cross-referencing two snapshots taken seconds apart).
+            top_users_rows = await connection.fetch(
+                """
+                SELECT t.telegram_id,
+                       u.username,
+                       SUM(t.amount_usd_credited)::float AS revenue_usd,
+                       COUNT(*)::int AS topup_count,
+                       COALESCE(
+                           (
+                               SELECT SUM(ul.cost_deducted_usd)
+                               FROM usage_logs ul
+                               WHERE ul.telegram_id = t.telegram_id
+                                 AND ul.created_at >= NOW() - $1::interval
+                           ),
+                           0
+                       )::float AS charged_usd
+                FROM transactions t
+                LEFT JOIN users u ON u.telegram_id = t.telegram_id
+                WHERE t.status IN ('SUCCESS', 'PARTIAL')
+                  AND t.gateway NOT IN ('admin', 'gift')
+                  AND COALESCE(t.completed_at, t.created_at)
+                      >= NOW() - $1::interval
+                GROUP BY t.telegram_id, u.username
+                ORDER BY revenue_usd DESC, t.telegram_id ASC
+                LIMIT $2
+                """,
+                window_interval,
+                int(top_users_limit),
+            )
 
         revenue_total_f = float(revenue_total or 0)
         charged_total_f = float(charged_total or 0)
@@ -4207,6 +4274,18 @@ class Database:
                 }
             )
 
+        top_users: list[dict] = []
+        for row in top_users_rows:
+            top_users.append(
+                {
+                    "telegram_id": int(row["telegram_id"]),
+                    "username": row["username"],
+                    "revenue_usd": float(row["revenue_usd"] or 0),
+                    "topup_count": int(row["topup_count"] or 0),
+                    "charged_usd": float(row["charged_usd"] or 0),
+                }
+            )
+
         return {
             "markup": markup,
             "lifetime": {
@@ -4227,6 +4306,7 @@ class Database:
                 "net_profit_usd": revenue_window_f - openrouter_cost_window,
             },
             "by_model": by_model,
+            "top_users": top_users,
         }
 
     # ---- bot_strings (Stage-9-Step-1.6) ---------------------------

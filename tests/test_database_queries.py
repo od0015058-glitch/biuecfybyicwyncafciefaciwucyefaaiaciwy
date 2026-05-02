@@ -155,7 +155,9 @@ async def test_get_monetization_summary_returns_shape(monkeypatch):
 
     result = await db.get_monetization_summary()
 
-    assert set(result.keys()) == {"markup", "lifetime", "window", "by_model"}
+    assert set(result.keys()) == {
+        "markup", "lifetime", "window", "by_model", "top_users",
+    }
     assert result["markup"] == 2.0
 
     expected_block_keys = {
@@ -277,19 +279,30 @@ async def test_get_monetization_summary_by_model_sorted_by_charged_desc(
     import pricing
     monkeypatch.setattr(pricing, "get_markup", lambda: 2.0)
     conn = _make_conn()
-    conn.fetch = AsyncMock(
-        return_value=[
-            {"model": "openai/gpt-4o", "requests": 10, "charged_usd": 4.0},
-            {"model": "anthropic/sonnet", "requests": 100, "charged_usd": 1.0},
-        ]
-    )
+    # The implementation issues two ``fetch`` calls: one for
+    # ``by_model`` then one for ``top_users``. Route them by SQL
+    # body so the ordering inside the method is the test's
+    # business; this also documents the sequence for readers.
+    def _fake_fetch(sql, *args, **kwargs):
+        normalized = " ".join(sql.split())
+        if "FROM usage_logs" in normalized and "GROUP BY model_used" in normalized:
+            return [
+                {"model": "openai/gpt-4o", "requests": 10, "charged_usd": 4.0},
+                {"model": "anthropic/sonnet", "requests": 100, "charged_usd": 1.0},
+            ]
+        return []
+    conn.fetch = AsyncMock(side_effect=_fake_fetch)
     conn.fetchval = AsyncMock(return_value=0)
     db = database_module.Database()
     db.pool = _PoolStub(conn)
 
     result = await db.get_monetization_summary()
 
-    by_model_sql = conn.fetch.await_args.args[0]
+    fetched_sqls = [c.args[0] for c in conn.fetch.await_args_list]
+    by_model_sql = next(
+        s for s in fetched_sqls
+        if "FROM usage_logs" in s and "GROUP BY model_used" in s
+    )
     normalized = " ".join(by_model_sql.split())
     assert "ORDER BY charged_usd DESC" in normalized, (
         "per-model query must rank by charged USD descending; "
@@ -348,6 +361,264 @@ async def test_get_monetization_summary_rejects_non_positive_window():
         await db.get_monetization_summary(window_days=-7)
     with pytest.raises(ValueError):
         await db.get_monetization_summary(top_models_limit=0)
+    with pytest.raises(ValueError):
+        await db.get_monetization_summary(top_users_limit=0)
+    with pytest.raises(ValueError):
+        await db.get_monetization_summary(top_users_limit=-3)
+
+
+# ---------------------------------------------------------------------
+# get_monetization_summary — top-users-by-revenue panel
+# (Stage-15-Step-E #9 follow-up)
+# ---------------------------------------------------------------------
+
+
+def _route_monetization_fetch(*, by_model_rows=None, top_users_rows=None):
+    """Return a ``side_effect`` callable that routes the two
+    ``connection.fetch`` calls inside ``get_monetization_summary``
+    (one for ``by_model``, one for ``top_users``) by SQL body. The
+    test-side dispatch keeps the production code free of any
+    test-only marker.
+    """
+    by_model_rows = by_model_rows or []
+    top_users_rows = top_users_rows or []
+
+    def _fake_fetch(sql, *args, **kwargs):
+        normalized = " ".join(sql.split())
+        if (
+            "FROM usage_logs" in normalized
+            and "GROUP BY model_used" in normalized
+        ):
+            return list(by_model_rows)
+        if "FROM transactions" in normalized and "GROUP BY t.telegram_id" in normalized:
+            return list(top_users_rows)
+        return []
+
+    return _fake_fetch
+
+
+async def test_get_monetization_summary_top_users_returns_shape(monkeypatch):
+    """Top users panel surfaces telegram_id, username, revenue,
+    topup_count and per-window charged_usd. Sort is preserved
+    from the SQL (revenue DESC, telegram_id ASC).
+    """
+    import pricing
+    monkeypatch.setattr(pricing, "get_markup", lambda: 2.0)
+
+    conn = _make_conn()
+    conn.fetch = AsyncMock(
+        side_effect=_route_monetization_fetch(
+            top_users_rows=[
+                {
+                    "telegram_id": 100,
+                    "username": "alice",
+                    "revenue_usd": 80.0,
+                    "topup_count": 4,
+                    "charged_usd": 30.0,
+                },
+                {
+                    "telegram_id": 200,
+                    "username": None,
+                    "revenue_usd": 50.0,
+                    "topup_count": 1,
+                    "charged_usd": 0.0,
+                },
+            ],
+        )
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.get_monetization_summary()
+
+    assert "top_users" in result
+    assert len(result["top_users"]) == 2
+    first = result["top_users"][0]
+    assert first == {
+        "telegram_id": 100,
+        "username": "alice",
+        "revenue_usd": 80.0,
+        "topup_count": 4,
+        "charged_usd": 30.0,
+    }
+    # username=None is preserved (NOT coerced to "" in the DB
+    # layer — that's the template's call).
+    second = result["top_users"][1]
+    assert second["username"] is None
+    assert second["telegram_id"] == 200
+    assert second["topup_count"] == 1
+
+
+async def test_get_monetization_summary_top_users_sql_filters(monkeypatch):
+    """The top_users SQL must:
+
+    1. Filter by SUCCESS / PARTIAL — same as the scope-level
+       revenue rollup (so per-user sums to ≤ window revenue).
+    2. Exclude admin / gift gateways — same exclusion as the
+       dashboard's revenue tile.
+    3. Use COALESCE(completed_at, created_at) for the window
+       boundary so a row that completed inside the window but
+       was created earlier still counts.
+    4. Sort by revenue DESC, then telegram_id ASC for stability.
+    """
+    import pricing
+    monkeypatch.setattr(pricing, "get_markup", lambda: 1.5)
+
+    conn = _make_conn()
+    conn.fetch = AsyncMock(side_effect=_route_monetization_fetch())
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_monetization_summary(window_days=14, top_users_limit=5)
+
+    fetched_sqls = [c.args[0] for c in conn.fetch.await_args_list]
+    fetched_args = [c.args[1:] for c in conn.fetch.await_args_list]
+    top_users_sql = next(
+        s for s in fetched_sqls
+        if "FROM transactions" in s and "GROUP BY t.telegram_id" in s
+    )
+    normalized = " ".join(top_users_sql.split())
+
+    assert "status IN ('SUCCESS', 'PARTIAL')" in normalized, (
+        f"top_users SQL must filter by SUCCESS/PARTIAL: {normalized!r}"
+    )
+    assert "gateway NOT IN ('admin', 'gift')" in normalized, (
+        f"top_users SQL must exclude admin/gift: {normalized!r}"
+    )
+    assert "COALESCE(t.completed_at, t.created_at)" in normalized, (
+        "top_users window filter must coalesce completed_at to "
+        f"created_at: {normalized!r}"
+    )
+    assert "ORDER BY revenue_usd DESC, t.telegram_id ASC" in normalized, (
+        f"top_users SQL must sort revenue DESC, tid ASC: {normalized!r}"
+    )
+    assert "LEFT JOIN users u ON u.telegram_id = t.telegram_id" in normalized, (
+        "top_users must LEFT JOIN users so a deleted account still "
+        f"surfaces: {normalized!r}"
+    )
+
+    # Bind args for the top_users query: ($1=interval text, $2=limit).
+    top_users_idx = fetched_sqls.index(top_users_sql)
+    top_users_binds = fetched_args[top_users_idx]
+    assert top_users_binds == ("14 days", 5), (
+        f"top_users SQL must bind ('14 days', 5); got {top_users_binds!r}"
+    )
+
+
+async def test_get_monetization_summary_top_users_charged_subquery_uses_window(
+    monkeypatch,
+):
+    """The per-user ``charged_usd`` subquery must scope the
+    wallet-charge sum to the SAME trailing window as the outer
+    revenue filter — operators reading the panel expect the two
+    USD figures to share a time slice.
+    """
+    import pricing
+    monkeypatch.setattr(pricing, "get_markup", lambda: 1.5)
+
+    conn = _make_conn()
+    conn.fetch = AsyncMock(side_effect=_route_monetization_fetch())
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_monetization_summary(window_days=7)
+
+    top_users_sql = next(
+        c.args[0] for c in conn.fetch.await_args_list
+        if "FROM transactions" in c.args[0]
+        and "GROUP BY t.telegram_id" in c.args[0]
+    )
+    normalized = " ".join(top_users_sql.split())
+    # The charged_usd subquery must filter usage_logs to the
+    # same window. We bind the window interval ONCE
+    # (``$1::interval``) and re-use it inside the subquery.
+    assert (
+        "ul.created_at >= NOW() - $1::interval" in normalized
+    ), (
+        "top_users charged_usd subquery must scope to the same "
+        f"window interval: {normalized!r}"
+    )
+
+
+async def test_get_monetization_summary_top_users_handles_decimal(monkeypatch):
+    """asyncpg returns NUMERIC columns as ``Decimal`` by default;
+    the production code must coerce to ``float`` so the JSON / CSV
+    serializers don't choke. Mirrors the same defence in
+    ``get_user_spending_summary``.
+    """
+    from decimal import Decimal
+    import pricing
+    monkeypatch.setattr(pricing, "get_markup", lambda: 2.0)
+
+    conn = _make_conn()
+    conn.fetch = AsyncMock(
+        side_effect=_route_monetization_fetch(
+            top_users_rows=[
+                {
+                    "telegram_id": 999,
+                    "username": "decimal-user",
+                    "revenue_usd": Decimal("12.3400"),
+                    "topup_count": 2,
+                    "charged_usd": Decimal("4.5000"),
+                },
+            ],
+        )
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.get_monetization_summary()
+
+    row = result["top_users"][0]
+    assert isinstance(row["revenue_usd"], float)
+    assert isinstance(row["charged_usd"], float)
+    assert isinstance(row["telegram_id"], int)
+    assert isinstance(row["topup_count"], int)
+    assert row["revenue_usd"] == pytest.approx(12.34)
+    assert row["charged_usd"] == pytest.approx(4.5)
+
+
+async def test_get_monetization_summary_top_users_empty_when_no_revenue(
+    monkeypatch,
+):
+    """A fresh deployment with no paid top-ups in the window
+    returns ``top_users=[]`` rather than crashing or emitting a
+    placeholder row. The page renders an "empty state" panel for
+    that case (template-side).
+    """
+    import pricing
+    monkeypatch.setattr(pricing, "get_markup", lambda: 1.5)
+    conn = _make_conn()
+    conn.fetch = AsyncMock(side_effect=_route_monetization_fetch())
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.get_monetization_summary()
+    assert result["top_users"] == []
+
+
+async def test_get_monetization_summary_top_users_default_limit_is_10(
+    monkeypatch,
+):
+    """The default top_users_limit matches the on-page panel cap
+    (10). Operators wanting the long tail go through the CSV
+    export, which uses a wider limit (1000)."""
+    import pricing
+    monkeypatch.setattr(pricing, "get_markup", lambda: 1.5)
+    conn = _make_conn()
+    conn.fetch = AsyncMock(side_effect=_route_monetization_fetch())
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_monetization_summary()
+
+    top_users_call = next(
+        c for c in conn.fetch.await_args_list
+        if "FROM transactions" in c.args[0]
+        and "GROUP BY t.telegram_id" in c.args[0]
+    )
+    # ($1=interval, $2=limit).
+    assert top_users_call.args[2] == 10
 
 
 # ---------------------------------------------------------------------
