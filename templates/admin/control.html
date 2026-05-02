@@ -106,6 +106,19 @@
   .signals-table td.value {
     font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   }
+  .loop-status-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .loop-status-badge.fresh    { background: rgba(166, 227, 161, 0.15); color: #a6e3a1; }
+  .loop-status-badge.warming  { background: rgba(249, 226, 175, 0.15); color: #f9e2af; }
+  .loop-status-badge.overdue  { background: rgba(243, 139, 168, 0.18); color: #f38ba8; }
+  .loop-status-badge.unknown  { background: rgba(180, 180, 200, 0.10); color: var(--text-muted); }
 </style>
 {% endblock %}
 
@@ -174,11 +187,20 @@
 
   {% if signals.loops %}
   <h4 style="margin: 18px 0 8px 0; font-size: 13px;">Background loop heartbeats</h4>
+  <p style="color: var(--text-muted); font-size: 12px; margin: 0 0 8px 0;">
+    Cadence is the published interval for each loop; stale-after is the
+    declared overdue threshold (≈ 2× cadence, the same line the
+    classifier uses to escalate to <strong>degraded</strong>). Override
+    per-loop with <code>BOT_HEALTH_LOOP_STALE_&lt;NAME&gt;_SECONDS</code>.
+  </p>
   <table class="signals-table">
     <thead>
       <tr>
         <td class="label">Loop</td>
+        <td class="label">Cadence</td>
         <td class="label">Last tick</td>
+        <td class="label">Stale after</td>
+        <td class="label">Status</td>
       </tr>
     </thead>
     <tbody>
@@ -186,10 +208,44 @@
       <tr>
         <td class="label">{{ loop_row.name }}</td>
         <td class="value">
-          {% if loop_row.last_tick_age_s is none %}
-            <span style="color: var(--danger);">never ticked</span>
+          {% if loop_row.cadence_s is none %}
+            <span style="color: var(--text-muted);">unknown</span>
           {% else %}
-            {{ loop_row.last_tick_age_s }}s ago
+            {{ "{:,}".format(loop_row.cadence_s) }}s
+          {% endif %}
+        </td>
+        <td class="value">
+          {% if loop_row.last_tick_age_s is none %}
+            <span style="color: var(--text-muted);">never ticked</span>
+          {% else %}
+            {{ "{:,}".format(loop_row.last_tick_age_s) }}s ago
+            {% if loop_row.next_tick_in_s is not none %}
+              <span style="color: var(--text-muted); font-size: 11px;">
+                {% if loop_row.next_tick_in_s >= 0 %}
+                  (next in ~{{ "{:,}".format(loop_row.next_tick_in_s) }}s)
+                {% else %}
+                  (overdue by ~{{ "{:,}".format(-loop_row.next_tick_in_s) }}s)
+                {% endif %}
+              </span>
+            {% endif %}
+          {% endif %}
+        </td>
+        <td class="value">
+          {% if loop_row.stale_threshold_s and loop_row.stale_threshold_s > 0 %}
+            {{ "{:,}".format(loop_row.stale_threshold_s) }}s
+          {% else %}
+            <span style="color: var(--text-muted);">—</span>
+          {% endif %}
+        </td>
+        <td class="value">
+          {% if loop_row.is_overdue %}
+            <span class="loop-status-badge overdue">overdue</span>
+          {% elif loop_row.grace_pending %}
+            <span class="loop-status-badge warming">warming up</span>
+          {% elif loop_row.last_tick_age_s is none %}
+            <span class="loop-status-badge unknown">no tick</span>
+          {% else %}
+            <span class="loop-status-badge fresh">fresh</span>
           {% endif %}
         </td>
       </tr>

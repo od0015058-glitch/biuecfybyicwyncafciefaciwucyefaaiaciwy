@@ -339,12 +339,62 @@ LOOP_CADENCES: dict[str, int] = {
     # Bot-health proactive alert loop — 60 s by default, see
     # ``bot_health_alert._BOT_HEALTH_ALERT_INTERVAL_SECONDS_DEFAULT``.
     "bot_health_alert": 60,
+    # Zarinpal browser-close-race backfill reaper — 5 min by
+    # default, see ``zarinpal_backfill._DEFAULT_INTERVAL_MIN``.
+    # Without this entry the loop fell back to the legacy 30-min
+    # ``BOT_HEALTH_LOOP_STALE_SECONDS`` knob — six missed ticks
+    # before the panel flagged it stale, defeating the whole
+    # cadence-derived contract.
+    "zarinpal_backfill": 300,
 }
 
 # Safety margin added on top of (2 × cadence) so a tick that lands
 # just past its nominal window doesn't oscillate the panel between
 # fresh and stale.
 _STALE_THRESHOLD_MARGIN_SECONDS = 60
+
+
+def loop_cadence_seconds(loop_name: str) -> int | None:
+    """Public accessor: published cadence for *loop_name*.
+
+    Returns the integer seconds-between-ticks for known loops, or
+    ``None`` for loops that don't have a registered cadence (these
+    fall back to the legacy ``BOT_HEALTH_LOOP_STALE_SECONDS`` knob
+    in :func:`_stale_threshold_seconds`).
+
+    Exposed so the ``/admin/control`` panel can surface each loop's
+    expected cadence next to its actual last-tick age — operators
+    can then tell at a glance whether a loop is overdue (cadence is
+    the published "how often it should fire" number, the per-loop
+    threshold ``loop_stale_threshold_seconds(name)`` is the
+    "declared overdue" number which is roughly twice the cadence).
+    """
+    return LOOP_CADENCES.get(loop_name)
+
+
+def loop_stale_threshold_seconds(loop_name: str) -> int:
+    """Public accessor: stale threshold for *loop_name* in seconds.
+
+    Same resolution order as the private :func:`_stale_threshold_seconds`
+    used by :func:`compute_bot_status`, but with the legacy fallback
+    bound at call time so the panel and the classifier agree by
+    construction.
+
+    Resolution order:
+
+    1. Explicit env override
+       ``BOT_HEALTH_LOOP_STALE_<UPPER_NAME>_SECONDS`` if set to a
+       positive integer.
+    2. Cadence-derived: ``2 × LOOP_CADENCES[name] +
+       _STALE_THRESHOLD_MARGIN_SECONDS``.
+    3. Legacy single-knob ``BOT_HEALTH_LOOP_STALE_SECONDS``
+       (default :data:`DEFAULT_LOOP_STALE_SECONDS`) for unknown
+       loop names.
+    """
+    legacy = _env_int(
+        "BOT_HEALTH_LOOP_STALE_SECONDS", DEFAULT_LOOP_STALE_SECONDS
+    )
+    return _stale_threshold_seconds(loop_name, fallback=legacy)
 
 
 def _stale_threshold_seconds(loop_name: str, *, fallback: int) -> int:
@@ -722,7 +772,11 @@ __all__ = (
     "DEFAULT_IPN_DROP_ATTACK_THRESHOLD",
     "DEFAULT_LOGIN_THROTTLE_ATTACK_KEYS",
     "DEFAULT_LOOP_STALE_SECONDS",
+    "LOOP_CADENCES",
     "compute_bot_status",
+    "get_process_start_epoch",
+    "loop_cadence_seconds",
+    "loop_stale_threshold_seconds",
     "request_force_stop",
     "status_score",
 )

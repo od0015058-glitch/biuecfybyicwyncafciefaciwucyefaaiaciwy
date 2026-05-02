@@ -9517,6 +9517,258 @@ async def test_control_force_stop_post_requires_auth(
     assert captured == []
 
 
+# ── Stage-15-Step-F follow-up #4: cadence introspection ────────────
+
+
+def _control_signals_for_test(monkeypatch):
+    """Build a control-panel signals dict against a known loop-tick
+    state. Stubs out the dashboard side-channels so the test only
+    exercises the new cadence/threshold/overdue plumbing.
+    """
+    from aiohttp import web as _aw
+    from unittest.mock import patch
+    import bot_health
+    import metrics
+    import web_admin
+
+    metrics.reset_loop_ticks_for_tests()
+
+    # Pretend the bot booted long enough ago that the never-ticked
+    # grace window has expired for every loop. The test that exercises
+    # the grace window overrides ``boot`` directly via monkeypatch.
+    boot = 0.0
+    monkeypatch.setattr(bot_health, "_PROCESS_START_EPOCH", boot)
+    monkeypatch.setattr(web_admin, "_BOT_PROCESS_START_EPOCH", boot)
+
+    app = _aw.Application()
+    with patch("web_admin._collect_ipn_health", return_value={}):
+        return web_admin._collect_control_signals(app=app, db_error=None)
+
+
+def test_collect_control_signals_attaches_cadence_to_each_loop(
+    monkeypatch,
+):
+    """Every loop in the snapshot carries its published cadence +
+    stale-after threshold so the panel can render them next to the
+    last-tick age. ``zarinpal_backfill`` (the bug-fix regression
+    target) is in there with its proper 5-min cadence."""
+    import bot_health
+
+    signals = _control_signals_for_test(monkeypatch)
+    by_name = {row["name"]: row for row in signals["loops"]}
+
+    assert "fx_refresh" in by_name
+    assert by_name["fx_refresh"]["cadence_s"] == bot_health.LOOP_CADENCES["fx_refresh"]
+    assert (
+        by_name["fx_refresh"]["stale_threshold_s"]
+        == bot_health.loop_stale_threshold_seconds("fx_refresh")
+    )
+
+    assert "zarinpal_backfill" in by_name
+    assert by_name["zarinpal_backfill"]["cadence_s"] == 300
+    assert by_name["zarinpal_backfill"]["stale_threshold_s"] == 660
+
+
+def test_collect_control_signals_marks_fresh_tick_not_overdue(
+    monkeypatch,
+):
+    """A loop that ticked within its threshold renders ``fresh``
+    (not overdue, not warming). ``next_tick_in_s`` is positive when
+    the loop is on schedule."""
+    import metrics
+    import time as _t
+
+    metrics.reset_loop_ticks_for_tests()
+    metrics.record_loop_tick("fx_refresh", ts=_t.time() - 120.0)
+    signals = _control_signals_for_test_with_existing_ticks(monkeypatch)
+    row = next(r for r in signals["loops"] if r["name"] == "fx_refresh")
+
+    assert row["last_tick_age_s"] is not None
+    assert row["last_tick_age_s"] >= 100
+    assert row["is_overdue"] is False
+    assert row["grace_pending"] is False
+    # Cadence 600s, age ~120s → next-in ~480s.
+    assert row["next_tick_in_s"] is not None
+    assert row["next_tick_in_s"] > 0
+
+
+def _control_signals_for_test_with_existing_ticks(monkeypatch):
+    """Variant of ``_control_signals_for_test`` that does NOT clear
+    the loop-tick registry — used by tests that pre-record ticks."""
+    from aiohttp import web as _aw
+    from unittest.mock import patch
+    import bot_health
+    import web_admin
+
+    boot = 0.0
+    monkeypatch.setattr(bot_health, "_PROCESS_START_EPOCH", boot)
+    monkeypatch.setattr(web_admin, "_BOT_PROCESS_START_EPOCH", boot)
+
+    app = _aw.Application()
+    with patch("web_admin._collect_ipn_health", return_value={}):
+        return web_admin._collect_control_signals(app=app, db_error=None)
+
+
+def test_collect_control_signals_marks_stale_tick_overdue(
+    monkeypatch,
+):
+    """A loop that hasn't ticked in longer than its threshold renders
+    ``overdue`` (the same condition the classifier uses to escalate
+    to DEGRADED — single source of truth)."""
+    import metrics
+    import time as _t
+
+    metrics.reset_loop_ticks_for_tests()
+    # fx_refresh threshold is 1260s. A 5000s-old tick is past due.
+    metrics.record_loop_tick("fx_refresh", ts=_t.time() - 5000.0)
+    signals = _control_signals_for_test_with_existing_ticks(monkeypatch)
+    row = next(r for r in signals["loops"] if r["name"] == "fx_refresh")
+
+    assert row["last_tick_age_s"] is not None
+    assert row["last_tick_age_s"] >= 5000
+    assert row["is_overdue"] is True
+    # next_tick_in_s is negative (overdue by ~age - cadence).
+    assert row["next_tick_in_s"] is not None
+    assert row["next_tick_in_s"] < 0
+
+
+def test_collect_control_signals_grace_window_for_never_ticked_loop(
+    monkeypatch,
+):
+    """Bug-fix regression: pre-fix the panel rendered every never-
+    ticked loop in red, even on a freshly-booted bot whose long-
+    cadence loop simply hasn't fired yet. The classifier already
+    has a grace window for this case (so it stays HEALTHY rather
+    than DEGRADED) — the panel must agree, otherwise an operator
+    sees alarming red dots on a perfectly-healthy fresh deploy."""
+    import bot_health
+    import metrics
+    import time as _t
+    from aiohttp import web as _aw
+    from unittest.mock import patch
+    import web_admin
+
+    metrics.reset_loop_ticks_for_tests()
+    # Bot booted 30 seconds ago — well within every loop's threshold.
+    boot = _t.time() - 30.0
+    monkeypatch.setattr(bot_health, "_PROCESS_START_EPOCH", boot)
+    monkeypatch.setattr(web_admin, "_BOT_PROCESS_START_EPOCH", boot)
+
+    app = _aw.Application()
+    with patch("web_admin._collect_ipn_health", return_value={}):
+        signals = web_admin._collect_control_signals(
+            app=app, db_error=None,
+        )
+
+    for row in signals["loops"]:
+        assert row["last_tick_age_s"] is None, row
+        # 30s uptime is below every cadence-derived threshold, so
+        # every never-ticked loop is "warming up" rather than
+        # "overdue".
+        assert row["grace_pending"] is True, row
+        assert row["is_overdue"] is False, row
+
+
+def test_collect_control_signals_never_ticked_past_grace_is_overdue(
+    monkeypatch,
+):
+    """The grace window is bounded — once uptime exceeds a loop's
+    stale threshold, a never-ticked loop flips to ``overdue``."""
+    import bot_health
+    import metrics
+    import time as _t
+    from aiohttp import web as _aw
+    from unittest.mock import patch
+    import web_admin
+
+    metrics.reset_loop_ticks_for_tests()
+    # Boot was 200000s ago — past every loop's cadence-derived
+    # threshold including the 24h-cadence catalog_refresh.
+    boot = _t.time() - 200_000.0
+    monkeypatch.setattr(bot_health, "_PROCESS_START_EPOCH", boot)
+    monkeypatch.setattr(web_admin, "_BOT_PROCESS_START_EPOCH", boot)
+
+    app = _aw.Application()
+    with patch("web_admin._collect_ipn_health", return_value={}):
+        signals = web_admin._collect_control_signals(
+            app=app, db_error=None,
+        )
+
+    by_name = {row["name"]: row for row in signals["loops"]}
+    # fx_refresh threshold 1260 → past grace by a long shot.
+    assert by_name["fx_refresh"]["grace_pending"] is False
+    assert by_name["fx_refresh"]["is_overdue"] is True
+    # bot_health_alert threshold 180 → past grace too.
+    assert by_name["bot_health_alert"]["is_overdue"] is True
+
+
+async def test_control_get_renders_cadence_columns(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """End-to-end render: the new Cadence / Stale-after / Status
+    columns appear in the panel HTML, with the right cadence value
+    next to each known loop."""
+    import bot_health
+    import metrics
+    import time as _t
+
+    metrics.reset_loop_ticks_for_tests()
+    metrics.record_loop_tick("fx_refresh", ts=_t.time() - 30.0)
+    boot = _t.time() - 60.0
+    monkeypatch.setattr(bot_health, "_PROCESS_START_EPOCH", boot)
+    monkeypatch.setattr("web_admin._BOT_PROCESS_START_EPOCH", boot)
+
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/control")
+    assert resp.status == 200
+    body = await resp.text()
+
+    # New table columns + descriptive copy.
+    assert "Cadence" in body
+    assert "Stale after" in body
+    assert "loop-status-badge" in body
+    assert "BOT_HEALTH_LOOP_STALE_" in body  # docs the env override
+
+    # Cadence values for the loops that just ticked / never ticked.
+    assert "600s" in body  # fx_refresh cadence
+    # zarinpal_backfill row is now reachable with its proper cadence.
+    assert "zarinpal_backfill" in body
+    assert "300s" in body
+    # fx_refresh ticked recently → fresh badge.
+    assert "fresh" in body
+
+
+async def test_control_get_renders_overdue_badge_for_stale_loop(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """A loop with a tick older than its threshold renders the red
+    ``overdue`` badge so an operator can spot it without reading
+    integers."""
+    import bot_health
+    import metrics
+    import time as _t
+
+    metrics.reset_loop_ticks_for_tests()
+    metrics.record_loop_tick("fx_refresh", ts=_t.time() - 5000.0)
+    boot = _t.time() - 200_000.0
+    monkeypatch.setattr(bot_health, "_PROCESS_START_EPOCH", boot)
+    monkeypatch.setattr("web_admin._BOT_PROCESS_START_EPOCH", boot)
+
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/control")
+    body = await resp.text()
+    assert "overdue" in body
+    assert "loop-status-badge overdue" in body
+
+
 # ── Stage-15-Step-E #4 follow-up: /admin/openrouter-keys ops view ──
 
 

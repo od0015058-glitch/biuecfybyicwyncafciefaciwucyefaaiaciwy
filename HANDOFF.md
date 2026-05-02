@@ -1293,10 +1293,14 @@ What remains for a follow-up PR:
   populate the dict at import time, eliminating the
   manual-sync hazard between a loop's actual cadence and the
   classifier's expected cadence.
-* **Cadence introspection on the panel** — `/admin/control` could
+* ~~**Cadence introspection on the panel** — `/admin/control` could
   show each loop's published cadence + stale threshold next to
   the current "last ticked Ns ago" so the operator can see at a
-  glance which loops are overdue.
+  glance which loops are overdue.~~
+  *shipped in Stage-15-Step-F follow-up #4
+  (`bot_health.loop_cadence_seconds` /
+  `loop_stale_threshold_seconds` + `/admin/control` heartbeat
+  table). See that section below.*
 * **`pending_alert` cadence isn't quite 30 min** — the loop wakes
   every `PENDING_ALERT_INTERVAL_MIN` (default 30 min) but only
   ticks the gauge if it actually finds stuck rows. A correctly
@@ -1508,6 +1512,105 @@ Files in this PR (Stage-15-Step-F follow-up #4):
   Plus a default `list_settings_with_prefix=AsyncMock({})` on
   the shared `_stub_db` so existing control-panel tests still
   pass without per-test wiring.
+
+---
+
+#### Stage-15-Step-F follow-up #4: cadence introspection on /admin/control (queued 2026-05-01)
+
+The Step-F panel (PR #131) and the cadence-derived stale
+thresholds (follow-up #2) gave the classifier per-loop knowledge,
+but the panel's "Background loop heartbeats" table only showed
+*last tick Ns ago* — an operator had to memorise each loop's
+expected cadence to answer "is this loop overdue?". The user's
+roadmap line:
+*"`/admin/control` could show each loop's published cadence +
+stale threshold next to the current 'last ticked Ns ago' so the
+operator can see at a glance which loops are overdue."*
+This PR ships exactly that.
+
+What this PR ships:
+
+* **`bot_health.loop_cadence_seconds(name)`** — public accessor
+  returning the integer cadence for a known loop, or `None` for
+  unknown names. Same dict the classifier reads, exposed by name
+  so the panel can render it next to the live last-tick.
+* **`bot_health.loop_stale_threshold_seconds(name)`** — public
+  accessor returning the per-loop stale threshold (the number
+  of seconds past which the loop is "declared overdue" by both
+  the panel and the classifier). Reads `BOT_HEALTH_LOOP_STALE_<NAME>_SECONDS`
+  → cadence-derived `2 × cadence + 60s` margin → legacy
+  `BOT_HEALTH_LOOP_STALE_SECONDS` knob (in that order). The same
+  resolution order the private `_stale_threshold_seconds` uses
+  inside `compute_bot_status`, with the legacy fallback bound at
+  call time so the panel and the classifier agree by construction.
+* **`web_admin._collect_control_signals`** — every per-loop
+  snapshot row now carries `cadence_s`, `stale_threshold_s`,
+  `next_tick_in_s`, `is_overdue`, and `grace_pending` alongside
+  the existing `last_tick_age_s`. The classifier's grace contract
+  is mirrored: a never-ticked loop on a freshly-booted bot is
+  "warming up" (yellow), not "overdue" (red), until uptime
+  exceeds the loop's threshold.
+* **`templates/admin/control.html`** — the heartbeat section is
+  now a five-column table: *Loop / Cadence / Last tick (with
+  next-due hint) / Stale after / Status*. Status renders as a
+  colour-coded badge: green `fresh`, yellow `warming up`,
+  red `overdue`, muted `no tick`. A short paragraph above the
+  table documents the env override convention so an operator
+  doesn't have to hunt through `.env.example`.
+
+Bundled bug fix in this PR (real, found while wiring up the
+cadence accessors): **`zarinpal_backfill` was in
+`metrics._LOOP_METRIC_NAMES` but missing from `LOOP_CADENCES`**.
+The 5-min cadence backfill reaper (Stage-15-Step-E #8 follow-up
+#2 PR) opted into the heartbeat-gauge plumbing without a
+matching cadence registration, so it fell through to the legacy
+`BOT_HEALTH_LOOP_STALE_SECONDS=1800` (30 min). On a deploy that
+followed convention, that's *six missed ticks* before the
+classifier even hinted at a problem — completely defeating the
+"flag a single missed tick" contract follow-up #2 was designed
+around. Fix: registered `"zarinpal_backfill": 300` so the
+threshold lands at the correct 660s. Pinned by a regression test
+that asserts every name in `_LOOP_METRIC_NAMES` has a
+`LOOP_CADENCES` entry — a future loop opt-in that forgets the
+cadence registration will fail loudly at PR-review time.
+
+What remains for a follow-up PR:
+
+* **Cadence registration via decorator** — `LOOP_CADENCES` is
+  still a hand-maintained dict. A `@register_loop("name",
+  cadence_seconds=N)` decorator at each loop's definition would
+  populate the dict at import time, eliminating the manual-sync
+  hazard between a loop's actual cadence and the classifier's
+  expected cadence. The new "missing from `LOOP_CADENCES`"
+  regression test catches the symptom; the decorator would
+  prevent the symptom.
+* **Per-loop manual "tick now" button on the panel** — useful
+  for operators who want to verify a freshly-deployed loop
+  without waiting up to the cadence. Out of scope here because
+  it requires a new POST handler + per-loop runner registry.
+* **Sparkline / trend column** — current panel is a snapshot.
+  A per-loop sparkline of recent tick lag would surface "this
+  loop is *trending* toward stale even though it's still fresh
+  right now". Trade-off is JS + a server-side ring buffer; not
+  worth the complexity until an operator hits the bug.
+
+Files in this PR (Stage-15-Step-F follow-up #4):
+
+* `bot_health.py` — new public accessors
+  `loop_cadence_seconds` + `loop_stale_threshold_seconds`,
+  added `zarinpal_backfill` to `LOOP_CADENCES` (bug fix), updated
+  `__all__`.
+* `web_admin.py` — `_collect_control_signals` enriches each loop
+  row with cadence/threshold/overdue/grace metadata.
+* `templates/admin/control.html` — five-column heartbeat table
+  with colour-coded status badges and an env-override hint.
+* `tests/test_bot_health.py` — 7 new tests covering the
+  accessors + the cadence-coverage invariant for
+  `_LOOP_METRIC_NAMES`.
+* `tests/test_web_admin.py` — 7 new tests covering the snapshot
+  enrichment (fresh / overdue / never-ticked-grace /
+  past-grace-overdue) and the rendered HTML (cadence column,
+  status badge, env override hint).
 
 ---
 
