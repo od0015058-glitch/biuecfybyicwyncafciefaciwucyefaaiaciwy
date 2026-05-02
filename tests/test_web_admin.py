@@ -3910,6 +3910,341 @@ async def test_wallet_config_free_messages_post_persists_audit_meta_diff(
 
 
 # ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 24: /admin/wallet-config —
+# FX_REFRESH_INTERVAL_SECONDS editor
+# ---------------------------------------------------------------------
+
+
+def _reset_fx_refresh_override_for_web():
+    """Scrub the in-process FX-refresh-interval cache so each test
+    sees a clean baseline."""
+    import fx_refresh_config
+    fx_refresh_config.clear_fx_refresh_interval_override()
+
+
+async def test_wallet_config_get_renders_fx_refresh_card(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """The page renders the FX-refresh editor card alongside the
+    other wallet-config knobs."""
+    monkeypatch.setenv("FX_REFRESH_INTERVAL_SECONDS", "1200")
+    _reset_fx_refresh_override_for_web()
+
+    db = _stub_db_for_wallet_config()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/wallet-config")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "USD→Toman refresher cadence" in body
+    assert "fx_refresh_interval_seconds" in body
+    assert "/admin/wallet-config/fx-refresh" in body
+    # Effective value renders in human-readable form (1200s = 20m).
+    assert "20m" in body
+
+
+async def test_wallet_config_fx_refresh_post_requires_auth(
+    aiohttp_client, make_admin_app,
+):
+    """Unauth requests redirect to /admin/login."""
+    _reset_fx_refresh_override_for_web()
+    db = _stub_db_for_wallet_config()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    resp = await client.post(
+        "/admin/wallet-config/fx-refresh",
+        data={"fx_refresh_interval_seconds": "1800"},
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303)
+    assert resp.headers.get("Location", "").startswith("/admin/login")
+
+
+async def test_wallet_config_fx_refresh_post_rejects_csrf_mismatch(
+    aiohttp_client, make_admin_app,
+):
+    """A wrong CSRF token redirects to /admin/wallet-config without
+    touching the DB or the cache."""
+    _reset_fx_refresh_override_for_web()
+    db = _stub_db_for_wallet_config()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.post(
+        "/admin/wallet-config/fx-refresh",
+        data={
+            "fx_refresh_interval_seconds": "1800",
+            "csrf_token": "totally_wrong_token",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/wallet-config"
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+
+
+async def test_wallet_config_fx_refresh_post_persists_value_and_refreshes_cache(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """Happy path: a valid value goes through ``upsert_setting`` AND
+    updates the in-process override so the next FX refresher tick
+    sees it without a process restart."""
+    monkeypatch.setenv("FX_REFRESH_INTERVAL_SECONDS", "600")
+    _reset_fx_refresh_override_for_web()
+    saved = {"value": None}
+
+    async def _upsert(key: str, value: str) -> None:
+        import fx_refresh_config
+        if key == fx_refresh_config.FX_REFRESH_INTERVAL_SETTING_KEY:
+            saved["value"] = value
+
+    async def _get(key: str):
+        import fx_refresh_config
+        if key == fx_refresh_config.FX_REFRESH_INTERVAL_SETTING_KEY:
+            return saved["value"]
+        return None
+
+    db = _stub_db_for_wallet_config()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/fx-refresh",
+        data={"fx_refresh_interval_seconds": "1800", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302, await resp.text()
+    assert resp.headers["Location"] == "/admin/wallet-config"
+
+    import fx_refresh_config
+    db.upsert_setting.assert_awaited_with(
+        fx_refresh_config.FX_REFRESH_INTERVAL_SETTING_KEY, "1800",
+    )
+    db.delete_setting.assert_not_awaited()
+    assert fx_refresh_config.get_fx_refresh_interval_override() == 1800
+    assert fx_refresh_config.get_fx_refresh_interval_seconds() == 1800
+    audit_calls = db.record_admin_audit.await_args_list
+    matching = [
+        c for c in audit_calls
+        if c.kwargs.get("action") == "wallet_config_fx_refresh_update"
+    ]
+    assert matching, audit_calls
+    meta = matching[-1].kwargs["meta"]
+    assert meta["action"] == "set"
+    assert meta["before"] == 600
+    assert meta["after"] == 1800
+
+
+async def test_wallet_config_fx_refresh_post_blank_value_clears_override(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """Empty form value drops the override; falls through to env / default."""
+    monkeypatch.setenv("FX_REFRESH_INTERVAL_SECONDS", "1200")
+    _reset_fx_refresh_override_for_web()
+    import fx_refresh_config
+    fx_refresh_config.set_fx_refresh_interval_override(3600)
+    assert fx_refresh_config.get_fx_refresh_interval_seconds() == 3600
+
+    db = _stub_db_for_wallet_config(
+        delete_setting_result=True, get_setting_result=None,
+    )
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/fx-refresh",
+        data={"fx_refresh_interval_seconds": "", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.delete_setting.assert_awaited_once_with(
+        fx_refresh_config.FX_REFRESH_INTERVAL_SETTING_KEY,
+    )
+    db.upsert_setting.assert_not_awaited()
+    assert fx_refresh_config.get_fx_refresh_interval_override() is None
+    # Falls through to env (1200).
+    assert fx_refresh_config.get_fx_refresh_interval_seconds() == 1200
+    audit_calls = db.record_admin_audit.await_args_list
+    matching = [
+        c for c in audit_calls
+        if c.kwargs.get("action") == "wallet_config_fx_refresh_update"
+    ]
+    assert matching
+    assert matching[-1].kwargs["meta"]["action"] == "clear"
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        "not-a-number",
+        "nan",
+        "inf",
+        "-inf",
+        "0",
+        "-1",
+        "59",        # below min
+        "86401",     # above max
+        "1234.5",    # non-integer rejected
+        "9999999",   # well above cap
+    ],
+)
+async def test_wallet_config_fx_refresh_post_rejects_invalid_value(
+    aiohttp_client, make_admin_app, monkeypatch, bad_value,
+):
+    """Anything non-int, non-finite, or outside [60, 86400] is rejected
+    with a flash-error redirect; the cache is not poisoned."""
+    monkeypatch.setenv("FX_REFRESH_INTERVAL_SECONDS", "600")
+    _reset_fx_refresh_override_for_web()
+
+    db = _stub_db_for_wallet_config()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/fx-refresh",
+        data={
+            "fx_refresh_interval_seconds": bad_value,
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/wallet-config"
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+    import fx_refresh_config
+    assert fx_refresh_config.get_fx_refresh_interval_override() is None
+
+
+async def test_wallet_config_fx_refresh_post_accepts_minimum(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """Boundary: the inclusive minimum (60s) round-trips."""
+    monkeypatch.setenv("FX_REFRESH_INTERVAL_SECONDS", "600")
+    _reset_fx_refresh_override_for_web()
+    saved = {"value": None}
+
+    async def _upsert(key: str, value: str) -> None:
+        saved["value"] = value
+
+    async def _get(key: str):
+        return saved["value"]
+
+    db = _stub_db_for_wallet_config()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+    resp = await client.post(
+        "/admin/wallet-config/fx-refresh",
+        data={"fx_refresh_interval_seconds": "60", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    import fx_refresh_config
+    assert fx_refresh_config.get_fx_refresh_interval_override() == 60
+    assert fx_refresh_config.get_fx_refresh_interval_seconds() == 60
+
+
+async def test_wallet_config_fx_refresh_post_accepts_maximum(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """Boundary: the inclusive maximum (86400s = 1 day) round-trips."""
+    monkeypatch.setenv("FX_REFRESH_INTERVAL_SECONDS", "600")
+    _reset_fx_refresh_override_for_web()
+    saved = {"value": None}
+
+    async def _upsert(key: str, value: str) -> None:
+        saved["value"] = value
+
+    async def _get(key: str):
+        return saved["value"]
+
+    db = _stub_db_for_wallet_config()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+    resp = await client.post(
+        "/admin/wallet-config/fx-refresh",
+        data={"fx_refresh_interval_seconds": "86400", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    import fx_refresh_config
+    assert fx_refresh_config.get_fx_refresh_interval_override() == 86400
+
+
+async def test_wallet_config_fx_refresh_post_db_failure_keeps_previous_value(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """An ``upsert_setting`` failure must NOT poison the in-process
+    cache; the previous override (or fall-through chain) must still
+    apply."""
+    monkeypatch.setenv("FX_REFRESH_INTERVAL_SECONDS", "600")
+    _reset_fx_refresh_override_for_web()
+
+    db = _stub_db_for_wallet_config()
+    db.upsert_setting = AsyncMock(side_effect=RuntimeError("boom"))
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/fx-refresh",
+        data={"fx_refresh_interval_seconds": "1800", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    import fx_refresh_config
+    # The override is unchanged (never set because upsert failed).
+    assert fx_refresh_config.get_fx_refresh_interval_override() is None
+
+
+async def test_wallet_config_fx_refresh_post_persists_audit_meta_diff(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """The audit row's ``meta`` carries the before/after diff with
+    sources, sibling pin to the other wallet-config audit-meta tests."""
+    monkeypatch.setenv("FX_REFRESH_INTERVAL_SECONDS", "600")
+    _reset_fx_refresh_override_for_web()
+    saved = {"value": None}
+
+    async def _upsert(key: str, value: str) -> None:
+        saved["value"] = value
+
+    async def _get(key: str):
+        return saved["value"]
+
+    db = _stub_db_for_wallet_config()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+    resp = await client.post(
+        "/admin/wallet-config/fx-refresh",
+        data={"fx_refresh_interval_seconds": "3600", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    audit_calls = db.record_admin_audit.await_args_list
+    matching = [
+        c for c in audit_calls
+        if c.kwargs.get("action") == "wallet_config_fx_refresh_update"
+    ]
+    assert matching
+    meta = matching[-1].kwargs["meta"]
+    assert meta["before"] == 600
+    assert meta["before_source"] == "env"
+    assert meta["after"] == 3600
+    assert meta["after_source"] == "db"
+
+
+# ---------------------------------------------------------------------
 # Stage-15-Step-E #9 follow-up #2: monetization CSV export
 # ---------------------------------------------------------------------
 
@@ -15828,3 +16163,470 @@ def test_string_detail_template_has_no_nested_form():
             )
             depth += 1
     assert depth == 0, "unbalanced <form> tags in string_detail.html"
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 25: /admin/profile (password rotation)
+# Plus the bundled bug fix on /admin/logout (extra cookie cleanup).
+# ---------------------------------------------------------------------
+
+
+import admin_password as _ap  # noqa: E402  (module imported for tests)
+
+
+def _stub_db_for_profile(
+    *,
+    upsert_setting_result: object | Exception = None,
+    get_setting_result: str | None | Exception = None,
+):
+    """Stub DB pre-wired with the system_settings CRUD needed by the
+    profile-page password rotation handler."""
+    db = _stub_db()
+    if isinstance(upsert_setting_result, Exception):
+        db.upsert_setting = AsyncMock(side_effect=upsert_setting_result)
+    else:
+        db.upsert_setting = AsyncMock(return_value=upsert_setting_result)
+    if isinstance(get_setting_result, Exception):
+        db.get_setting = AsyncMock(side_effect=get_setting_result)
+    else:
+        db.get_setting = AsyncMock(return_value=get_setting_result)
+    return db
+
+
+@pytest.fixture(autouse=False)
+def _reset_admin_password_cache():
+    """Each profile-handler test starts with a clean module cache so
+    the resolution chain (DB hash → env) is deterministic."""
+    _ap.clear_admin_password_hash_override()
+    yield
+    _ap.clear_admin_password_hash_override()
+
+
+async def _login_and_get_profile_csrf(
+    client, password: str = "letmein-1234",
+) -> str:
+    """Log in, fetch /admin/profile, scrape its CSRF token."""
+    await client.post(
+        "/admin/login", data={"password": password}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/profile")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    import re
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+    assert m, "Expected CSRF token on /admin/profile rotation form"
+    return m.group(1)
+
+
+async def test_profile_get_renders_form(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    db = _stub_db_for_profile()
+    client = await aiohttp_client(
+        make_admin_app(password="letmein-1234", db=db)
+    )
+    await client.post(
+        "/admin/login",
+        data={"password": "letmein-1234"},
+        allow_redirects=False,
+    )
+    resp = await client.get("/admin/profile")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert 'action="/admin/profile/rotate-password"' in body
+    assert 'name="csrf_token"' in body
+    assert 'name="current_password"' in body
+    assert 'name="new_password"' in body
+    assert 'name="confirm_password"' in body
+    # Source badge surfaces "Environment variable" since we're using
+    # the back-compat env path (no DB rotation yet).
+    assert "Environment variable" in body
+    # Profile sidebar link active.
+    assert 'class="active"' in body and 'href="/admin/profile"' in body
+
+
+async def test_profile_get_requires_auth(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    client = await aiohttp_client(make_admin_app(password="letmein-1234"))
+    resp = await client.get("/admin/profile", allow_redirects=False)
+    assert resp.status in (302, 303)
+    assert resp.headers.get("Location", "").startswith("/admin/login")
+
+
+async def test_profile_rotate_password_post_requires_auth(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    client = await aiohttp_client(make_admin_app(password="letmein-1234"))
+    resp = await client.post(
+        "/admin/profile/rotate-password",
+        data={
+            "current_password": "letmein-1234",
+            "new_password": "NewPassword99!",
+            "confirm_password": "NewPassword99!",
+            "csrf_token": "x",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303), resp.status
+    assert resp.headers.get("Location", "").startswith("/admin/login")
+
+
+async def test_profile_rotate_password_rejects_csrf_mismatch(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    db = _stub_db_for_profile()
+    client = await aiohttp_client(
+        make_admin_app(password="letmein-1234", db=db)
+    )
+    await _login_and_get_profile_csrf(client, password="letmein-1234")
+    resp = await client.post(
+        "/admin/profile/rotate-password",
+        data={
+            "current_password": "letmein-1234",
+            "new_password": "NewPassword99!",
+            "confirm_password": "NewPassword99!",
+            "csrf_token": "wrong-csrf-token",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303)
+    assert resp.headers.get("Location", "").endswith("/admin/profile")
+    db.upsert_setting.assert_not_awaited()
+
+
+async def test_profile_rotate_password_persists_and_caches(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    """The rotation persists into upsert_setting AND lands the new
+    hash into the in-process cache via refresh-from-DB so subsequent
+    logins prefer the new password over the env back-compat."""
+    saved: dict = {}
+
+    async def _upsert(key, value):
+        saved[key] = value
+        return None
+
+    async def _get(key):
+        return saved.get(key)
+
+    db = _stub_db_for_profile()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+
+    client = await aiohttp_client(
+        make_admin_app(password="letmein-1234", db=db)
+    )
+    csrf = await _login_and_get_profile_csrf(client, password="letmein-1234")
+
+    resp = await client.post(
+        "/admin/profile/rotate-password",
+        data={
+            "current_password": "letmein-1234",
+            "new_password": "NewPasswordRotated2024",
+            "confirm_password": "NewPasswordRotated2024",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303), await resp.text()
+    assert resp.headers.get("Location", "").endswith("/admin/profile")
+    db.upsert_setting.assert_awaited_once()
+    args, _ = db.upsert_setting.call_args
+    assert args[0] == _ap.ADMIN_PASSWORD_HASH_SETTING_KEY
+    assert args[1].startswith("scrypt$")
+    # Cache now carries the rotated hash.
+    cached = _ap.get_admin_password_hash_override()
+    assert cached is not None
+    assert _ap.verify_password("NewPasswordRotated2024", cached)
+    # Old env plaintext is NO longer accepted.
+    assert not _ap.verify_admin_password(
+        "letmein-1234", env_expected="letmein-1234",
+    )
+
+
+async def test_profile_rotate_password_rejects_wrong_current(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    db = _stub_db_for_profile()
+    client = await aiohttp_client(
+        make_admin_app(password="letmein-1234", db=db)
+    )
+    csrf = await _login_and_get_profile_csrf(client, password="letmein-1234")
+    resp = await client.post(
+        "/admin/profile/rotate-password",
+        data={
+            "current_password": "wrong-current-1234",
+            "new_password": "NewPasswordRotated2024",
+            "confirm_password": "NewPasswordRotated2024",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303)
+    db.upsert_setting.assert_not_awaited()
+    assert _ap.get_admin_password_hash_override() is None
+
+
+async def test_profile_rotate_password_rejects_confirm_mismatch(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    db = _stub_db_for_profile()
+    client = await aiohttp_client(
+        make_admin_app(password="letmein-1234", db=db)
+    )
+    csrf = await _login_and_get_profile_csrf(client, password="letmein-1234")
+    resp = await client.post(
+        "/admin/profile/rotate-password",
+        data={
+            "current_password": "letmein-1234",
+            "new_password": "NewPasswordRotated2024",
+            "confirm_password": "DIFFERENT-confirm-99",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303)
+    db.upsert_setting.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "weak_password",
+    [
+        "",                       # empty
+        "short1!",                # below 12
+        "abcdefghijkl",           # alpha-only
+        "123456789012",           # digit-only
+        "             ",          # whitespace-only (12 chars)
+    ],
+)
+async def test_profile_rotate_password_rejects_weak(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+    weak_password,
+):
+    db = _stub_db_for_profile()
+    client = await aiohttp_client(
+        make_admin_app(password="letmein-1234", db=db)
+    )
+    csrf = await _login_and_get_profile_csrf(client, password="letmein-1234")
+    resp = await client.post(
+        "/admin/profile/rotate-password",
+        data={
+            "current_password": "letmein-1234",
+            "new_password": weak_password,
+            "confirm_password": weak_password,
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303)
+    db.upsert_setting.assert_not_awaited()
+
+
+async def test_profile_rotate_password_rejects_unchanged(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    """An operator can't rotate to the same password — refuses with
+    a flash, audits the failure."""
+    db = _stub_db_for_profile()
+    client = await aiohttp_client(
+        make_admin_app(password="letmein-1234", db=db)
+    )
+    csrf = await _login_and_get_profile_csrf(client, password="letmein-1234")
+    resp = await client.post(
+        "/admin/profile/rotate-password",
+        data={
+            "current_password": "letmein-1234",
+            "new_password": "letmein-1234",
+            "confirm_password": "letmein-1234",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303)
+    db.upsert_setting.assert_not_awaited()
+
+
+async def test_profile_rotate_password_db_error_flashes(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    """upsert_setting raising → flash an error, leave cache as-is."""
+    db = _stub_db_for_profile(
+        upsert_setting_result=RuntimeError("db down"),
+    )
+    client = await aiohttp_client(
+        make_admin_app(password="letmein-1234", db=db)
+    )
+    csrf = await _login_and_get_profile_csrf(client, password="letmein-1234")
+    resp = await client.post(
+        "/admin/profile/rotate-password",
+        data={
+            "current_password": "letmein-1234",
+            "new_password": "NewPasswordRotated2024",
+            "confirm_password": "NewPasswordRotated2024",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303)
+    # Cache stays as-is — rotation failed at the persistence step.
+    assert _ap.get_admin_password_hash_override() is None
+
+
+async def test_login_post_uses_db_hash_after_rotation(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    """End-to-end: rotate via /admin/profile, then sign in with the
+    NEW password (not the env back-compat) on a fresh login flow."""
+    saved: dict = {}
+
+    async def _upsert(key, value):
+        saved[key] = value
+        return None
+
+    async def _get(key):
+        return saved.get(key)
+
+    db = _stub_db_for_profile()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+
+    client = await aiohttp_client(
+        make_admin_app(password="letmein-1234", db=db)
+    )
+    csrf = await _login_and_get_profile_csrf(client, password="letmein-1234")
+    await client.post(
+        "/admin/profile/rotate-password",
+        data={
+            "current_password": "letmein-1234",
+            "new_password": "NewPasswordRotated2024",
+            "confirm_password": "NewPasswordRotated2024",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+
+    # Sign out, then sign in with the NEW password — should succeed.
+    await client.get("/admin/logout")
+    resp_new = await client.post(
+        "/admin/login",
+        data={"password": "NewPasswordRotated2024"},
+        allow_redirects=False,
+    )
+    assert resp_new.status == 302
+    assert resp_new.headers["Location"] == "/admin/"
+
+
+async def test_login_post_rejects_old_env_after_rotation(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    """End-to-end: after rotation the OLD env plaintext is rejected
+    even if it stays in app config (the canonical "rotated" flow)."""
+    saved: dict = {}
+
+    async def _upsert(key, value):
+        saved[key] = value
+        return None
+
+    async def _get(key):
+        return saved.get(key)
+
+    db = _stub_db_for_profile()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+
+    client = await aiohttp_client(
+        make_admin_app(password="letmein-1234", db=db)
+    )
+    csrf = await _login_and_get_profile_csrf(client, password="letmein-1234")
+    await client.post(
+        "/admin/profile/rotate-password",
+        data={
+            "current_password": "letmein-1234",
+            "new_password": "NewPasswordRotated2024",
+            "confirm_password": "NewPasswordRotated2024",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    await client.get("/admin/logout")
+    resp_old = await client.post(
+        "/admin/login",
+        data={"password": "letmein-1234"},
+        allow_redirects=False,
+    )
+    # Old env value NO longer signs in — DB hash wins.
+    assert resp_old.status == 401
+
+
+# ---------------------------------------------------------------------
+# Bundled bug fix: /admin/logout clears every cookie the panel sets
+# ---------------------------------------------------------------------
+
+
+async def test_logout_clears_view_as_cookie(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    """The previous logout impl only cleared the session cookie,
+    leaving the signed view-as cookie behind. Verify the rotation-
+    PR bug fix sweeps it too."""
+    client = await aiohttp_client(make_admin_app(password="letmein-1234"))
+    await client.post(
+        "/admin/login",
+        data={"password": "letmein-1234"},
+        allow_redirects=False,
+    )
+    # Set a view-as cookie via the toggle endpoint.
+    body = await (await client.get("/admin/")).text()
+    import re
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+    csrf = m.group(1) if m else ""
+    await client.post(
+        "/admin/view-as",
+        data={"role": "viewer", "csrf_token": csrf, "next": "/admin/"},
+        allow_redirects=False,
+    )
+    # Confirm the cookie is set on the client.
+    cookie_jar = client.session.cookie_jar
+    cookies_pre = {c.key: c.value for c in cookie_jar}
+    assert "meow_admin_view_as" in cookies_pre, cookies_pre
+
+    resp = await client.get("/admin/logout", allow_redirects=False)
+    assert resp.status == 302
+    # Logout must emit a Set-Cookie that clears the view-as cookie.
+    set_cookie_headers = resp.headers.getall("Set-Cookie", [])
+    assert any(
+        "meow_admin_view_as=" in h
+        and ("Max-Age=0" in h or "expires=" in h.lower())
+        for h in set_cookie_headers
+    ), set_cookie_headers
+
+
+async def test_logout_clears_flash_cookie(
+    aiohttp_client, make_admin_app, _reset_admin_password_cache,
+):
+    """Logout sweeps the flash cookie too, even if no flash is
+    currently set — defensive cleanup is cheap and keeps the post-
+    logout state pristine."""
+    client = await aiohttp_client(make_admin_app(password="letmein-1234"))
+    await client.post(
+        "/admin/login",
+        data={"password": "letmein-1234"},
+        allow_redirects=False,
+    )
+    resp = await client.get("/admin/logout", allow_redirects=False)
+    assert resp.status == 302
+    set_cookie_headers = resp.headers.getall("Set-Cookie", [])
+    # Three cleanup cookies in total: session, view-as, flash.
+    cleared = {
+        "meow_admin": False,
+        "meow_admin_view_as": False,
+        "meow_flash": False,
+    }
+    for h in set_cookie_headers:
+        for key in cleared:
+            if h.startswith(f"{key}=") and (
+                "Max-Age=0" in h or "expires=" in h.lower()
+            ):
+                cleared[key] = True
+    assert all(cleared.values()), (set_cookie_headers, cleared)

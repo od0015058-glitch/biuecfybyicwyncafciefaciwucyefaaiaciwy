@@ -616,6 +616,52 @@ async def main():
             "— falling through to env / compile-time default"
         )
 
+    # Stage-15-Step-E #10b row 24: warm the FX-refresh interval
+    # override so the first FX refresher tick uses the operator's
+    # saved cadence rather than the env / compile-time default.
+    try:
+        import fx_refresh_config
+        loaded_fx_interval = await (
+            fx_refresh_config
+            .refresh_fx_refresh_interval_override_from_db(db)
+        )
+        log.info(
+            "loaded FX_REFRESH_INTERVAL_SECONDS override from "
+            "system_settings: %s (source=%s, effective=%ds)",
+            loaded_fx_interval,
+            fx_refresh_config.get_fx_refresh_interval_source(),
+            fx_refresh_config.get_fx_refresh_interval_seconds(),
+        )
+    except Exception:
+        log.exception(
+            "failed to load FX_REFRESH_INTERVAL_SECONDS override "
+            "from DB — falling through to env / compile-time default"
+        )
+
+    # Stage-15-Step-E #10b row 25: warm the admin-password hash
+    # override so the first sign-in after restart uses the operator's
+    # rotated credential rather than the env back-compat fallback.
+    # Without this, a freshly-restarted worker would accept the OLD
+    # env plaintext until the first /admin/login (which refreshes
+    # from DB itself) — annoying after a planned rotation, dangerous
+    # if the env value has leaked.
+    try:
+        import admin_password
+        loaded_hash = await (
+            admin_password.refresh_admin_password_hash_from_db(db)
+        )
+        env_pw = os.getenv("ADMIN_PASSWORD", "")
+        log.info(
+            "loaded ADMIN_PASSWORD_HASH override from "
+            "system_settings: present=%s (active source=%s)",
+            loaded_hash is not None,
+            admin_password.get_admin_password_source(env_expected=env_pw),
+        )
+    except Exception:
+        log.exception(
+            "failed to load ADMIN_PASSWORD_HASH override from DB "
+            "— falling through to env back-compat"
+        )
     # Overwrite BotFather's cached slash-command list with the
     # canonical one. Without this, Telegram shows whatever was last
     # typed into the BotFather "Edit Commands" panel — including

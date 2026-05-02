@@ -80,6 +80,7 @@ from aiohttp import web
 # parse_transactions_query (Stage-8-Part-6). Only the class is
 # referenced — not the module-level ``db`` singleton — so the admin
 # still works against the injected DB in tests.
+import admin_password
 import strings as bot_strings_module
 from admin_roles import (
     ROLE_OPERATOR,
@@ -658,7 +659,25 @@ async def login_post(request: web.Request) -> web.StreamResponse:
     ttl_hours = request.app.get(APP_KEY_TTL_HOURS, DEFAULT_TTL_HOURS)
     secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
 
-    if not expected or not secret:
+    # Stage-15-Step-E #10b row 25: prefer a DB-stored scrypt hash over
+    # the env plaintext when one's been rotated in. Refresh from DB
+    # on every login so a sibling worker's rotation lands on this
+    # process without a restart; transient DB errors keep the cached
+    # hash so an outage doesn't lock every operator out.
+    db = request.app.get(APP_KEY_DB)
+    if db is not None:
+        try:
+            await admin_password.refresh_admin_password_hash_from_db(db)
+        except Exception:
+            log.exception(
+                "login_post: admin-password hash refresh failed; "
+                "using cached value",
+            )
+    has_db_hash = (
+        admin_password.get_admin_password_hash_override() is not None
+    )
+
+    if (not expected and not has_db_hash) or not secret:
         # Misconfigured deploy — refuse to log anyone in. Better to
         # surface this loudly than silently let in everyone with an
         # empty cookie.
@@ -707,10 +726,14 @@ async def login_post(request: web.Request) -> web.StreamResponse:
     form = await request.post()
     submitted = str(form.get("password", ""))
 
-    # Constant-time compare on the bytes — the lengths can differ, but
-    # ``compare_digest`` handles that without leaking which one was
-    # right.
-    if not hmac.compare_digest(submitted, expected):
+    # Stage-15-Step-E #10b row 25: ``verify_admin_password`` consults
+    # the DB-backed scrypt hash first (if rotated) and falls back to
+    # the env plaintext for back-compat. Both branches do a constant-
+    # time compare so an attacker can't time-attack which path was
+    # taken.
+    if not admin_password.verify_admin_password(
+        submitted, env_expected=expected,
+    ):
         log.warning(
             "admin login: bad password key=%s remote=%s",
             client_key, request.remote,
@@ -779,8 +802,23 @@ async def login_post(request: web.Request) -> web.StreamResponse:
 
 
 async def logout(request: web.Request) -> web.StreamResponse:
+    """Sign the admin out — clears every cookie the panel sets.
+
+    Stage-15-Step-E #10b row 25 bundled bug fix: the previous
+    implementation only cleared the session cookie, leaving
+    ``meow_admin_view_as`` AND the one-shot flash cookie on the
+    browser. On a shared workstation this leaked the previous
+    operator's "viewing as <role>" preference into the next person's
+    session — they'd open ``/admin/login``, sign in, and find
+    themselves implicitly previewing as whatever role the prior user
+    had selected, with no audit trail explaining where that came
+    from. Per-user web auth (the open Step-E #5 redesign) makes this
+    leak louder, so a defensive sweep here is the right floor today.
+    """
     response = web.HTTPFound(location="/admin/login")
     response.del_cookie(COOKIE_NAME, path="/admin/")
+    response.del_cookie(VIEW_AS_COOKIE_NAME, path="/admin/")
+    response.del_cookie(FLASH_COOKIE, path="/admin/")
     return response
 
 
@@ -1769,6 +1807,52 @@ def _build_referral_view() -> dict:
     }
 
 
+def _build_fx_refresh_view() -> dict:
+    """Snapshot of the resolved FX_REFRESH_INTERVAL_SECONDS knob.
+
+    Stage-15-Step-E #10b row 24. Same shape as
+    :func:`_build_min_topup_view` so the wallet-config page renders
+    one consistent breakdown for every DB-backed override (effective
+    / db / env / default).
+    """
+    import fx_refresh_config
+
+    override_value = fx_refresh_config.get_fx_refresh_interval_override()
+    env_raw = os.getenv("FX_REFRESH_INTERVAL_SECONDS", "").strip()
+    env_value: int | None = None
+    if env_raw:
+        env_value = fx_refresh_config._coerce_fx_refresh_interval(env_raw)
+    effective = int(fx_refresh_config.get_fx_refresh_interval_seconds())
+    return {
+        "effective": effective,
+        "effective_human": (
+            fx_refresh_config.format_interval_human(effective)
+        ),
+        "source": fx_refresh_config.get_fx_refresh_interval_source(),
+        "default_value": int(
+            fx_refresh_config.DEFAULT_FX_REFRESH_INTERVAL_SECONDS
+        ),
+        "default_human": fx_refresh_config.format_interval_human(
+            fx_refresh_config.DEFAULT_FX_REFRESH_INTERVAL_SECONDS
+        ),
+        "env_value": env_value,
+        "env_value_human": (
+            fx_refresh_config.format_interval_human(env_value)
+            if env_value is not None
+            else None
+        ),
+        "env_raw": env_raw,
+        "override_value": override_value,
+        "override_value_human": (
+            fx_refresh_config.format_interval_human(override_value)
+            if override_value is not None
+            else None
+        ),
+        "minimum": int(fx_refresh_config.FX_REFRESH_INTERVAL_MINIMUM),
+        "maximum": int(fx_refresh_config.FX_REFRESH_INTERVAL_MAXIMUM),
+    }
+
+
 def _build_free_messages_view() -> dict:
     """Snapshot of the resolved FREE_MESSAGES_PER_USER knob.
 
@@ -1854,6 +1938,7 @@ async def wallet_config_get(request: web.Request) -> web.StreamResponse:
     import payments
     import referral
     import free_trial
+    import fx_refresh_config
 
     if db is not None:
         try:
@@ -1896,16 +1981,32 @@ async def wallet_config_get(request: web.Request) -> web.StreamResponse:
                 "refresh_free_messages_per_user_override_from_db failed"
             )
             db_error = "Database query failed — see logs."
+        # Stage-15-Step-E #10b row 24: refresh the FX-refresh
+        # interval override on every render so a tweak made on a
+        # different replica is reflected here.
+        try:
+            await (
+                fx_refresh_config
+                .refresh_fx_refresh_interval_override_from_db(db)
+            )
+        except Exception:
+            log.exception(
+                "wallet_config_get: "
+                "refresh_fx_refresh_interval_override_from_db failed"
+            )
+            db_error = "Database query failed — see logs."
 
     toman_per_usd = await _read_toman_per_usd_from_db(db)
     min_topup_view = _build_min_topup_view(toman_per_usd)
     referral_view = _build_referral_view()
     free_messages_view = _build_free_messages_view()
+    fx_refresh_view = _build_fx_refresh_view()
 
     ctx = {
         "min_topup_view": min_topup_view,
         "referral_view": referral_view,
         "free_messages_view": free_messages_view,
+        "fx_refresh_view": fx_refresh_view,
         "db_error": db_error,
         "active_page": "wallet_config",
         "csrf_token": csrf_token_for(request),
@@ -2754,6 +2855,233 @@ async def wallet_config_free_messages_post(
 
 
 # ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 24: /admin/wallet-config — FX_REFRESH_INTERVAL_SECONDS
+# ---------------------------------------------------------------------
+
+
+async def wallet_config_fx_refresh_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/wallet-config/fx-refresh`` — update
+    ``FX_REFRESH_INTERVAL_SECONDS``.
+
+    Stage-15-Step-E #10b row 24. Operators were forced to redeploy
+    the bot to retune the USD→Toman refresher cadence because it was
+    env-only. This handler writes the override to the
+    ``system_settings`` overlay (DB-backed), refreshes the in-process
+    cache so the next iteration of the FX refresher loop picks up
+    the new sleep duration without a restart, and audit-logs a row
+    whose ``meta`` carries the diff.
+
+    Form keys:
+
+    * ``fx_refresh_interval_seconds`` — new effective interval, or
+      empty / blank to clear the override (fall through to env / default).
+
+    Validation order (mirrors :func:`wallet_config_min_topup_post`):
+
+    1. CSRF.
+    2. Integer parse via
+       :func:`fx_refresh_config._coerce_fx_refresh_interval`.
+    3. Range check ([``FX_REFRESH_INTERVAL_MINIMUM``,
+       ``FX_REFRESH_INTERVAL_MAXIMUM``]) — done by the coercer.
+    4. ``set_fx_refresh_interval_override`` defence-in-depth.
+    5. Persist via ``upsert_setting``.
+    6. Audit row.
+    7. Redirect with a flash banner.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app.get(APP_KEY_DB)
+    form = await request.post()
+
+    guard = _wallet_config_csrf_guard(request, form)
+    if guard is not None:
+        return guard
+
+    if db is None:
+        response = web.HTTPFound(location="/admin/wallet-config")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Database is not configured — FX-refresh interval "
+                "edits require a live DB connection."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    import fx_refresh_config
+
+    raw_value = str(form.get("fx_refresh_interval_seconds", "")).strip()
+    previous_effective = int(
+        fx_refresh_config.get_fx_refresh_interval_seconds()
+    )
+    previous_source = fx_refresh_config.get_fx_refresh_interval_source()
+
+    if not raw_value:
+        # Empty field == clear override and fall through to env / default.
+        try:
+            await db.delete_setting(
+                fx_refresh_config.FX_REFRESH_INTERVAL_SETTING_KEY,
+            )
+        except Exception:
+            log.exception(
+                "wallet_config_fx_refresh_post: delete_setting failed"
+            )
+            response = web.HTTPFound(location="/admin/wallet-config")
+            set_flash(
+                response, kind="error",
+                message=(
+                    "Failed to clear the override — see logs. "
+                    "The previous value is still in effect."
+                ),
+                secret=secret, cookie_secure=cookie_secure,
+            )
+            return response
+        fx_refresh_config.clear_fx_refresh_interval_override()
+        try:
+            await (
+                fx_refresh_config
+                .refresh_fx_refresh_interval_override_from_db(db)
+            )
+        except Exception:
+            log.exception(
+                "wallet_config_fx_refresh_post: refresh after clear failed"
+            )
+        new_effective = int(
+            fx_refresh_config.get_fx_refresh_interval_seconds()
+        )
+        await _record_audit_safe(
+            request, "wallet_config_fx_refresh_update",
+            target="fx_refresh_interval_seconds",
+            meta={
+                "action": "clear",
+                "before": previous_effective,
+                "before_source": previous_source,
+                "after": new_effective,
+                "after_source": (
+                    fx_refresh_config
+                    .get_fx_refresh_interval_source()
+                ),
+            },
+        )
+        response = web.HTTPFound(location="/admin/wallet-config")
+        set_flash(
+            response, kind="success",
+            message=(
+                f"FX-refresh interval override cleared. Effective "
+                f"interval is now "
+                f"{fx_refresh_config.format_interval_human(new_effective)} "
+                f"(source: "
+                f"{fx_refresh_config.get_fx_refresh_interval_source()})."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    parsed = fx_refresh_config._coerce_fx_refresh_interval(raw_value)
+    if parsed is None:
+        response = web.HTTPFound(location="/admin/wallet-config")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"FX-refresh interval must be an integer in "
+                f"[{fx_refresh_config.FX_REFRESH_INTERVAL_MINIMUM}, "
+                f"{fx_refresh_config.FX_REFRESH_INTERVAL_MAXIMUM}] "
+                f"seconds. Got: {raw_value!r}. No changes were made."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    # Persist + apply.
+    try:
+        await db.upsert_setting(
+            fx_refresh_config.FX_REFRESH_INTERVAL_SETTING_KEY,
+            str(parsed),
+        )
+    except Exception:
+        log.exception(
+            "wallet_config_fx_refresh_post: upsert_setting failed value=%r",
+            parsed,
+        )
+        response = web.HTTPFound(location="/admin/wallet-config")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Failed to persist the new interval — see logs. "
+                "The previous value is still in effect."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        fx_refresh_config.set_fx_refresh_interval_override(parsed)
+    except ValueError:
+        log.exception(
+            "wallet_config_fx_refresh_post: "
+            "set_fx_refresh_interval_override rejected %r after "
+            "upsert succeeded — refreshing from DB",
+            parsed,
+        )
+
+    # Re-read whatever ended up in the DB so the cache reflects the
+    # truth (in case e.g. the upsert wrote a sanitised value).
+    try:
+        await (
+            fx_refresh_config
+            .refresh_fx_refresh_interval_override_from_db(db)
+        )
+    except Exception:
+        log.exception(
+            "wallet_config_fx_refresh_post: refresh after upsert failed"
+        )
+
+    new_effective = int(
+        fx_refresh_config.get_fx_refresh_interval_seconds()
+    )
+    await _record_audit_safe(
+        request, "wallet_config_fx_refresh_update",
+        target="fx_refresh_interval_seconds",
+        meta={
+            "action": "set",
+            "before": previous_effective,
+            "before_source": previous_source,
+            "after": new_effective,
+            "after_source": (
+                fx_refresh_config.get_fx_refresh_interval_source()
+            ),
+        },
+    )
+    response = web.HTTPFound(location="/admin/wallet-config")
+    if new_effective == previous_effective:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"FX-refresh interval unchanged "
+                f"({fx_refresh_config.format_interval_human(new_effective)}). "
+                f"The override is now persisted in the DB."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    else:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"FX-refresh interval updated: "
+                f"{fx_refresh_config.format_interval_human(previous_effective)} "
+                f"→ "
+                f"{fx_refresh_config.format_interval_human(new_effective)}. "
+                f"The new cadence applies on the next FX refresher tick."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    return response
+
+
+# ---------------------------------------------------------------------
 # Stage-15-Step-E #10b row 8: /admin/memory-config
 # (MEMORY_CONTEXT_LIMIT + MEMORY_CONTENT_MAX_CHARS editors)
 # ---------------------------------------------------------------------
@@ -3202,6 +3530,10 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     "string_save": "Bot text override saved",
     "string_revert": "Bot text override reverted",
     "enroll_2fa_view": "2FA enrolment page viewed",
+    # Stage-15-Step-E #10b row 25: admin password rotation.
+    "profile_view": "Admin profile page viewed",
+    "admin_password_rotated": "Admin panel password rotated",
+    "admin_password_rotation_failed": "Admin password rotation refused",
     # Stage-12-Step-A: refund flow on /admin/transactions.
     "refund_issued": "Refund issued",
     "refund_refused": "Refund refused",
@@ -3311,6 +3643,14 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     # investigation can pin the cause to a knob tweak vs. unrelated
     # signup-funnel shifts.
     "wallet_config_free_messages_update": "Trial allowance updated",
+    # Stage-15-Step-E #10b row 24: FX_REFRESH_INTERVAL_SECONDS
+    # editor on ``/admin/wallet-config``. Recorded by
+    # :func:`wallet_config_fx_refresh_post`; the dropdown entry
+    # lets an operator filter the audit feed to "FX cadence
+    # changes only" so a "why is the wallet showing approximate
+    # rates?" investigation can pin the cause to a knob tweak vs.
+    # an upstream FX source outage.
+    "wallet_config_fx_refresh_update": "FX-refresh interval updated",
     # Stage-15-Step-E #10b row 21: BOT_HEALTH_ALERT_INTERVAL_SECONDS
     # editor on ``/admin/control``. Recorded by
     # :func:`control_alert_interval_post`; the dropdown entry lets
@@ -7542,6 +7882,273 @@ async def enroll_2fa_get(request: web.Request) -> web.StreamResponse:
             "is_suggestion": is_suggestion,
         },
     )
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 25: /admin/profile (password rotation)
+# ---------------------------------------------------------------------
+
+
+def _build_password_view(env_expected: str) -> dict:
+    """Snapshot of the live admin-password credential for the
+    ``/admin/profile`` page.
+
+    Mirrors the ``effective / db / env / default / source`` shape
+    used by the wallet-config knobs, but the credential itself is
+    NEVER shown — only its provenance (where the live value comes
+    from) and the env-flagged "is the back-compat fallback armed?".
+    """
+    has_db_hash = (
+        admin_password.get_admin_password_hash_override() is not None
+    )
+    has_env = bool(env_expected)
+    return {
+        "source": admin_password.get_admin_password_source(
+            env_expected=env_expected,
+        ),
+        "has_db_hash": has_db_hash,
+        "has_env": has_env,
+        "min_length": admin_password.MIN_PASSWORD_LENGTH,
+        "max_length": admin_password.MAX_PASSWORD_LENGTH,
+        "setting_key": admin_password.ADMIN_PASSWORD_HASH_SETTING_KEY,
+    }
+
+
+async def profile_get(request: web.Request) -> web.StreamResponse:
+    """Render the admin profile / security page.
+
+    Hosts the password-rotation form and links to 2FA enrolment +
+    sign-out. Read-only; the actual rotation lives on
+    ``/admin/profile/rotate-password``.
+    """
+    env_expected = request.app.get(APP_KEY_PASSWORD, "")
+    db = request.app.get(APP_KEY_DB)
+
+    # Refresh from DB on every render so a sibling worker's rotation
+    # lands here without a redeploy. Fail-soft so an outage on the DB
+    # doesn't lock the page out — the page is read-only anyway.
+    if db is not None:
+        try:
+            await admin_password.refresh_admin_password_hash_from_db(db)
+        except Exception:
+            log.exception(
+                "profile_get: refresh_admin_password_hash_from_db failed; "
+                "falling back to cached value",
+            )
+
+    password_view = _build_password_view(env_expected)
+    totp_secret = request.app.get(APP_KEY_TOTP_SECRET, "")
+    has_totp = bool(totp_secret)
+
+    await _record_audit_safe(request, "profile_view")
+    ctx = {
+        "active_page": "profile",
+        "password_view": password_view,
+        "has_totp": has_totp,
+        "csrf_token": csrf_token_for(request),
+        "flash": None,
+    }
+    response = aiohttp_jinja2.render_template(
+        "profile.html", request, ctx,
+    )
+    flash = pop_flash(request, response)
+    if flash is not None:
+        ctx["flash"] = flash
+        response = aiohttp_jinja2.render_template(
+            "profile.html", request, ctx,
+        )
+        response.del_cookie(FLASH_COOKIE, path="/admin/")
+    return response
+
+
+async def profile_password_post(request: web.Request) -> web.StreamResponse:
+    """Rotate the admin panel password.
+
+    Gated to :data:`ROLE_SUPER` (the password owner). Verifies the
+    current password before accepting a new one — mirrors the
+    pattern every webmail / banking flow uses to refuse a casually-
+    captured session from rotating credentials.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app.get(APP_KEY_DB)
+    env_expected = request.app.get(APP_KEY_PASSWORD, "")
+
+    response = web.HTTPFound(location="/admin/profile")
+
+    form = await request.post()
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning(
+            "profile_password_post: CSRF token mismatch from %s",
+            request.remote,
+        )
+        set_flash(
+            response, kind="error",
+            message=(
+                "Form submission was rejected (CSRF). "
+                "Refresh and try again."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    if db is None:
+        log.error(
+            "profile_password_post: no DB attached; refusing rotation",
+        )
+        set_flash(
+            response, kind="error",
+            message=(
+                "Admin panel database is not attached — the rotation "
+                "cannot be persisted. Contact the deploy operator."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    current = str(form.get("current_password", ""))
+    new_password = str(form.get("new_password", ""))
+    confirm_password = str(form.get("confirm_password", ""))
+
+    # Refresh cache so a sibling worker's rotation is reflected when
+    # we verify the "current password" — otherwise an operator who
+    # rotated on worker A would see worker B refuse their NEW
+    # password as "wrong current".
+    try:
+        await admin_password.refresh_admin_password_hash_from_db(db)
+    except Exception:
+        log.exception(
+            "profile_password_post: refresh failed; using cached value",
+        )
+
+    if not admin_password.verify_admin_password(
+        current, env_expected=env_expected,
+    ):
+        await _record_audit_safe(
+            request,
+            "admin_password_rotation_failed",
+            outcome="deny",
+            meta={"reason": "wrong_current"},
+        )
+        set_flash(
+            response, kind="error",
+            message="Current password is incorrect.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    if new_password != confirm_password:
+        await _record_audit_safe(
+            request,
+            "admin_password_rotation_failed",
+            outcome="deny",
+            meta={"reason": "confirm_mismatch"},
+        )
+        set_flash(
+            response, kind="error",
+            message="New password and confirmation do not match.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    err = admin_password.validate_password_strength(new_password)
+    if err is not None:
+        await _record_audit_safe(
+            request,
+            "admin_password_rotation_failed",
+            outcome="deny",
+            meta={"reason": "weak_password"},
+        )
+        set_flash(
+            response, kind="error",
+            message=f"New password is too weak: {err}.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    if new_password == current:
+        await _record_audit_safe(
+            request,
+            "admin_password_rotation_failed",
+            outcome="deny",
+            meta={"reason": "unchanged"},
+        )
+        set_flash(
+            response, kind="error",
+            message=(
+                "New password must differ from the current password."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    # Capture the source BEFORE we persist so the audit row records
+    # the rotation step ("env→db" on first rotation, "db→db" on
+    # subsequent rotations).
+    previous_source = admin_password.get_admin_password_source(
+        env_expected=env_expected,
+    )
+
+    stored = admin_password.hash_password(new_password)
+    try:
+        await db.upsert_setting(
+            admin_password.ADMIN_PASSWORD_HASH_SETTING_KEY, stored,
+        )
+    except Exception:
+        log.exception(
+            "profile_password_post: upsert_setting failed; not "
+            "rotating in-process cache",
+        )
+        await _record_audit_safe(
+            request,
+            "admin_password_rotation_failed",
+            outcome="deny",
+            meta={"reason": "db_error"},
+        )
+        set_flash(
+            response, kind="error",
+            message=(
+                "Failed to persist the new password — please retry. "
+                "If the failure persists, check the application log."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    # Refresh-from-DB instead of set_admin_password_hash_override so
+    # the cache only loads a value that round-trips through the
+    # storage layer — guards against the rare case where the DB
+    # silently truncates / mangles the stored value.
+    try:
+        await admin_password.refresh_admin_password_hash_from_db(db)
+    except Exception:
+        log.exception(
+            "profile_password_post: post-rotation refresh failed; "
+            "in-process cache may be stale until the next render",
+        )
+
+    await _record_audit_safe(
+        request,
+        "admin_password_rotated",
+        meta={
+            "previous_source": previous_source,
+            "new_source": "db",
+        },
+    )
+    log.info(
+        "admin_password_rotated: panel password rotated from %s",
+        request.remote,
+    )
+
+    set_flash(
+        response, kind="success",
+        message=(
+            "Admin password rotated. Existing sessions stay valid; "
+            "the new password takes effect on the next sign-in."
+        ),
+        secret=secret, cookie_secure=cookie_secure,
+    )
+    return response
 
 
 # ---------------------------------------------------------------------
@@ -11789,6 +12396,16 @@ def setup_admin_routes(
         "/admin/wallet-config/free-messages",
         _require_role(ROLE_OPERATOR)(wallet_config_free_messages_post),
     )
+    # Stage-15-Step-E #10b row 24: FX_REFRESH_INTERVAL_SECONDS editor
+    # on ``/admin/wallet-config``. Operator-floored: tuning the FX
+    # refresher cadence too aggressively can hammer Nobitex (or
+    # whichever upstream is configured) and get the API key
+    # rate-limited; tuning it too slowly can leave the wallet UI
+    # rendering stale "(approx)" rates for hours.
+    app.router.add_post(
+        "/admin/wallet-config/fx-refresh",
+        _require_role(ROLE_OPERATOR)(wallet_config_fx_refresh_post),
+    )
 
     # Stage-15-Step-E #10b row 8: MEMORY_CONTEXT_LIMIT +
     # MEMORY_CONTENT_MAX_CHARS editors on ``/admin/memory-config``.
@@ -11944,6 +12561,19 @@ def setup_admin_routes(
     app.router.add_get(
         "/admin/enroll_2fa",
         _require_auth(enroll_2fa_get),
+    )
+
+    # Stage-15-Step-E #10b row 25: admin profile + password rotation.
+    # GET is read-only (auth-gated); POST is super-floored (the
+    # password owner is implicitly ROLE_SUPER per the env-list back-
+    # compat in admin_roles.effective_role).
+    app.router.add_get(
+        "/admin/profile",
+        _require_auth(profile_get),
+    )
+    app.router.add_post(
+        "/admin/profile/rotate-password",
+        _require_role(ROLE_SUPER)(profile_password_post),
     )
 
     # Stage-14: model & gateway toggle pages. Stage-15-Step-E #5
