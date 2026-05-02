@@ -1,6 +1,8 @@
 import logging
 import math
 import os
+import time
+from email.utils import parsedate_to_datetime
 
 import aiohttp
 
@@ -20,6 +22,73 @@ from vision import (
 )
 
 log = logging.getLogger("bot.ai_engine")
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse an HTTP ``Retry-After`` header value into a delta-seconds float.
+
+    Per RFC 7231 §7.1.3, ``Retry-After`` can carry **either** a
+    decimal delta-seconds count (``Retry-After: 60``) **or** an
+    HTTP-date (``Retry-After: Wed, 21 Oct 2015 07:28:00 GMT``).
+    The first slice of the per-key cooldown shipped only handled
+    the delta-seconds form; an HTTP-date fell into the
+    ``ValueError`` catch in :func:`chat_with_model` and the
+    cooldown silently used the default 60s window. That's the
+    Stage-15-Step-E #4 follow-up #4 **bundled bug fix**: many CDNs
+    (Cloudflare, Akamai, AWS CloudFront — all of which can sit in
+    front of OpenRouter's edge) emit HTTP-dates instead of
+    delta-seconds, so the bot was throwing away a real upstream
+    signal and waiting longer than necessary on short throttles
+    (and shorter than necessary on long ones — both directions
+    were wrong).
+
+    Returns ``None`` when *value* is empty / unparseable / yields
+    a non-positive delta. The caller treats ``None`` as "no
+    Retry-After supplied" and uses
+    :data:`openrouter_keys.DEFAULT_COOLDOWN_SECS`.
+
+    The function is sync + side-effect-free so unit tests can
+    exercise the parsing matrix directly without spinning up an
+    aiohttp session.
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    # 1. Try delta-seconds first — by far the common case.
+    try:
+        delta = float(stripped)
+    except (TypeError, ValueError):
+        delta = None
+    if delta is not None:
+        if math.isfinite(delta) and delta > 0.0:
+            return delta
+        # Non-positive delta-seconds: treat as "no usable header"
+        # and let the caller fall back to the default cooldown.
+        return None
+    # 2. Fall through to HTTP-date. ``parsedate_to_datetime`` is
+    # tolerant of all three RFC-acceptable date formats (RFC 1123,
+    # RFC 850, asctime) and returns a tz-aware datetime; subtracting
+    # ``time.time()`` gives the delta-seconds. A parse failure or
+    # a date in the past (clock skew, stale upstream cache) yields
+    # ``None`` so the caller falls back to the default cooldown
+    # rather than locking out forever (past) or for a giant span
+    # (parser returning a placeholder).
+    try:
+        dt = parsedate_to_datetime(stripped)
+    except (TypeError, ValueError):
+        return None
+    if dt is None:
+        return None
+    try:
+        epoch = dt.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+    delta_from_date = epoch - time.time()
+    if not math.isfinite(delta_from_date) or delta_from_date <= 0.0:
+        return None
+    return delta_from_date
 
 # Legacy single-key env var kept for reference in comments/tests.
 # Actual key selection now routes through openrouter_keys.key_for_user.
@@ -201,8 +270,12 @@ async def chat_with_model(
         messages.append({"role": "user", "content": user_prompt})
 
     # 4. Call OpenRouter API
+    # Stage-15-Step-E #4 follow-up #4: pass ``model=active_model``
+    # so the picker treats slots cooled for *other* models on the
+    # same key as still available — only slots cooled for the
+    # user's active model are skipped.
     try:
-        api_key = key_for_user(telegram_id)
+        api_key = key_for_user(telegram_id, model=active_model)
     except RuntimeError:
         log.error("No OpenRouter API keys configured — cannot serve chat.")
         return t(lang, "ai_provider_unavailable")
@@ -244,26 +317,30 @@ async def chat_with_model(
                         # cooldown so the next user routed to it
                         # falls through to a different pool member
                         # rather than retrying the same hot key.
-                        # We honour the upstream Retry-After header
-                        # when present; ``mark_key_rate_limited``
-                        # silently clamps + falls back if the value
-                        # is unusable. Wrapped in a broad except so
-                        # a parsing quirk in the response doesn't
-                        # mask the user-facing 429 reply.
+                        # Stage-15-Step-E #4 follow-up #4: scope
+                        # the cooldown to ``(api_key, active_model)``
+                        # so other models on the same key keep
+                        # serving — OpenRouter typically 429s a
+                        # specific (often ``:free``) model rather
+                        # than the API key as a whole, and a
+                        # whole-key cooldown over-blocked paid
+                        # traffic on the same key.
+                        # ``_parse_retry_after`` handles both the
+                        # delta-seconds form and the RFC HTTP-date
+                        # form (bundled bug fix); the inner
+                        # ``mark_key_rate_limited`` clamps + falls
+                        # back if the value is still unusable.
+                        # Wrapped in a broad except so a parsing
+                        # quirk doesn't mask the user-facing reply.
                         try:
-                            retry_after = response.headers.get(
-                                "Retry-After"
+                            retry_after_secs = _parse_retry_after(
+                                response.headers.get("Retry-After")
                             )
                             mark_key_rate_limited(
                                 api_key,
-                                retry_after_secs=(
-                                    float(retry_after)
-                                    if retry_after
-                                    else None
-                                ),
+                                retry_after_secs=retry_after_secs,
+                                model=active_model,
                             )
-                        except (ValueError, TypeError):
-                            mark_key_rate_limited(api_key)
                         except Exception:
                             log.exception(
                                 "mark_key_rate_limited raised "

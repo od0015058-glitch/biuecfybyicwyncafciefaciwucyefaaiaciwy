@@ -512,7 +512,36 @@ NowPayments crypto invoices.
   bug fix — pre-PR that column was only updated by tests, so
   the panel's "Last used" column always rendered `—` even for
   actively-used DB keys). Cross-replica cooldown coordination
-  (Redis-backed) and per-model 429 tracking remain follow-ups.
+  (Redis-backed) remains a follow-up.
+  **Stage-15-Step-E #4 follow-up #4 — per-(key, model) cooldown:**
+  OpenRouter typically 429s a specific `:free` model whose
+  upstream provider is throttling, not the API key as a whole.
+  The first slice cooled the *whole key* on every 429, which
+  over-blocked: a user routed to that key paying for a
+  paid model got an unhelpful "rate limited" reply because
+  someone else had hit a free-tier limit on a different model.
+  A second cooldown table keyed by `(api_key, model_id)` lives
+  alongside the whole-key table. `mark_key_rate_limited(key,
+  model="<slug>")` writes to the per-(key, model) table; the
+  picker (`key_for_user(uid, model="<slug>")`) walks past slots
+  blocked for that model while keeping slots blocked for *other*
+  models on the same key. `ai_engine.chat_with_model` passes
+  `model=active_model` through automatically. New Prometheus
+  family `meowassist_openrouter_key_model_cooldown_remaining_seconds{
+  index="N",model="<slug>"}` (only emits a row per *active*
+  cooldown — no sentinel zeros for the whole key × model cross
+  product). **Bundled bug fix** in this slice: the inline
+  `float(retry_after)` previously only handled the delta-seconds
+  form of `Retry-After`; per RFC 7231 §7.1.3 the header can also
+  be an HTTP-date, and many CDNs (Cloudflare, Akamai,
+  CloudFront — all of which can sit in front of OpenRouter's
+  edge) emit the date form. The first slice silently fell back
+  to the default 60s on the date form, throwing away a real
+  upstream signal in both directions. New `_parse_retry_after`
+  helper handles both forms (RFC 1123 / RFC 850 / asctime via
+  `email.utils.parsedate_to_datetime`), rejects past dates / NaN
+  / Inf / negative values so the caller still falls back cleanly
+  to the default when the header is unusable.
 - **Bot health & emergency control panel** — new `/admin/control`
   page surfaces a traffic-light status tile (idle / healthy /
   busy / degraded / under-attack / down) classified by

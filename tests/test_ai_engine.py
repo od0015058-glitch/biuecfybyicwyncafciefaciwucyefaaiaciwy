@@ -105,7 +105,15 @@ def stub_db(monkeypatch):
     db.get_recent_messages = AsyncMock(return_value=[])
     monkeypatch.setattr(ai_engine, "db", db)
     # Stage-14: stub multi-key routing so tests don't need real env vars.
-    monkeypatch.setattr(ai_engine, "key_for_user", lambda tid: "test-key")
+    # Stage-15-Step-E #4 follow-up #4: the picker now takes a
+    # ``model=`` keyword to scope cooldowns to (key, model) pairs;
+    # the stub silently accepts and ignores it so test cases that
+    # don't care about per-model routing keep working unchanged.
+    monkeypatch.setattr(
+        ai_engine,
+        "key_for_user",
+        lambda tid, *, model=None: "test-key",
+    )
     return db
 
 
@@ -316,6 +324,109 @@ def test_resolve_active_model_coerces_non_string_input():
     assert ai_engine._resolve_active_model(123) == "123"
 
 
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #4 follow-up #4 — _parse_retry_after
+#
+# Bundled bug fix: the first slice's inline ``float(retry_after)``
+# only handled delta-seconds. Per RFC 7231 §7.1.3 the header can
+# also be an HTTP-date and many CDNs (Cloudflare, Akamai) emit
+# the date form. This unit-tests the matrix without spinning up
+# an aiohttp session.
+# ---------------------------------------------------------------------
+
+
+def test_parse_retry_after_none_returns_none():
+    assert ai_engine._parse_retry_after(None) is None
+
+
+def test_parse_retry_after_empty_returns_none():
+    assert ai_engine._parse_retry_after("") is None
+
+
+def test_parse_retry_after_whitespace_returns_none():
+    assert ai_engine._parse_retry_after("   ") is None
+
+
+def test_parse_retry_after_integer_seconds():
+    assert ai_engine._parse_retry_after("60") == 60.0
+
+
+def test_parse_retry_after_float_seconds():
+    assert ai_engine._parse_retry_after("12.5") == 12.5
+
+
+def test_parse_retry_after_strips_whitespace_around_int():
+    assert ai_engine._parse_retry_after("  60  ") == 60.0
+
+
+def test_parse_retry_after_zero_returns_none():
+    """Zero delta-seconds → no usable cooldown duration; caller
+    should fall back to the default."""
+    assert ai_engine._parse_retry_after("0") is None
+
+
+def test_parse_retry_after_negative_seconds_returns_none():
+    """Negative delta-seconds is nonsensical (would expire the
+    cooldown before it starts); rejected as unusable."""
+    assert ai_engine._parse_retry_after("-5") is None
+
+
+def test_parse_retry_after_nan_returns_none():
+    """``float("nan")`` parses but isn't a usable duration."""
+    assert ai_engine._parse_retry_after("NaN") is None
+
+
+def test_parse_retry_after_inf_returns_none():
+    """``float("inf")`` parses but would lock out forever; reject."""
+    assert ai_engine._parse_retry_after("Infinity") is None
+
+
+def test_parse_retry_after_garbage_string_returns_none():
+    """Genuinely unparseable strings (not dates, not numbers) yield
+    ``None`` rather than raising — caller falls back to default."""
+    assert ai_engine._parse_retry_after("soon") is None
+    assert ai_engine._parse_retry_after("xyz") is None
+
+
+def test_parse_retry_after_http_date_in_future():
+    """RFC 1123 HTTP-date in the future yields ~that-many-seconds
+    delta. This is the headline bundled-bug-fix case."""
+    from datetime import datetime, timezone, timedelta
+    from email.utils import format_datetime
+
+    target = datetime.now(timezone.utc) + timedelta(seconds=120)
+    http_date = format_datetime(target, usegmt=True)
+    parsed = ai_engine._parse_retry_after(http_date)
+    assert parsed is not None
+    # Generous bounds: parsing + assertion overhead can shave
+    # a couple of seconds.
+    assert 110.0 <= parsed <= 130.0
+
+
+def test_parse_retry_after_http_date_in_past_returns_none():
+    """An HTTP-date in the past (clock skew, stale upstream
+    cache) yields ``None`` so the caller falls back to default
+    rather than expiring the cooldown immediately."""
+    from datetime import datetime, timezone, timedelta
+    from email.utils import format_datetime
+
+    past = datetime.now(timezone.utc) - timedelta(seconds=300)
+    http_date = format_datetime(past, usegmt=True)
+    assert ai_engine._parse_retry_after(http_date) is None
+
+
+def test_parse_retry_after_malformed_http_date_returns_none():
+    """Strings that look date-ish but aren't valid HTTP-dates fall
+    through to ``None``."""
+    assert ai_engine._parse_retry_after("not a date at all") is None
+    # Almost-RFC-1123 but missing the timezone — parsedate is
+    # lenient enough that this does parse on some Python versions;
+    # the test just asserts we don't raise. The return value is
+    # either None or a finite delta, both fine.
+    parsed = ai_engine._parse_retry_after("Wed, 21 Oct 2199 07:28:00")
+    assert parsed is None or isinstance(parsed, float)
+
+
 async def test_chat_with_model_uses_fallback_when_active_model_is_none(
     stub_db,
 ):
@@ -512,8 +623,12 @@ class _StubResponseWithHeaders(_StubResponse):
 
 @pytest.mark.asyncio
 async def test_chat_429_marks_key_rate_limited(stub_db):
-    """OpenRouter 429 must put the user's key in cooldown so the next
-    user routed to it falls through to a different pool member.
+    """OpenRouter 429 must put the (key, model) pair in cooldown so the
+    next user routed to it on the same model falls through to a
+    different pool member, while users on a *different* model on
+    the same key keep serving (Stage-15-Step-E #4 follow-up #4 —
+    per-(key, model) cooldown). The whole-key cooldown is reserved
+    for cases where the call site has no model context.
     """
     import openrouter_keys
 
@@ -525,7 +640,20 @@ async def test_chat_429_marks_key_rate_limited(stub_db):
     with _patched_session(response):
         reply = await ai_engine.chat_with_model(42, "hi")
 
-    assert openrouter_keys.is_key_rate_limited("test-key")
+    # The (key, model) pair is the one cooled — NOT the whole key.
+    assert openrouter_keys.is_key_rate_limited(
+        "test-key", model="test/m1"
+    )
+    # And users on a DIFFERENT model on the same key still see it
+    # as available — exactly the over-block behaviour the
+    # follow-up fixes.
+    assert not openrouter_keys.is_key_rate_limited(
+        "test-key", model="other/m2"
+    )
+    # Whole-key check (no model context) should also be False —
+    # we never wrote to ``_cooldowns`` because the call site
+    # provided model context.
+    assert not openrouter_keys.is_key_rate_limited("test-key")
     assert "rate" in reply.lower() or "limit" in reply.lower() or reply
     openrouter_keys.clear_all_cooldowns()
     openrouter_keys._keys = []
@@ -534,7 +662,12 @@ async def test_chat_429_marks_key_rate_limited(stub_db):
 
 @pytest.mark.asyncio
 async def test_chat_429_honours_retry_after_header(stub_db):
-    """A numeric ``Retry-After`` propagates to the cooldown deadline."""
+    """A numeric ``Retry-After`` propagates to the (key, model) cooldown
+    deadline. Stage-15-Step-E #4 follow-up #4 keyed the cooldown by
+    ``(api_key, model_id)``; the assertion now reads from
+    ``_per_model_cooldowns`` instead of the whole-key
+    ``_cooldowns`` table the first slice used.
+    """
     import openrouter_keys
 
     openrouter_keys.clear_all_cooldowns()
@@ -547,7 +680,9 @@ async def test_chat_429_honours_retry_after_header(stub_db):
     with _patched_session(response):
         await ai_engine.chat_with_model(42, "hi")
 
-    deadline = openrouter_keys._cooldowns.get("test-key")
+    deadline = openrouter_keys._per_model_cooldowns.get(
+        ("test-key", "test/m1")
+    )
     assert deadline is not None
     now = openrouter_keys.time.monotonic()
     # ~120s from now (within the cooldown clamp ceiling).
@@ -560,7 +695,8 @@ async def test_chat_429_honours_retry_after_header(stub_db):
 @pytest.mark.asyncio
 async def test_chat_429_falls_back_to_default_on_garbage_retry_after(stub_db):
     """``Retry-After: not-a-number`` should not crash the 429 branch;
-    cooldown falls back to the default duration.
+    cooldown falls back to the default duration on the
+    per-(key, model) table.
     """
     import openrouter_keys
 
@@ -574,8 +710,9 @@ async def test_chat_429_falls_back_to_default_on_garbage_retry_after(stub_db):
     with _patched_session(response):
         await ai_engine.chat_with_model(42, "hi")
 
-    # Cooldown table must have an entry — the 429 fired the marker.
-    assert "test-key" in openrouter_keys._cooldowns
+    # Per-(key, model) table must have an entry — the 429 fired
+    # the marker scoped to the active model.
+    assert ("test-key", "test/m1") in openrouter_keys._per_model_cooldowns
     openrouter_keys.clear_all_cooldowns()
     openrouter_keys._keys = []
     openrouter_keys._loaded = False
@@ -583,7 +720,9 @@ async def test_chat_429_falls_back_to_default_on_garbage_retry_after(stub_db):
 
 @pytest.mark.asyncio
 async def test_chat_429_no_retry_after_uses_default_cooldown(stub_db):
-    """Missing ``Retry-After`` → default 60s cooldown."""
+    """Missing ``Retry-After`` → default 60s cooldown on the
+    per-(key, model) entry.
+    """
     import openrouter_keys
 
     openrouter_keys.clear_all_cooldowns()
@@ -594,10 +733,97 @@ async def test_chat_429_no_retry_after_uses_default_cooldown(stub_db):
     with _patched_session(response):
         await ai_engine.chat_with_model(42, "hi")
 
-    deadline = openrouter_keys._cooldowns.get("test-key")
+    deadline = openrouter_keys._per_model_cooldowns.get(
+        ("test-key", "test/m1")
+    )
     assert deadline is not None
     now = openrouter_keys.time.monotonic()
     # ~DEFAULT_COOLDOWN_SECS (60s) from now.
+    expected = openrouter_keys.DEFAULT_COOLDOWN_SECS
+    assert expected - 1.0 <= deadline - now <= expected + 1.0
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys._keys = []
+    openrouter_keys._loaded = False
+
+
+@pytest.mark.asyncio
+async def test_chat_429_http_date_retry_after_parses(stub_db):
+    """RFC 7231 §7.1.3 allows ``Retry-After`` to be an HTTP-date
+    instead of delta-seconds. Stage-15-Step-E #4 follow-up #4
+    bundled bug fix: the first slice's ``float(retry_after)``
+    threw on the date form and silently fell back to the default
+    cooldown. ``_parse_retry_after`` now handles both forms; the
+    assertion is that a date ~90s in the future yields a cooldown
+    deadline ~90s out (not the 60s default).
+    """
+    import time as _time
+    from email.utils import format_datetime
+    from datetime import datetime, timezone, timedelta
+
+    import openrouter_keys
+
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys._keys = ["test-key"]
+    openrouter_keys._loaded = True
+
+    target_dt = datetime.now(timezone.utc) + timedelta(seconds=90)
+    http_date = format_datetime(target_dt, usegmt=True)
+    response = _StubResponseWithHeaders(
+        status=429, headers={"Retry-After": http_date}
+    )
+    with _patched_session(response):
+        await ai_engine.chat_with_model(42, "hi")
+
+    deadline = openrouter_keys._per_model_cooldowns.get(
+        ("test-key", "test/m1")
+    )
+    assert deadline is not None
+    now = openrouter_keys.time.monotonic()
+    # ~90s from now — the HTTP-date drove the cooldown, not the
+    # 60s default. Allow ±5s for the wall-clock vs monotonic
+    # offset and test scheduling jitter.
+    delta = deadline - now
+    assert 80.0 <= delta <= 100.0, (
+        f"expected ~90s cooldown from HTTP-date; got {delta:.1f}s "
+        f"(would have been ~60s if the date parse silently failed)"
+    )
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys._keys = []
+    openrouter_keys._loaded = False
+
+
+@pytest.mark.asyncio
+async def test_chat_429_past_http_date_retry_after_uses_default(stub_db):
+    """A ``Retry-After`` HTTP-date in the *past* (clock skew, stale
+    upstream cache, malformed proxy that just stamps the current
+    time minus 1s) must fall through to the default cooldown
+    rather than expiring the cooldown immediately. Stage-15-Step-E
+    #4 follow-up #4 bundled-bug-fix coverage.
+    """
+    from email.utils import format_datetime
+    from datetime import datetime, timezone, timedelta
+
+    import openrouter_keys
+
+    openrouter_keys.clear_all_cooldowns()
+    openrouter_keys._keys = ["test-key"]
+    openrouter_keys._loaded = True
+
+    past_dt = datetime.now(timezone.utc) - timedelta(seconds=300)
+    http_date = format_datetime(past_dt, usegmt=True)
+    response = _StubResponseWithHeaders(
+        status=429, headers={"Retry-After": http_date}
+    )
+    with _patched_session(response):
+        await ai_engine.chat_with_model(42, "hi")
+
+    deadline = openrouter_keys._per_model_cooldowns.get(
+        ("test-key", "test/m1")
+    )
+    assert deadline is not None
+    now = openrouter_keys.time.monotonic()
+    # ~DEFAULT_COOLDOWN_SECS (60s) from now — the past date was
+    # rejected and the marker fell back to the default.
     expected = openrouter_keys.DEFAULT_COOLDOWN_SECS
     assert expected - 1.0 <= deadline - now <= expected + 1.0
     openrouter_keys.clear_all_cooldowns()

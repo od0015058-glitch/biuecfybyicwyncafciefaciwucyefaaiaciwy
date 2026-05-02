@@ -442,6 +442,7 @@ def render_metrics() -> str:
         get_key_429_counters,
         get_key_fallback_counters,
         key_status_snapshot,
+        per_model_cooldown_snapshot,
     )
 
     parts.extend(
@@ -509,6 +510,59 @@ def render_metrics() -> str:
         parts.append(
             "meowassist_openrouter_key_cooldown_remaining_seconds"
             f'{{index="{idx_label}"}} {rendered}'
+        )
+
+    # Stage-15-Step-E #4 follow-up #4 — per-(key, model) cooldown
+    # gauge family. Emitted as a labelled gauge with one row per
+    # *active* (key, model) cooldown (not every (key × model)
+    # cross product — that would be cardinality fireworks for
+    # deploys with many keys / models). Inactive entries are
+    # absent from the exposition; the natural PromQL pattern is
+    # ``meowassist_openrouter_key_model_cooldown_remaining_seconds
+    # > 0`` to surface "currently throttled" pairs without
+    # filtering on a sentinel zero. The model label IS rendered
+    # (unlike the api_key) — the model id is public information
+    # (it shows up in user-visible chat replies) and the operator
+    # absolutely needs it to debug "which slug is jamming up".
+    per_model_help = (
+        "Seconds remaining in the per-(key, model) OpenRouter "
+        "cooldown. Rows are present only while the cooldown is "
+        "active; an absent row means the (index, model) pair is "
+        "currently available."
+    )
+    parts.extend(
+        _format_help_and_type(
+            "meowassist_openrouter_key_model_cooldown_remaining_seconds",
+            per_model_help,
+            "gauge",
+        )
+    )
+    for row in per_model_cooldown_snapshot():
+        idx = row.get("index")
+        model_id = row.get("model")
+        remaining = row.get("cooldown_remaining_secs")
+        if not isinstance(remaining, (int, float)):
+            continue
+        v = float(remaining)
+        # NaN / Inf would render as ``nan`` / ``inf`` which Prom
+        # does parse but is meaningless for a duration gauge —
+        # skip rather than emit garbage.
+        if v != v or v in (float("inf"), float("-inf")):
+            continue
+        if v <= 0.0:
+            # Defence-in-depth: snapshot already prunes expired
+            # entries but a zero/negative value here would clash
+            # with the "absent row = available" semantics above.
+            continue
+        idx_label = _escape_label_value(str(idx))
+        model_label = _escape_label_value(str(model_id))
+        if v.is_integer():
+            rendered = str(int(v))
+        else:
+            rendered = str(v)
+        parts.append(
+            "meowassist_openrouter_key_model_cooldown_remaining_seconds"
+            f'{{index="{idx_label}",model="{model_label}"}} {rendered}'
         )
 
     # Stage-15-Step-F: coarse bot-health score. Operators alert on
