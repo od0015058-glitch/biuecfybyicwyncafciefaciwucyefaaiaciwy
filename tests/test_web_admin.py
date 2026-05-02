@@ -3910,6 +3910,341 @@ async def test_wallet_config_free_messages_post_persists_audit_meta_diff(
 
 
 # ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 24: /admin/wallet-config —
+# FX_REFRESH_INTERVAL_SECONDS editor
+# ---------------------------------------------------------------------
+
+
+def _reset_fx_refresh_override_for_web():
+    """Scrub the in-process FX-refresh-interval cache so each test
+    sees a clean baseline."""
+    import fx_refresh_config
+    fx_refresh_config.clear_fx_refresh_interval_override()
+
+
+async def test_wallet_config_get_renders_fx_refresh_card(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """The page renders the FX-refresh editor card alongside the
+    other wallet-config knobs."""
+    monkeypatch.setenv("FX_REFRESH_INTERVAL_SECONDS", "1200")
+    _reset_fx_refresh_override_for_web()
+
+    db = _stub_db_for_wallet_config()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/wallet-config")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "USD→Toman refresher cadence" in body
+    assert "fx_refresh_interval_seconds" in body
+    assert "/admin/wallet-config/fx-refresh" in body
+    # Effective value renders in human-readable form (1200s = 20m).
+    assert "20m" in body
+
+
+async def test_wallet_config_fx_refresh_post_requires_auth(
+    aiohttp_client, make_admin_app,
+):
+    """Unauth requests redirect to /admin/login."""
+    _reset_fx_refresh_override_for_web()
+    db = _stub_db_for_wallet_config()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    resp = await client.post(
+        "/admin/wallet-config/fx-refresh",
+        data={"fx_refresh_interval_seconds": "1800"},
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303)
+    assert resp.headers.get("Location", "").startswith("/admin/login")
+
+
+async def test_wallet_config_fx_refresh_post_rejects_csrf_mismatch(
+    aiohttp_client, make_admin_app,
+):
+    """A wrong CSRF token redirects to /admin/wallet-config without
+    touching the DB or the cache."""
+    _reset_fx_refresh_override_for_web()
+    db = _stub_db_for_wallet_config()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.post(
+        "/admin/wallet-config/fx-refresh",
+        data={
+            "fx_refresh_interval_seconds": "1800",
+            "csrf_token": "totally_wrong_token",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/wallet-config"
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+
+
+async def test_wallet_config_fx_refresh_post_persists_value_and_refreshes_cache(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """Happy path: a valid value goes through ``upsert_setting`` AND
+    updates the in-process override so the next FX refresher tick
+    sees it without a process restart."""
+    monkeypatch.setenv("FX_REFRESH_INTERVAL_SECONDS", "600")
+    _reset_fx_refresh_override_for_web()
+    saved = {"value": None}
+
+    async def _upsert(key: str, value: str) -> None:
+        import fx_refresh_config
+        if key == fx_refresh_config.FX_REFRESH_INTERVAL_SETTING_KEY:
+            saved["value"] = value
+
+    async def _get(key: str):
+        import fx_refresh_config
+        if key == fx_refresh_config.FX_REFRESH_INTERVAL_SETTING_KEY:
+            return saved["value"]
+        return None
+
+    db = _stub_db_for_wallet_config()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/fx-refresh",
+        data={"fx_refresh_interval_seconds": "1800", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302, await resp.text()
+    assert resp.headers["Location"] == "/admin/wallet-config"
+
+    import fx_refresh_config
+    db.upsert_setting.assert_awaited_with(
+        fx_refresh_config.FX_REFRESH_INTERVAL_SETTING_KEY, "1800",
+    )
+    db.delete_setting.assert_not_awaited()
+    assert fx_refresh_config.get_fx_refresh_interval_override() == 1800
+    assert fx_refresh_config.get_fx_refresh_interval_seconds() == 1800
+    audit_calls = db.record_admin_audit.await_args_list
+    matching = [
+        c for c in audit_calls
+        if c.kwargs.get("action") == "wallet_config_fx_refresh_update"
+    ]
+    assert matching, audit_calls
+    meta = matching[-1].kwargs["meta"]
+    assert meta["action"] == "set"
+    assert meta["before"] == 600
+    assert meta["after"] == 1800
+
+
+async def test_wallet_config_fx_refresh_post_blank_value_clears_override(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """Empty form value drops the override; falls through to env / default."""
+    monkeypatch.setenv("FX_REFRESH_INTERVAL_SECONDS", "1200")
+    _reset_fx_refresh_override_for_web()
+    import fx_refresh_config
+    fx_refresh_config.set_fx_refresh_interval_override(3600)
+    assert fx_refresh_config.get_fx_refresh_interval_seconds() == 3600
+
+    db = _stub_db_for_wallet_config(
+        delete_setting_result=True, get_setting_result=None,
+    )
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/fx-refresh",
+        data={"fx_refresh_interval_seconds": "", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.delete_setting.assert_awaited_once_with(
+        fx_refresh_config.FX_REFRESH_INTERVAL_SETTING_KEY,
+    )
+    db.upsert_setting.assert_not_awaited()
+    assert fx_refresh_config.get_fx_refresh_interval_override() is None
+    # Falls through to env (1200).
+    assert fx_refresh_config.get_fx_refresh_interval_seconds() == 1200
+    audit_calls = db.record_admin_audit.await_args_list
+    matching = [
+        c for c in audit_calls
+        if c.kwargs.get("action") == "wallet_config_fx_refresh_update"
+    ]
+    assert matching
+    assert matching[-1].kwargs["meta"]["action"] == "clear"
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        "not-a-number",
+        "nan",
+        "inf",
+        "-inf",
+        "0",
+        "-1",
+        "59",        # below min
+        "86401",     # above max
+        "1234.5",    # non-integer rejected
+        "9999999",   # well above cap
+    ],
+)
+async def test_wallet_config_fx_refresh_post_rejects_invalid_value(
+    aiohttp_client, make_admin_app, monkeypatch, bad_value,
+):
+    """Anything non-int, non-finite, or outside [60, 86400] is rejected
+    with a flash-error redirect; the cache is not poisoned."""
+    monkeypatch.setenv("FX_REFRESH_INTERVAL_SECONDS", "600")
+    _reset_fx_refresh_override_for_web()
+
+    db = _stub_db_for_wallet_config()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/fx-refresh",
+        data={
+            "fx_refresh_interval_seconds": bad_value,
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/wallet-config"
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+    import fx_refresh_config
+    assert fx_refresh_config.get_fx_refresh_interval_override() is None
+
+
+async def test_wallet_config_fx_refresh_post_accepts_minimum(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """Boundary: the inclusive minimum (60s) round-trips."""
+    monkeypatch.setenv("FX_REFRESH_INTERVAL_SECONDS", "600")
+    _reset_fx_refresh_override_for_web()
+    saved = {"value": None}
+
+    async def _upsert(key: str, value: str) -> None:
+        saved["value"] = value
+
+    async def _get(key: str):
+        return saved["value"]
+
+    db = _stub_db_for_wallet_config()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+    resp = await client.post(
+        "/admin/wallet-config/fx-refresh",
+        data={"fx_refresh_interval_seconds": "60", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    import fx_refresh_config
+    assert fx_refresh_config.get_fx_refresh_interval_override() == 60
+    assert fx_refresh_config.get_fx_refresh_interval_seconds() == 60
+
+
+async def test_wallet_config_fx_refresh_post_accepts_maximum(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """Boundary: the inclusive maximum (86400s = 1 day) round-trips."""
+    monkeypatch.setenv("FX_REFRESH_INTERVAL_SECONDS", "600")
+    _reset_fx_refresh_override_for_web()
+    saved = {"value": None}
+
+    async def _upsert(key: str, value: str) -> None:
+        saved["value"] = value
+
+    async def _get(key: str):
+        return saved["value"]
+
+    db = _stub_db_for_wallet_config()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+    resp = await client.post(
+        "/admin/wallet-config/fx-refresh",
+        data={"fx_refresh_interval_seconds": "86400", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    import fx_refresh_config
+    assert fx_refresh_config.get_fx_refresh_interval_override() == 86400
+
+
+async def test_wallet_config_fx_refresh_post_db_failure_keeps_previous_value(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """An ``upsert_setting`` failure must NOT poison the in-process
+    cache; the previous override (or fall-through chain) must still
+    apply."""
+    monkeypatch.setenv("FX_REFRESH_INTERVAL_SECONDS", "600")
+    _reset_fx_refresh_override_for_web()
+
+    db = _stub_db_for_wallet_config()
+    db.upsert_setting = AsyncMock(side_effect=RuntimeError("boom"))
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+
+    resp = await client.post(
+        "/admin/wallet-config/fx-refresh",
+        data={"fx_refresh_interval_seconds": "1800", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    import fx_refresh_config
+    # The override is unchanged (never set because upsert failed).
+    assert fx_refresh_config.get_fx_refresh_interval_override() is None
+
+
+async def test_wallet_config_fx_refresh_post_persists_audit_meta_diff(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """The audit row's ``meta`` carries the before/after diff with
+    sources, sibling pin to the other wallet-config audit-meta tests."""
+    monkeypatch.setenv("FX_REFRESH_INTERVAL_SECONDS", "600")
+    _reset_fx_refresh_override_for_web()
+    saved = {"value": None}
+
+    async def _upsert(key: str, value: str) -> None:
+        saved["value"] = value
+
+    async def _get(key: str):
+        return saved["value"]
+
+    db = _stub_db_for_wallet_config()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_wallet_config_csrf(client)
+    resp = await client.post(
+        "/admin/wallet-config/fx-refresh",
+        data={"fx_refresh_interval_seconds": "3600", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    audit_calls = db.record_admin_audit.await_args_list
+    matching = [
+        c for c in audit_calls
+        if c.kwargs.get("action") == "wallet_config_fx_refresh_update"
+    ]
+    assert matching
+    meta = matching[-1].kwargs["meta"]
+    assert meta["before"] == 600
+    assert meta["before_source"] == "env"
+    assert meta["after"] == 3600
+    assert meta["after_source"] == "db"
+
+
+# ---------------------------------------------------------------------
 # Stage-15-Step-E #9 follow-up #2: monetization CSV export
 # ---------------------------------------------------------------------
 
