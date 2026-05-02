@@ -422,6 +422,31 @@ async def main():
             "from DB — falling through to env / compile-time default"
         )
 
+    # Stage-15-Step-E #10b row 9: warm the pending-PENDING expiration
+    # threshold override cache so the very first reaper tick after
+    # boot uses the operator's configured threshold rather than the
+    # env / compile-time default. The loop itself re-reads on every
+    # iteration (so a saved override always takes effect on the next
+    # tick), but the very first tick happens before that re-read —
+    # hence the boot warm-up.
+    try:
+        import pending_expiration
+        loaded_hours = await (
+            pending_expiration.refresh_expiration_hours_override_from_db(db)
+        )
+        log.info(
+            "loaded PENDING_EXPIRATION_HOURS override from "
+            "system_settings: %s (source=%s, effective=%dh)",
+            loaded_hours,
+            pending_expiration.get_pending_expiration_hours_source(),
+            pending_expiration.get_pending_expiration_hours(),
+        )
+    except Exception:
+        log.exception(
+            "failed to load PENDING_EXPIRATION_HOURS override from DB "
+            "— falling through to env / compile-time default"
+        )
+
     # Overwrite BotFather's cached slash-command list with the
     # canonical one. Without this, Telegram shows whatever was last
     # typed into the BotFather "Edit Commands" panel — including
