@@ -312,6 +312,26 @@ async def main():
             "falling through to env / compile-time default"
         )
 
+    # Stage-15-Step-E #10b row 4: warm the MIN_TOPUP_USD override
+    # cache so the very first top-up attempt is gated against the
+    # operator's configured floor rather than the env / compile-time
+    # default. Same fail-soft shape as the markup load above.
+    try:
+        import payments
+        loaded = await payments.refresh_min_topup_override_from_db(db)
+        log.info(
+            "loaded MIN_TOPUP_USD override from system_settings: %s "
+            "(source=%s, effective=$%.2f)",
+            loaded,
+            payments.get_min_topup_source(),
+            payments.get_min_topup_usd(),
+        )
+    except Exception:
+        log.exception(
+            "failed to load MIN_TOPUP_USD override from DB — "
+            "falling through to env / compile-time default"
+        )
+
     # Overwrite BotFather's cached slash-command list with the
     # canonical one. Without this, Telegram shows whatever was last
     # typed into the BotFather "Edit Commands" panel — including

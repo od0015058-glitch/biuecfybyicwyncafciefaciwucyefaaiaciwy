@@ -27,12 +27,152 @@ NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET")
 # a lower per-currency number, because sub-dollar top-ups don't cover
 # our own processing overhead.
 #
-# Overridable via ``MIN_TOPUP_USD`` so ops can bump it without a
-# redeploy if the economics change (e.g. gateway-fee schedule shifts).
+# Resolution order (Stage-15-Step-E #10b row 4):
+# 1. ``_MIN_TOPUP_USD_OVERRIDE`` — process-local cache populated from
+#    ``system_settings.MIN_TOPUP_USD`` via
+#    :func:`refresh_min_topup_override_from_db` at boot and on every
+#    ``/admin/wallet-config`` render. The web admin form writes this
+#    row so an operator can retune the floor without a redeploy.
+# 2. ``MIN_TOPUP_USD`` env var — same shape as before; bumped in
+#    ``.env.example`` for staging deploys.
+# 3. ``DEFAULT_MIN_TOPUP_USD = 2.0`` — compile-time fallback.
+#
+# ``GLOBAL_MIN_TOPUP_USD`` (the env-resolved snapshot) is preserved
+# as a module-level constant for backwards compatibility — the
+# per-call resolution happens in :func:`get_min_topup_usd` which
+# every caller in ``handlers.py`` and this module routes through.
+
+DEFAULT_MIN_TOPUP_USD: float = 2.0
+MIN_TOPUP_USD_MINIMUM: float = 0.0  # 0 is allowed but actively
+# discouraged on the form (operators will warn-banner below 0.5).
+MIN_TOPUP_USD_MAXIMUM: float = 10_000.0
+MIN_TOPUP_SETTING_KEY: str = "MIN_TOPUP_USD"
+
+_MIN_TOPUP_USD_OVERRIDE: float | None = None
+
 try:
-    GLOBAL_MIN_TOPUP_USD = max(0.0, float(os.getenv("MIN_TOPUP_USD", "2")))
+    GLOBAL_MIN_TOPUP_USD = max(
+        0.0, float(os.getenv("MIN_TOPUP_USD", str(DEFAULT_MIN_TOPUP_USD)))
+    )
 except (TypeError, ValueError):
-    GLOBAL_MIN_TOPUP_USD = 2.0
+    GLOBAL_MIN_TOPUP_USD = DEFAULT_MIN_TOPUP_USD
+
+
+def _coerce_min_topup(value: object) -> float | None:
+    """Parse a min-topup-USD candidate from raw input. Returns ``None``
+    if the value is non-finite, non-numeric, or outside the
+    [``MIN_TOPUP_USD_MINIMUM``, ``MIN_TOPUP_USD_MAXIMUM``] range."""
+    if isinstance(value, bool):
+        return None
+    try:
+        coerced = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(coerced):
+        return None
+    if coerced < MIN_TOPUP_USD_MINIMUM or coerced >= MIN_TOPUP_USD_MAXIMUM:
+        return None
+    return coerced
+
+
+def set_min_topup_override(value: float) -> None:
+    """Replace the in-process min-topup override.
+
+    Validates against the same rules as :func:`_coerce_min_topup`.
+    Refuses ``bool`` (a buggy caller posting ``True`` would otherwise
+    sneak through as ``1.0``)."""
+    global _MIN_TOPUP_USD_OVERRIDE
+    if isinstance(value, bool):
+        raise ValueError("min-topup override must be numeric, not bool")
+    coerced = _coerce_min_topup(value)
+    if coerced is None:
+        raise ValueError(
+            f"min-topup override {value!r} must be a finite number in "
+            f"[{MIN_TOPUP_USD_MINIMUM}, {MIN_TOPUP_USD_MAXIMUM})"
+        )
+    _MIN_TOPUP_USD_OVERRIDE = coerced
+
+
+def clear_min_topup_override() -> bool:
+    """Drop the in-process override. Returns True if one was active."""
+    global _MIN_TOPUP_USD_OVERRIDE
+    had = _MIN_TOPUP_USD_OVERRIDE is not None
+    _MIN_TOPUP_USD_OVERRIDE = None
+    return had
+
+
+def get_min_topup_override() -> float | None:
+    """Return the current in-process override (or ``None``)."""
+    return _MIN_TOPUP_USD_OVERRIDE
+
+
+async def refresh_min_topup_override_from_db(db) -> float | None:
+    """Reload the override from the ``system_settings`` overlay.
+
+    Mirrors :func:`pricing.refresh_markup_override_from_db`: a
+    transient DB error keeps the previous cache in place so a pool
+    blip can't accidentally revert to env / default mid-incident.
+    A malformed stored value (non-finite / out-of-range / NUL-ridden)
+    is treated as "no override" rather than crashing the bot.
+    """
+    global _MIN_TOPUP_USD_OVERRIDE
+    if db is None:
+        return _MIN_TOPUP_USD_OVERRIDE
+    try:
+        raw = await db.get_setting(MIN_TOPUP_SETTING_KEY)
+    except Exception:
+        log.exception(
+            "refresh_min_topup_override_from_db: get_setting failed; "
+            "keeping previous cache value=%s",
+            _MIN_TOPUP_USD_OVERRIDE,
+        )
+        return _MIN_TOPUP_USD_OVERRIDE
+    if raw is None:
+        _MIN_TOPUP_USD_OVERRIDE = None
+        return None
+    coerced = _coerce_min_topup(raw)
+    if coerced is None:
+        log.warning(
+            "refresh_min_topup_override_from_db: rejected stored value %r; "
+            "clearing override",
+            raw,
+        )
+        _MIN_TOPUP_USD_OVERRIDE = None
+        return None
+    _MIN_TOPUP_USD_OVERRIDE = coerced
+    return coerced
+
+
+def get_min_topup_usd() -> float:
+    """Return the resolved minimum-topup floor in USD.
+
+    Resolution order: in-process override → ``MIN_TOPUP_USD`` env →
+    ``DEFAULT_MIN_TOPUP_USD`` (2.0). Always returns a finite value
+    in ``[MIN_TOPUP_USD_MINIMUM, MIN_TOPUP_USD_MAXIMUM)``.
+    """
+    if _MIN_TOPUP_USD_OVERRIDE is not None:
+        return _MIN_TOPUP_USD_OVERRIDE
+    raw = os.getenv("MIN_TOPUP_USD")
+    if raw is not None:
+        coerced = _coerce_min_topup(raw)
+        if coerced is not None:
+            return coerced
+    return DEFAULT_MIN_TOPUP_USD
+
+
+def get_min_topup_source() -> str:
+    """Return ``db`` / ``env`` / ``default`` for the resolved value.
+
+    Used by the ``/admin/wallet-config`` panel to render the same
+    "effective / db / env / default" badge the bot-health thresholds
+    card and the COST_MARKUP editor use.
+    """
+    if _MIN_TOPUP_USD_OVERRIDE is not None:
+        return "db"
+    raw = os.getenv("MIN_TOPUP_USD")
+    if raw is not None and _coerce_min_topup(raw) is not None:
+        return "env"
+    return "default"
 
 # How long we trust a cached min-amount lookup before re-querying the
 # NowPayments API. The minimums move with the underlying network
@@ -351,7 +491,7 @@ async def get_min_amount_usd(
 def effective_min_usd(pay_currency: str) -> float:
     """Return the effective floor a top-up in ``pay_currency`` must clear.
 
-    ``max(GLOBAL_MIN_TOPUP_USD, cached per-currency NowPayments min)``.
+    ``max(get_min_topup_usd(), cached per-currency NowPayments min)``.
     A cache miss / ``None`` cached value means we have no trustworthy
     per-currency number, so we fall back to the global floor only.
 
@@ -359,13 +499,19 @@ def effective_min_usd(pay_currency: str) -> float:
     by :func:`get_min_amount_usd` and the background refresher. Callers
     that want an on-demand lookup with HTTP fallback should await
     :func:`get_min_amount_usd` directly.
+
+    Resolution of the global floor goes through
+    :func:`get_min_topup_usd` so a runtime DB override flips the
+    rejection threshold for every supported currency at once
+    without a process restart.
     """
     pay_currency = pay_currency.lower()
     cached = _min_amount_cache.get(pay_currency)
     per_currency_min = cached[0] if cached is not None else None
+    global_floor = get_min_topup_usd()
     if per_currency_min is None:
-        return GLOBAL_MIN_TOPUP_USD
-    return max(GLOBAL_MIN_TOPUP_USD, float(per_currency_min))
+        return global_floor
+    return max(global_floor, float(per_currency_min))
 
 
 def find_cheaper_alternative(

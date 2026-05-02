@@ -2134,7 +2134,7 @@ or unblock other work.
 | 1 | **OpenRouter API keys** — multi-key load balancer is configured by env (`OPENROUTER_API_KEY` comma-separated). | Read-only `/admin/openrouter-keys` shows usage. | New `/admin/openrouter-keys` add/remove/disable + per-key 24h usage / cost / 429-cooldown stats. Persist in DB (encrypted at rest). | P1 | **Shipped** (PR #156 for the DB-backed registry; PR #160 added 24h usage/cost; PR #165 added per-(key, model) cooldown viewer) |
 | 2 | **`COST_MARKUP`** — global price multiplier. | Env-only, default 1.5×. | Editor on `/admin/monetization` with audit row + history table. | P1 | **Shipped** (this PR — editor + DB-backed override + audit row; history table is a separate row #12) |
 | 3 | **Bot-health severity thresholds** (`BOT_HEALTH_*`). | Env-only. | Editor on `/admin/control` with effective/source columns. | P1 | **Shipped** (Stage-15-Step-F follow-up #4 — this PR) |
-| 4 | **`MIN_TOPUP_USD` / `MIN_TOPUP_TOMAN`** — minimum allowed top-up amounts. | Env-only. | Editor on a new `/admin/wallet-config` page. | P2 | Pending |
+| 4 | **`MIN_TOPUP_USD` / `MIN_TOPUP_TOMAN`** — minimum allowed top-up amounts. | Env-only. | Editor on a new `/admin/wallet-config` page. | P2 | **In progress** — override layer in `payments.py` shipped (this PR); web surface deferred to follow-up PR. See §10b.1 below for resume guide. |
 | 5 | **`REQUIRED_CHANNEL`** — force-join channel handle. | Env-only. | Editor on `/admin/control` (or new `/admin/access`). | P2 | Pending |
 | 6 | **`FREE_MESSAGES_PER_USER`** — initial free-trial messages. | Env-only. | Editor on `/admin/wallet-config`. | P2 | Pending |
 | 7 | **`REFERRAL_BONUS_USD` + `REFERRAL_PERCENT`** — referral payouts. | Env-only. | Editor on `/admin/wallet-config`. | P2 | Pending |
@@ -2176,6 +2176,172 @@ a slot):
 
 Each shipped row should also link the PR # so the audit table is
 the single source of truth for "what's wired up where".
+
+---
+
+### §10b.1 — Resume guide for row #4 (MIN_TOPUP_USD web surface)
+
+**Context (added 2026-05-02):** PR-2a shipped the override layer
+in `payments.py` (mirrors the COST_MARKUP pattern in `pricing.py`)
+plus the boot-time cache warm in `main.py` and the handler-side
+integration so every paid path now resolves the floor through
+`get_min_topup_usd()` instead of reading `GLOBAL_MIN_TOPUP_USD`
+directly. **The Telegram side is fully wired** — once an operator
+upserts `system_settings.MIN_TOPUP_USD` (via psql, for example),
+the new floor is in effect after one bot restart (or sooner if
+the next admin page render calls `refresh_min_topup_override_from_db`).
+
+**What's left for PR-2b** (the web surface — was implemented in
+the same branch but reverted before merge because of an
+unresolved test-isolation bug; see "Known issue" below):
+
+1. **`web_admin.py`** — add four things, in this order:
+   - **Audit label** in `_AUDIT_ACTION_LABELS`:
+     `"wallet_config_min_topup_update": "Minimum top-up updated"`.
+   - **`_build_min_topup_view(toman_per_usd)`** helper that
+     mirrors `_build_markup_view`. It must return a dict with
+     keys `effective`, `source`, `default_value`, `env_value`,
+     `env_raw`, `override_value`, `minimum`, `maximum_exclusive`,
+     `derived_min_toman`. Pull from `payments.get_min_topup_usd()`,
+     `payments.get_min_topup_source()`, and friends.
+   - **`async def wallet_config_get(request)`** — best-effort
+     `await payments.refresh_min_topup_override_from_db(db)`
+     (set `db_error` on failure, do not re-raise), best-effort
+     `await get_usd_to_toman_snapshot()` from `fx_rates`, then
+     `aiohttp_jinja2.render_template("wallet_config.html", ...)`
+     with `min_topup_view`, `csrf_token`, `flash`, `active_page`.
+   - **`async def wallet_config_min_topup_post(request)`** — CSRF
+     guard (mirror `_monetization_csrf_guard`), parse the
+     `min_topup_usd` form field, blank → `db.delete_setting(...)`
+     and `clear_min_topup_override()`, otherwise `_coerce_min_topup`
+     + `db.upsert_setting(MIN_TOPUP_SETTING_KEY, str(parsed))` +
+     `set_min_topup_override(parsed)`. Wrap the DB write in
+     `try/except` and on failure leave the cache untouched and
+     flash an error. Always redirect (302) back to
+     `/admin/wallet-config` and use `set_flash` for the banner.
+   - **Audit trail** — call the same `audit.record(...)` helper
+     monetization uses with action key `wallet_config_min_topup_update`
+     and meta `{"before": …, "after": …, "source_before": …,
+     "source_after": …}`.
+
+2. **Route registration** in `setup_admin_routes(...)`:
+   ```python
+   app.router.add_get(
+       "/admin/wallet-config",
+       _require_auth(wallet_config_get),
+   )
+   app.router.add_post(
+       "/admin/wallet-config/min-topup",
+       _require_role(ROLE_OPERATOR)(wallet_config_min_topup_post),
+   )
+   ```
+
+3. **`templates/admin/wallet_config.html`** (new file) — copy the
+   structure from `templates/admin/monetization.html`'s markup
+   editor card. Include:
+   - Page title + description.
+   - Flash banner block.
+   - Source badge (renders `min_topup_view.source` as a coloured
+     pill: `db` / `env` / `default`).
+   - Breakdown table: DB override / env / compile-time default /
+     effective / derived-Toman.
+   - The form: hidden CSRF token, `<input type="number"
+     name="min_topup_usd" min="0" max="9999.99" step="0.01">`,
+     submit button, and a hint paragraph showing the allowed range.
+
+4. **`templates/admin/_layout.html`** — add a sidebar nav link
+   pointing at `/admin/wallet-config` with `active_page ==
+   'wallet_config'` highlight (mirror the existing pattern).
+
+5. **`tests/test_web_admin.py`** — port the 11 wallet_config
+   tests that were on the original PR-2 branch. The reverted
+   block is preserved verbatim under `/tmp/test_web_admin.py.bak`
+   on the dev VM if the next session is the same machine; if
+   not, the test names from the original list are:
+   - `test_wallet_config_renders_min_topup_editor_form`
+   - `test_wallet_config_min_topup_post_requires_auth`
+   - `test_wallet_config_min_topup_post_rejects_csrf_mismatch`
+   - `test_wallet_config_min_topup_post_persists_value_and_refreshes_cache`
+   - `test_wallet_config_min_topup_post_blank_value_clears_override`
+   - 5× parametrized `test_wallet_config_min_topup_post_rejects_invalid_value`
+   - `test_wallet_config_min_topup_post_db_failure_keeps_previous_value`
+
+   They should mirror the corresponding `monetization_markup_*`
+   tests one-for-one.
+
+**Known issue** — when the original PR-2 branch ran the full
+suite (`pytest tests/ -p no:randomly`), the wallet_config web
+tests intermittently hit `aiohttp.client_exceptions.ServerDisconnectedError`
+on the GET to `/admin/wallet-config`. Symptoms:
+
+- The login POST returns 302 normally and the cookie is set.
+- The very next GET on the same `aiohttp_client` connection
+  fails with "Server disconnected" before the access log even
+  records the request.
+- Running just the wallet_config tests, or running them with
+  `tests/test_web_admin.py` only, passes 100% — so it's
+  cumulative state from earlier test files.
+- The autouse fixture `_clear_admin_setting_overrides` in
+  `tests/conftest.py` (added in PR-2a) clears
+  `pricing._MARKUP_OVERRIDE` and `payments._MIN_TOPUP_USD_OVERRIDE`
+  between tests but did **not** fix the disconnect.
+- `fx_rates._cache` is None at the start of the failing test
+  (the autouse `_reset_cache_per_test` in `test_fx_rates.py`
+  doesn't apply globally), so `_warm_cache_from_db` falls
+  through to `database.db.get_fx_snapshot()` which raises
+  `AttributeError: 'NoneType' object has no attribute 'acquire'`.
+  That exception is caught — but **may** be the source of the
+  disconnect if it's racing with the request lifecycle. Worth
+  testing first: skip the FX snapshot lookup entirely when
+  `db is None` or wrap the call in `asyncio.wait_for(..., timeout=1)`.
+
+**Suggested first attempt to fix** — replace the
+`get_usd_to_toman_snapshot()` call inside `wallet_config_get`
+with a safer variant that reads `request.app[APP_KEY_DB]`
+directly instead of going through the module-level `database.db`
+singleton. That singleton's `pool` is None in tests, and the
+`AttributeError` it raises may be triggering a half-closed
+connection state on the test server. Inline:
+
+```python
+# Stage-15-Step-E #10b row 4 — fx snapshot lookup. Use the
+# request-scoped DB instead of the module-level singleton so
+# tests that wire a stub DB don't fall through to a NoneType
+# pool.acquire() call (which works in prod but races weirdly
+# under pytest-aiohttp's TestServer).
+toman_per_usd: float | None = None
+if db is not None:
+    try:
+        snap = await db.get_fx_snapshot()
+        if snap is not None:
+            toman_per_usd = float(snap[0])
+    except Exception:
+        log.exception("wallet_config_get: get_fx_snapshot failed")
+```
+
+If that doesn't fix it, the next thing to try is bisecting
+which test file in the alphabetical ordering pollutes state.
+A starting bash recipe (adapt as needed):
+
+```bash
+for f in tests/test_*.py; do
+  result=$(python -m pytest "$f" tests/test_web_admin.py \
+    -p no:randomly --tb=no -q -k "wallet_config_renders" 2>&1 | tail -1)
+  echo "$f -> $result"
+done
+```
+
+If any single pair shows `1 failed`, that's your bad neighbour.
+If no single pair fails, the pollution is from the *combination*
+of multiple files.
+
+**PR-2b acceptance criteria (don't ship without all four):**
+1. `/admin/wallet-config` GET renders the breakdown + form.
+2. POST happy-path persists, refreshes cache, audit row written.
+3. Empty POST clears the override (delete_setting + clear_min_topup_override).
+4. Bad inputs (NaN/Inf/negative/above max) flash an error and
+   leave the cache untouched.
+5. Full test suite green: `pytest tests/ --ignore=tests/integration`.
 
 ---
 
