@@ -260,7 +260,17 @@ async def refresh_threshold_overrides_from_db(db) -> dict[str, int]:
     for key, value in raw.items():
         if key not in valid_keys:
             continue
-        stripped = (value or "").strip()
+        # Bundled bug fix: previously ``(value or "").strip()`` would
+        # AttributeError on a non-string-non-None row (e.g. an int
+        # written by a future ``upsert_setting`` overload, or a
+        # historical row left over from a different schema). The
+        # whole refresh would then bubble up to the caller and
+        # leave the override cache half-loaded — every key after
+        # the bad row would silently fall through to env / default.
+        # Coerce to ``str`` defensively and skip rows that won't
+        # coerce so a single garbage row can't poison the rest of
+        # the load.
+        stripped = _coerce_setting_to_str(key, value).strip()
         if not stripped:
             continue
         try:
@@ -286,6 +296,250 @@ async def refresh_threshold_overrides_from_db(db) -> dict[str, int]:
     _THRESHOLD_OVERRIDES.clear()
     _THRESHOLD_OVERRIDES.update(new_overrides)
     return dict(_THRESHOLD_OVERRIDES)
+
+
+def _coerce_setting_to_str(key: str, value: object) -> str:
+    """Coerce a ``system_settings`` row value to a str defensively.
+
+    Historical rows / future schema changes / stub DBs in tests can
+    legitimately return ``None``, ``int``, ``Decimal`` or other
+    non-str types from ``list_settings_with_prefix``. The downstream
+    parsers all expect a ``str`` they can ``.strip()`` and ``int(...)``,
+    so a single non-str row would otherwise blow up the entire
+    refresh path with ``AttributeError`` and revert every per-key
+    override to env / default — including overrides that hadn't
+    been touched since the last successful refresh. Returning ``""``
+    for non-coercible values lets the loop continue and the row's
+    ``not stripped`` skip clause filter it out cleanly.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return str(value)
+    except Exception:
+        log.warning(
+            "bot_health: ignoring system_settings %s=%r "
+            "(non-coercible to str)",
+            key, value,
+        )
+        return ""
+
+
+# ── Per-loop stale-threshold overrides (Stage-15-Step-E #10b row 11) ──
+#
+# Stage-15-Step-F's threshold editor ships four global knobs (busy
+# inflight, legacy single-knob loop-stale, IPN drop attack, login
+# throttle attack). Per-loop stale thresholds (``BOT_HEALTH_LOOP_STALE_
+# <UPPER_NAME>_SECONDS``) are still env-only — operators wanting to
+# extend the freshness window for a specific loop without redeploying
+# (e.g. a new gateway is slow-syncing and ``zarinpal_backfill`` is
+# legitimately late) had to live with false-DEGRADED on the panel
+# until the next deploy.
+#
+# This second cache stores per-loop overrides keyed by the **loop
+# name** (e.g. ``"fx_refresh"`` → ``600``). The DB-backed key is
+# ``BOT_HEALTH_LOOP_STALE_<UPPER_NAME>_SECONDS`` so an operator who
+# already knew the env var name finds the same shape on the panel.
+#
+# Resolution order in :func:`_stale_threshold_seconds`:
+#
+#   1. Per-loop in-process override (this cache, populated by the
+#      panel + boot warm-up).
+#   2. Per-loop env var ``BOT_HEALTH_LOOP_STALE_<UPPER_NAME>_SECONDS``.
+#   3. Cadence-derived ``2 × LOOP_CADENCES[name] + 60``.
+#   4. Legacy fallback (the caller's ``fallback`` arg, typically the
+#      ``BOT_HEALTH_LOOP_STALE_SECONDS`` global with its own DB-backed
+#      override layer).
+#
+# Bounds: ``LOOP_STALE_OVERRIDE_MINIMUM`` is 1 s (matches
+# ``THRESHOLD_MINIMUMS`` for the global key) and the maximum is one
+# week — wide enough for daily-cadence loops with multi-day backoff,
+# but narrow enough that a typo of ``604800000`` (ms instead of s)
+# is rejected at validation rather than silently disabling stale
+# detection for a loop forever.
+LOOP_STALE_OVERRIDE_MINIMUM: int = 1
+LOOP_STALE_OVERRIDE_MAXIMUM: int = 86_400 * 7  # 1 week, in seconds
+_LOOP_STALE_OVERRIDES: dict[str, int] = {}
+
+
+def loop_stale_setting_key(loop_name: str) -> str:
+    """Build the ``system_settings`` / env key for *loop_name*.
+
+    Single source of truth for the key shape so the env path, the
+    DB path, and the panel template can't drift. Mirrors the
+    existing ``BOT_HEALTH_LOOP_STALE_<UPPER_NAME>_SECONDS`` shape
+    documented in HANDOFF since the per-loop env override shipped.
+    """
+    if not isinstance(loop_name, str) or not loop_name:
+        raise ValueError(
+            f"loop_stale_setting_key: name must be a non-empty str, "
+            f"got {loop_name!r}"
+        )
+    return f"BOT_HEALTH_LOOP_STALE_{loop_name.upper()}_SECONDS"
+
+
+def _coerce_loop_stale_seconds(value: object) -> int | None:
+    """Validate a per-loop stale-threshold candidate.
+
+    Returns the parsed int when it's a positive int within
+    ``[LOOP_STALE_OVERRIDE_MINIMUM, LOOP_STALE_OVERRIDE_MAXIMUM]``;
+    ``None`` for anything else (so the caller can decide whether to
+    log + reject or silently fall through). Booleans are refused
+    explicitly — a stored ``"true"`` row would otherwise coerce to
+    ``1`` and shrink every loop's freshness window to 1 s, painting
+    the whole panel red.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        candidate = value
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            candidate = int(stripped)
+        except ValueError:
+            return None
+    else:
+        return None
+    if candidate < LOOP_STALE_OVERRIDE_MINIMUM:
+        return None
+    if candidate > LOOP_STALE_OVERRIDE_MAXIMUM:
+        return None
+    return candidate
+
+
+def set_loop_stale_override(loop_name: str, value: int) -> None:
+    """Apply an in-process per-loop stale-threshold override.
+
+    Defence-in-depth: re-validates via :func:`_coerce_loop_stale_seconds`
+    so a future caller bypassing the web-UI's coercer (e.g. a
+    direct-call from a script) still gets a clean rejection. The
+    panel's POST handler validates *before* writing the DB so an
+    invalid value never reaches this function in production.
+    """
+    coerced = _coerce_loop_stale_seconds(value)
+    if coerced is None:
+        raise ValueError(
+            f"loop stale override for {loop_name!r} must be int in "
+            f"[{LOOP_STALE_OVERRIDE_MINIMUM}, "
+            f"{LOOP_STALE_OVERRIDE_MAXIMUM}], got {value!r}"
+        )
+    if not isinstance(loop_name, str) or not loop_name:
+        raise ValueError(
+            f"loop stale override: name must be a non-empty str, "
+            f"got {loop_name!r}"
+        )
+    _LOOP_STALE_OVERRIDES[loop_name] = coerced
+
+
+def clear_loop_stale_override(loop_name: str) -> bool:
+    """Drop the in-process override for *loop_name*.
+
+    Returns ``True`` if one existed (so the caller can short-circuit
+    the audit-log "no-op" branch). Idempotent for unknown names.
+    """
+    return _LOOP_STALE_OVERRIDES.pop(loop_name, None) is not None
+
+
+def get_loop_stale_override(loop_name: str) -> int | None:
+    """Return the current in-process override for *loop_name* or ``None``."""
+    return _LOOP_STALE_OVERRIDES.get(loop_name)
+
+
+def get_loop_stale_overrides_snapshot() -> dict[str, int]:
+    """Read-only copy of the per-loop overrides cache.
+
+    Mirrors :func:`get_threshold_overrides_snapshot`. Returning a
+    copy keeps the panel from mutating the live cache by accident
+    while iterating its rows.
+    """
+    return dict(_LOOP_STALE_OVERRIDES)
+
+
+def reset_loop_stale_overrides_for_tests() -> None:
+    """Test-helper: drop every per-loop override slot.
+
+    Mirrors :func:`reset_loop_registry_for_tests` so the autouse
+    reset fixtures in ``test_bot_health.py`` / ``test_web_admin.py``
+    can null the cache between cases without exporting the private
+    dict.
+    """
+    _LOOP_STALE_OVERRIDES.clear()
+
+
+async def refresh_loop_stale_overrides_from_db(db) -> dict[str, int]:
+    """Reload the per-loop override cache from ``system_settings``.
+
+    Mirrors :func:`refresh_threshold_overrides_from_db` shape but
+    iterates every ``BOT_HEALTH_LOOP_STALE_*_SECONDS`` row and
+    derives the loop name from the key (strip prefix + suffix,
+    lowercase). Excludes the legacy ``BOT_HEALTH_LOOP_STALE_SECONDS``
+    key which is owned by the global threshold cache (Stage-15-Step-F).
+
+    Best-effort: a transient DB error keeps the cache in place
+    (logged at ERROR). A malformed row clears just that row's
+    override (logged at WARNING). A non-string value type
+    coerces via :func:`_coerce_setting_to_str` so a single bad row
+    can't blow up the whole refresh.
+    """
+    if db is None:
+        return get_loop_stale_overrides_snapshot()
+    try:
+        raw = await db.list_settings_with_prefix(
+            "BOT_HEALTH_LOOP_STALE_"
+        )
+    except Exception:
+        log.exception(
+            "bot_health: refresh_loop_stale_overrides_from_db failed; "
+            "keeping previous cache"
+        )
+        return get_loop_stale_overrides_snapshot()
+    if not isinstance(raw, dict):
+        log.warning(
+            "bot_health: list_settings_with_prefix returned %r "
+            "(not a dict); keeping previous loop-stale cache",
+            type(raw).__name__,
+        )
+        return get_loop_stale_overrides_snapshot()
+
+    new_overrides: dict[str, int] = {}
+    suffix = "_SECONDS"
+    prefix = "BOT_HEALTH_LOOP_STALE_"
+    for key, value in raw.items():
+        if not isinstance(key, str):
+            continue
+        # Skip the legacy single-knob — owned by the global
+        # threshold cache, not the per-loop cache.
+        if key == "BOT_HEALTH_LOOP_STALE_SECONDS":
+            continue
+        if not key.startswith(prefix) or not key.endswith(suffix):
+            continue
+        loop_name = key[len(prefix):-len(suffix)].lower()
+        if not loop_name:
+            continue
+        coerced_str = _coerce_setting_to_str(key, value).strip()
+        if not coerced_str:
+            continue
+        coerced = _coerce_loop_stale_seconds(coerced_str)
+        if coerced is None:
+            log.warning(
+                "bot_health: ignoring system_settings %s=%r "
+                "(not in [%d, %d])",
+                key, value,
+                LOOP_STALE_OVERRIDE_MINIMUM,
+                LOOP_STALE_OVERRIDE_MAXIMUM,
+            )
+            continue
+        new_overrides[loop_name] = coerced
+
+    # Atomic swap so a partial update can't leave half-loaded state.
+    _LOOP_STALE_OVERRIDES.clear()
+    _LOOP_STALE_OVERRIDES.update(new_overrides)
+    return dict(_LOOP_STALE_OVERRIDES)
 
 
 # ── Per-loop expected cadences ──────────────────────────────────────
@@ -571,40 +825,72 @@ def _stale_threshold_seconds(loop_name: str, *, fallback: int) -> int:
 
     Resolution order:
 
-    1. Explicit env override
+    1. In-process per-loop override
+       (:data:`_LOOP_STALE_OVERRIDES`, populated by the
+       ``/admin/control`` per-loop editor + boot warm-up). DB beats
+       env so an operator's saved value can't be silently shadowed
+       by a stale env override left behind from a previous deploy.
+    2. Explicit env override
        ``BOT_HEALTH_LOOP_STALE_<UPPER_NAME>_SECONDS`` if set to a
        positive integer. Bad values fall through silently to the
        next layer (mirrors ``_env_int``'s fail-safe).
-    2. Cadence-derived: ``2 × LOOP_CADENCES[name] +
+    3. Cadence-derived: ``2 × LOOP_CADENCES[name] +
        _STALE_THRESHOLD_MARGIN_SECONDS``.
-    3. *fallback* (the caller's legacy single-knob value) for
+    4. *fallback* (the caller's legacy single-knob value) for
        unknown loop names.
     """
-    explicit_key = (
-        f"BOT_HEALTH_LOOP_STALE_{loop_name.upper()}_SECONDS"
-    )
-    raw = os.getenv(explicit_key, "").strip()
-    if raw:
-        try:
-            value = int(raw)
-        except ValueError:
-            log.warning(
-                "bot_health: invalid %s=%r (not an int) — "
-                "falling back to cadence-derived threshold",
-                explicit_key, raw,
-            )
-        else:
-            if value > 0:
-                return value
-            log.warning(
-                "bot_health: invalid %s=%d (non-positive) — "
-                "falling back to cadence-derived threshold",
-                explicit_key, value,
-            )
+    db_override = _LOOP_STALE_OVERRIDES.get(loop_name)
+    if db_override is not None and db_override >= LOOP_STALE_OVERRIDE_MINIMUM:
+        return db_override
+    explicit_key = loop_stale_setting_key(loop_name) if loop_name else None
+    if explicit_key is not None:
+        raw = os.getenv(explicit_key, "").strip()
+        if raw:
+            try:
+                value = int(raw)
+            except ValueError:
+                log.warning(
+                    "bot_health: invalid %s=%r (not an int) — "
+                    "falling back to cadence-derived threshold",
+                    explicit_key, raw,
+                )
+            else:
+                if value > 0:
+                    return value
+                log.warning(
+                    "bot_health: invalid %s=%d (non-positive) — "
+                    "falling back to cadence-derived threshold",
+                    explicit_key, value,
+                )
     cadence = LOOP_CADENCES.get(loop_name)
     if cadence is not None:
         return cadence * 2 + _STALE_THRESHOLD_MARGIN_SECONDS
     return fallback
+
+
+def loop_stale_source(loop_name: str) -> str:
+    """Return the source label for *loop_name*'s stale threshold.
+
+    One of ``"db" / "env" / "cadence" / "default"`` so the
+    ``/admin/control`` panel can render a per-loop badge that
+    matches the four-layer resolution order in
+    :func:`_stale_threshold_seconds`. Mirrors the per-key ``source``
+    column on the global threshold card.
+    """
+    if _LOOP_STALE_OVERRIDES.get(loop_name) is not None:
+        return "db"
+    if loop_name:
+        env_key = loop_stale_setting_key(loop_name)
+        raw = os.getenv(env_key, "").strip()
+        if raw:
+            try:
+                if int(raw) > 0:
+                    return "env"
+            except ValueError:
+                pass
+    if loop_name in LOOP_CADENCES:
+        return "cadence"
+    return "default"
 
 
 # Process-boot epoch — used to grace-period a never-ticked loop on
@@ -943,14 +1229,24 @@ __all__ = (
     "DEFAULT_LOOP_STALE_SECONDS",
     "LOOP_CADENCES",
     "LOOP_RUNNERS",
+    "LOOP_STALE_OVERRIDE_MAXIMUM",
+    "LOOP_STALE_OVERRIDE_MINIMUM",
+    "clear_loop_stale_override",
     "compute_bot_status",
+    "get_loop_stale_override",
+    "get_loop_stale_overrides_snapshot",
     "get_process_start_epoch",
     "loop_cadence_seconds",
     "loop_runner",
+    "loop_stale_setting_key",
+    "loop_stale_source",
     "loop_stale_threshold_seconds",
+    "refresh_loop_stale_overrides_from_db",
     "register_loop",
     "request_force_stop",
     "reset_loop_registry_for_tests",
+    "reset_loop_stale_overrides_for_tests",
+    "set_loop_stale_override",
     "status_score",
     "update_loop_cadence",
 )

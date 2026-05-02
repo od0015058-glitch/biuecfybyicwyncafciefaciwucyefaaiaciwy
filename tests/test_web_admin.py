@@ -13540,6 +13540,375 @@ async def test_control_get_renders_alert_threshold_card(
 
 
 # =====================================================================
+# Stage-15-Step-E #10b row 11: per-loop stale-threshold editor
+# =====================================================================
+
+
+async def test_control_loop_stale_post_persists_value_and_refreshes(
+    aiohttp_client, make_admin_app
+):
+    """Happy path: a valid integer is upserted to system_settings AND
+    pushed into the per-loop in-process override cache so the panel +
+    classifier see the new threshold without a restart."""
+    import bot_health
+
+    bot_health.reset_loop_stale_overrides_for_tests()
+    saved: dict[str, str | None] = {"value": None}
+
+    async def _upsert(key: str, value: str) -> None:
+        if key == "BOT_HEALTH_LOOP_STALE_FX_REFRESH_SECONDS":
+            saved["value"] = value
+
+    async def _list(prefix: str):
+        if not prefix.startswith("BOT_HEALTH_LOOP_STALE_"):
+            return {}
+        if saved["value"] is None:
+            return {}
+        return {
+            "BOT_HEALTH_LOOP_STALE_FX_REFRESH_SECONDS": saved["value"],
+        }
+
+    db = _stub_toggle_db()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.list_settings_with_prefix = AsyncMock(side_effect=_list)
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/loop-stale",
+        data={
+            "loop_name": "fx_refresh",
+            "loop_stale_seconds": "600",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302, await resp.text()
+    assert resp.headers["Location"] == "/admin/control"
+
+    db.upsert_setting.assert_awaited_once_with(
+        "BOT_HEALTH_LOOP_STALE_FX_REFRESH_SECONDS", "600",
+    )
+    assert bot_health.get_loop_stale_override("fx_refresh") == 600
+    assert bot_health.loop_stale_threshold_seconds("fx_refresh") == 600
+    matching = [
+        c for c in db.record_admin_audit.await_args_list
+        if c.kwargs.get("action") == "control_loop_stale_update"
+    ]
+    assert matching, db.record_admin_audit.await_args_list
+    bot_health.reset_loop_stale_overrides_for_tests()
+
+
+async def test_control_loop_stale_post_clear_drops_db_row(
+    aiohttp_client, make_admin_app
+):
+    """``action=clear`` deletes the DB row and clears the in-process
+    override so the env / cadence-derived threshold takes over."""
+    import bot_health
+
+    bot_health.reset_loop_stale_overrides_for_tests()
+    bot_health.set_loop_stale_override("fx_refresh", 600)
+
+    db = _stub_toggle_db()
+    db.delete_setting = AsyncMock(return_value=True)
+    db.list_settings_with_prefix = AsyncMock(return_value={})
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    bot_health.set_loop_stale_override("fx_refresh", 600)
+    db.delete_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/loop-stale",
+        data={
+            "loop_name": "fx_refresh",
+            "loop_stale_seconds": "",
+            "action": "clear",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302, await resp.text()
+    db.delete_setting.assert_awaited_once_with(
+        "BOT_HEALTH_LOOP_STALE_FX_REFRESH_SECONDS",
+    )
+    assert bot_health.get_loop_stale_override("fx_refresh") is None
+    bot_health.reset_loop_stale_overrides_for_tests()
+
+
+async def test_control_loop_stale_post_rejects_below_minimum(
+    aiohttp_client, make_admin_app
+):
+    import bot_health
+
+    bot_health.reset_loop_stale_overrides_for_tests()
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/loop-stale",
+        data={
+            "loop_name": "fx_refresh",
+            "loop_stale_seconds": "0",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+    assert bot_health.get_loop_stale_override("fx_refresh") is None
+
+
+async def test_control_loop_stale_post_rejects_above_maximum(
+    aiohttp_client, make_admin_app
+):
+    import bot_health
+
+    bot_health.reset_loop_stale_overrides_for_tests()
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/loop-stale",
+        data={
+            "loop_name": "fx_refresh",
+            "loop_stale_seconds": str(
+                bot_health.LOOP_STALE_OVERRIDE_MAXIMUM + 1
+            ),
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+    assert bot_health.get_loop_stale_override("fx_refresh") is None
+
+
+async def test_control_loop_stale_post_rejects_unknown_loop(
+    aiohttp_client, make_admin_app
+):
+    """Bug-fix coverage: a typo in ``loop_name`` (or a malicious POST)
+    must NOT write a ``BOT_HEALTH_LOOP_STALE_*_SECONDS`` row that no
+    real loop reads — the panel rejects loops not registered via
+    :func:`bot_health.register_loop`."""
+    import bot_health
+
+    bot_health.reset_loop_stale_overrides_for_tests()
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/loop-stale",
+        data={
+            "loop_name": "totally_made_up_loop",
+            "loop_stale_seconds": "600",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+
+
+async def test_control_loop_stale_post_rejects_blank_set(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/loop-stale",
+        data={
+            "loop_name": "fx_refresh",
+            "loop_stale_seconds": "",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+
+
+async def test_control_loop_stale_post_rejects_unknown_action(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+    db.delete_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/loop-stale",
+        data={
+            "loop_name": "fx_refresh",
+            "loop_stale_seconds": "600",
+            "action": "bogus",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+
+
+async def test_control_loop_stale_post_db_failure_keeps_previous(
+    aiohttp_client, make_admin_app
+):
+    """A transient DB blip on upsert keeps the previous override in
+    place rather than half-applying the change."""
+    import bot_health
+
+    bot_health.reset_loop_stale_overrides_for_tests()
+
+    db = _stub_toggle_db()
+    db.upsert_setting = AsyncMock(side_effect=RuntimeError("DB down"))
+    db.list_settings_with_prefix = AsyncMock(return_value={
+        "BOT_HEALTH_LOOP_STALE_FX_REFRESH_SECONDS": "300",
+    })
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    # GET-render refresh loaded 300 into the cache.
+    assert bot_health.get_loop_stale_override("fx_refresh") == 300
+
+    resp = await client.post(
+        "/admin/control/loop-stale",
+        data={
+            "loop_name": "fx_refresh",
+            "loop_stale_seconds": "777",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert bot_health.get_loop_stale_override("fx_refresh") == 300
+    bot_health.reset_loop_stale_overrides_for_tests()
+
+
+async def test_control_loop_stale_post_csrf_required(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/loop-stale",
+        data={
+            "loop_name": "fx_refresh",
+            "loop_stale_seconds": "600",
+            "action": "set",
+            # No csrf_token — must be rejected.
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 400, 403)
+    db.upsert_setting.assert_not_awaited()
+
+
+async def test_control_loop_stale_post_requires_super(
+    aiohttp_client, make_admin_app
+):
+    """Operator + viewer roles must NOT be able to write per-loop
+    stale-threshold overrides — same posture as the other
+    ``/admin/control/*`` POSTs."""
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    # No login → 401.
+    resp = await client.post(
+        "/admin/control/loop-stale",
+        data={
+            "loop_name": "fx_refresh",
+            "loop_stale_seconds": "600",
+            "action": "set",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 401, 403)
+    db.upsert_setting.assert_not_awaited()
+
+
+def test_audit_action_labels_includes_loop_stale_update():
+    """Regression: ``control_loop_stale_update`` must be listed in
+    ``AUDIT_ACTION_LABELS`` so the ``/admin/audit`` filter dropdown
+    surfaces per-loop stale-threshold changes."""
+    from web_admin import AUDIT_ACTION_LABELS
+
+    assert "control_loop_stale_update" in AUDIT_ACTION_LABELS
+    assert AUDIT_ACTION_LABELS["control_loop_stale_update"] == (
+        "Per-loop stale threshold updated"
+    )
+
+
+async def test_control_get_renders_loop_stale_card(
+    aiohttp_client, make_admin_app
+):
+    """The /admin/control panel renders the new per-loop stale
+    threshold card with the form, the source badge, and at least
+    one registered loop row."""
+    import bot_health
+
+    bot_health.reset_loop_stale_overrides_for_tests()
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/control")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Per-loop stale thresholds" in body
+    assert "/admin/control/loop-stale" in body
+    assert 'name="loop_stale_seconds"' in body
+    # Every production loop should appear; spot-check fx_refresh.
+    assert "fx_refresh" in body
+
+
+async def test_control_get_loop_stale_view_source_db_when_override_set(
+    aiohttp_client, make_admin_app
+):
+    """A saved per-loop override flips the rendered "source" badge to
+    ``db``. This is the panel-side complement to
+    :func:`test_db_override_beats_env_for_per_loop`."""
+    import bot_health
+
+    bot_health.reset_loop_stale_overrides_for_tests()
+    db = _stub_toggle_db()
+    db.list_settings_with_prefix = AsyncMock(return_value={
+        "BOT_HEALTH_LOOP_STALE_FX_REFRESH_SECONDS": "600",
+    })
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/control")
+    assert resp.status == 200
+    body = await resp.text()
+    # The fx_refresh row should now report 600s effective.
+    assert "600s" in body
+    bot_health.reset_loop_stale_overrides_for_tests()
+
+
+# =====================================================================
 # Stage-15-Step-F follow-up #6: per-loop manual "tick now" button
 # =====================================================================
 

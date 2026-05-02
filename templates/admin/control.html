@@ -769,6 +769,115 @@
   </form>
 </div>
 
+<div class="control-card">
+  <h3>⏱ Per-loop stale thresholds</h3>
+  <p>
+    The freshness window beyond which the panel + classifier flag a
+    background loop <em>DEGRADED</em>. Defaults to
+    <code>2&times;cadence + 60s</code> (e.g. a 6h-cadence loop is
+    stale at 12h&nbsp;1m). Save a value here to override per-loop
+    without a redeploy &mdash; useful when a slow-syncing gateway is
+    legitimately late and falsely tripping DEGRADED on the panel.
+    The legacy single-knob
+    <code>BOT_HEALTH_LOOP_STALE_SECONDS</code> still applies to
+    loops that have no cadence registered (extremely rare); use the
+    severity-thresholds card above for that knob.
+  </p>
+  <p style="margin-top: 4px; color: var(--text-muted); font-size: 12px;">
+    The "source" column shows where each loop's threshold comes
+    from. <code>db</code> = saved here, <code>env</code> = process
+    <code>BOT_HEALTH_LOOP_STALE_&lt;NAME&gt;_SECONDS</code>,
+    <code>cadence</code> = derived from the loop's published
+    cadence, <code>default</code> = legacy single-knob fallback.
+    Override range:
+    <code>{{ loop_stale.minimum }}</code>&ndash;<code>{{ loop_stale.maximum }}</code>
+    seconds. Leave the input blank and click "Clear" to drop the
+    DB row and fall back to env / cadence.
+  </p>
+  <table class="signals-table" style="margin-top: 12px;">
+    <thead>
+      <tr>
+        <td class="label">Loop</td>
+        <td class="label">Effective</td>
+        <td class="label">Source</td>
+        <td class="label">Cadence</td>
+        <td class="label">Cadence-derived</td>
+        <td class="label">DB override</td>
+        <td class="label">Env value</td>
+        <td class="label">Update</td>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in loop_stale.rows %}
+      <tr>
+        <td class="label">
+          <code>{{ row.name }}</code><br>
+          <code style="font-size: 11px; opacity: 0.7;">{{ row.setting_key }}</code>
+        </td>
+        <td class="value">{{ "{:,}".format(row.effective) }}s</td>
+        <td class="value">
+          {% if row.source == 'db' %}
+            <span style="color: var(--success);">db</span>
+          {% elif row.source == 'env' %}
+            <span style="color: var(--warn, #f9e2af);">env</span>
+          {% elif row.source == 'cadence' %}
+            <span style="color: var(--text);">cadence</span>
+          {% else %}
+            <span style="color: var(--text-muted);">default</span>
+          {% endif %}
+        </td>
+        <td class="value">
+          {% if row.cadence_s is not none %}
+            {{ "{:,}".format(row.cadence_s) }}s
+          {% else %}
+            <span style="color: var(--text-muted);">(none)</span>
+          {% endif %}
+        </td>
+        <td class="value">
+          {% if row.cadence_derived_s is not none %}
+            {{ "{:,}".format(row.cadence_derived_s) }}s
+          {% else %}
+            <span style="color: var(--text-muted);">(n/a)</span>
+          {% endif %}
+        </td>
+        <td class="value">
+          {% if row.override_value is none %}
+            <span style="color: var(--text-muted);">(not set)</span>
+          {% else %}
+            <code>{{ "{:,}".format(row.override_value) }}s</code>
+          {% endif %}
+        </td>
+        <td class="value">
+          {% if row.env_value is not none %}
+            <code>{{ "{:,}".format(row.env_value) }}s</code>
+          {% else %}
+            <span style="color: var(--text-muted);">(unset)</span>
+          {% endif %}
+        </td>
+        <td class="value">
+          <form method="post" action="/admin/control/loop-stale"
+                style="display: flex; gap: 4px; flex-wrap: wrap; align-items: center;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="loop_name" value="{{ row.name }}">
+            <input type="number" name="loop_stale_seconds"
+                   min="{{ loop_stale.minimum }}"
+                   max="{{ loop_stale.maximum }}"
+                   value="{% if row.override_value is not none %}{{ row.override_value }}{% endif %}"
+                   placeholder="seconds"
+                   style="width: 110px;">
+            <button type="submit" name="action" value="set" class="btn-confirm" style="padding: 4px 10px;">Save</button>
+            <button type="submit" name="action" value="clear" class="btn-secondary"
+                    style="background: transparent; border: 1px solid var(--border, #444); color: var(--text); padding: 4px 10px;">
+              Clear
+            </button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
 <div class="control-card danger-zone">
   <h3>🛑 Force-stop bot</h3>
   <p>

@@ -1224,3 +1224,254 @@ def test_update_loop_cadence_changes_stale_threshold(_isolated_loop_registry):
     assert new_threshold > initial
     # 2 × 600 + 60 (the margin) = 1260.
     assert new_threshold == 1260
+
+
+# ── Stage-15-Step-E #10b row 11: per-loop stale-threshold overrides ──
+
+
+@pytest.fixture()
+def _reset_loop_stale_overrides():
+    """Drop every per-loop override slot before/after a test.
+
+    The override cache is module-state so a test that calls
+    :func:`bh.set_loop_stale_override` would otherwise leak into
+    every later test that reads :func:`bh.loop_stale_threshold_seconds`.
+    """
+    bh.reset_loop_stale_overrides_for_tests()
+    yield
+    bh.reset_loop_stale_overrides_for_tests()
+
+
+def test_loop_stale_setting_key_shape():
+    """The DB key matches the env var name shape so an operator
+    who already knows the env var name finds the same key in the
+    panel and the audit log."""
+    assert bh.loop_stale_setting_key("fx_refresh") == (
+        "BOT_HEALTH_LOOP_STALE_FX_REFRESH_SECONDS"
+    )
+    assert bh.loop_stale_setting_key("zarinpal_backfill") == (
+        "BOT_HEALTH_LOOP_STALE_ZARINPAL_BACKFILL_SECONDS"
+    )
+
+
+def test_loop_stale_setting_key_rejects_empty():
+    with pytest.raises(ValueError):
+        bh.loop_stale_setting_key("")
+
+
+def test_set_loop_stale_override_round_trips(_reset_loop_stale_overrides):
+    bh.set_loop_stale_override("fx_refresh", 1234)
+    assert bh.get_loop_stale_override("fx_refresh") == 1234
+    snap = bh.get_loop_stale_overrides_snapshot()
+    assert snap == {"fx_refresh": 1234}
+    # Mutating the snapshot does not leak into the live cache.
+    snap["fx_refresh"] = 999
+    assert bh.get_loop_stale_override("fx_refresh") == 1234
+
+
+def test_set_loop_stale_override_refuses_below_minimum(
+    _reset_loop_stale_overrides,
+):
+    with pytest.raises(ValueError):
+        bh.set_loop_stale_override("fx_refresh", 0)
+
+
+def test_set_loop_stale_override_refuses_above_maximum(
+    _reset_loop_stale_overrides,
+):
+    with pytest.raises(ValueError):
+        bh.set_loop_stale_override(
+            "fx_refresh", bh.LOOP_STALE_OVERRIDE_MAXIMUM + 1
+        )
+
+
+def test_set_loop_stale_override_refuses_bool(_reset_loop_stale_overrides):
+    """Bug fix coverage: a stored 'true' row must NOT coerce to 1
+    (the True / int subclass trap) and shrink every loop's
+    freshness window to 1 s."""
+    with pytest.raises(ValueError):
+        bh.set_loop_stale_override("fx_refresh", True)  # type: ignore[arg-type]
+
+
+def test_set_loop_stale_override_refuses_empty_name(
+    _reset_loop_stale_overrides,
+):
+    with pytest.raises(ValueError):
+        bh.set_loop_stale_override("", 60)
+
+
+def test_clear_loop_stale_override_returns_true_when_present(
+    _reset_loop_stale_overrides,
+):
+    bh.set_loop_stale_override("fx_refresh", 600)
+    assert bh.clear_loop_stale_override("fx_refresh") is True
+    assert bh.get_loop_stale_override("fx_refresh") is None
+    # Idempotent on a missing name.
+    assert bh.clear_loop_stale_override("fx_refresh") is False
+
+
+def test_db_override_beats_env_for_per_loop(
+    _reset_loop_stale_overrides, monkeypatch,
+):
+    """DB override wins over env so a saved value can't be silently
+    shadowed by an env var left behind on a previous deploy."""
+    monkeypatch.setenv("BOT_HEALTH_LOOP_STALE_FX_REFRESH_SECONDS", "300")
+    bh.set_loop_stale_override("fx_refresh", 7777)
+    assert bh.loop_stale_threshold_seconds("fx_refresh") == 7777
+    assert bh.loop_stale_source("fx_refresh") == "db"
+
+
+def test_env_override_used_when_no_db_override(
+    _reset_loop_stale_overrides, monkeypatch,
+):
+    monkeypatch.setenv("BOT_HEALTH_LOOP_STALE_FX_REFRESH_SECONDS", "555")
+    assert bh.loop_stale_threshold_seconds("fx_refresh") == 555
+    assert bh.loop_stale_source("fx_refresh") == "env"
+
+
+def test_cadence_used_when_no_overrides(
+    _reset_loop_stale_overrides, monkeypatch,
+):
+    monkeypatch.delenv(
+        "BOT_HEALTH_LOOP_STALE_FX_REFRESH_SECONDS", raising=False,
+    )
+    expected = bh.LOOP_CADENCES["fx_refresh"] * 2 + 60
+    assert bh.loop_stale_threshold_seconds("fx_refresh") == expected
+    assert bh.loop_stale_source("fx_refresh") == "cadence"
+
+
+def test_db_override_drives_compute_bot_status(
+    _reset_loop_stale_overrides,
+):
+    """A saved override flips the classifier output without an env
+    var and without a code change."""
+    now = 1_000_000.0
+    cadence_threshold = bh.LOOP_CADENCES["fx_refresh"] * 2 + 60
+    # Last tick 200 s ago — fresh under cadence-derived (~1260 s)
+    # but stale under our forced-tight 100 s override.
+    bh.set_loop_stale_override("fx_refresh", 100)
+    status = bh.compute_bot_status(
+        inflight_count=0,
+        ipn_drops_total=0,
+        loop_ticks={"fx_refresh": now - 200.0},
+        expected_loops=("fx_refresh",),
+        db_error=None,
+        login_throttle_active_keys=0,
+        now=now,
+        process_start_epoch=now - 100_000.0,
+    )
+    assert status.level is bh.BotStatusLevel.DEGRADED
+    # Sanity: with no override the same scenario is fresh.
+    bh.clear_loop_stale_override("fx_refresh")
+    fresh = bh.compute_bot_status(
+        inflight_count=0,
+        ipn_drops_total=0,
+        loop_ticks={"fx_refresh": now - 200.0},
+        expected_loops=("fx_refresh",),
+        db_error=None,
+        login_throttle_active_keys=0,
+        now=now,
+        process_start_epoch=now - 100_000.0,
+    )
+    assert fresh.level is not bh.BotStatusLevel.DEGRADED
+    # Threshold sanity check.
+    assert 200 < cadence_threshold
+
+
+@pytest.mark.asyncio
+async def test_refresh_loop_stale_overrides_loads_db_rows(
+    _reset_loop_stale_overrides,
+):
+    """A round-trip through ``list_settings_with_prefix`` populates
+    the cache and excludes the legacy single-knob row."""
+
+    class _DB:
+        def __init__(self, rows):
+            self._rows = rows
+
+        async def list_settings_with_prefix(self, prefix):
+            return {
+                k: v for k, v in self._rows.items()
+                if k.startswith(prefix)
+            }
+
+    db = _DB({
+        # Should be picked up by the per-loop refresh.
+        "BOT_HEALTH_LOOP_STALE_FX_REFRESH_SECONDS": "600",
+        "BOT_HEALTH_LOOP_STALE_ZARINPAL_BACKFILL_SECONDS": "1800",
+        # Legacy single-knob — owned by the global threshold cache.
+        "BOT_HEALTH_LOOP_STALE_SECONDS": "120",
+        # Garbage / out-of-range — silently skipped.
+        "BOT_HEALTH_LOOP_STALE_GARBAGE_SECONDS": "not-an-int",
+        "BOT_HEALTH_LOOP_STALE_TOO_BIG_SECONDS": str(
+            bh.LOOP_STALE_OVERRIDE_MAXIMUM + 1
+        ),
+        # Different prefix — must not appear.
+        "OTHER_KEY": "999",
+    })
+    snap = await bh.refresh_loop_stale_overrides_from_db(db)
+    assert snap == {
+        "fx_refresh": 600,
+        "zarinpal_backfill": 1800,
+    }
+
+
+@pytest.mark.asyncio
+async def test_refresh_loop_stale_overrides_handles_db_failure(
+    _reset_loop_stale_overrides,
+):
+    """A transient DB error keeps the existing cache in place rather
+    than reverting every saved override mid-incident."""
+
+    class _DB:
+        async def list_settings_with_prefix(self, prefix):
+            raise RuntimeError("connection lost")
+
+    bh.set_loop_stale_override("fx_refresh", 500)
+    snap = await bh.refresh_loop_stale_overrides_from_db(_DB())
+    assert snap == {"fx_refresh": 500}
+
+
+@pytest.mark.asyncio
+async def test_refresh_loop_stale_overrides_handles_none_db(
+    _reset_loop_stale_overrides,
+):
+    """A ``None`` db (called from a test app or before connect) is
+    a clean no-op rather than a TypeError."""
+    bh.set_loop_stale_override("fx_refresh", 500)
+    snap = await bh.refresh_loop_stale_overrides_from_db(None)
+    assert snap == {"fx_refresh": 500}
+
+
+# ── Bundled bug fix: defensive coercion in the global refresher ──
+
+
+@pytest.mark.asyncio
+async def test_refresh_threshold_overrides_skips_non_string_row():
+    """Bug fix coverage: a single non-string row in the
+    ``system_settings`` overlay (e.g. an int from a future schema
+    change) must NOT abort the whole refresh — the remaining valid
+    rows still apply.
+
+    Pre-fix: ``(value or "").strip()`` raised ``AttributeError`` on
+    a non-str-non-None row, which propagated up and reverted every
+    other override that hadn't been touched in the same load.
+    """
+    class _DB:
+        async def list_settings_with_prefix(self, prefix):
+            return {
+                # Bad row first to exercise the "single bad row
+                # poisons the rest" failure mode.
+                "BOT_HEALTH_BUSY_INFLIGHT": 7,  # non-str — used to AttributeError
+                "BOT_HEALTH_LOOP_STALE_SECONDS": "120",
+            }
+
+    bh._THRESHOLD_OVERRIDES.clear()
+    snap = await bh.refresh_threshold_overrides_from_db(_DB())
+    # Both rows accepted: int coerces via _coerce_setting_to_str,
+    # str passes through unchanged.
+    assert snap == {
+        "BOT_HEALTH_BUSY_INFLIGHT": 7,
+        "BOT_HEALTH_LOOP_STALE_SECONDS": 120,
+    }
+    bh._THRESHOLD_OVERRIDES.clear()

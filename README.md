@@ -806,6 +806,31 @@ NowPayments crypto invoices.
   in a `try/except` that falls back to the previous threshold (logged
   at ERROR) rather than letting a transient resolver blip propagate
   up and starve the loop. Stage-15-Step-E #10b row 10.
+- **Tunable per-loop stale thresholds** — the
+  `BOT_HEALTH_LOOP_STALE_<NAME>_SECONDS` knobs (default
+  `2 × cadence + 60s`) are now editable per-loop from
+  `/admin/control` instead of being env-only. A new "⏱ Per-loop
+  stale thresholds" card renders one row per registered loop with
+  effective / source / cadence / cadence-derived / DB / env columns
+  and inline Save+Clear forms. Saved overrides take effect on the
+  next panel render and next classifier read (no restart) — DB
+  beats env so a saved override cannot be silently shadowed by a
+  stale env left behind from a previous deploy. Useful when a
+  slow-syncing gateway is legitimately late and falsely tripping
+  DEGRADED on the panel for `zarinpal_backfill`, or when the
+  `2 × cadence + 60s` default isn't right for a long-cadence job.
+  Override range bounded to `[1, 604_800]` seconds (1 week); an
+  explicit `bool` rejection in the coercer prevents a stored
+  `"true"` row from shrinking every loop's freshness window to 1s
+  and painting the whole panel red; the POST handler validates
+  `loop_name` against `metrics._LOOP_METRIC_NAMES` so a typo can't
+  write a row no real loop reads. Bundled bug fix:
+  `refresh_threshold_overrides_from_db` previously raised
+  `AttributeError` on a non-string-non-None row in `system_settings`
+  (e.g. an int from a future schema change), poisoning the whole
+  load and reverting every other override; the refresh now coerces
+  via `_coerce_setting_to_str` so a single garbage row only drops
+  itself. Stage-15-Step-E #10b row 11.
 
 For the full project history, file map, and roadmap **read [HANDOFF.md](./HANDOFF.md)**.
 
