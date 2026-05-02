@@ -2141,7 +2141,7 @@ or unblock other work.
 | 8 | **`MEMORY_CONTEXT_LIMIT` / `MEMORY_CONTENT_MAX_CHARS`** — conversation memory caps. | Env-only. | Editor on a new `/admin/memory-config` page. | P3 | Pending |
 | 9 | **Pending-PENDING expiration window** (`PENDING_EXPIRATION_HOURS_DEFAULT`; the actual env-var name in `pending_expiration.py` is `PENDING_EXPIRATION_HOURS`). | Env-only. | Editor on `/admin/control` or `/admin/payments`. | P3 | **Shipped** (this PR — DB-backed override layer in `pending_expiration.py` + boot warm-up + `/admin/control` editor card with set / clear actions, audit row `control_expiration_hours_update`, source badge, audit `meta` carries `threshold_hours_used`). |
 | 10 | **Stuck-PENDING alert threshold** (`PENDING_ALERT_THRESHOLD_HOURS`). | Env-only. | Editor on `/admin/control`. | P3 | **Shipped** (this PR — DB-backed override layer in `pending_alert.py` + boot warm-up + `/admin/control` editor card with set / clear actions, audit row `control_alert_threshold_update`, source badge, iteration-time re-read in `_alert_loop` so a saved override is live on the next tick). |
-| 11 | **Per-loop cadence overrides** (`BOT_HEALTH_LOOP_STALE_<NAME>_SECONDS`). | Env-only. | Editor on `/admin/control` (one row per loop name). | P3 | Pending |
+| 11 | **Per-loop cadence overrides** (`BOT_HEALTH_LOOP_STALE_<NAME>_SECONDS`). | Env-only. | Editor on `/admin/control` (one row per loop name). | P3 | **Shipped** (this PR — DB-backed `_LOOP_STALE_OVERRIDES` cache in `bot_health.py` + `refresh_loop_stale_overrides_from_db` + `_stale_threshold_seconds` consults DB before env, panel `_build_loop_stale_view` per-loop card with cadence / cadence-derived / env / DB / effective / source columns + per-row Save/Clear forms, `control_loop_stale_post` validates against `metrics._LOOP_METRIC_NAMES` so a typo can't write a row no real loop reads, audit slug `control_loop_stale_update`, boot warm-up in `main.py`. **Bundled bug fix:** `refresh_threshold_overrides_from_db` previously raised `AttributeError` on a non-string-non-None row in `system_settings` (e.g. an int from a future schema change), poisoning the whole load and reverting every other override; the refresh now coerces via `_coerce_setting_to_str` so a single garbage row only drops itself.) |
 | 12 | **`COST_MARKUP` history & analytics** — operator can see when markup last changed and the impact on revenue. | Not tracked. | Markup-history table + revenue-attribution chart on `/admin/monetization`. | P2 | Pending |
 | 13 | **Per-user revenue contribution panel** — top spenders. | Existed in `get_monetization_summary` aggregates but not surfaced. | New "Top users" tab on `/admin/monetization`. | P2 | **Shipped** (PR #166) |
 | 14 | **Disable individual gateways** (NowPayments / TetraPay / Zarinpal). | DB row in `disabled_gateways` (already wired via `/admin/gateways`). | Already exposed — but no per-currency granularity. Add per-crypto toggle. | P3 | Partial |
@@ -2745,6 +2745,138 @@ by `test_alert_loop_keeps_previous_threshold_when_resolver_raises`.
   handler (auth / CSRF / persist / clear / below-minimum /
   above-max / non-int / blank-set / unknown-action / DB-blip),
   the GET-render card, and the audit-slug regression.
+
+### §10b.7 — Row #11 (per-loop stale-threshold web surface) — shipped
+
+**Diagnosis.** Per-loop stale thresholds
+(`BOT_HEALTH_LOOP_STALE_<UPPER_NAME>_SECONDS`, e.g.
+`BOT_HEALTH_LOOP_STALE_FX_REFRESH_SECONDS=900`) were env-only.
+Operators who needed to widen one specific loop's freshness
+window — e.g. a slow-syncing gateway is legitimately late and
+falsely tripping `DEGRADED` on the panel for `zarinpal_backfill`,
+or a long-cadence job's `2 × cadence + 60s` default isn't right
+for the deploy — had to redeploy. The four global knobs from
+Stage-15-Step-F's threshold editor (busy-inflight, legacy single
+loop-stale, IPN drop attack, login throttle attack) are not
+per-loop, so the existing card couldn't cover this gap.
+
+**Surface.** A new "⏱ Per-loop stale thresholds" card on
+`/admin/control` next to the existing four control-panel cards,
+rendering one row per registered loop with `effective` / `source`
+/ `cadence` / `cadence-derived` / `DB override` / `env value` /
+inline Save+Clear form. The classifier, the panel tile, and
+Prometheus heartbeats all read the resolved threshold via
+`bot_health.loop_stale_threshold_seconds(name)` so they cannot
+disagree.
+
+**DB layer.** `bot_health.py` gains a second cache parallel to
+`_THRESHOLD_OVERRIDES`:
+
+- `LOOP_STALE_OVERRIDE_MINIMUM = 1` (matches the global key's
+  minimum) and `LOOP_STALE_OVERRIDE_MAXIMUM = 86_400 × 7` (1
+  week — wide enough for daily-cadence loops with multi-day
+  backoff, narrow enough to reject a `604_800_000` ms-instead-of-s
+  typo at validation rather than silently disabling stale
+  detection forever).
+- `_LOOP_STALE_OVERRIDES: dict[str, int]` — keyed by loop name
+  (e.g. `"fx_refresh"` → `600`).
+- `loop_stale_setting_key(name)` — single source of truth for the
+  `BOT_HEALTH_LOOP_STALE_<UPPER>_SECONDS` shape so the env path,
+  the DB path, and the panel template can't drift.
+- `_coerce_loop_stale_seconds(value)` — explicit `bool` rejection
+  (so a stored `"true"` row can't coerce to `1` and shrink every
+  loop's freshness window to 1s, painting the whole panel red),
+  int coercion, range check.
+- `set_/clear_/get_loop_stale_override(name)` and
+  `get_loop_stale_overrides_snapshot()` — module-level cache
+  helpers; `set_*` re-validates as defence-in-depth.
+- `refresh_loop_stale_overrides_from_db(database)` — async,
+  best-effort. Transient `list_settings_with_prefix` error keeps
+  the cache in place (logs at ERROR). Skips the legacy
+  `BOT_HEALTH_LOOP_STALE_SECONDS` key (owned by the global
+  threshold cache). Atomic swap so a partial update can't leave
+  half-loaded state.
+- `_stale_threshold_seconds(name, ...)` consults
+  `_LOOP_STALE_OVERRIDES` BEFORE the env var so a saved DB value
+  cannot be silently shadowed by a stale env override left behind
+  on a previous deploy.
+- `loop_stale_source(name)` — returns
+  `"db" / "env" / "cadence" / "default"` so the panel can render
+  the same source badge it uses for the global threshold card.
+- `reset_loop_stale_overrides_for_tests()` — test helper.
+
+**Boot warm-up.** `main.py` now calls
+`refresh_loop_stale_overrides_from_db(db)` after the Row-#10
+warm-up so the very first `compute_bot_status` call after boot
+sees the operator's per-loop overrides rather than reverting to
+env / cadence-derived for one render. Best-effort — a startup DB
+blip logs `failed to load BOT_HEALTH_LOOP_STALE_*_SECONDS
+overrides from DB`.
+
+**Web surface.**
+
+- `_build_loop_stale_view()` returns
+  `{"rows": [...], "minimum": ..., "maximum": ...}` where each
+  row carries `name` / `setting_key` / `cadence_s` /
+  `cadence_derived_s` / `env_value` / `env_raw` / `override_value`
+  / `effective` / `source`. Iterates `metrics._LOOP_METRIC_NAMES`
+  so a future loop registered via
+  `bot_health.register_loop` automatically gets a row without
+  touching this module.
+- `control_get` calls `refresh_loop_stale_overrides_from_db` on
+  every page render so a DB poke from another admin instance
+  becomes visible in this process within one HTTP round-trip.
+- `control_loop_stale_post` (`POST /admin/control/loop-stale`,
+  `ROLE_SUPER`) — CSRF guard, action allowlist (`set` / `clear`),
+  loop-name validation against `metrics._LOOP_METRIC_NAMES` (a
+  typo or malicious POST is rejected before it can write a
+  `BOT_HEALTH_LOOP_STALE_*_SECONDS` row that no real loop reads),
+  coerce + range-check, upsert / delete `system_settings`,
+  refresh cache, audit row `control_loop_stale_update` with
+  `meta = {action, loop, setting_key, before, before_source,
+  after, after_source}`, redirect with flash.
+- Audit slug `control_loop_stale_update` =
+  `"Per-loop stale threshold updated"` registered in
+  `AUDIT_ACTION_LABELS` so `/admin/audit` filter dropdown
+  surfaces this row type.
+- `templates/admin/control.html` gets the new card with one row
+  per loop, source badge, and inline Save/Clear form bounded by
+  `loop_stale.minimum` / `loop_stale.maximum`.
+
+**Bundled bug fix.** Pre-row-11,
+`refresh_threshold_overrides_from_db` did
+`(value or "").strip()` on every row — which `AttributeError`-ed
+on a non-string-non-None row in `system_settings` (e.g. an int
+written by a future `upsert_setting` overload, or a historical
+row left over from a different schema). The whole refresh would
+then bubble up to the caller and leave the override cache
+half-loaded — every key after the bad row would silently fall
+through to env / default for that load. The fix:
+
+- New `_coerce_setting_to_str(key, value)` helper coerces `None →
+  ""`, str through, anything else via `str()`, falling back to
+  `""` if even `str()` fails. Logs at WARNING for non-coercible
+  rows so the bad row is visible without aborting the load.
+- `refresh_threshold_overrides_from_db` now goes through
+  `_coerce_setting_to_str(...).strip()`. The new `refresh_loop_
+  stale_overrides_from_db` uses the same helper from day one.
+- Pinned by `test_refresh_threshold_overrides_skips_non_string_row`.
+
+**Tests.** All running, all green (2971 passed, 9 skipped — was
+2942 baseline, +29 new):
+
+- `tests/test_bot_health.py` — 22 new tests covering the per-loop
+  override layer (round-trip / minimum / maximum / bool rejection
+  / empty name / clear-returns-bool / DB-beats-env / env-when-no-DB
+  / cadence-when-no-overrides / classifier integration / refresh
+  loads + skips legacy + handles DB failure + handles None DB)
+  plus 1 regression test for the bundled
+  `refresh_threshold_overrides_from_db` non-str-row bug fix.
+- `tests/test_web_admin.py` — 12 new tests covering the new POST
+  handler (auth / CSRF / persist / clear / below-minimum /
+  above-max / unknown-loop / blank-set / unknown-action / DB-blip
+  / requires-super), the GET-render card, the source-badge
+  rendering, and the audit-slug regression.
 
 ---
 

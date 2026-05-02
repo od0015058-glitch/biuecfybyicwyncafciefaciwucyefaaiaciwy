@@ -470,6 +470,31 @@ async def main():
             "— falling through to env / compile-time default"
         )
 
+    # Stage-15-Step-E #10b row 11: warm the per-loop stale-threshold
+    # override cache so the very first ``compute_bot_status`` call
+    # after boot (the panel, /metrics, the alert loop) sees the
+    # operator's per-loop overrides rather than reverting to env /
+    # cadence-derived for one render. Best-effort — a transient DB
+    # blip leaves the cache empty and the classifier falls through
+    # to env / cadence / fallback for every loop, which is exactly
+    # the pre-row-11 behaviour.
+    try:
+        from bot_health import refresh_loop_stale_overrides_from_db
+        loaded_loop_stale = await (
+            refresh_loop_stale_overrides_from_db(db)
+        )
+        if loaded_loop_stale:
+            log.info(
+                "loaded BOT_HEALTH_LOOP_STALE_*_SECONDS overrides from "
+                "system_settings: %s",
+                sorted(loaded_loop_stale.items()),
+            )
+    except Exception:
+        log.exception(
+            "failed to load BOT_HEALTH_LOOP_STALE_*_SECONDS overrides "
+            "from DB — falling through to env / cadence / default"
+        )
+
     # Overwrite BotFather's cached slash-command list with the
     # canonical one. Without this, Telegram shows whatever was last
     # typed into the BotFather "Edit Commands" panel — including

@@ -2599,6 +2599,15 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     # only" so a "why did the alert DM stop firing for 4-hour-stuck
     # invoices?" investigation can pin the cause to a knob tweak.
     "control_alert_threshold_update": "Pending-alert threshold updated",
+    # Stage-15-Step-E #10b row 11: per-loop stale-threshold editor
+    # on ``/admin/control``. Recorded by
+    # :func:`control_loop_stale_post`; the dropdown entry lets an
+    # operator filter the audit feed to "per-loop freshness window
+    # changes only" so a "why did the panel stop / start flagging
+    # zarinpal_backfill stale at 1h?" investigation can pin the
+    # cause to a knob tweak vs. a real change in the loop's actual
+    # ticking cadence.
+    "control_loop_stale_update": "Per-loop stale threshold updated",
 }
 
 
@@ -7798,6 +7807,23 @@ async def control_get(request: web.Request) -> web.StreamResponse:
                 "control: refresh_alert_threshold_override_from_db failed"
             )
 
+    # Stage-15-Step-E #10b row 11: refresh the per-loop stale
+    # threshold overrides so the panel + the classifier + Prometheus
+    # all see the same per-loop freshness windows on the next render
+    # / tick. Best-effort — a transient DB blip leaves the previous
+    # cache in place rather than reverting every saved override to
+    # env / cadence-derived mid-incident.
+    if db is not None:
+        try:
+            import bot_health
+            await (
+                bot_health.refresh_loop_stale_overrides_from_db(db)
+            )
+        except Exception:
+            log.exception(
+                "control: refresh_loop_stale_overrides_from_db failed"
+            )
+
     # Read the bot-health alert loop's most-recent rate-windowed drop
     # count so the panel + the loop + Prometheus all classify
     # identically. The panel can't observe a rate-of-drops on its own
@@ -7827,6 +7853,7 @@ async def control_get(request: web.Request) -> web.StreamResponse:
     alert_interval_view = _build_alert_interval_view()
     expiration_hours_view = _build_expiration_hours_view()
     alert_threshold_view = _build_alert_threshold_view()
+    loop_stale_view = _build_loop_stale_view()
 
     ctx = {
         "active_page": "control",
@@ -7839,6 +7866,7 @@ async def control_get(request: web.Request) -> web.StreamResponse:
         "alert_interval": alert_interval_view,
         "expiration_hours": expiration_hours_view,
         "alert_threshold": alert_threshold_view,
+        "loop_stale": loop_stale_view,
     }
     response = aiohttp_jinja2.render_template("control.html", request, ctx)
     flash = pop_flash(request, response)
@@ -7917,6 +7945,90 @@ def _build_thresholds_view() -> list[dict]:
             "minimum": bot_health.THRESHOLD_MINIMUMS.get(key, 1),
         })
     return rows
+
+
+def _build_loop_stale_view() -> dict:
+    """Snapshot of every registered loop's stale threshold + breakdown.
+
+    Stage-15-Step-E #10b row 11. The global ``BOT_HEALTH_*`` editor
+    above only covers the four global knobs (busy inflight, legacy
+    fallback, IPN drop attack, login-throttle attack). The per-loop
+    stale threshold (the freshness window beyond which the panel +
+    classifier flag a loop DEGRADED) is its own knob per loop —
+    ``BOT_HEALTH_LOOP_STALE_<UPPER_NAME>_SECONDS`` — and was env-only
+    until this row.
+
+    The view returns ``{"rows": [...], "minimum": ..., "maximum": ...}``
+    so the template can render bound hints once at the top of the
+    card and a row per loop with effective / source / cadence /
+    override-input — same shape as the other ``/admin/control``
+    cards.
+
+    Each row carries:
+
+    * ``name`` — registered loop name (e.g. ``"fx_refresh"``).
+    * ``setting_key`` — full ``BOT_HEALTH_LOOP_STALE_*_SECONDS`` key
+      so the template input has a stable ``name=`` attr.
+    * ``cadence_s`` — published cadence (``None`` if the loop has
+      no cadence registered yet — extremely rare; only happens for
+      a loop registered without cadence in tests).
+    * ``cadence_derived_s`` — ``2 × cadence + 60``, what the panel
+      would use without any override.
+    * ``env_value`` / ``env_raw`` — parsed env override or ``None``.
+    * ``override_value`` — DB-stored override or ``None``.
+    * ``effective`` — what the panel + classifier actually use.
+    * ``source`` — ``"db" / "env" / "cadence" / "default"``.
+    """
+    import bot_health
+
+    try:
+        from metrics import _LOOP_METRIC_NAMES  # type: ignore
+    except Exception:
+        log.exception("control: metrics._LOOP_METRIC_NAMES import failed")
+        loop_names: tuple[str, ...] = ()
+    else:
+        loop_names = _LOOP_METRIC_NAMES
+    overrides = bot_health.get_loop_stale_overrides_snapshot()
+    rows: list[dict] = []
+    for name in sorted(loop_names):
+        cadence = bot_health.loop_cadence_seconds(name)
+        cadence_derived: int | None
+        if cadence is not None:
+            cadence_derived = (
+                cadence * 2
+                + bot_health._STALE_THRESHOLD_MARGIN_SECONDS
+            )
+        else:
+            cadence_derived = None
+        env_key = bot_health.loop_stale_setting_key(name)
+        env_raw = os.getenv(env_key, "").strip()
+        env_value: int | None = None
+        if env_raw:
+            try:
+                parsed = int(env_raw)
+            except ValueError:
+                env_value = None
+            else:
+                env_value = parsed if parsed > 0 else None
+        override_value = overrides.get(name)
+        effective = bot_health.loop_stale_threshold_seconds(name)
+        source = bot_health.loop_stale_source(name)
+        rows.append({
+            "name": name,
+            "setting_key": env_key,
+            "cadence_s": cadence,
+            "cadence_derived_s": cadence_derived,
+            "env_value": env_value,
+            "env_raw": env_raw,
+            "override_value": override_value,
+            "effective": effective,
+            "source": source,
+        })
+    return {
+        "rows": rows,
+        "minimum": bot_health.LOOP_STALE_OVERRIDE_MINIMUM,
+        "maximum": bot_health.LOOP_STALE_OVERRIDE_MAXIMUM,
+    }
 
 
 def _build_required_channel_view() -> dict:
@@ -9730,6 +9842,282 @@ async def control_alert_threshold_post(
     return response
 
 
+async def control_loop_stale_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/control/loop-stale`` — update a per-loop stale window.
+
+    Stage-15-Step-E #10b row 11. Per-loop ``BOT_HEALTH_LOOP_STALE_*_
+    SECONDS`` knobs were env-only, so an operator who needed to widen
+    a single loop's freshness window (e.g. a slow-syncing gateway is
+    legitimately late and falsely tripping DEGRADED on the panel)
+    had to redeploy. This handler writes a per-loop override to the
+    ``system_settings`` overlay (DB-backed), refreshes the in-process
+    cache so the next ``compute_bot_status`` reflects the change
+    without a restart, and audit-logs a row whose ``meta`` carries
+    the diff.
+
+    Form keys:
+
+    * ``loop_name`` — the registered loop name to update (validated
+      against ``metrics._LOOP_METRIC_NAMES`` so a typo is rejected
+      rather than persisted as a row that no loop reads).
+    * ``loop_stale_seconds`` — new threshold in seconds (only honoured
+      when ``action=="set"``).
+    * ``action`` — ``"set"`` writes the value, ``"clear"`` deletes
+      the row and falls through to env / cadence / default. The form
+      uses two distinct submit buttons so the operator can't blank
+      the field and accidentally trigger an unintended clear.
+
+    Validation order (mirrors :func:`control_alert_threshold_post`):
+
+    1. CSRF.
+    2. Action allowlist (``set`` / ``clear``).
+    3. ``loop_name`` is non-empty + appears in
+       ``metrics._LOOP_METRIC_NAMES`` (a future loop ships its row by
+       calling :func:`bot_health.register_loop`; the panel iterates
+       that registry so it can't drift).
+    4. For ``set``: parse + validate seconds against
+       ``[LOOP_STALE_OVERRIDE_MINIMUM, LOOP_STALE_OVERRIDE_MAXIMUM]``.
+    5. ``set_loop_stale_override`` defence-in-depth.
+    6. Persist via ``upsert_setting`` / ``delete_setting``.
+    7. Audit row.
+    8. Redirect with a flash banner.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app.get(APP_KEY_DB)
+    form = await request.post()
+
+    guard = _control_csrf_guard(request, form)
+    if guard is not None:
+        return guard
+
+    if db is None:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Database is not configured — per-loop stale-threshold "
+                "edits require a live DB connection."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    import bot_health
+
+    action = str(form.get("action", "set")).strip().lower()
+    if action not in {"set", "clear"}:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Unknown loop-stale action {action!r}. "
+                "Expected 'set' or 'clear'. No changes were made."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    loop_name = str(form.get("loop_name", "")).strip()
+    if not loop_name:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Missing loop_name. No changes were made."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    # Reject a loop_name that isn't actually registered. This catches
+    # typos AND prevents a malicious POST from writing arbitrary
+    # ``BOT_HEALTH_LOOP_STALE_*_SECONDS`` rows that no real loop reads.
+    try:
+        from metrics import _LOOP_METRIC_NAMES  # type: ignore
+    except Exception:
+        log.exception(
+            "control_loop_stale_post: metrics._LOOP_METRIC_NAMES "
+            "import failed"
+        )
+        _LOOP_METRIC_NAMES = ()  # type: ignore
+    if loop_name not in _LOOP_METRIC_NAMES:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Unknown loop {loop_name!r}. The per-loop stale "
+                f"editor only accepts loops registered via "
+                f"bot_health.register_loop. No changes were made."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    setting_key = bot_health.loop_stale_setting_key(loop_name)
+    previous_effective = bot_health.loop_stale_threshold_seconds(loop_name)
+    previous_source = bot_health.loop_stale_source(loop_name)
+
+    if action == "clear":
+        try:
+            await db.delete_setting(setting_key)
+        except Exception:
+            log.exception(
+                "control_loop_stale_post: delete_setting failed key=%r",
+                setting_key,
+            )
+            response = web.HTTPFound(location="/admin/control")
+            set_flash(
+                response, kind="error",
+                message=(
+                    f"Failed to clear the {setting_key} override — "
+                    "see logs. The previous value is still in effect."
+                ),
+                secret=secret, cookie_secure=cookie_secure,
+            )
+            return response
+        bot_health.clear_loop_stale_override(loop_name)
+        try:
+            await bot_health.refresh_loop_stale_overrides_from_db(db)
+        except Exception:
+            log.exception(
+                "control_loop_stale_post: refresh after clear failed"
+            )
+        new_effective = bot_health.loop_stale_threshold_seconds(loop_name)
+        new_source = bot_health.loop_stale_source(loop_name)
+        await _record_audit_safe(
+            request, "control_loop_stale_update",
+            target=loop_name,
+            meta={
+                "action": "clear",
+                "loop": loop_name,
+                "setting_key": setting_key,
+                "before": previous_effective,
+                "before_source": previous_source,
+                "after": new_effective,
+                "after_source": new_source,
+            },
+        )
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="success",
+            message=(
+                f"{loop_name} stale-threshold override cleared. The "
+                f"effective threshold is now {new_effective}s "
+                f"(source: {new_source})."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    # action == "set". Validate + persist + apply.
+    raw_value = str(form.get("loop_stale_seconds", "")).strip()
+    if not raw_value:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Loop stale threshold cannot be blank when applying "
+                "a 'set'. Use 'Clear' to drop the override."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    coerced = bot_health._coerce_loop_stale_seconds(raw_value)
+    if coerced is None:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"{setting_key} must be an integer in "
+                f"[{bot_health.LOOP_STALE_OVERRIDE_MINIMUM}, "
+                f"{bot_health.LOOP_STALE_OVERRIDE_MAXIMUM}] "
+                f"(got {raw_value!r}). No changes were made."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        await db.upsert_setting(setting_key, str(coerced))
+    except Exception:
+        log.exception(
+            "control_loop_stale_post: upsert_setting failed "
+            "key=%r value=%r",
+            setting_key, coerced,
+        )
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Failed to persist the new {loop_name} stale "
+                f"threshold — see logs. The previous value is still "
+                f"in effect."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        bot_health.set_loop_stale_override(loop_name, coerced)
+    except ValueError:
+        log.exception(
+            "control_loop_stale_post: set_loop_stale_override rejected "
+            "%r after upsert succeeded — refreshing from DB",
+            coerced,
+        )
+
+    try:
+        await bot_health.refresh_loop_stale_overrides_from_db(db)
+    except Exception:
+        log.exception(
+            "control_loop_stale_post: refresh after upsert failed"
+        )
+
+    new_effective = bot_health.loop_stale_threshold_seconds(loop_name)
+    new_source = bot_health.loop_stale_source(loop_name)
+    await _record_audit_safe(
+        request, "control_loop_stale_update",
+        target=loop_name,
+        meta={
+            "action": "set",
+            "loop": loop_name,
+            "setting_key": setting_key,
+            "before": previous_effective,
+            "before_source": previous_source,
+            "after": new_effective,
+            "after_source": new_source,
+        },
+    )
+
+    response = web.HTTPFound(location="/admin/control")
+    if new_effective == previous_effective:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"{loop_name} stale threshold unchanged "
+                f"({new_effective}s). The override is now "
+                f"persisted in the DB."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    else:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"{loop_name} stale threshold updated: "
+                f"{previous_effective}s → {new_effective}s. The new "
+                f"threshold is live for the panel, the classifier, "
+                f"and Prometheus on the next read."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    return response
+
+
 # ---------------------------------------------------------------------
 # Stage-15-Step-E #5 follow-up #4: per-template globals.
 # ---------------------------------------------------------------------
@@ -10255,6 +10643,15 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/control/alert-threshold",
         _require_role(ROLE_SUPER)(control_alert_threshold_post),
+    )
+    # Stage-15-Step-E #10b row 11: per-loop stale-threshold editor
+    # on /admin/control. Lets an operator widen / shrink a single
+    # loop's freshness window without a redeploy. The classifier and
+    # the panel both read the resolved threshold on every render
+    # so the new value takes effect on the next refresh.
+    app.router.add_post(
+        "/admin/control/loop-stale",
+        _require_role(ROLE_SUPER)(control_loop_stale_post),
     )
     # Stage-15-Step-F follow-up #6: per-loop manual "tick now" button.
     app.router.add_post(
