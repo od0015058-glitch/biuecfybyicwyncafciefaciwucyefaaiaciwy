@@ -337,4 +337,94 @@
     </form>
   </details>
 </div>
+
+{# Stage-15-Step-E #10b row 24: FX_REFRESH_INTERVAL_SECONDS editor.
+   USD→Toman refresher cadence. Same "effective / db / env / default"
+   breakdown as the other wallet-config knobs. Re-read on every
+   refresher tick so a saved override is live without a redeploy. #}
+<div class="panel" style="margin-top: 1em;">
+  <h3>💱 USD→Toman refresher cadence</h3>
+  <p style="margin: 0 0 0.75em 0;">
+    Effective interval:
+    <strong>{{ fx_refresh_view.effective_human }}</strong>
+    ({{ fx_refresh_view.effective }}s)
+    &nbsp;<span class="badge badge-{{ fx_refresh_view.source }}">source: {{ fx_refresh_view.source }}</span>
+  </p>
+  <p style="color: var(--text-muted); margin: 0 0 0.75em 0; font-size: 0.9em;">
+    How often the FX refresher polls the configured upstream
+    (<code>FX_RATE_SOURCE</code>) for the live USD→Toman rate. The
+    rate snapshot powers the wallet UI's Toman display, the Custom
+    (Toman) top-up flow, and the per-invoice locked rate at
+    order-creation time. A shorter interval means more accurate
+    rates (and more upstream calls — be careful with rate-limited
+    APIs); a longer interval means the wallet may render
+    "(approx)" markers for users.
+  </p>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-muted); font-size: 0.9em;">
+      Edit FX-refresh interval (operator+)
+    </summary>
+    <table style="margin: 0.75em 0; font-size: 0.9em; max-width: 36em;">
+      <tbody>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;">DB override</td>
+          <td>
+            {% if fx_refresh_view.override_value is not none %}
+              <strong>{{ fx_refresh_view.override_value_human }}</strong>
+              ({{ fx_refresh_view.override_value }}s)
+            {% else %}
+              <span style="color: var(--text-muted);">(none — fall through to env / default)</span>
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;">Env (<code>FX_REFRESH_INTERVAL_SECONDS</code>)</td>
+          <td>
+            {% if fx_refresh_view.env_value is not none %}
+              {{ fx_refresh_view.env_value_human }}
+              ({{ fx_refresh_view.env_value }}s)
+            {% elif fx_refresh_view.env_raw %}
+              <span style="color: var(--text-warn);">{{ fx_refresh_view.env_raw }} (rejected — see logs)</span>
+            {% else %}
+              <span style="color: var(--text-muted);">(unset)</span>
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;">Compile-time default</td>
+          <td>{{ fx_refresh_view.default_human }} ({{ fx_refresh_view.default_value }}s)</td>
+        </tr>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;"><strong>Effective</strong></td>
+          <td><strong>{{ fx_refresh_view.effective_human }}</strong> ({{ fx_refresh_view.effective }}s) (source: {{ fx_refresh_view.source }})</td>
+        </tr>
+      </tbody>
+    </table>
+    <form method="post"
+          action="/admin/wallet-config/fx-refresh"
+          style="display: flex; gap: 0.75em; align-items: baseline; flex-wrap: wrap;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>
+        New interval (seconds)
+        <input type="number"
+               name="fx_refresh_interval_seconds"
+               step="1"
+               min="{{ fx_refresh_view.minimum }}"
+               max="{{ fx_refresh_view.maximum }}"
+               value="{% if fx_refresh_view.override_value is not none %}{{ fx_refresh_view.override_value }}{% endif %}"
+               placeholder="leave blank to clear override"
+               style="width: 12em;">
+      </label>
+      <button type="submit">Save</button>
+      <span style="color: var(--text-muted); font-size: 0.85em;">
+        Range: {{ fx_refresh_view.minimum }} ≤ n ≤
+        {{ fx_refresh_view.maximum }} seconds
+        ({{ fx_refresh_view.minimum // 60 if fx_refresh_view.minimum >= 60 else fx_refresh_view.minimum }}{% if fx_refresh_view.minimum >= 60 %}m{% else %}s{% endif %}
+        – {{ fx_refresh_view.maximum // 3600 }}h).
+        Blank clears the override.
+      </span>
+    </form>
+  </details>
+</div>
 {% endblock %}
