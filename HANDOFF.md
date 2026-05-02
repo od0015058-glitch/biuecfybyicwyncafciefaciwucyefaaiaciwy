@@ -2139,7 +2139,7 @@ or unblock other work.
 | 6 | **`FREE_MESSAGES_PER_USER`** — initial free-trial messages. | Env-only. | Editor on `/admin/wallet-config`. | P2 | Pending |
 | 7 | **`REFERRAL_BONUS_PERCENT` + `REFERRAL_BONUS_MAX_USD`** — referral payouts. (Earlier drafts of this row called these `REFERRAL_BONUS_USD` / `REFERRAL_PERCENT`; the actual env-var names in `referral.py` are `REFERRAL_BONUS_PERCENT` and `REFERRAL_BONUS_MAX_USD`.) | Env-only. | Editor on `/admin/wallet-config`. | P2 | **Shipped** (this PR — DB-backed override layer in `referral.py` for both knobs + boot warm-up + `/admin/wallet-config` editor card with combined Save form / per-knob Clear form, audit row `wallet_config_referral_update`). |
 | 8 | **`MEMORY_CONTEXT_LIMIT` / `MEMORY_CONTENT_MAX_CHARS`** — conversation memory caps. | Env-only. | Editor on a new `/admin/memory-config` page. | P3 | Pending |
-| 9 | **Pending-PENDING expiration window** (`PENDING_EXPIRATION_HOURS_DEFAULT`). | Env-only. | Editor on `/admin/control` or `/admin/payments`. | P3 | Pending |
+| 9 | **Pending-PENDING expiration window** (`PENDING_EXPIRATION_HOURS_DEFAULT`; the actual env-var name in `pending_expiration.py` is `PENDING_EXPIRATION_HOURS`). | Env-only. | Editor on `/admin/control` or `/admin/payments`. | P3 | **Shipped** (this PR — DB-backed override layer in `pending_expiration.py` + boot warm-up + `/admin/control` editor card with set / clear actions, audit row `control_expiration_hours_update`, source badge, audit `meta` carries `threshold_hours_used`). |
 | 10 | **Stuck-PENDING alert threshold** (`PENDING_ALERT_THRESHOLD_HOURS`). | Env-only. | Editor on `/admin/control`. | P3 | Pending |
 | 11 | **Per-loop cadence overrides** (`BOT_HEALTH_LOOP_STALE_<NAME>_SECONDS`). | Env-only. | Editor on `/admin/control` (one row per loop name). | P3 | Pending |
 | 12 | **`COST_MARKUP` history & analytics** — operator can see when markup last changed and the impact on revenue. | Not tracked. | Markup-history table + revenue-attribution chart on `/admin/monetization`. | P2 | Pending |
@@ -2531,6 +2531,113 @@ Tests added:
 - `tests/test_bot_health.py` — 10 new tests covering
   `update_loop_cadence` validation matrix + the bundled bug-fix
   regression (`test_update_loop_cadence_changes_stale_threshold`).
+- `tests/test_web_admin.py` — 12 new tests covering the new POST
+  handler (auth / CSRF / persist / clear / below-minimum /
+  above-max / non-int / blank-set / unknown-action / DB-blip),
+  the GET-render card, and the audit-slug regression.
+
+### §10b.5 — Row #9 (PENDING_EXPIRATION_HOURS web surface) — shipped
+
+**Diagnosis.** `PENDING_EXPIRATION_HOURS` (default 24h) was env-only:
+operators who wanted to widen / shrink the pending-PENDING
+expiration window had to redeploy. The reaper loop in
+`pending_expiration._expiration_loop` already runs forever, so
+flipping the threshold via a DB-backed override + iteration-time
+re-read is enough — no restart needed.
+
+**Surface.** `/admin/control` already had two `system_settings`
+editors (REQUIRED_CHANNEL, BOT_HEALTH_ALERT_INTERVAL_SECONDS), so
+this PR slots a third card next to them — same pattern (effective /
+source / override / env table + Save / Clear submit pair). The
+panel + the loop both call `pending_expiration.get_pending_expiration_hours`
+so they cannot disagree about the live threshold.
+
+**DB layer.** `pending_expiration.py` gains the same shape as the
+Row-#21 / Row-#5 / Row-#7 / Row-#4 layers:
+
+- `EXPIRATION_HOURS_SETTING_KEY = "PENDING_EXPIRATION_HOURS"`,
+  `EXPIRATION_HOURS_DEFAULT = 24`, `EXPIRATION_HOURS_MINIMUM = 1`,
+  `EXPIRATION_HOURS_OVERRIDE_MAXIMUM = 24 * 365` (1-year cap so a
+  fat-finger like `876000` (intended `168`) can't silently disable
+  the reaper for the rest of the deploy lifetime).
+- `_coerce_expiration_hours(value)` — explicit `bool` rejection
+  (so a stored `"true"` / `"True"` row can't shrink the window to
+  1h and EXPIRE most of the legit-but-slow PENDING invoices), int
+  coercion, range check.
+- `set_/clear_/get_expiration_hours_override()` — module-level
+  cache slot; `set_*` re-validates as defence-in-depth.
+- `refresh_expiration_hours_override_from_db(database)` — async,
+  best-effort. Transient `get_setting` error keeps the cache value
+  in place (logs at ERROR). Malformed value (non-int, below min,
+  above max) clears the cache (logs at WARNING). Returns the new
+  cache value.
+- `get_pending_expiration_hours()` — DB → env → default precedence.
+- `get_pending_expiration_hours_source()` — returns
+  `"db" / "env" / "default"`.
+- `reset_expiration_hours_override_for_tests()` — test helper.
+
+**Loop re-read.** `_expiration_loop` now re-reads the threshold via
+`get_pending_expiration_hours` on every iteration, so a saved DB
+override takes effect on the next tick — no restart required. The
+existing `threshold_hours` kwarg is retained as the bootstrap value
+for the very first iteration (mirrors `bot_health_alert._alert_loop`).
+
+**Boot warm-up.** `main.py` now calls
+`pending_expiration.refresh_expiration_hours_override_from_db(db)`
+after the bot-health alert interval warm-up so the very first reaper
+tick after boot uses the operator's configured threshold. Best-effort
+— a startup DB blip falls through to env / default and logs
+`failed to load PENDING_EXPIRATION_HOURS override from DB`.
+
+**Web surface.**
+
+- `_build_expiration_hours_view()` returns a single-knob view dict
+  (`effective` / `source` / `override_value` / `env_value` /
+  `env_raw` / `default_value` / `minimum` / `maximum`) and is
+  bound to the `expiration_hours` template var.
+- `control_get` calls `refresh_expiration_hours_override_from_db`
+  on every page render so a DB poke from another admin instance
+  becomes visible in this process within one HTTP round-trip.
+- `control_expiration_hours_post` (`POST
+  /admin/control/expiration-hours`, `ROLE_SUPER`) — CSRF guard,
+  action allowlist (`set` / `clear`), coerce + range-check,
+  upsert / delete `system_settings`, refresh cache, audit row
+  `control_expiration_hours_update` with `meta = {action, before,
+  before_source, after, after_source}`, redirect with flash.
+- Audit slug `control_expiration_hours_update` =
+  `"Pending-expiration window updated"` registered in
+  `AUDIT_ACTION_LABELS` so `/admin/audit` filter dropdown
+  surfaces this row type.
+- `templates/admin/control.html` gets a new card with a number
+  input bounded by `min`/`max` from the view, two distinct submit
+  buttons (`action=set` and `action=clear`), and a status table
+  matching the alert-interval card.
+
+**Bundled bug fix #1.** `_record_expiration_audit()` now logs
+`threshold_hours_used` in `meta` so investigators can later tell
+whether an EXPIRED row was reaped under the default 24h or a
+custom override. Pre-fix the audit row carried no threshold
+metadata, which meant a question like "did we expire a paid invoice
+because the window was set too aggressively?" was unanswerable
+weeks after the fact. Now every audit row pins the exact threshold
+the reaper used for that batch, so you can reconcile EXPIRED rows
+against the operator's `control_expiration_hours_update` audit
+trail.
+
+**Bundled bug fix #2.** `_tick_pending_reaper_from_app()` (the
+"Tick now" button on `/admin/control`) now routes through
+`get_pending_expiration_hours()` instead of `_read_int_env()`. Pre-
+fix the manual tick path read the env var directly, which would
+have made it silently bypass any DB override the operator had
+applied — surprising and inconsistent with the loop's iteration-
+time behaviour. Now the manual tick agrees with the loop.
+
+**Tests.** All running, all green:
+
+- `tests/test_pending_expiration.py` — 31 new tests covering
+  coerce / set / clear / get / refresh-from-DB / source resolver /
+  loop bootstrap re-read / manual-tick path consistency / audit
+  meta carries `threshold_hours_used`.
 - `tests/test_web_admin.py` — 12 new tests covering the new POST
   handler (auth / CSRF / persist / clear / below-minimum /
   above-max / non-int / blank-set / unknown-action / DB-blip),

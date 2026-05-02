@@ -12891,6 +12891,338 @@ async def test_control_get_renders_alert_interval_card(
 
 
 # =====================================================================
+# Stage-15-Step-E #10b row 9: PENDING_EXPIRATION_HOURS editor
+# =====================================================================
+
+
+async def test_control_expiration_hours_post_requires_auth(
+    aiohttp_client, make_admin_app
+):
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    resp = await client.post(
+        "/admin/control/expiration-hours",
+        data={
+            "expiration_hours": "24",
+            "action": "set",
+            "csrf_token": "x",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303), resp.status
+    assert resp.headers.get("Location", "").startswith("/admin/login")
+
+
+async def test_control_expiration_hours_post_csrf_required(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False,
+    )
+    db.upsert_setting.reset_mock()
+    resp = await client.post(
+        "/admin/control/expiration-hours",
+        data={"expiration_hours": "24", "action": "set"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/control"
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+
+
+async def test_control_expiration_hours_post_persists_value_and_refreshes(
+    aiohttp_client, make_admin_app
+):
+    """Happy path: a valid integer is upserted to system_settings AND
+    pushed into the in-process override cache."""
+    import pending_expiration
+
+    pending_expiration.clear_expiration_hours_override()
+    saved: dict[str, str | None] = {"value": None}
+
+    async def _upsert(key: str, value: str) -> None:
+        if key == pending_expiration.EXPIRATION_HOURS_SETTING_KEY:
+            saved["value"] = value
+
+    async def _get(key: str):
+        if key == pending_expiration.EXPIRATION_HOURS_SETTING_KEY:
+            return saved["value"]
+        return None
+
+    db = _stub_toggle_db()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/expiration-hours",
+        data={
+            "expiration_hours": "72",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302, await resp.text()
+    assert resp.headers["Location"] == "/admin/control"
+
+    db.upsert_setting.assert_awaited_once_with(
+        pending_expiration.EXPIRATION_HOURS_SETTING_KEY, "72",
+    )
+    # In-process cache reflects the new value (no restart needed).
+    assert pending_expiration.get_expiration_hours_override() == 72
+    assert pending_expiration.get_pending_expiration_hours() == 72
+    matching = [
+        c for c in db.record_admin_audit.await_args_list
+        if c.kwargs.get("action") == "control_expiration_hours_update"
+    ]
+    assert matching, db.record_admin_audit.await_args_list
+    pending_expiration.clear_expiration_hours_override()
+
+
+async def test_control_expiration_hours_post_clear_drops_db_row(
+    aiohttp_client, make_admin_app
+):
+    """``action=clear`` deletes the DB row and clears the in-process
+    override so the env var (or default) takes effect again."""
+    import pending_expiration
+
+    pending_expiration.set_expiration_hours_override(48)
+
+    async def _get(key: str):
+        return None  # row already deleted
+
+    db = _stub_toggle_db()
+    db.delete_setting = AsyncMock(return_value=True)
+    db.get_setting = AsyncMock(side_effect=_get)
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    pending_expiration.set_expiration_hours_override(48)
+    db.delete_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/expiration-hours",
+        data={
+            "expiration_hours": "",
+            "action": "clear",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.delete_setting.assert_awaited_once_with(
+        pending_expiration.EXPIRATION_HOURS_SETTING_KEY,
+    )
+    assert pending_expiration.get_expiration_hours_override() is None
+    pending_expiration.clear_expiration_hours_override()
+
+
+async def test_control_expiration_hours_post_rejects_below_minimum(
+    aiohttp_client, make_admin_app
+):
+    import pending_expiration
+
+    pending_expiration.clear_expiration_hours_override()
+
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/expiration-hours",
+        data={
+            "expiration_hours": "0",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+    assert pending_expiration.get_expiration_hours_override() is None
+
+
+async def test_control_expiration_hours_post_rejects_above_max(
+    aiohttp_client, make_admin_app
+):
+    """The 1-year cap on the override slot prevents a fat-finger like
+    ``876000`` (intended ``168``) silently disabling the reaper for
+    the rest of the deploy lifetime."""
+    import pending_expiration
+
+    pending_expiration.clear_expiration_hours_override()
+
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/expiration-hours",
+        data={
+            "expiration_hours": str(
+                pending_expiration.EXPIRATION_HOURS_OVERRIDE_MAXIMUM + 1
+            ),
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+    assert pending_expiration.get_expiration_hours_override() is None
+
+
+async def test_control_expiration_hours_post_rejects_non_int(
+    aiohttp_client, make_admin_app
+):
+    import pending_expiration
+
+    pending_expiration.clear_expiration_hours_override()
+
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/expiration-hours",
+        data={
+            "expiration_hours": "abc",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+
+
+async def test_control_expiration_hours_post_rejects_blank_set(
+    aiohttp_client, make_admin_app
+):
+    """A blank input on action=set must be rejected so the operator
+    doesn't accidentally try to "set blank" instead of clicking
+    "Clear DB override"."""
+    import pending_expiration
+
+    pending_expiration.clear_expiration_hours_override()
+
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/expiration-hours",
+        data={
+            "expiration_hours": "",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+
+
+async def test_control_expiration_hours_post_rejects_unknown_action(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/expiration-hours",
+        data={
+            "expiration_hours": "24",
+            "action": "delete_everything",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+
+
+async def test_control_expiration_hours_post_db_failure_keeps_previous(
+    aiohttp_client, make_admin_app
+):
+    """A transient DB blip on upsert keeps the previous override in
+    place."""
+    import pending_expiration
+
+    pending_expiration.clear_expiration_hours_override()
+
+    db = _stub_toggle_db()
+    db.upsert_setting = AsyncMock(side_effect=RuntimeError("DB down"))
+    db.get_setting = AsyncMock(return_value="36")
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    # GET-render refresh loaded "36" into the cache.
+    assert pending_expiration.get_expiration_hours_override() == 36
+
+    resp = await client.post(
+        "/admin/control/expiration-hours",
+        data={
+            "expiration_hours": "72",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    # Override unchanged after a failed write.
+    assert pending_expiration.get_expiration_hours_override() == 36
+    pending_expiration.clear_expiration_hours_override()
+
+
+def test_audit_action_labels_includes_expiration_hours_update():
+    """Regression: ``control_expiration_hours_update`` must be listed
+    in ``AUDIT_ACTION_LABELS`` so the ``/admin/audit`` filter
+    dropdown surfaces expiration-window changes."""
+    from web_admin import AUDIT_ACTION_LABELS
+
+    assert "control_expiration_hours_update" in AUDIT_ACTION_LABELS
+    assert AUDIT_ACTION_LABELS["control_expiration_hours_update"] == (
+        "Pending-expiration window updated"
+    )
+
+
+async def test_control_get_renders_expiration_hours_card(
+    aiohttp_client, make_admin_app
+):
+    """The /admin/control panel renders the new pending-expiration
+    card with the current effective value, source badge, and the
+    form."""
+    import pending_expiration
+
+    pending_expiration.clear_expiration_hours_override()
+
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/control")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Pending-PENDING expiration window" in body
+    assert "/admin/control/expiration-hours" in body
+    assert 'name="expiration_hours"' in body
+
+
+# =====================================================================
 # Stage-15-Step-F follow-up #6: per-loop manual "tick now" button
 # =====================================================================
 

@@ -771,6 +771,26 @@ NowPayments crypto invoices.
   `bot_health.update_loop_cadence()` helper, so retuning the
   cadence at runtime no longer leaves the panel forever showing
   the alert loop as "running late". Stage-15-Step-E #10b row 21.
+- **Tunable pending-PENDING expiration window** — the
+  `PENDING_EXPIRATION_HOURS` knob (default 24h) is now editable
+  from `/admin/control` instead of being env-only. The reaper loop
+  re-reads its resolved threshold every iteration so a saved
+  override takes effect on the next tick (no restart). Override
+  range is bounded to `[1, 8_760]` hours — the 1-year cap on the
+  override slot prevents a fat-finger like `876000` (intended
+  `168`) from silently disabling the reaper for the rest of the
+  deploy lifetime. Bundled bug fixes: (1) `_record_expiration_audit`
+  now logs `threshold_hours_used` in `meta` so investigators can
+  later reconcile EXPIRED rows against the operator's
+  `control_expiration_hours_update` audit trail (pre-fix the audit
+  row carried no threshold metadata, so "did we expire a paid
+  invoice because the window was set too aggressively?" was
+  unanswerable weeks after the fact); (2) the manual "Tick now"
+  button on `/admin/control` now routes through
+  `pending_expiration.get_pending_expiration_hours()` instead of
+  reading the env var directly, so it respects saved DB overrides
+  and agrees with the loop's iteration-time behaviour.
+  Stage-15-Step-E #10b row 9.
 
 For the full project history, file map, and roadmap **read [HANDOFF.md](./HANDOFF.md)**.
 

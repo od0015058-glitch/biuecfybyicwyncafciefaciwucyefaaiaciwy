@@ -592,6 +592,93 @@
   </form>
 </div>
 
+<div class="control-card">
+  <h3>🕒 Pending-PENDING expiration window</h3>
+  <p>
+    How long a stuck <code>PENDING</code> transaction (NowPayments
+    invoice the user abandoned mid-checkout) sits in the ledger
+    before the reaper flips it to <code>EXPIRED</code>. Save here to
+    override the <code>PENDING_EXPIRATION_HOURS</code> env var
+    without a redeploy; the new threshold takes effect on the
+    reaper's next tick.
+  </p>
+  <p style="margin-top: 4px; color: var(--text-muted); font-size: 12px;">
+    The "source" badge below shows where the currently-applied
+    threshold comes from. <code>db</code> = saved here,
+    <code>env</code> = process env var, <code>default</code> =
+    {{ expiration_hours.default_value }}h. Override range:
+    <code>{{ expiration_hours.minimum }}</code>–<code>{{ expiration_hours.maximum }}</code>
+    hours (1-year cap on the override slot prevents a fat-finger
+    that silently disables the reaper for the rest of the deploy
+    lifetime). The reaper re-reads the threshold on every iteration
+    so a saved override is live within at most one tick — no
+    restart required.
+  </p>
+  <table class="signals-table" style="margin-top: 12px;">
+    <thead>
+      <tr>
+        <td class="label">Field</td>
+        <td class="label">Value</td>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="label">Effective</td>
+        <td class="value">{{ "{:,}".format(expiration_hours.effective) }}h</td>
+      </tr>
+      <tr>
+        <td class="label">Source</td>
+        <td class="value">
+          {% if expiration_hours.source == 'db' %}
+            <span style="color: var(--success);">db</span>
+          {% elif expiration_hours.source == 'env' %}
+            <span style="color: var(--warn, #f9e2af);">env</span>
+          {% else %}
+            <span style="color: var(--text-muted);">default</span>
+          {% endif %}
+        </td>
+      </tr>
+      <tr>
+        <td class="label">DB override</td>
+        <td class="value">
+          {% if expiration_hours.override_value is none %}
+            <span style="color: var(--text-muted);">(not set)</span>
+          {% else %}
+            <code>{{ "{:,}".format(expiration_hours.override_value) }}h</code>
+          {% endif %}
+        </td>
+      </tr>
+      <tr>
+        <td class="label">Env value</td>
+        <td class="value">
+          {% if expiration_hours.env_value is not none %}
+            <code>{{ "{:,}".format(expiration_hours.env_value) }}h</code>
+          {% else %}
+            <span style="color: var(--text-muted);">(unset)</span>
+          {% endif %}
+        </td>
+      </tr>
+    </tbody>
+  </table>
+  <form method="post" action="/admin/control/expiration-hours"
+        style="margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="number" name="expiration_hours"
+           min="{{ expiration_hours.minimum }}"
+           max="{{ expiration_hours.maximum }}"
+           value="{% if expiration_hours.override_value is not none %}{{ expiration_hours.override_value }}{% endif %}"
+           placeholder="hours (e.g. 24)"
+           style="width: 160px;">
+    <button type="submit" name="action" value="set" class="btn-confirm">
+      Save threshold
+    </button>
+    <button type="submit" name="action" value="clear" class="btn-secondary"
+            style="background: transparent; border: 1px solid var(--border, #444); color: var(--text);">
+      Clear DB override
+    </button>
+  </form>
+</div>
+
 <div class="control-card danger-zone">
   <h3>🛑 Force-stop bot</h3>
   <p>

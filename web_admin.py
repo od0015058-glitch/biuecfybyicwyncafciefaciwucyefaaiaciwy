@@ -2584,6 +2584,14 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     # investigation can pin the cause to a knob tweak vs. unrelated
     # incident-rate changes.
     "control_alert_interval_update": "Bot-health alert interval updated",
+    # Stage-15-Step-E #10b row 9: PENDING_EXPIRATION_HOURS editor
+    # on ``/admin/control``. Recorded by
+    # :func:`control_expiration_hours_post`; the dropdown entry lets
+    # an operator filter the audit feed to "expiration-window
+    # changes only" so a "did we expire a paid invoice because the
+    # window was set too aggressively?" investigation can pin the
+    # cause to a knob tweak vs. unrelated invoice-creation traffic.
+    "control_expiration_hours_update": "Pending-expiration window updated",
 }
 
 
@@ -7753,6 +7761,21 @@ async def control_get(request: web.Request) -> web.StreamResponse:
                 "control: refresh_alert_interval_override_from_db failed"
             )
 
+    # Stage-15-Step-E #10b row 9: refresh the pending-PENDING
+    # expiration threshold override so the panel + the reaper loop
+    # agree on the live threshold. Best-effort — a transient DB blip
+    # leaves the previous cache in place.
+    if db is not None:
+        try:
+            import pending_expiration
+            await (
+                pending_expiration.refresh_expiration_hours_override_from_db(db)
+            )
+        except Exception:
+            log.exception(
+                "control: refresh_expiration_hours_override_from_db failed"
+            )
+
     # Read the bot-health alert loop's most-recent rate-windowed drop
     # count so the panel + the loop + Prometheus all classify
     # identically. The panel can't observe a rate-of-drops on its own
@@ -7780,6 +7803,7 @@ async def control_get(request: web.Request) -> web.StreamResponse:
     thresholds_view = _build_thresholds_view()
     required_channel_view = _build_required_channel_view()
     alert_interval_view = _build_alert_interval_view()
+    expiration_hours_view = _build_expiration_hours_view()
 
     ctx = {
         "active_page": "control",
@@ -7790,6 +7814,7 @@ async def control_get(request: web.Request) -> web.StreamResponse:
         "thresholds": thresholds_view,
         "required_channel": required_channel_view,
         "alert_interval": alert_interval_view,
+        "expiration_hours": expiration_hours_view,
     }
     response = aiohttp_jinja2.render_template("control.html", request, ctx)
     flash = pop_flash(request, response)
@@ -7955,6 +7980,56 @@ def _build_alert_interval_view() -> dict:
         ),
         "minimum": bot_health_alert.INTERVAL_MINIMUM,
         "maximum": bot_health_alert.INTERVAL_OVERRIDE_MAXIMUM,
+    }
+
+
+def _build_expiration_hours_view() -> dict:
+    """Snapshot of the pending-expiration threshold for the panel.
+
+    Mirrors :func:`_build_alert_interval_view` (single dict, single
+    knob) so ``control.html`` can re-use the
+    effective / source / override / env badge pattern.
+
+    Stage-15-Step-E #10b row 9. The override slot is bounded by
+    :data:`pending_expiration.EXPIRATION_HOURS_OVERRIDE_MAXIMUM`
+    (1 year cap) so a fat-finger like ``876000`` (intended ``168``)
+    can't silently disable the reaper for the rest of the deploy
+    lifetime.
+    """
+    import pending_expiration
+
+    override_value = pending_expiration.get_expiration_hours_override()
+    env_raw = os.getenv("PENDING_EXPIRATION_HOURS", "").strip()
+    env_value: int | None = None
+    if env_raw:
+        try:
+            parsed = int(env_raw)
+        except ValueError:
+            env_value = None
+        else:
+            if parsed >= pending_expiration.EXPIRATION_HOURS_MINIMUM:
+                env_value = parsed
+            elif parsed >= 1:
+                # ``_read_int_env`` clamps below the minimum; surface
+                # the *clamped* value so the panel doesn't lie about
+                # what's live. The minimum is currently 1 so this
+                # branch is unreachable today, but kept defensive so
+                # a future minimum bump doesn't desync the panel.
+                env_value = pending_expiration.EXPIRATION_HOURS_MINIMUM
+            # else: env_raw was 0 / negative → falls back to default;
+            # leave env_value None so the source resolver returns
+            # "default".
+    effective = pending_expiration.get_pending_expiration_hours()
+    source = pending_expiration.get_pending_expiration_hours_source()
+    return {
+        "effective": effective,
+        "source": source,
+        "override_value": override_value,
+        "env_value": env_value,
+        "env_raw": env_raw,
+        "default_value": pending_expiration.EXPIRATION_HOURS_DEFAULT,
+        "minimum": pending_expiration.EXPIRATION_HOURS_MINIMUM,
+        "maximum": pending_expiration.EXPIRATION_HOURS_OVERRIDE_MAXIMUM,
     }
 
 
@@ -9113,6 +9188,247 @@ async def control_alert_interval_post(
     return response
 
 
+async def control_expiration_hours_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/control/expiration-hours`` — update reaper threshold.
+
+    Stage-15-Step-E #10b row 9. ``PENDING_EXPIRATION_HOURS`` was
+    env-only, so an operator who wanted to widen / shrink the
+    pending-PENDING expiration window had to redeploy. This handler
+    writes the override to the ``system_settings`` overlay
+    (DB-backed), refreshes the in-process cache so
+    :func:`pending_expiration._expiration_loop` picks up the change
+    on its next iteration without a restart, and audit-logs a row
+    whose ``meta`` carries the diff.
+
+    Form keys:
+
+    * ``expiration_hours`` — new threshold in hours. Must coerce to
+      an integer in
+      ``[EXPIRATION_HOURS_MINIMUM, EXPIRATION_HOURS_OVERRIDE_MAXIMUM]``.
+    * ``action`` — explicit operator intent. ``set`` writes the
+      value; ``clear`` drops the DB row and falls through to env.
+
+    Validation order (mirrors :func:`control_alert_interval_post`):
+
+    1. CSRF.
+    2. Action allowlist (``set`` / ``clear``).
+    3. Coerce + range-check via
+       :func:`pending_expiration._coerce_expiration_hours`.
+    4. ``set_expiration_hours_override`` defence-in-depth.
+    5. Persist via ``upsert_setting`` / ``delete_setting``.
+    6. Audit row.
+    7. Redirect with a flash banner.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app.get(APP_KEY_DB)
+    form = await request.post()
+
+    guard = _control_csrf_guard(request, form)
+    if guard is not None:
+        return guard
+
+    if db is None:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Database is not configured — "
+                "PENDING_EXPIRATION_HOURS edits require a "
+                "live DB connection."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    import pending_expiration
+
+    action = str(form.get("action", "set")).strip().lower()
+    if action not in {"set", "clear"}:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Unknown expiration-hours action {action!r}. "
+                "Expected 'set' or 'clear'. No changes were made."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    raw_value = str(form.get("expiration_hours", "")).strip()
+    previous_effective = (
+        pending_expiration.get_pending_expiration_hours()
+    )
+    previous_source = (
+        pending_expiration.get_pending_expiration_hours_source()
+    )
+
+    if action == "clear":
+        try:
+            await db.delete_setting(
+                pending_expiration.EXPIRATION_HOURS_SETTING_KEY
+            )
+        except Exception:
+            log.exception(
+                "control_expiration_hours_post: delete_setting failed"
+            )
+            response = web.HTTPFound(location="/admin/control")
+            set_flash(
+                response, kind="error",
+                message=(
+                    "Failed to clear the PENDING_EXPIRATION_HOURS "
+                    "override — see logs. The previous value is still "
+                    "in effect."
+                ),
+                secret=secret, cookie_secure=cookie_secure,
+            )
+            return response
+        pending_expiration.clear_expiration_hours_override()
+        try:
+            await (
+                pending_expiration.refresh_expiration_hours_override_from_db(db)
+            )
+        except Exception:
+            log.exception(
+                "control_expiration_hours_post: refresh after clear failed"
+            )
+        new_effective = (
+            pending_expiration.get_pending_expiration_hours()
+        )
+        new_source = (
+            pending_expiration.get_pending_expiration_hours_source()
+        )
+        await _record_audit_safe(
+            request, "control_expiration_hours_update",
+            target="pending_expiration_hours",
+            meta={
+                "action": "clear",
+                "before": previous_effective,
+                "before_source": previous_source,
+                "after": new_effective,
+                "after_source": new_source,
+            },
+        )
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Expiration-hours override cleared. The reaper "
+                f"threshold is now {new_effective}h "
+                f"(source: {new_source})."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    # action == "set". Validate + persist + apply.
+    if not raw_value:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Expiration hours cannot be blank when applying a "
+                "'set'. Use 'Clear DB override' to drop the override."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    coerced = pending_expiration._coerce_expiration_hours(raw_value)
+    if coerced is None:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"PENDING_EXPIRATION_HOURS must be an integer in "
+                f"[{pending_expiration.EXPIRATION_HOURS_MINIMUM}, "
+                f"{pending_expiration.EXPIRATION_HOURS_OVERRIDE_MAXIMUM}] "
+                f"(got {raw_value!r}). No changes were made."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        await db.upsert_setting(
+            pending_expiration.EXPIRATION_HOURS_SETTING_KEY, str(coerced),
+        )
+    except Exception:
+        log.exception(
+            "control_expiration_hours_post: upsert_setting failed value=%r",
+            coerced,
+        )
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Failed to persist the new expiration hours — see logs. "
+                "The previous value is still in effect."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        pending_expiration.set_expiration_hours_override(coerced)
+    except ValueError:
+        log.exception(
+            "control_expiration_hours_post: set_expiration_hours_override "
+            "rejected %r after upsert succeeded — refreshing from DB",
+            coerced,
+        )
+
+    # Re-read whatever ended up in the DB so the cache reflects the
+    # truth.
+    try:
+        await pending_expiration.refresh_expiration_hours_override_from_db(db)
+    except Exception:
+        log.exception(
+            "control_expiration_hours_post: refresh after upsert failed"
+        )
+
+    new_effective = (
+        pending_expiration.get_pending_expiration_hours()
+    )
+    new_source = pending_expiration.get_pending_expiration_hours_source()
+    await _record_audit_safe(
+        request, "control_expiration_hours_update",
+        target="pending_expiration_hours",
+        meta={
+            "action": "set",
+            "before": previous_effective,
+            "before_source": previous_source,
+            "after": new_effective,
+            "after_source": new_source,
+        },
+    )
+
+    response = web.HTTPFound(location="/admin/control")
+    if new_effective == previous_effective:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Expiration hours unchanged ({new_effective}h). "
+                "The override is now persisted in the DB."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    else:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Expiration hours updated: {previous_effective}h → "
+                f"{new_effective}h. The new threshold is live for "
+                f"the next tick of the pending-expiration reaper."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    return response
+
+
 # ---------------------------------------------------------------------
 # Stage-15-Step-E #5 follow-up #4: per-template globals.
 # ---------------------------------------------------------------------
@@ -9620,6 +9936,15 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/control/alert-interval",
         _require_role(ROLE_SUPER)(control_alert_interval_post),
+    )
+    # Stage-15-Step-E #10b row 9: PENDING_EXPIRATION_HOURS editor on
+    # /admin/control. Lets an operator widen / shrink the
+    # pending-PENDING expiration window without a redeploy. The
+    # reaper loop re-reads the resolved threshold on every iteration
+    # so the new value takes effect on the next tick.
+    app.router.add_post(
+        "/admin/control/expiration-hours",
+        _require_role(ROLE_SUPER)(control_expiration_hours_post),
     )
     # Stage-15-Step-F follow-up #6: per-loop manual "tick now" button.
     app.router.add_post(
