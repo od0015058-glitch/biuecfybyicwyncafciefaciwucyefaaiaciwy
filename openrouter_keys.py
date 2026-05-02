@@ -61,6 +61,48 @@ slice: the cooldown is short (60s default) so an out-of-sync
 replica catches up within minutes; durable cross-replica state
 is on the follow-up list in HANDOFF §5.
 
+Stage-15-Step-E #4 follow-up #4 — per-(key, model) cooldown:
+
+The first slice cooled the **whole key** on every 429. That was
+over-aggressive: OpenRouter typically 429s a *specific* model
+(usually a ``:free`` slug whose upstream provider is throttling
+the burst), not the API key itself. Cooling the whole key
+blocked every other model on that key — including paid models
+the user was actively spending real money on — for the entire
+60s window. A user routed to the cooled key paying for
+``anthropic/claude-3.5-sonnet`` got an unhelpful
+``ai_provider_unavailable`` reply because someone *else* (or
+even the same user a moment ago) had hit a free-tier limit on
+``google/gemini-2.0-flash-exp:free``.
+
+The follow-up adds a **second cooldown table keyed by**
+``(api_key, model_id)`` alongside the existing whole-key table.
+The call site (``ai_engine.chat_with_model``) now passes
+``model=active_model`` through to both
+:func:`mark_key_rate_limited` and :func:`key_for_user`. A 429
+caused by a specific model goes into the per-(key, model) table
+and only blocks *that* model on *that* key — every other model
+on the same key keeps serving. The whole-key table is reserved
+for cases where the call site has no model context (or wants to
+deliberately blacklist the whole key, e.g. a 401 / 403 from an
+expired key).
+
+Membership semantics: :func:`is_key_rate_limited` returns True
+if **either** the whole-key cooldown is active **or**, when
+``model=`` is provided, the per-(key, model) cooldown is
+active. The picker (:func:`key_for_user`) then walks past any
+slot for which ``is_key_rate_limited(slot, model=model)`` is
+True, just like the first slice did with the whole-key table.
+
+Both tables share the same ``DEFAULT_COOLDOWN_SECS`` /
+``MAX_COOLDOWN_SECS`` semantics, the same ``Retry-After``
+parsing rules, the same lazy expiry on read, and the same
+"keep the longer existing deadline" behaviour. The pruning
+helpers (:func:`_drop_expired_cooldowns`, the ``load_keys``
+stale-eviction sweep, :func:`clear_all_cooldowns`) operate on
+both tables in lockstep so the per-model entries never
+out-live the whole-key entries' rotation discipline.
+
 Public surface:
 
 * :func:`load_keys` — re-read the env and refill ``_keys``. Tests
@@ -73,15 +115,23 @@ Public surface:
 * :func:`key_count` — number of keys in the pool. Lazy-loads on
   first call.
 * :func:`mark_key_rate_limited` — put a key in cooldown for
-  ``retry_after_secs`` (default 60).
+  ``retry_after_secs`` (default 60). Pass ``model="<slug>"`` to
+  cool only the (key, model) pair instead of the whole key.
 * :func:`is_key_rate_limited` — check if a key is currently in
-  cooldown. Useful for tests and ops dashboards.
+  cooldown. Pass ``model="<slug>"`` to also consult the
+  per-(key, model) table. Useful for tests and ops dashboards.
 * :func:`available_key_count` — number of keys that aren't in
-  cooldown right now.
+  cooldown right now. Pass ``model="<slug>"`` for "available
+  for this specific model" rather than the global tally.
 * :func:`key_status_snapshot` — per-key dict for diagnostics
-  (admin panel / metrics).
-* :func:`clear_all_cooldowns` — wipe the cooldown table. Tests +
-  ops "force everything back online" recovery.
+  (admin panel / metrics). Pass ``model="<slug>"`` to fold the
+  per-(key, model) cooldown into the per-slot view.
+* :func:`per_model_cooldown_snapshot` — every active
+  per-(key, model) cooldown row. Used by the admin panel and
+  the Prometheus exposition.
+* :func:`clear_all_cooldowns` — wipe BOTH the whole-key and the
+  per-(key, model) cooldown tables. Tests + ops "force everything
+  back online" recovery.
 """
 
 from __future__ import annotations
@@ -102,6 +152,18 @@ _loaded: bool = False
 # the size of the key pool (max 10 entries) so there's no need for
 # a separate eviction policy.
 _cooldowns: dict[str, float] = {}
+
+# Per-(key, model) cooldown table: ``(api_key, model_id) ->
+# deadline_monotonic_seconds``. Stage-15-Step-E #4 follow-up #4.
+# Populated when :func:`mark_key_rate_limited` is called with an
+# explicit ``model=`` kwarg (the call site has model context for
+# the 429). Entries are pruned by the same lazy-expiry discipline
+# the whole-key ``_cooldowns`` table follows. Bounded in the
+# worst case by ``len(_keys) * len(distinct_models_in_use)``;
+# in practice most deploys have <= 5 keys and <= 20 active
+# models so the table stays well under a hundred entries even at
+# saturation.
+_per_model_cooldowns: dict[tuple[str, str], float] = {}
 
 # Default cooldown when the call site doesn't supply a Retry-After.
 # 60s matches OpenRouter's typical per-minute rate-limit window for
@@ -479,12 +541,49 @@ def load_keys() -> None:
     stale = [k for k in _cooldowns if k not in pool]
     for k in stale:
         _cooldowns.pop(k, None)
+    # Stage-15-Step-E #4 follow-up #4: same eviction discipline for
+    # the per-(key, model) cooldown table. A pool rotation that
+    # drops api_key X from ``_keys`` should evict every
+    # ``(X, model)`` entry in lockstep so the per-model dict
+    # stays bounded by ``len(_keys) * len(distinct_models)``.
+    stale_pairs = [
+        pair for pair in _per_model_cooldowns if pair[0] not in pool
+    ]
+    for pair in stale_pairs:
+        _per_model_cooldowns.pop(pair, None)
 
 
 def _ensure_loaded() -> None:
     """Trigger lazy-load if it hasn't run yet this process lifetime."""
     if not _loaded:
         load_keys()
+
+
+def _normalise_model(model: str | None) -> str | None:
+    """Return a stripped, non-empty model id or ``None``.
+
+    Stage-15-Step-E #4 follow-up #4. The per-(key, model) cooldown
+    table keys on the model id verbatim, so we want to canonicalise
+    the input *once* at the entry points and then trust the
+    canonical form everywhere else. Whitespace-only and ``None``
+    inputs collapse to ``None`` which the call sites read as
+    "no model context — fall back to whole-key cooldown" and is
+    semantically equivalent to "the caller never passed a model".
+
+    NOT lower-cased: OpenRouter model ids are case-sensitive
+    (``openrouter/auto`` vs ``openrouter/Auto`` are different
+    routes — the first is the autopicker, the second 404s) so
+    folding case here would silently merge two distinct slugs
+    into one cooldown entry.
+    """
+    if model is None:
+        return None
+    if not isinstance(model, str):
+        return None
+    stripped = model.strip()
+    if not stripped:
+        return None
+    return stripped
 
 
 def _drop_expired_cooldowns(now: float | None = None) -> None:
@@ -494,6 +593,12 @@ def _drop_expired_cooldowns(now: float | None = None) -> None:
     self-cleans without needing a background sweeper task. ``now``
     is parameterised purely for tests; production code passes
     ``None`` and the function reads ``time.monotonic()`` itself.
+
+    Stage-15-Step-E #4 follow-up #4: also prunes the
+    per-(key, model) cooldown table in the same call so the two
+    tables stay in lockstep. A test that wants to drive only one
+    side at a time can use :func:`clear_all_cooldowns` followed
+    by a fresh :func:`mark_key_rate_limited`.
     """
     deadline_now = time.monotonic() if now is None else now
     expired = [
@@ -503,29 +608,59 @@ def _drop_expired_cooldowns(now: float | None = None) -> None:
     ]
     for api_key in expired:
         _cooldowns.pop(api_key, None)
+    expired_pairs = [
+        pair
+        for pair, deadline in _per_model_cooldowns.items()
+        if deadline <= deadline_now
+    ]
+    for pair in expired_pairs:
+        _per_model_cooldowns.pop(pair, None)
 
 
-def is_key_rate_limited(api_key: str) -> bool:
+def is_key_rate_limited(api_key: str, *, model: str | None = None) -> bool:
     """True iff *api_key* is currently in cooldown.
 
-    Side effect: drops *api_key*'s entry from the cooldown table
-    when the deadline has passed (lazy expiry). The membership
-    check is therefore monotonic — once a deadline elapses, every
-    subsequent call sees the key as available.
+    With ``model=None`` (the default — back-compat for callers
+    that haven't been updated) only the whole-key cooldown table
+    is consulted. With ``model="<slug>"`` the call returns True
+    if **either** the whole-key cooldown is active **or** the
+    per-(api_key, model) cooldown is active — the picker treats
+    a per-model block the same as a whole-key block from its
+    perspective (the slot can't serve this user's current model
+    so walk to the next one).
+
+    Side effect: drops the matching entries from each table when
+    their deadline has passed (lazy expiry). The membership check
+    is therefore monotonic — once a deadline elapses, every
+    subsequent call sees that table as available for this lookup.
     """
     if not api_key:
         return False
+    now = time.monotonic()
     deadline = _cooldowns.get(api_key)
-    if deadline is None:
+    if deadline is not None:
+        if deadline <= now:
+            _cooldowns.pop(api_key, None)
+        else:
+            return True
+    norm_model = _normalise_model(model)
+    if norm_model is None:
         return False
-    if deadline <= time.monotonic():
-        _cooldowns.pop(api_key, None)
+    pair = (api_key, norm_model)
+    pair_deadline = _per_model_cooldowns.get(pair)
+    if pair_deadline is None:
+        return False
+    if pair_deadline <= now:
+        _per_model_cooldowns.pop(pair, None)
         return False
     return True
 
 
 def mark_key_rate_limited(
-    api_key: str, retry_after_secs: float | None = None
+    api_key: str,
+    retry_after_secs: float | None = None,
+    *,
+    model: str | None = None,
 ) -> None:
     """Put *api_key* in cooldown for *retry_after_secs* seconds.
 
@@ -539,6 +674,19 @@ def mark_key_rate_limited(
     * Above :data:`MAX_COOLDOWN_SECS` — clamped down. A
       misbehaving CDN that sends ``Retry-After: 86400`` shouldn't
       lock a key out for a day.
+
+    Cooldown scope (Stage-15-Step-E #4 follow-up #4):
+
+    * ``model=None`` (default) — the **whole key** is cooled.
+      Every model routed to this key is blocked for the duration.
+      Used when the call site has no model context, or the 429
+      / 401 / 403 isn't tied to a specific model (e.g. the key
+      itself is exhausted / revoked).
+    * ``model="<slug>"`` — only **(api_key, slug)** is cooled.
+      Other models on the same key keep serving. This is the
+      common case: OpenRouter typically 429s a specific
+      ``:free`` model whose upstream provider is throttling,
+      not the API key as a whole.
 
     No-op if ``api_key`` is empty / not in the configured pool —
     we don't want to inflate the cooldown dict with junk that
@@ -587,46 +735,88 @@ def mark_key_rate_limited(
             secs = min(candidate, MAX_COOLDOWN_SECS)
 
     deadline = time.monotonic() + secs
-    # If a previous cooldown is still active and would extend
-    # further out than the new one, KEEP the longer deadline —
-    # we never want a fresh 429 with a small Retry-After to
-    # *shorten* a still-running cooldown that came from a
-    # bigger Retry-After. (OpenRouter sometimes sends two 429s
-    # back-to-back with different windows.)
-    existing = _cooldowns.get(api_key)
-    if existing is None or existing < deadline:
-        _cooldowns[api_key] = deadline
+    norm_model = _normalise_model(model)
+    if norm_model is None:
+        # Whole-key cooldown path (back-compat).
+        # If a previous cooldown is still active and would extend
+        # further out than the new one, KEEP the longer deadline —
+        # we never want a fresh 429 with a small Retry-After to
+        # *shorten* a still-running cooldown that came from a
+        # bigger Retry-After. (OpenRouter sometimes sends two 429s
+        # back-to-back with different windows.)
+        existing = _cooldowns.get(api_key)
+        if existing is None or existing < deadline:
+            _cooldowns[api_key] = deadline
+    else:
+        # Per-(key, model) cooldown path. Same "keep the longer
+        # deadline" discipline as the whole-key table — back-to-back
+        # 429s for the same model with different Retry-After
+        # windows shouldn't shorten the lockout.
+        pair = (api_key, norm_model)
+        existing_pair = _per_model_cooldowns.get(pair)
+        if existing_pair is None or existing_pair < deadline:
+            _per_model_cooldowns[pair] = deadline
     # Increment the per-key 429 counter against the pool index
     # of *this* api_key. ``index`` lookup is O(N) but N <= 10
     # so it doesn't matter; we resolve here so the counter
     # stays index-keyed (key string never leaves this module).
+    # The 429 counter aggregates across whole-key and per-model
+    # cooldowns — a 429 is a 429 from the per-key 429-rate
+    # alerting POV, regardless of which table absorbed it.
     try:
         idx = _keys.index(api_key)
     except ValueError:  # pragma: no cover — guarded above
         idx = -1
     _increment_key_429(idx)
-    log.warning(
-        "OpenRouter key (len=%d) put in cooldown for %.1fs "
-        "(pool size=%d, available=%d).",
-        len(api_key),
-        secs,
-        len(_keys),
-        available_key_count(),
-    )
+    if norm_model is None:
+        log.warning(
+            "OpenRouter key (len=%d) put in cooldown for %.1fs "
+            "(pool size=%d, available=%d).",
+            len(api_key),
+            secs,
+            len(_keys),
+            available_key_count(),
+        )
+    else:
+        log.warning(
+            "OpenRouter (key len=%d, model=%r) put in cooldown for "
+            "%.1fs (pool size=%d, available_for_model=%d).",
+            len(api_key),
+            norm_model,
+            secs,
+            len(_keys),
+            available_key_count(model=norm_model),
+        )
 
 
-def available_key_count() -> int:
+def available_key_count(*, model: str | None = None) -> int:
     """Number of pool keys that aren't in cooldown right now.
 
     Used by :func:`key_for_user` to decide whether to fall back
     to the sticky pick (when every key is rate-limited) and by
     the diagnostic snapshot below.
+
+    With ``model="<slug>"`` the count reflects availability for
+    *that specific model* — a slot blocked by the per-(key, model)
+    table is excluded, but a slot only cooled for a *different*
+    model on the same key is still counted as available. Stage-15
+    -Step-E #4 follow-up #4 — used by ``ai_engine.chat_with_model``
+    so the user-facing "all keys cooled" warning fires only when
+    the *user's actual model* really has no available slot.
     """
     _ensure_loaded()
     if not _keys:
         return 0
     _drop_expired_cooldowns()
-    return sum(1 for k in _keys if k not in _cooldowns)
+    norm_model = _normalise_model(model)
+    if norm_model is None:
+        return sum(1 for k in _keys if k not in _cooldowns)
+    return sum(
+        1
+        for k in _keys
+        if k not in _cooldowns
+        and (k, norm_model) not in _per_model_cooldowns
+    )
 
 
 def clear_all_cooldowns() -> None:
@@ -636,11 +826,20 @@ def clear_all_cooldowns() -> None:
     Operators with a "force everything back online right now"
     button can call it to recover from an over-aggressive
     Retry-After without restarting the bot.
+
+    Stage-15-Step-E #4 follow-up #4: also wipes the
+    per-(key, model) cooldown table so the ops "force back online"
+    button doesn't leave a half-cleared state where individual
+    (key, model) pairs are still locked while the whole-key
+    side has been cleared.
     """
     _cooldowns.clear()
+    _per_model_cooldowns.clear()
 
 
-def key_status_snapshot() -> list[dict[str, object]]:
+def key_status_snapshot(
+    *, model: str | None = None
+) -> list[dict[str, object]]:
     """Return one dict per pool key for diagnostics.
 
     Each dict has shape::
@@ -658,13 +857,38 @@ def key_status_snapshot() -> list[dict[str, object]]:
     to correlate a snapshot row to a specific key can use the
     ``index`` field together with their own
     ``openrouter_keys._keys`` reference.
+
+    With ``model="<slug>"`` the snapshot reflects availability
+    *for that specific model*. ``rate_limited`` is True when
+    either the whole-key cooldown is active OR the (key, model)
+    cooldown is active. ``cooldown_remaining_secs`` is the
+    larger of the two (whichever expires later — that's when
+    the slot becomes usable for this model). Stage-15-Step-E #4
+    follow-up #4.
     """
     _ensure_loaded()
     _drop_expired_cooldowns()
     snapshot: list[dict[str, object]] = []
     now = time.monotonic()
+    norm_model = _normalise_model(model)
     for idx, api_key in enumerate(_keys):
-        deadline = _cooldowns.get(api_key)
+        whole_deadline = _cooldowns.get(api_key)
+        pair_deadline = (
+            _per_model_cooldowns.get((api_key, norm_model))
+            if norm_model is not None
+            else None
+        )
+        # Pick whichever deadline is later — that's the time at
+        # which the slot becomes usable for the requested model.
+        deadline: float | None
+        if whole_deadline is None and pair_deadline is None:
+            deadline = None
+        elif whole_deadline is None:
+            deadline = pair_deadline
+        elif pair_deadline is None:
+            deadline = whole_deadline
+        else:
+            deadline = max(whole_deadline, pair_deadline)
         if deadline is None:
             snapshot.append(
                 {
@@ -685,7 +909,63 @@ def key_status_snapshot() -> list[dict[str, object]]:
     return snapshot
 
 
-def key_for_user(telegram_id: int) -> str:
+def per_model_cooldown_snapshot() -> list[dict[str, object]]:
+    """Return one dict per active (key, model) cooldown for diagnostics.
+
+    Stage-15-Step-E #4 follow-up #4. Used by the
+    ``/admin/openrouter-keys`` panel to render the per-(key, model)
+    cooldown table alongside the existing whole-key view, and by
+    the Prometheus exposition to emit the new
+    ``meowassist_openrouter_key_model_cooldown_remaining_seconds``
+    labelled-gauge family.
+
+    Each dict has shape::
+
+        {
+            "index": int,                       # pool index of the key
+            "model": str,                       # OpenRouter model slug
+            "cooldown_remaining_secs": float,   # always > 0 (expired
+                                                # entries are pruned
+                                                # before the snapshot)
+        }
+
+    Entries for keys no longer in the pool (rotated out between
+    the cooldown landing and the snapshot read) are filtered
+    out — they'd be misleading to render against an index that
+    no longer exists. Same discipline as
+    :func:`get_key_24h_usage`.
+    """
+    _ensure_loaded()
+    _drop_expired_cooldowns()
+    snapshot: list[dict[str, object]] = []
+    now = time.monotonic()
+    # Build a quick api_key -> idx lookup so the O(per_model_pairs)
+    # render isn't O(per_model_pairs * len(_keys)) for the index
+    # resolution.
+    idx_by_key = {k: i for i, k in enumerate(_keys)}
+    for (api_key, model_id), deadline in _per_model_cooldowns.items():
+        if deadline <= now:
+            # Defence-in-depth: _drop_expired_cooldowns above
+            # should have pruned it but double-check so we don't
+            # render a row with cooldown_remaining_secs == 0.0.
+            continue
+        idx = idx_by_key.get(api_key)
+        if idx is None:
+            continue
+        snapshot.append(
+            {
+                "index": idx,
+                "model": model_id,
+                "cooldown_remaining_secs": max(0.0, deadline - now),
+            }
+        )
+    # Sort by (index, model) for deterministic rendering in tests
+    # and for stable Prometheus label ordering across scrapes.
+    snapshot.sort(key=lambda row: (row["index"], row["model"]))
+    return snapshot
+
+
+def key_for_user(telegram_id: int, *, model: str | None = None) -> str:
     """Return the API key to use for *telegram_id*.
 
     Selection policy:
@@ -700,6 +980,13 @@ def key_for_user(telegram_id: int) -> str:
        The caller will see another 429 and re-mark — but at
        least the user's request was made.
 
+    With ``model="<slug>"`` (Stage-15-Step-E #4 follow-up #4)
+    "in cooldown" expands to "whole-key cooldown active OR
+    per-(key, model) cooldown active for *this* model". A slot
+    cooled for a *different* model on the same key is treated
+    as available — the user's current model has nothing to do
+    with that other model's 429 history.
+
     Raises ``RuntimeError`` if no keys are configured.
     """
     _ensure_loaded()
@@ -710,8 +997,28 @@ def key_for_user(telegram_id: int) -> str:
         )
     _drop_expired_cooldowns()
     n = len(_keys)
+    norm_model = _normalise_model(model)
     sticky_idx = telegram_id % n
-    if _keys[sticky_idx] not in _cooldowns:
+
+    def _slot_available(slot_idx: int) -> bool:
+        """Cooldown-aware check for a single pool slot.
+
+        Lifted out of the inline ``in _cooldowns`` checks so the
+        sticky-pick and the fallback-walk paths share the exact
+        same logic — keeping a slot "available for this user's
+        current model" predicate consistent across both branches.
+        """
+        api_key = _keys[slot_idx]
+        if api_key in _cooldowns:
+            return False
+        if (
+            norm_model is not None
+            and (api_key, norm_model) in _per_model_cooldowns
+        ):
+            return False
+        return True
+
+    if _slot_available(sticky_idx):
         _increment_key_request(sticky_idx)
         return _keys[sticky_idx]
     # Sticky key is hot — walk forward through the pool. ``range
@@ -719,7 +1026,7 @@ def key_for_user(telegram_id: int) -> str:
     # above), so we examine each *other* slot exactly once.
     for offset in range(1, n):
         idx = (sticky_idx + offset) % n
-        if _keys[idx] not in _cooldowns:
+        if _slot_available(idx):
             # Record which pool slot absorbed the fallback so a
             # "fallback rate per key" dashboard plot answers
             # "which key is taking the load when others go hot".
@@ -730,10 +1037,11 @@ def key_for_user(telegram_id: int) -> str:
             _increment_key_request(idx)
             log.info(
                 "Routing user %d off cooldown'd sticky key "
-                "(idx=%d) to fallback idx=%d.",
+                "(idx=%d) to fallback idx=%d (model=%r).",
                 telegram_id,
                 sticky_idx,
                 idx,
+                norm_model,
             )
             return _keys[idx]
     # Every key is in cooldown. Best-effort: return the sticky
@@ -741,10 +1049,11 @@ def key_for_user(telegram_id: int) -> str:
     # see another 429 (or a 200 if the cooldown was conservative)
     # and either way we won't have silently dropped the request.
     log.warning(
-        "All %d OpenRouter key(s) in cooldown — falling back to "
-        "sticky pick (idx=%d) for user %d. The request may still "
-        "be rate-limited.",
+        "All %d OpenRouter key(s) in cooldown for model=%r — falling "
+        "back to sticky pick (idx=%d) for user %d. The request may "
+        "still be rate-limited.",
         n,
+        norm_model,
         sticky_idx,
         telegram_id,
     )

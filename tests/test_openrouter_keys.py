@@ -1198,3 +1198,446 @@ def test_reset_key_counters_for_tests_clears_24h_buffer():
     openrouter_keys.reset_key_counters_for_tests()
     assert openrouter_keys.get_key_24h_usage() == {}
     _reset_env()
+
+
+# ---- Stage-15-Step-E #4 follow-up #4: per-(key, model) cooldown ----
+
+
+def test_mark_key_rate_limited_with_model_uses_per_model_table():
+    """Calling ``mark_key_rate_limited(key, model="x/y")`` writes to
+    ``_per_model_cooldowns`` and NOT the whole-key ``_cooldowns``.
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited("k1", model="x/y")
+    assert ("k1", "x/y") in openrouter_keys._per_model_cooldowns
+    assert "k1" not in openrouter_keys._cooldowns
+    _reset_env()
+
+
+def test_mark_key_rate_limited_without_model_uses_whole_key_table():
+    """Calling ``mark_key_rate_limited(key)`` (no model kwarg) keeps
+    the back-compat behaviour: writes to the whole-key
+    ``_cooldowns`` table.
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited("k1")
+    assert "k1" in openrouter_keys._cooldowns
+    assert not any(
+        pair[0] == "k1" for pair in openrouter_keys._per_model_cooldowns
+    )
+    _reset_env()
+
+
+def test_is_key_rate_limited_with_model_consults_both_tables():
+    """``is_key_rate_limited(key, model=m)`` returns True when EITHER
+    the whole-key cooldown OR the (key, model) cooldown is active.
+    """
+    _setup_three_keys()
+    # Per-model only.
+    openrouter_keys.mark_key_rate_limited("k0", model="vendor/foo")
+    assert openrouter_keys.is_key_rate_limited("k0", model="vendor/foo")
+    assert not openrouter_keys.is_key_rate_limited("k0", model="vendor/bar")
+    # Whole-key only also blocks the model query.
+    openrouter_keys.mark_key_rate_limited("k1")
+    assert openrouter_keys.is_key_rate_limited("k1", model="anything/x")
+    _reset_env()
+
+
+def test_is_key_rate_limited_without_model_only_whole_key():
+    """Back-compat: ``is_key_rate_limited(key)`` (no model kwarg) only
+    checks the whole-key table — a per-(key, model) entry alone
+    should not flip the membership check.
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited("k0", model="vendor/foo")
+    assert not openrouter_keys.is_key_rate_limited("k0")
+    _reset_env()
+
+
+def test_per_model_cooldown_blocks_only_that_model_in_picker():
+    """``key_for_user(uid, model=m)`` must skip a slot whose
+    (api_key, m) pair is in cooldown but pick that same slot
+    happily for a *different* model.
+    """
+    _setup_three_keys()
+    # User 1 → sticky idx 1 → "k1"
+    openrouter_keys.mark_key_rate_limited("k1", model="paid/expensive")
+    # Same user, OTHER model: sticky still works.
+    assert openrouter_keys.key_for_user(1, model="paid/cheap") == "k1"
+    # Same user, the cooled model: walks to next slot ("k2").
+    assert openrouter_keys.key_for_user(1, model="paid/expensive") == "k2"
+    _reset_env()
+
+
+def test_per_model_cooldown_does_not_affect_no_model_picker():
+    """Back-compat: ``key_for_user(uid)`` (no model kwarg) doesn't
+    consult the per-(key, model) table — only the whole-key
+    cooldown can divert it.
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited("k1", model="anything/x")
+    # No model context → the per-(key, model) entry is ignored.
+    assert openrouter_keys.key_for_user(1) == "k1"
+    _reset_env()
+
+
+def test_available_key_count_with_model_excludes_per_model_blocks():
+    """``available_key_count(model=m)`` excludes slots blocked for
+    that model. ``available_key_count()`` (no model) ignores the
+    per-(key, model) table.
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited("k0", model="hot/free")
+    openrouter_keys.mark_key_rate_limited("k1", model="hot/free")
+    assert openrouter_keys.available_key_count(model="hot/free") == 1
+    # Different model: all 3 keys still available.
+    assert openrouter_keys.available_key_count(model="cool/paid") == 3
+    # No model context: also all 3 (no whole-key cooldowns).
+    assert openrouter_keys.available_key_count() == 3
+    _reset_env()
+
+
+def test_per_model_cooldown_expires_lazily(monkeypatch):
+    """Per-(key, model) cooldown expires on read like the whole-key
+    table does. After the deadline elapses,
+    ``is_key_rate_limited(..., model=...)`` returns False AND the
+    entry is pruned.
+    """
+    _setup_three_keys()
+    # Mark with a small Retry-After we'll accelerate past.
+    openrouter_keys.mark_key_rate_limited(
+        "k0", retry_after_secs=5, model="fast/expire",
+    )
+    assert ("k0", "fast/expire") in openrouter_keys._per_model_cooldowns
+
+    real_monotonic = openrouter_keys.time.monotonic
+    advanced = [real_monotonic() + 10.0]
+    monkeypatch.setattr(
+        openrouter_keys.time, "monotonic", lambda: advanced[0]
+    )
+    assert not openrouter_keys.is_key_rate_limited(
+        "k0", model="fast/expire",
+    )
+    # And the entry was pruned by the lazy-expiry side effect.
+    assert ("k0", "fast/expire") not in openrouter_keys._per_model_cooldowns
+    _reset_env()
+
+
+def test_drop_expired_cooldowns_prunes_per_model_table():
+    """``_drop_expired_cooldowns`` operates on both tables in
+    lockstep so the per-model table self-cleans without needing
+    its own sweeper.
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited("k0", model="model/a")
+    openrouter_keys.mark_key_rate_limited("k1", model="model/b")
+    # Force entries to be in the past.
+    far_past = openrouter_keys.time.monotonic() - 1000.0
+    openrouter_keys._per_model_cooldowns[("k0", "model/a")] = far_past
+    openrouter_keys._per_model_cooldowns[("k1", "model/b")] = far_past
+    openrouter_keys._drop_expired_cooldowns()
+    assert openrouter_keys._per_model_cooldowns == {}
+    _reset_env()
+
+
+def test_clear_all_cooldowns_wipes_per_model_table():
+    """``clear_all_cooldowns`` wipes the per-(key, model) table too —
+    leaving it half-cleared after an ops "force back online"
+    button would be the worst-of-both-worlds bug.
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited("k0")
+    openrouter_keys.mark_key_rate_limited("k1", model="model/a")
+    assert "k0" in openrouter_keys._cooldowns
+    assert ("k1", "model/a") in openrouter_keys._per_model_cooldowns
+    openrouter_keys.clear_all_cooldowns()
+    assert openrouter_keys._cooldowns == {}
+    assert openrouter_keys._per_model_cooldowns == {}
+    _reset_env()
+
+
+def test_load_keys_evicts_stale_per_model_cooldown_entries():
+    """``load_keys`` must drop per-(key, model) entries whose api_key
+    is no longer in the new pool — same eviction discipline the
+    whole-key table follows.
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited("k1", model="model/a")
+    assert ("k1", "model/a") in openrouter_keys._per_model_cooldowns
+    # Hot rotation: drop k1 from the env; reload.
+    os.environ.pop("OPENROUTER_API_KEY_2", None)
+    openrouter_keys.load_keys()
+    # k1 is no longer in the pool; the per-(k1, *) entry must be
+    # evicted alongside the whole-key table eviction.
+    assert ("k1", "model/a") not in openrouter_keys._per_model_cooldowns
+    _reset_env()
+
+
+def test_mark_per_model_keeps_longer_existing_deadline():
+    """Two back-to-back 429s for the same (key, model) with a
+    *shorter* second Retry-After must NOT shorten the first
+    cooldown. Same "keep the longer deadline" discipline the
+    whole-key table follows.
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited(
+        "k0", retry_after_secs=300, model="model/x",
+    )
+    long_deadline = openrouter_keys._per_model_cooldowns[("k0", "model/x")]
+    openrouter_keys.mark_key_rate_limited(
+        "k0", retry_after_secs=10, model="model/x",
+    )
+    assert (
+        openrouter_keys._per_model_cooldowns[("k0", "model/x")]
+        == long_deadline
+    )
+    _reset_env()
+
+
+def test_mark_per_model_extends_to_longer_new_deadline():
+    """Conversely: a longer second Retry-After EXTENDS the
+    cooldown. Same as the whole-key behaviour.
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited(
+        "k0", retry_after_secs=10, model="model/x",
+    )
+    short_deadline = openrouter_keys._per_model_cooldowns[("k0", "model/x")]
+    openrouter_keys.mark_key_rate_limited(
+        "k0", retry_after_secs=300, model="model/x",
+    )
+    new_deadline = openrouter_keys._per_model_cooldowns[("k0", "model/x")]
+    assert new_deadline > short_deadline
+    _reset_env()
+
+
+def test_mark_per_model_with_blank_or_none_falls_back_to_whole_key():
+    """``model=""`` / ``model=None`` / ``model="   "`` collapse via
+    ``_normalise_model`` to "no model context" — the cooldown
+    lands on the whole-key table, preserving back-compat for
+    callers that pass a falsy value.
+    """
+    _setup_three_keys()
+    for falsy in (None, "", "   ", "\t\n"):
+        openrouter_keys.clear_all_cooldowns()
+        openrouter_keys.mark_key_rate_limited("k0", model=falsy)
+        assert "k0" in openrouter_keys._cooldowns, (
+            f"falsy model={falsy!r} should collapse to whole-key"
+        )
+        assert openrouter_keys._per_model_cooldowns == {}
+    _reset_env()
+
+
+def test_mark_per_model_strips_surrounding_whitespace():
+    """Surrounding whitespace on the model id is stripped before
+    keying the cooldown table — ``"  vendor/x  "`` and
+    ``"vendor/x"`` are the same model from a routing POV.
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited("k0", model="  vendor/x  ")
+    assert ("k0", "vendor/x") in openrouter_keys._per_model_cooldowns
+    assert ("k0", "  vendor/x  ") not in openrouter_keys._per_model_cooldowns
+    # ``is_key_rate_limited`` strips too so the membership check
+    # finds the canonical entry.
+    assert openrouter_keys.is_key_rate_limited(
+        "k0", model="vendor/x",
+    )
+    assert openrouter_keys.is_key_rate_limited(
+        "k0", model="  vendor/x  ",
+    )
+    _reset_env()
+
+
+def test_mark_per_model_does_not_lower_case_model():
+    """OpenRouter ids are case-sensitive — ``vendor/X`` and
+    ``vendor/x`` are different routes. Verify the cooldown key
+    keeps the original case.
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited("k0", model="vendor/X")
+    assert ("k0", "vendor/X") in openrouter_keys._per_model_cooldowns
+    # Querying with the lower-case form must NOT match.
+    assert not openrouter_keys.is_key_rate_limited(
+        "k0", model="vendor/x",
+    )
+    _reset_env()
+
+
+def test_mark_per_model_increments_429_counter():
+    """A per-model cooldown still bumps the per-key 429 counter —
+    ops aggregating "429s seen against this key" want every
+    429 counted regardless of which table absorbed it.
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited("k1", model="model/x")
+    counts = openrouter_keys.get_key_429_counters()
+    assert counts.get(1, 0) == 1
+    _reset_env()
+
+
+def test_per_model_cooldown_snapshot_returns_active_pairs_only():
+    """``per_model_cooldown_snapshot`` returns one row per active
+    (key, model) cooldown with ``index``, ``model``, and
+    ``cooldown_remaining_secs > 0``. Expired entries are excluded.
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited(
+        "k0", retry_after_secs=120, model="vendor/a",
+    )
+    openrouter_keys.mark_key_rate_limited(
+        "k1", retry_after_secs=120, model="vendor/b",
+    )
+    snap = openrouter_keys.per_model_cooldown_snapshot()
+    assert len(snap) == 2
+    rows_by_key = {(row["index"], row["model"]): row for row in snap}
+    assert (0, "vendor/a") in rows_by_key
+    assert (1, "vendor/b") in rows_by_key
+    for row in snap:
+        assert row["cooldown_remaining_secs"] > 0
+    _reset_env()
+
+
+def test_per_model_cooldown_snapshot_filters_rotated_keys():
+    """A per-(key, model) entry whose api_key has been rotated out
+    is filtered from the snapshot — rendering an idx that no
+    longer exists would be misleading. Same discipline as
+    ``get_key_24h_usage``.
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited(
+        "k1", retry_after_secs=120, model="vendor/a",
+    )
+    # Force a stale entry: simulate "key rotated out" by clearing
+    # the load flag and removing k1 from _keys directly. The next
+    # snapshot read should filter it out (idx_by_key won't find
+    # "k1" so the row is skipped).
+    openrouter_keys._keys = ["k0", "k2"]
+    snap = openrouter_keys.per_model_cooldown_snapshot()
+    assert all(row["model"] != "vendor/a" for row in snap)
+    _reset_env()
+
+
+def test_per_model_cooldown_snapshot_sorts_deterministically():
+    """Snapshot rows are sorted by (index, model) so test
+    assertions and Prometheus label ordering are deterministic
+    across scrapes / runs.
+    """
+    _setup_three_keys()
+    # Mark out of order.
+    openrouter_keys.mark_key_rate_limited("k2", model="vendor/c")
+    openrouter_keys.mark_key_rate_limited("k0", model="vendor/b")
+    openrouter_keys.mark_key_rate_limited("k0", model="vendor/a")
+    openrouter_keys.mark_key_rate_limited("k1", model="vendor/x")
+    snap = openrouter_keys.per_model_cooldown_snapshot()
+    keys = [(row["index"], row["model"]) for row in snap]
+    assert keys == sorted(keys)
+    _reset_env()
+
+
+def test_key_status_snapshot_with_model_folds_per_model_into_view():
+    """``key_status_snapshot(model=m)`` reflects (key, m) cooldowns
+    in the per-slot ``rate_limited`` flag and reports the LATER
+    of the two deadlines (whichever expires later).
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited(
+        "k0", retry_after_secs=120, model="vendor/x",
+    )
+    snap = openrouter_keys.key_status_snapshot(model="vendor/x")
+    assert snap[0]["rate_limited"] is True
+    assert 119.0 <= snap[0]["cooldown_remaining_secs"] <= 121.0
+    # No-model snapshot doesn't see the per-model entry.
+    snap_global = openrouter_keys.key_status_snapshot()
+    assert snap_global[0]["rate_limited"] is False
+    _reset_env()
+
+
+def test_key_status_snapshot_with_model_takes_max_of_both_deadlines():
+    """When a slot has BOTH a whole-key cooldown AND a per-(key,m)
+    cooldown active, ``cooldown_remaining_secs`` is the max of
+    the two — the slot only becomes usable when *both* expire.
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited(
+        "k0", retry_after_secs=30,
+    )
+    openrouter_keys.mark_key_rate_limited(
+        "k0", retry_after_secs=300, model="vendor/x",
+    )
+    snap = openrouter_keys.key_status_snapshot(model="vendor/x")
+    # Whole-key 30s vs per-model 300s → max is ~300s.
+    assert 295.0 <= snap[0]["cooldown_remaining_secs"] <= 305.0
+    _reset_env()
+
+
+def test_key_for_user_walks_past_per_model_blocked_slots():
+    """When a user's sticky slot is per-model-blocked AND the next
+    slot is per-model-blocked too, the picker walks all the way
+    around the pool until it finds an available slot.
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited("k0", model="hot/x")
+    openrouter_keys.mark_key_rate_limited("k1", model="hot/x")
+    # User 0 → sticky idx 0 → "k0" (blocked).
+    # Walk: k1 (blocked), k2 (free).
+    assert openrouter_keys.key_for_user(0, model="hot/x") == "k2"
+    _reset_env()
+
+
+def test_key_for_user_falls_back_to_sticky_when_all_keys_per_model_cooled():
+    """Every (key, m) blocked → fall back to sticky idx, log
+    warning. Mirrors the whole-key all-cooled branch.
+    """
+    _setup_three_keys()
+    for k in ("k0", "k1", "k2"):
+        openrouter_keys.mark_key_rate_limited(k, model="hot/x")
+    # All three blocked for "hot/x"; sticky pick wins.
+    assert openrouter_keys.key_for_user(1, model="hot/x") == "k1"
+    _reset_env()
+
+
+def test_per_model_cooldown_isolates_same_key_different_models():
+    """Two distinct (key, model) cooldowns on the SAME key for
+    DIFFERENT models don't interact: clearing one leaves the
+    other in place.
+    """
+    _setup_three_keys()
+    openrouter_keys.mark_key_rate_limited(
+        "k0", retry_after_secs=10, model="model/a",
+    )
+    openrouter_keys.mark_key_rate_limited(
+        "k0", retry_after_secs=300, model="model/b",
+    )
+    # Force model/a to expire.
+    openrouter_keys._per_model_cooldowns[("k0", "model/a")] = (
+        openrouter_keys.time.monotonic() - 1.0
+    )
+    openrouter_keys._drop_expired_cooldowns()
+    assert ("k0", "model/a") not in openrouter_keys._per_model_cooldowns
+    assert ("k0", "model/b") in openrouter_keys._per_model_cooldowns
+    _reset_env()
+
+
+def test_normalise_model_returns_none_for_non_string():
+    """``_normalise_model`` returns ``None`` for non-str inputs so
+    a buggy caller that passes (e.g.) an int doesn't end up
+    keying the cooldown table on a non-str tuple."""
+    assert openrouter_keys._normalise_model(None) is None
+    assert openrouter_keys._normalise_model(42) is None
+    assert openrouter_keys._normalise_model(["a", "b"]) is None
+
+
+def test_normalise_model_strips_whitespace():
+    """Surrounding whitespace is stripped; otherwise non-empty
+    inputs pass through unchanged."""
+    assert openrouter_keys._normalise_model("  vendor/x  ") == "vendor/x"
+    assert openrouter_keys._normalise_model("vendor/x") == "vendor/x"
+    assert openrouter_keys._normalise_model("\tvendor/x\n") == "vendor/x"
+
+
+def test_normalise_model_returns_none_for_blank():
+    """All-whitespace inputs collapse to ``None`` — same as the
+    falsy-fallback path in :func:`mark_key_rate_limited`."""
+    assert openrouter_keys._normalise_model("") is None
+    assert openrouter_keys._normalise_model("   ") is None
+    assert openrouter_keys._normalise_model("\t\n  ") is None

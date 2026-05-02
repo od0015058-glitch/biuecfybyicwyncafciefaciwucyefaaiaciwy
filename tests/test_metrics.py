@@ -651,6 +651,88 @@ def test_render_metrics_emits_per_key_cooldown_remaining_gauge(monkeypatch):
         )
 
 
+def test_render_metrics_emits_per_key_model_cooldown_gauge(monkeypatch):
+    """Stage-15-Step-E #4 follow-up #4 — the per-(key, model) cooldown
+    gauge family renders one row per *active* (key, model) pair.
+
+    Available pairs are absent (not rendered as 0) so PromQL queries
+    can use the natural ``> 0`` filter without polluting the result
+    set with sentinel zeros for every (key × model) cross product.
+    """
+    import openrouter_keys
+
+    metrics.reset_loop_ticks_for_tests()
+    _patch_collectors(monkeypatch)
+    _setup_three_key_pool(monkeypatch)
+    openrouter_keys.mark_key_rate_limited(
+        "km1", retry_after_secs=42.0, model="vendor/x",
+    )
+    openrouter_keys.mark_key_rate_limited(
+        "km2", retry_after_secs=10.0, model="vendor/y",
+    )
+
+    body = metrics.render_metrics()
+    assert (
+        "# HELP meowassist_openrouter_key_model_cooldown_remaining_seconds"
+        in body
+    )
+    assert (
+        "# TYPE meowassist_openrouter_key_model_cooldown_remaining_seconds gauge"
+        in body
+    )
+    # Two active rows — one per (key, model) cooldown.
+    rows = [
+        line
+        for line in body.splitlines()
+        if line.startswith(
+            "meowassist_openrouter_key_model_cooldown_remaining_seconds{"
+        )
+    ]
+    assert len(rows) == 2
+    # Both rows present with their model labels.
+    assert any(
+        'index="1"' in line and 'model="vendor/x"' in line
+        for line in rows
+    )
+    assert any(
+        'index="2"' in line and 'model="vendor/y"' in line
+        for line in rows
+    )
+    # An idle (key, model) pair MUST NOT render a sentinel zero.
+    assert not any(
+        'model="vendor/z"' in line for line in rows
+    )
+
+
+def test_render_metrics_per_key_model_gauge_empty_when_no_per_model(monkeypatch):
+    """When no per-(key, model) cooldowns are active, the family
+    emits the HELP/TYPE preamble but zero data rows. Mirrors the
+    discipline the per-key counter families follow.
+    """
+    import openrouter_keys
+
+    metrics.reset_loop_ticks_for_tests()
+    _patch_collectors(monkeypatch)
+    _setup_three_key_pool(monkeypatch)
+    # Only a whole-key cooldown — the per-model family must render
+    # zero rows.
+    openrouter_keys.mark_key_rate_limited("km1", retry_after_secs=42.0)
+
+    body = metrics.render_metrics()
+    assert (
+        "# HELP meowassist_openrouter_key_model_cooldown_remaining_seconds"
+        in body
+    )
+    assert (
+        "# TYPE meowassist_openrouter_key_model_cooldown_remaining_seconds gauge"
+        in body
+    )
+    assert (
+        "meowassist_openrouter_key_model_cooldown_remaining_seconds{"
+        not in body
+    )
+
+
 def test_render_metrics_per_key_counters_zero_when_pool_empty(monkeypatch):
     """No keys configured → the labelled counter families still emit
     the HELP/TYPE preamble (Prometheus rate(...) queries shouldn't
