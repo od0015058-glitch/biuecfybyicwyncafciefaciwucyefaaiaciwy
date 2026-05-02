@@ -610,10 +610,11 @@ async def discover_new_models_loop(
     # a misconfigured ``DISCOVERY_INTERVAL_SECONDS=0`` would otherwise
     # busy-loop the OpenRouter catalog refresh and get the API key
     # rate-limited (Stage-15-Step-E #8 bundled bug fix).
+    from model_discovery_config import get_discovery_interval_seconds as _db_interval
     interval = (
         interval_seconds
         if interval_seconds is not None
-        else _get_discovery_interval_seconds()
+        else _db_interval()
     )
     while True:
         try:
@@ -631,6 +632,10 @@ async def discover_new_models_loop(
             from metrics import record_loop_tick
 
             record_loop_tick("model_discovery")
+        # Re-read interval every tick so a DB override takes effect
+        # on the next sleep without a redeploy.
+        if interval_seconds is None:
+            interval = _db_interval()
         try:
             await asyncio.sleep(interval)
         except asyncio.CancelledError:

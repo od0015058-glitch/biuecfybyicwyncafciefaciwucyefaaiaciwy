@@ -2153,7 +2153,7 @@ or unblock other work.
 | 20 | **Audit retention policy** — audit log grows forever. | No retention. | Editor on `/admin/audit` + nightly delete loop. | P2 | Pending |
 | 21 | **Bot-health alert cadence** — `BOT_HEALTH_ALERT_INTERVAL_SECONDS`. | Env-only. | Editor on `/admin/control`. | P3 | **Shipped** (PR #173) |
 | 22 | **`I18N_LOCK`** — gate live string overrides during deploy. | Not implemented. | Toggle on `/admin/strings` that blocks the upsert form. | P3 | Pending |
-| 23 | **`MODEL_DISCOVERY_INTERVAL_SECONDS`** — catalog refresh cadence. | Env-only. | Editor on a new `/admin/models-config` page. | P3 | Pending |
+| 23 | **`MODEL_DISCOVERY_INTERVAL_SECONDS`** — catalog refresh cadence. | Env-only. | Editor on a new `/admin/models-config` page. | P3 | **Shipped** (this PR — new `model_discovery_config.py` module with DB-backed override for `DISCOVERY_INTERVAL_SECONDS`. New `/admin/models-config` page with sidebar link + discovery interval editor (breakdown table + set/clear form). Boot warm-up in `main.py`. Discovery loop re-reads DB-backed interval every tick. Audit slug `models_config_discovery_interval_update`. Bundled bug fix: `delete_setting` now strips NUL bytes from the key, mirroring `upsert_setting`.) |
 | 24 | **`FX_REFRESH_INTERVAL_SECONDS`** — USD→Toman refresh cadence. | Env-only. | Editor on `/admin/wallet-config`. | P3 | Pending |
 | 25 | **`ADMIN_PASSWORD`** rotation — currently env-only. | Env-only. | "Rotate password" form on `/admin` profile page. | P2 | Pending |
 | 26 | **`ADMIN_2FA_ENROLLMENT_TIMEOUT`** — TOTP enrollment window. | Env-only. | Editor on the existing `/admin/enroll_2fa` page. | P3 | Pending |
@@ -4201,7 +4201,14 @@ The user's process for this project — **do not deviate**:
     `_require_role(ROLE_SUPER)` so a regression that drops a
     gate fails immediately. Total suite: 2454 → 2487 passing
     (+33 new).
-26. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+26. **Stage-15-Step-E #10b row 23 OPENED** — DISCOVERY_INTERVAL_SECONDS
+    editor on `/admin/models-config`. New `model_discovery_config.py`
+    module (DB-backed override, range [60, 604800]). Discovery loop
+    re-reads interval from DB every tick. Sidebar link ⚙️ Models config.
+    Audit slug `models_config_discovery_interval_update`. Bundled bug fix:
+    `delete_setting` now strips NUL bytes, mirroring `upsert_setting`.
+    47 new tests. Total suite: 3119 passing.
+27. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-27. **Read the §11 working agreement before doing anything.**
+28. **Read the §11 working agreement before doing anything.**

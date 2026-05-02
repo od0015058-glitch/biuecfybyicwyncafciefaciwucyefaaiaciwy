@@ -2916,6 +2916,8 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     # cause to a knob tweak vs. a real change in the loop's actual
     # ticking cadence.
     "control_loop_stale_update": "Per-loop stale threshold updated",
+    # Stage-15-Step-E #10b row 23: model discovery interval editor.
+    "models_config_discovery_interval_update": "Model discovery interval updated",
 }
 
 
@@ -6714,6 +6716,236 @@ _ADMIN_PROVIDER_LABELS: dict[str, str] = {
     "x-ai": "⚫ xAI",
     "deepseek": "🐋 DeepSeek",
 }
+
+
+# ---------------------------------------------------------------------
+# Models config page (Stage-15-Step-E #10b row 23)
+# ---------------------------------------------------------------------
+
+
+def _build_discovery_interval_view() -> dict:
+    """Snapshot of the resolved DISCOVERY_INTERVAL_SECONDS."""
+    import model_discovery_config as mdc
+
+    override_value = mdc.get_discovery_interval_override()
+    env_raw = os.getenv("DISCOVERY_INTERVAL_SECONDS", "").strip()
+    env_value: int | None = None
+    if env_raw:
+        env_value = mdc._coerce_discovery_interval(env_raw)
+    return {
+        "effective": mdc.get_discovery_interval_seconds(),
+        "effective_human": mdc.format_interval_human(
+            mdc.get_discovery_interval_seconds()
+        ),
+        "source": mdc.get_discovery_interval_source(),
+        "default_value": mdc.DEFAULT_DISCOVERY_INTERVAL_SECONDS,
+        "default_human": mdc.format_interval_human(
+            mdc.DEFAULT_DISCOVERY_INTERVAL_SECONDS
+        ),
+        "env_value": env_value,
+        "env_raw": env_raw,
+        "override_value": override_value,
+        "override_human": (
+            mdc.format_interval_human(override_value)
+            if override_value is not None
+            else None
+        ),
+        "minimum": mdc.DISCOVERY_INTERVAL_MINIMUM,
+        "maximum": mdc.DISCOVERY_INTERVAL_MAXIMUM,
+    }
+
+
+async def models_config_get(
+    request: web.Request,
+) -> web.StreamResponse:
+    """GET /admin/models-config — discovery interval editor."""
+    db = request.app.get(APP_KEY_DB)
+    if db is not None:
+        import model_discovery_config as mdc
+        try:
+            await mdc.refresh_discovery_interval_override_from_db(db)
+        except Exception:
+            log.exception(
+                "models_config_get: "
+                "refresh_discovery_interval_override_from_db failed"
+            )
+
+    context = {
+        "active_page": "models_config",
+        "csrf_token": csrf_token_for(request),
+        "discovery_view": _build_discovery_interval_view(),
+        "flash": None,
+    }
+    response = aiohttp_jinja2.render_template(
+        "models_config.html", request, context,
+    )
+    flash = pop_flash(request, response)
+    if flash is not None:
+        context["flash"] = flash
+        response = aiohttp_jinja2.render_template(
+            "models_config.html", request, context,
+        )
+    return response
+
+
+async def models_config_discovery_interval_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """POST /admin/models-config/discovery-interval — update interval."""
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app.get(APP_KEY_DB)
+    form = await request.post()
+
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning(
+            "models_config_discovery_interval_post: CSRF mismatch from %s",
+            request.remote,
+        )
+        response = web.HTTPFound(location="/admin/models-config")
+        set_flash(
+            response, kind="error",
+            message="CSRF token mismatch — please reload and try again.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    if db is None:
+        response = web.HTTPFound(location="/admin/models-config")
+        set_flash(
+            response, kind="error",
+            message="Database is not configured.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    import model_discovery_config as mdc
+
+    raw_value = str(form.get("discovery_interval_seconds", "")).strip()
+    previous_effective = mdc.get_discovery_interval_seconds()
+    previous_source = mdc.get_discovery_interval_source()
+
+    if not raw_value:
+        try:
+            await db.delete_setting(mdc.DISCOVERY_INTERVAL_SETTING_KEY)
+        except Exception:
+            log.exception(
+                "models_config_discovery_interval_post: "
+                "delete_setting failed"
+            )
+            response = web.HTTPFound(location="/admin/models-config")
+            set_flash(
+                response, kind="error",
+                message="Failed to clear the override — see logs.",
+                secret=secret, cookie_secure=cookie_secure,
+            )
+            return response
+        mdc.clear_discovery_interval_override()
+        try:
+            await mdc.refresh_discovery_interval_override_from_db(db)
+        except Exception:
+            log.exception(
+                "models_config_discovery_interval_post: "
+                "refresh after clear failed"
+            )
+        new_effective = mdc.get_discovery_interval_seconds()
+        await _record_audit_safe(
+            request, "models_config_discovery_interval_update",
+            target="discovery_interval_seconds",
+            meta={
+                "action": "clear",
+                "before": previous_effective,
+                "before_source": previous_source,
+                "after": new_effective,
+                "after_source": mdc.get_discovery_interval_source(),
+            },
+        )
+        response = web.HTTPFound(location="/admin/models-config")
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Override cleared. Effective interval is now "
+                f"{new_effective}s "
+                f"({mdc.format_interval_human(new_effective)}, "
+                f"source: {mdc.get_discovery_interval_source()})."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    parsed = mdc._coerce_discovery_interval(raw_value)
+    if parsed is None:
+        response = web.HTTPFound(location="/admin/models-config")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Interval must be an integer in "
+                f"[{mdc.DISCOVERY_INTERVAL_MINIMUM}, "
+                f"{mdc.DISCOVERY_INTERVAL_MAXIMUM}]. "
+                f"Got: {raw_value!r}. No changes."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        await db.upsert_setting(
+            mdc.DISCOVERY_INTERVAL_SETTING_KEY, str(parsed),
+        )
+    except Exception:
+        log.exception(
+            "models_config_discovery_interval_post: "
+            "upsert_setting failed value=%r",
+            parsed,
+        )
+        response = web.HTTPFound(location="/admin/models-config")
+        set_flash(
+            response, kind="error",
+            message="Failed to persist — see logs.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        mdc.set_discovery_interval_override(parsed)
+    except ValueError:
+        log.exception(
+            "models_config_discovery_interval_post: "
+            "set_discovery_interval_override rejected %r",
+            parsed,
+        )
+
+    try:
+        await mdc.refresh_discovery_interval_override_from_db(db)
+    except Exception:
+        log.exception(
+            "models_config_discovery_interval_post: "
+            "refresh after upsert failed"
+        )
+
+    new_effective = mdc.get_discovery_interval_seconds()
+    await _record_audit_safe(
+        request, "models_config_discovery_interval_update",
+        target="discovery_interval_seconds",
+        meta={
+            "action": "set",
+            "before": previous_effective,
+            "before_source": previous_source,
+            "after": new_effective,
+            "after_source": mdc.get_discovery_interval_source(),
+        },
+    )
+    response = web.HTTPFound(location="/admin/models-config")
+    set_flash(
+        response, kind="success",
+        message=(
+            f"Discovery interval updated: "
+            f"{previous_effective}s → {new_effective}s "
+            f"({mdc.format_interval_human(new_effective)})."
+        ),
+        secret=secret, cookie_secure=cookie_secure,
+    )
+    return response
 
 
 async def models_get(request: web.Request) -> web.StreamResponse:
@@ -10829,6 +11061,17 @@ def setup_admin_routes(
     # original "only super-admins should disable AI / payments"
     # posture — an operator-tier user shouldn't be able to take the
     # bot offline mid-incident without super sign-off).
+    # Stage-15-Step-E #10b row 23: models-config page.
+    app.router.add_get(
+        "/admin/models-config",
+        _require_auth(models_config_get),
+    )
+    app.router.add_post(
+        "/admin/models-config/discovery-interval",
+        _require_role(ROLE_OPERATOR)(
+            models_config_discovery_interval_post
+        ),
+    )
     app.router.add_get("/admin/models", _require_auth(models_get))
     app.router.add_post(
         "/admin/models/disable",

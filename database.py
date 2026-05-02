@@ -6284,12 +6284,25 @@ class Database:
         )
 
     async def delete_setting(self, setting_key: str) -> bool:
-        """Delete *setting_key*. Returns True if a row was removed."""
+        """Delete *setting_key*. Returns True if a row was removed.
+
+        §10b row 23 bundled fix: strip NUL bytes from the key before
+        the DELETE, mirroring the same sanitization added to
+        ``upsert_setting`` in the §10b row 2 PR. Without this, a
+        caller that round-trips through ``upsert_setting`` (which
+        strips NUL) and then tries ``delete_setting`` with the
+        *original* un-stripped key would pass NUL to asyncpg and get
+        ``InvalidBinaryRepresentationError`` instead of the expected
+        ``True`` / ``False``.
+        """
         if not isinstance(setting_key, str) or not setting_key:
             raise ValueError("setting_key must be a non-empty string")
+        sanitized_key = setting_key.replace("\x00", "")
+        if not sanitized_key:
+            raise ValueError("setting_key was empty after NUL strip")
         result = await self.pool.execute(
             "DELETE FROM system_settings WHERE setting_key = $1",
-            setting_key,
+            sanitized_key,
         )
         return result.endswith("1")
 
