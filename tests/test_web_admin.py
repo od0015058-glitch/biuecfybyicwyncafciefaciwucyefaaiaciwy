@@ -1915,6 +1915,171 @@ async def test_monetization_empty_by_model_table_renders_placeholder(
 
 
 # ---------------------------------------------------------------------
+# Stage-15-Step-E #9 follow-up: top-users-by-revenue panel
+# ---------------------------------------------------------------------
+
+
+async def test_monetization_renders_top_users_panel(
+    aiohttp_client, make_admin_app
+):
+    """Happy path: the page renders the new "Top users by revenue"
+    panel with each user's username, top-up count, revenue and
+    wallet charges. Username links to the per-user detail page;
+    the telegram_id is shown as a secondary annotation when a
+    username is present, or as the primary identifier otherwise.
+    """
+    summary = {
+        "markup": 2.0,
+        "lifetime": {
+            "revenue_usd": 0.0, "charged_usd": 0.0,
+            "openrouter_cost_usd": 0.0, "gross_margin_usd": 0.0,
+            "gross_margin_pct": 50.0, "net_profit_usd": 0.0,
+        },
+        "window": {
+            "days": 30,
+            "revenue_usd": 130.0, "charged_usd": 30.0,
+            "openrouter_cost_usd": 15.0, "gross_margin_usd": 15.0,
+            "gross_margin_pct": 50.0, "net_profit_usd": 115.0,
+        },
+        "by_model": [],
+        "top_users": [
+            {
+                "telegram_id": 111,
+                "username": "alice",
+                "revenue_usd": 80.0,
+                "topup_count": 4,
+                "charged_usd": 30.0,
+            },
+            {
+                "telegram_id": 222,
+                "username": None,
+                "revenue_usd": 50.0,
+                "topup_count": 1,
+                "charged_usd": 0.0,
+            },
+        ],
+    }
+    db = _stub_db_with_monetization(summary)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+
+    # Panel heading.
+    assert "Top users by revenue" in body
+    # alice's username + link to her detail page.
+    assert "@alice" in body
+    assert "/admin/users/111" in body
+    # Username-less user falls back to the telegram_id as the
+    # link text and link target.
+    assert "/admin/users/222" in body
+    # Money fields rendered with thousands sep + 4 dp.
+    assert "$80.0000" in body
+    assert "$50.0000" in body
+    # Topup count rendered with thousands sep.
+    assert ">4<" in body  # alice's topup count
+    assert ">1<" in body  # bob's topup count
+
+
+async def test_monetization_renders_top_users_empty_state(
+    aiohttp_client, make_admin_app
+):
+    """When ``top_users`` is empty (fresh deploy, no paid top-ups in
+    the window) the panel renders an explanatory placeholder rather
+    than an empty ``<table>`` that looks broken. Mirrors the
+    by_model empty-state shape.
+    """
+    summary = {
+        "markup": 1.5,
+        "lifetime": {
+            "revenue_usd": 0.0, "charged_usd": 0.0,
+            "openrouter_cost_usd": 0.0, "gross_margin_usd": 0.0,
+            "gross_margin_pct": 0.0, "net_profit_usd": 0.0,
+        },
+        "window": {
+            "days": 7,
+            "revenue_usd": 0.0, "charged_usd": 0.0,
+            "openrouter_cost_usd": 0.0, "gross_margin_usd": 0.0,
+            "gross_margin_pct": 0.0, "net_profit_usd": 0.0,
+        },
+        "by_model": [],
+        "top_users": [],
+    }
+    db = _stub_db_with_monetization(summary)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization?window=7")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    assert "No paying users in the last 7 days" in body
+    assert "excluding manual credits and gift-code redemptions" in body
+
+
+async def test_monetization_route_passes_top_users_limit_to_db(
+    aiohttp_client, make_admin_app
+):
+    """The HTML handler must pass ``top_users_limit`` to the DB call
+    so the SQL caps the result set at the panel size (10).
+    """
+    from web_admin import _MONETIZATION_TOP_USERS_LIMIT
+
+    summary = {
+        "markup": 2.0,
+        "lifetime": {
+            "revenue_usd": 0.0, "charged_usd": 0.0,
+            "openrouter_cost_usd": 0.0, "gross_margin_usd": 0.0,
+            "gross_margin_pct": 50.0, "net_profit_usd": 0.0,
+        },
+        "window": {
+            "days": 30,
+            "revenue_usd": 0.0, "charged_usd": 0.0,
+            "openrouter_cost_usd": 0.0, "gross_margin_usd": 0.0,
+            "gross_margin_pct": 50.0, "net_profit_usd": 0.0,
+        },
+        "by_model": [],
+        "top_users": [],
+    }
+    db = _stub_db_with_monetization(summary)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization")
+    assert resp.status == 200
+    db.get_monetization_summary.assert_awaited_once()
+    kwargs = db.get_monetization_summary.await_args.kwargs
+    assert kwargs["top_users_limit"] == _MONETIZATION_TOP_USERS_LIMIT
+    assert kwargs["top_users_limit"] == 10
+
+
+async def test_monetization_csv_route_passes_wider_top_users_limit(
+    aiohttp_client, make_admin_app
+):
+    """CSV export pulls ``MONETIZATION_CSV_TOP_USERS_LIMIT`` (1000)
+    rather than the on-page panel cap so an operator doing monthly
+    P&L sees the long tail.
+    """
+    from web_admin import MONETIZATION_CSV_TOP_USERS_LIMIT
+
+    db = _stub_db_with_monetization(_sample_monetization_summary())
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await client.post(
+        "/admin/login", data={"password": "letmein"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/monetization/export.csv")
+    assert resp.status == 200
+    db.get_monetization_summary.assert_awaited()
+    call_kwargs = db.get_monetization_summary.await_args.kwargs
+    assert call_kwargs["top_users_limit"] == MONETIZATION_CSV_TOP_USERS_LIMIT
+    assert call_kwargs["top_users_limit"] == 1000
+
+
+# ---------------------------------------------------------------------
 # Stage-15-Step-E #9 follow-up #1: window selector
 # ---------------------------------------------------------------------
 
@@ -2201,6 +2366,23 @@ def _sample_monetization_summary() -> dict:
                 "gross_margin_usd": 15.0,
             },
         ],
+        # Stage-15-Step-E #9 follow-up — top-users-by-revenue panel.
+        "top_users": [
+            {
+                "telegram_id": 111,
+                "username": "alice",
+                "revenue_usd": 80.0,
+                "topup_count": 4,
+                "charged_usd": 30.0,
+            },
+            {
+                "telegram_id": 222,
+                "username": None,
+                "revenue_usd": 50.0,
+                "topup_count": 1,
+                "charged_usd": 0.0,
+            },
+        ],
     }
 
 
@@ -2222,6 +2404,10 @@ def test_monetization_csv_headers_pinned():
         "gross_margin_pct",
         "net_profit_usd",
         "markup",
+        # Stage-15-Step-E #9 follow-up — top-users-by-revenue rows.
+        "telegram_id",
+        "username",
+        "topup_count",
     )
 
 
@@ -2230,14 +2416,16 @@ def test_monetization_csv_rows_shape_for_populated_summary():
 
     rows = _format_monetization_csv_rows(_sample_monetization_summary())
 
-    # Two scope rows + two by_model rows = 4 total.
-    assert len(rows) == 4
+    # Two scope rows + two by_model rows + two top_users rows = 6.
+    assert len(rows) == 6
     # Each row terminates with CRLF.
     for r in rows:
         assert r.endswith("\r\n")
 
     # Row 1: lifetime — model + requests + window_days are blank;
-    # all numeric fields use 4 decimal places.
+    # all numeric fields use 4 decimal places. The trailing
+    # per-user fields (telegram_id / username / topup_count) are
+    # blank because lifetime is a scope-level row.
     parts = rows[0].rstrip("\r\n").split(",")
     assert parts[0] == "lifetime"
     assert parts[1] == ""  # window_days
@@ -2245,6 +2433,9 @@ def test_monetization_csv_rows_shape_for_populated_summary():
     assert parts[3] == ""  # requests
     assert parts[4] == "1234.5678"  # revenue
     assert parts[10] == "2.0000"  # markup
+    assert parts[11] == ""  # telegram_id: scope-level
+    assert parts[12] == ""  # username: scope-level
+    assert parts[13] == ""  # topup_count: scope-level
 
     # Row 2: window — window_days=30, model + requests blank.
     parts = rows[1].rstrip("\r\n").split(",")
@@ -2253,9 +2444,12 @@ def test_monetization_csv_rows_shape_for_populated_summary():
     assert parts[2] == ""
     assert parts[3] == ""
     assert parts[4] == "200.0000"
+    assert parts[11] == ""  # telegram_id: scope-level
+    assert parts[12] == ""
+    assert parts[13] == ""
 
     # Row 3: window_by_model — gpt-4o, requests=12, scope-level
-    # fields blank.
+    # fields blank, per-user fields blank.
     parts = rows[2].rstrip("\r\n").split(",")
     assert parts[0] == "window_by_model"
     assert parts[1] == "30"
@@ -2265,6 +2459,36 @@ def test_monetization_csv_rows_shape_for_populated_summary():
     assert parts[5] == "50.0000"
     assert parts[8] == ""  # gross_margin_pct: scope-level
     assert parts[9] == ""  # net_profit_usd: scope-level
+    assert parts[11] == ""  # telegram_id: per-model rows have no user
+    assert parts[12] == ""
+    assert parts[13] == ""
+
+    # Row 5 (after the second by_model row): window_top_users —
+    # alice (telegram_id=111, username='alice', revenue=$80,
+    # 4 top-ups, $30 wallet charges).
+    parts = rows[4].rstrip("\r\n").split(",")
+    assert parts[0] == "window_top_users"
+    assert parts[1] == "30"
+    assert parts[2] == ""  # model: per-user rows have no model
+    assert parts[3] == ""  # requests: per-user uses topup_count
+    assert parts[4] == "80.0000"  # revenue
+    assert parts[5] == "30.0000"  # charged
+    assert parts[6] == ""  # openrouter_cost: scope-level
+    assert parts[7] == ""  # gross_margin: scope-level
+    assert parts[8] == ""
+    assert parts[9] == ""
+    assert parts[10] == "2.0000"  # markup
+    assert parts[11] == "111"
+    assert parts[12] == "alice"
+    assert parts[13] == "4"
+
+    # Row 6: window_top_users for the username=None user (renders
+    # as an empty username field, NOT "None" or "null").
+    parts = rows[5].rstrip("\r\n").split(",")
+    assert parts[0] == "window_top_users"
+    assert parts[11] == "222"
+    assert parts[12] == ""
+    assert parts[13] == "1"
 
 
 def test_monetization_csv_rows_handle_empty_by_model():
@@ -2272,11 +2496,99 @@ def test_monetization_csv_rows_handle_empty_by_model():
 
     summary = _sample_monetization_summary()
     summary["by_model"] = []
+    summary["top_users"] = []
     rows = _format_monetization_csv_rows(summary)
     # Two scope rows only.
     assert len(rows) == 2
     assert rows[0].startswith("lifetime,")
     assert rows[1].startswith("window,30,")
+
+
+def test_monetization_csv_rows_handle_empty_top_users():
+    """Stage-15-Step-E #9 follow-up — the top_users block is
+    independent of by_model. An empty top_users with populated
+    by_model must render the by_model rows but no per-user rows.
+    """
+    from web_admin import _format_monetization_csv_rows
+
+    summary = _sample_monetization_summary()
+    summary["top_users"] = []
+    rows = _format_monetization_csv_rows(summary)
+    # Two scope rows + two by_model rows = 4 (no per-user rows).
+    assert len(rows) == 4
+    assert all("window_top_users" not in r for r in rows)
+
+
+def test_monetization_csv_rows_drop_non_dict_top_users_entries():
+    """Defence-in-depth: a future schema bump that returns a non-dict
+    in top_users must not crash the CSV serializer. Drop the
+    offender, keep going. Mirrors the by_model defence."""
+    from web_admin import _format_monetization_csv_rows
+
+    summary = _sample_monetization_summary()
+    summary["top_users"] = [
+        ("not", "a", "dict"),  # type: ignore[list-item]
+        {
+            "telegram_id": 333,
+            "username": "carol",
+            "revenue_usd": 10.0,
+            "topup_count": 1,
+            "charged_usd": 0.0,
+        },
+        None,
+    ]
+    rows = _format_monetization_csv_rows(summary)
+    # 2 scope + 2 by_model + 1 valid top_users = 5.
+    assert len(rows) == 5
+    assert rows[4].startswith("window_top_users,30,")
+    parts = rows[4].rstrip("\r\n").split(",")
+    assert parts[11] == "333"
+
+
+def test_monetization_csv_rows_drop_top_users_without_telegram_id():
+    """Stage-15-Step-E #9 follow-up bundled bug fix: drop top_users
+    rows whose telegram_id is None / non-int. The DB query never
+    returns NULL for telegram_id (the FK constraint guarantees it)
+    but a buggy stub or a future schema migration that nullifies
+    the column would otherwise produce a CSV row with an empty
+    identifier — which an operator importing into a spreadsheet
+    would silently mis-attribute to whichever row is sorted
+    adjacently.
+    """
+    from web_admin import _format_monetization_csv_rows
+
+    summary = _sample_monetization_summary()
+    summary["top_users"] = [
+        {
+            "telegram_id": None,
+            "username": "ghost",
+            "revenue_usd": 99.0,
+            "topup_count": 1,
+            "charged_usd": 0.0,
+        },
+        {
+            "telegram_id": "not-an-int",
+            "username": "garbage",
+            "revenue_usd": 88.0,
+            "topup_count": 1,
+            "charged_usd": 0.0,
+        },
+        {
+            "telegram_id": 444,
+            "username": "dana",
+            "revenue_usd": 5.0,
+            "topup_count": 1,
+            "charged_usd": 0.0,
+        },
+    ]
+    rows = _format_monetization_csv_rows(summary)
+    # 2 scope + 2 by_model + 1 valid top_users (the first two were
+    # dropped) = 5.
+    assert len(rows) == 5
+    assert rows[4].startswith("window_top_users,30,")
+    parts = rows[4].rstrip("\r\n").split(",")
+    assert parts[11] == "444"
+    assert parts[12] == "dana"
 
 
 def test_monetization_csv_rows_drop_non_dict_by_model_entries():
@@ -2293,6 +2605,7 @@ def test_monetization_csv_rows_drop_non_dict_by_model_entries():
          "openrouter_cost_usd": 0.25, "gross_margin_usd": 0.25},
         None,
     ]
+    summary["top_users"] = []
     rows = _format_monetization_csv_rows(summary)
     # 2 scope rows + 1 valid by_model row = 3.
     assert len(rows) == 3
@@ -2347,7 +2660,7 @@ async def test_monetization_csv_route_returns_csv_with_correct_headers(
     assert lines[0] == (
         "scope,window_days,model,requests,revenue_usd,charged_usd,"
         "openrouter_cost_usd,gross_margin_usd,gross_margin_pct,"
-        "net_profit_usd,markup"
+        "net_profit_usd,markup,telegram_id,username,topup_count"
     )
     assert lines[1].startswith("lifetime,")
     assert lines[2].startswith("window,30,")
@@ -2355,6 +2668,9 @@ async def test_monetization_csv_route_returns_csv_with_correct_headers(
     assert lines[4].startswith(
         "window_by_model,30,anthropic/claude-3-opus,8,"
     )
+    # Stage-15-Step-E #9 follow-up — top_users rows trail by_model.
+    assert lines[5].startswith("window_top_users,30,")
+    assert lines[6].startswith("window_top_users,30,")
 
 
 async def test_monetization_csv_route_honours_window_query_param(
@@ -2441,11 +2757,17 @@ async def test_monetization_csv_route_db_error_renders_empty_csv(
         body = await resp.text()
     assert resp.status == 200
     lines = body.split("\r\n")
-    # Header + lifetime + window rows (no by_model).
+    # Header + lifetime + window rows (no by_model, no top_users).
     assert lines[0].startswith("scope,window_days,")
     assert lines[1].startswith("lifetime,")
-    # Markup carried through from the fallback.
-    assert lines[1].endswith(",2.0000")
+    # Markup carried through from the fallback. After
+    # Stage-15-Step-E #9 follow-up the row trails three blank
+    # per-user columns (telegram_id / username / topup_count) so
+    # we check the markup field explicitly by index rather than
+    # via .endswith().
+    parts = lines[1].split(",")
+    assert parts[10] == "2.0000"
+    assert parts[11:] == ["", "", ""]
     assert lines[2].startswith("window,30,")
 
 

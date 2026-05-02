@@ -908,6 +908,13 @@ async def dashboard(request: web.Request) -> web.StreamResponse:
 # against the monetization table.
 _MONETIZATION_DEFAULT_WINDOW_DAYS: int = 30
 _MONETIZATION_TOP_MODELS_LIMIT: int = 10
+# Stage-15-Step-E #9 follow-up: "Top users by revenue" panel. Same
+# 10-row cap as ``_MONETIZATION_TOP_MODELS_LIMIT`` — enough to spot
+# the heavy hitters at a glance, short enough to not push the
+# explanatory "How to read these numbers" footer below the fold.
+# CSV export pulls a wider 1000-row tail (see
+# ``MONETIZATION_CSV_TOP_USERS_LIMIT`` below) for offline analysis.
+_MONETIZATION_TOP_USERS_LIMIT: int = 10
 
 # Stage-15-Step-E #9 follow-up #1: the page accepts ``?window=N`` on
 # the GET, but only against this allowlist. Arbitrary ``window_days``
@@ -983,6 +990,7 @@ def _empty_monetization_summary(
         "lifetime": dict(zero_block),
         "window": {"days": int(window_days), **zero_block},
         "by_model": [],
+        "top_users": [],
     }
 
 
@@ -1031,6 +1039,7 @@ async def monetization(request: web.Request) -> web.StreamResponse:
             summary = await db.get_monetization_summary(
                 window_days=window_days,
                 top_models_limit=_MONETIZATION_TOP_MODELS_LIMIT,
+                top_users_limit=_MONETIZATION_TOP_USERS_LIMIT,
             )
         except Exception:
             log.exception("monetization: get_monetization_summary failed")
@@ -1079,6 +1088,16 @@ MONETIZATION_CSV_HEADERS = (
     "gross_margin_pct",
     "net_profit_usd",
     "markup",
+    # Stage-15-Step-E #9 follow-up — "Top users by revenue" rows.
+    # Appended at the end (NOT inserted) so the existing column
+    # positions for lifetime / window / window_by_model rows don't
+    # shift — operators with saved spreadsheet imports keyed by
+    # column index keep working. Existing scope rows leave these
+    # three trailing fields blank; the new ``window_top_users``
+    # scope rows fill them in.
+    "telegram_id",
+    "username",
+    "topup_count",
 )
 
 # Cap on how many ``by_model`` rows the CSV export pulls. The
@@ -1088,6 +1107,13 @@ MONETIZATION_CSV_HEADERS = (
 # pathological user-set OPENROUTER_MODELS list (or a future "model
 # discovery" PR that adds variants) can't blow the response size.
 MONETIZATION_CSV_TOP_MODELS_LIMIT = 1000
+
+# Same idea as ``MONETIZATION_CSV_TOP_MODELS_LIMIT`` but for the
+# ``top_users`` rows. The on-screen panel caps at
+# ``_MONETIZATION_TOP_USERS_LIMIT`` (10); the CSV pulls 1000 so an
+# operator doing monthly P&L can see the long tail of paying users
+# without paginating.
+MONETIZATION_CSV_TOP_USERS_LIMIT = 1000
 
 
 def _format_usd_csv(value) -> str:
@@ -1119,14 +1145,22 @@ def _format_monetization_csv_rows(summary: dict) -> list[str]:
     """Serialize a monetization summary into a list of CSV row
     strings (each with trailing CRLF).
 
-    Yields three groups of rows, in display order:
+    Yields four groups of rows, in display order:
 
-    1. ``scope=lifetime`` — one row, model + requests blank.
+    1. ``scope=lifetime`` — one row, model + requests blank, plus the
+       three trailing per-user fields (``telegram_id`` / ``username`` /
+       ``topup_count``) blank.
     2. ``scope=window`` — one row with ``window_days`` set,
-       model + requests blank.
+       model + requests blank, per-user fields blank.
     3. ``scope=window_by_model`` — one row per top model.
        ``revenue_usd`` / ``gross_margin_pct`` / ``net_profit_usd``
        blank because those are scope-level figures, not per-model.
+       Per-user fields blank.
+    4. ``scope=window_top_users`` — one row per top user
+       (Stage-15-Step-E #9 follow-up). ``model`` / ``requests`` /
+       scope-level money fields except ``revenue_usd`` /
+       ``charged_usd`` blank; ``telegram_id`` / ``username`` /
+       ``topup_count`` filled in.
 
     Parametrised over ``summary``'s shape so a future schema bump
     surfaces here as a ``KeyError`` rather than silent data loss.
@@ -1148,6 +1182,9 @@ def _format_monetization_csv_rows(summary: dict) -> list[str]:
         _format_usd_csv(lifetime.get("gross_margin_pct")),
         _format_usd_csv(lifetime.get("net_profit_usd")),
         markup_field,
+        "",  # telegram_id: scope-level, not per-user
+        "",  # username: scope-level
+        "",  # topup_count: scope-level
     ]) + "\r\n")
 
     window = summary.get("window", {}) or {}
@@ -1166,6 +1203,9 @@ def _format_monetization_csv_rows(summary: dict) -> list[str]:
         _format_usd_csv(window.get("gross_margin_pct")),
         _format_usd_csv(window.get("net_profit_usd")),
         markup_field,
+        "",  # telegram_id
+        "",  # username
+        "",  # topup_count
     ]) + "\r\n")
 
     for model_row in summary.get("by_model", []) or []:
@@ -1187,6 +1227,44 @@ def _format_monetization_csv_rows(summary: dict) -> list[str]:
             "",  # gross_margin_pct: scope-level
             "",  # net_profit_usd: scope-level
             markup_field,
+            "",  # telegram_id
+            "",  # username
+            "",  # topup_count
+        ]) + "\r\n")
+
+    for user_row in summary.get("top_users", []) or []:
+        if not isinstance(user_row, dict):
+            continue
+        # ``telegram_id`` is the row identifier — drop the row if it
+        # comes through as None (shouldn't happen for a real DB
+        # result; defence-in-depth against a buggy stub).
+        tid_raw = user_row.get("telegram_id")
+        if tid_raw is None:
+            continue
+        try:
+            tid_field = str(int(tid_raw))
+        except (TypeError, ValueError):
+            continue
+        topup_field = (
+            str(int(user_row["topup_count"]))
+            if user_row.get("topup_count") is not None
+            else ""
+        )
+        rows.append(",".join(_csv_quote(f) for f in [
+            "window_top_users",
+            window_days_field,
+            "",  # model: scope is per-user
+            "",  # requests: per-user has topup_count instead
+            _format_usd_csv(user_row.get("revenue_usd")),
+            _format_usd_csv(user_row.get("charged_usd")),
+            "",  # openrouter_cost_usd: scope-level
+            "",  # gross_margin_usd: scope-level
+            "",  # gross_margin_pct: scope-level
+            "",  # net_profit_usd: scope-level
+            markup_field,
+            tid_field,
+            user_row.get("username") or "",
+            topup_field,
         ]) + "\r\n")
 
     return rows
@@ -1230,6 +1308,7 @@ async def monetization_csv_get(request: web.Request) -> web.StreamResponse:
             summary = await db.get_monetization_summary(
                 window_days=window_days,
                 top_models_limit=MONETIZATION_CSV_TOP_MODELS_LIMIT,
+                top_users_limit=MONETIZATION_CSV_TOP_USERS_LIMIT,
             )
         except Exception:
             log.exception(

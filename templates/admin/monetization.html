@@ -136,6 +136,60 @@
 </div>
 
 <div class="panel">
+  {# Stage-15-Step-E #9 follow-up — "Top users by revenue" panel.
+     Same trailing-window scope as the by-model table above so the
+     two panels speak about the same time slice. Sort key is
+     ``revenue_usd`` desc, then ``telegram_id`` asc for stability;
+     see ``database.get_monetization_summary`` for the SQL. The
+     ``charged_usd`` cross-reference exposes the "are big spenders
+     also big consumers?" question — a user paying $50 but
+     consuming $0 is either over-credited (refund risk) or about
+     to start consuming (growth). Telegram ids are PII; this page
+     is auth-gated like the rest of ``/admin/*``. #}
+  <h3>Top users by revenue — last {{ summary["window"].days }} days</h3>
+  {% if summary.top_users %}
+  <table>
+    <thead>
+      <tr>
+        <th>User</th>
+        <th>Top-ups</th>
+        <th>Revenue (USD)</th>
+        <th>Wallet charges (USD)</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in summary.top_users %}
+      <tr>
+        <td>
+          <a href="/admin/users/{{ row.telegram_id }}">
+            {%- if row.username -%}
+              @{{ row.username }}
+            {%- else -%}
+              {{ row.telegram_id }}
+            {%- endif -%}
+          </a>
+          {% if row.username %}
+          <span style="color: var(--text-muted); font-size: 0.85em;">
+            ({{ row.telegram_id }})
+          </span>
+          {% endif %}
+        </td>
+        <td>{{ "{:,}".format(row.topup_count) }}</td>
+        <td>${{ "{:,.4f}".format(row.revenue_usd) }}</td>
+        <td>${{ "{:,.4f}".format(row.charged_usd) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p style="color: var(--text-muted); margin: 0;">
+    No paying users in the last {{ summary["window"].days }} days
+    (excluding manual credits and gift-code redemptions).
+  </p>
+  {% endif %}
+</div>
+
+<div class="panel">
   <h3>How to read these numbers</h3>
   <ul style="margin: 0.5em 0; padding-left: 1.25em; color: var(--text-muted); font-size: 0.9em;">
     <li>

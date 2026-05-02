@@ -39,7 +39,19 @@ NowPayments crypto invoices.
   `_MONETIZATION_TOP_MODELS_LIMIT=10`) so the long-tail models are
   included for offline analysis. Each export records a
   `monetization_export_csv` audit row with the active window and
-  row count.
+  row count. The page also renders a **"Top users by revenue" panel**
+  (Stage-15-Step-E #9 follow-up #3) ranking the top-10 users by
+  total gateway revenue over the same trailing window. Each row
+  shows the user's `@username` (linking to `/admin/users/<telegram_id>`)
+  — or the bare telegram id when the username is null — plus their
+  top-up count, total revenue, and total wallet charges over the
+  window so an operator can cross-reference "are big spenders also
+  big consumers?" at a glance. CSV export includes the same data as
+  trailing `window_top_users` rows with three new trailing columns
+  (`telegram_id`, `username`, `topup_count`) appended at the end so
+  existing column positions for `lifetime` / `window` /
+  `window_by_model` rows don't shift; the CSV pulls
+  `MONETIZATION_CSV_TOP_USERS_LIMIT=1000` rows for the long tail.
 - Telegram-side admin commands (`/admin`, `/admin_metrics`,
   `/admin_credit`, `/admin_broadcast`, …) for ops via DMs.
 - **Canonical slash-command menu** — on every startup the bot
