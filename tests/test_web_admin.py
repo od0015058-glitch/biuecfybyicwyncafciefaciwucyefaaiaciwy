@@ -11782,6 +11782,361 @@ async def test_control_thresholds_post_csrf_required(
 
 
 # =====================================================================
+# Stage-15-Step-E #10b row 5: REQUIRED_CHANNEL editor on /admin/control
+# =====================================================================
+#
+# Mirrors :func:`test_control_thresholds_*` but for the single-string
+# REQUIRED_CHANNEL knob. Same fixture pattern (``_stub_toggle_db`` +
+# ``_login_and_get_control_csrf``); same assertions matrix (auth gate
+# / CSRF / happy-path persists+refresh+audit / clear / blank-but-set
+# is a force-OFF / parametrized invalid / DB-failure-keeps-cache).
+
+
+async def test_control_renders_required_channel_editor(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """The /admin/control page renders the REQUIRED_CHANNEL editor card
+    with the source badge + the two action buttons."""
+    import force_join
+
+    force_join.clear_required_channel_override()
+    monkeypatch.setenv("REQUIRED_CHANNEL", "@env_chan")
+
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/control")
+    body = await resp.text()
+    assert resp.status == 200
+    # The form posts to the new route.
+    assert 'action="/admin/control/required-channel"' in body
+    # Both action buttons are rendered (set + clear).
+    assert 'name="action" value="set"' in body
+    assert 'name="action" value="clear"' in body
+    # Env value rendered + source badge says env.
+    assert "@env_chan" in body
+    assert ">env<" in body
+    force_join.clear_required_channel_override()
+
+
+async def test_control_required_channel_post_requires_auth(
+    aiohttp_client, make_admin_app
+):
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    resp = await client.post(
+        "/admin/control/required-channel",
+        data={"required_channel": "@chan", "action": "set", "csrf_token": "x"},
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303), resp.status
+    assert resp.headers.get("Location", "").startswith("/admin/login")
+
+
+async def test_control_required_channel_post_csrf_required(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False,
+    )
+    db.upsert_setting.reset_mock()
+    resp = await client.post(
+        "/admin/control/required-channel",
+        data={"required_channel": "@chan", "action": "set"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/control"
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+
+
+async def test_control_required_channel_post_persists_value_and_refreshes(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """Happy path: a valid handle is upserted to system_settings AND
+    pushed into the in-process override cache."""
+    import force_join
+
+    force_join.clear_required_channel_override()
+    monkeypatch.setenv("REQUIRED_CHANNEL", "@env_chan")
+
+    saved: dict[str, str | None] = {"value": None}
+
+    async def _upsert(key: str, value: str) -> None:
+        if key == force_join.REQUIRED_CHANNEL_SETTING_KEY:
+            saved["value"] = value
+
+    async def _get(key: str):
+        if key == force_join.REQUIRED_CHANNEL_SETTING_KEY:
+            return saved["value"]
+        return None
+
+    db = _stub_toggle_db()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+    # Note: ``_login_and_get_control_csrf`` triggers the GET-render
+    # refresh which calls ``_get`` (currently returning ``None`` since
+    # ``saved["value"]`` is still ``None``). After login, the override
+    # cache is ``None`` — same as the pre-test state.
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/required-channel",
+        data={
+            "required_channel": "@db_chan",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302, await resp.text()
+    assert resp.headers["Location"] == "/admin/control"
+
+    db.upsert_setting.assert_awaited_once_with(
+        force_join.REQUIRED_CHANNEL_SETTING_KEY, "@db_chan",
+    )
+    # In-process cache reflects the new value (no restart needed).
+    assert force_join.get_required_channel_override() == "@db_chan"
+    assert force_join.get_required_channel() == "@db_chan"
+    # Audit row was recorded.
+    matching = [
+        c for c in db.record_admin_audit.await_args_list
+        if c.kwargs.get("action") == "control_required_channel_update"
+    ]
+    assert matching, db.record_admin_audit.await_args_list
+    force_join.clear_required_channel_override()
+
+
+async def test_control_required_channel_post_canonicalises_bare_handle(
+    aiohttp_client, make_admin_app
+):
+    """A bare handle without ``@`` is upserted in canonical form."""
+    import force_join
+
+    force_join.clear_required_channel_override()
+
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/required-channel",
+        data={
+            "required_channel": "MyChan",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_awaited_once_with(
+        force_join.REQUIRED_CHANNEL_SETTING_KEY, "@MyChan",
+    )
+    force_join.clear_required_channel_override()
+
+
+async def test_control_required_channel_post_blank_set_is_force_off(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """Blank value with ``action=set`` writes a force-OFF override
+    (empty string) — distinct from ``action=clear``."""
+    import force_join
+
+    force_join.clear_required_channel_override()
+    monkeypatch.setenv("REQUIRED_CHANNEL", "@env_chan")
+
+    # Wire a real-ish settings store so the post-write refresh
+    # re-reads what was just upserted (rather than the
+    # _stub_toggle_db default of always-None, which would clobber
+    # the force-OFF override during the post-upsert refresh).
+    settings_store: dict[str, str | None] = {}
+
+    async def _upsert(key: str, value: str) -> None:
+        settings_store[key] = value
+
+    async def _delete(key: str) -> bool:
+        return settings_store.pop(key, None) is not None
+
+    async def _get(key: str):
+        return settings_store.get(key)
+
+    db = _stub_toggle_db()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.delete_setting = AsyncMock(side_effect=_delete)
+    db.get_setting = AsyncMock(side_effect=_get)
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+    db.delete_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/required-channel",
+        data={"required_channel": "", "action": "set", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    # Empty string upserted, NOT a delete.
+    db.upsert_setting.assert_awaited_once_with(
+        force_join.REQUIRED_CHANNEL_SETTING_KEY, "",
+    )
+    db.delete_setting.assert_not_awaited()
+    # Cache reflects force-OFF (override is "", get_required_channel is "").
+    assert force_join.get_required_channel_override() == ""
+    assert force_join.get_required_channel() == ""
+    force_join.clear_required_channel_override()
+
+
+async def test_control_required_channel_post_clear_drops_db_row(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """``action=clear`` drops the DB row + cache; falls through to env."""
+    import force_join
+
+    force_join.clear_required_channel_override()
+    monkeypatch.setenv("REQUIRED_CHANNEL", "@env_chan")
+
+    # Wire a settings store so the GET render's refresh sees "@db_chan",
+    # then the post-clear refresh sees nothing (the delete drained it).
+    settings_store: dict[str, str | None] = {
+        force_join.REQUIRED_CHANNEL_SETTING_KEY: "@db_chan",
+    }
+
+    async def _delete(key: str) -> bool:
+        return settings_store.pop(key, None) is not None
+
+    async def _get(key: str):
+        return settings_store.get(key)
+
+    db = _stub_toggle_db()
+    db.delete_setting = AsyncMock(side_effect=_delete)
+    db.get_setting = AsyncMock(side_effect=_get)
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    # After the GET, the override loaded from the stubbed DB row.
+    assert force_join.get_required_channel_override() == "@db_chan"
+    db.upsert_setting.reset_mock()
+    db.delete_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/required-channel",
+        data={"required_channel": "", "action": "clear", "csrf_token": csrf},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.delete_setting.assert_awaited_once_with(
+        force_join.REQUIRED_CHANNEL_SETTING_KEY,
+    )
+    db.upsert_setting.assert_not_awaited()
+    # Override cleared; env wins.
+    assert force_join.get_required_channel_override() is None
+    assert force_join.get_required_channel() == "@env_chan"
+    force_join.clear_required_channel_override()
+
+
+async def test_control_required_channel_post_rejects_unknown_action(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+    db.delete_setting.reset_mock()
+
+    resp = await client.post(
+        "/admin/control/required-channel",
+        data={
+            "required_channel": "@chan",
+            "action": "delete-everything",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/control"
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+
+
+async def test_control_required_channel_post_rejects_over_cap(
+    aiohttp_client, make_admin_app
+):
+    """A handle longer than the 64-char cap is rejected with no DB writes."""
+    import force_join
+
+    force_join.clear_required_channel_override()
+
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    db.upsert_setting.reset_mock()
+
+    too_long = "@" + ("x" * 64)
+    resp = await client.post(
+        "/admin/control/required-channel",
+        data={
+            "required_channel": too_long,
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.upsert_setting.assert_not_awaited()
+    assert force_join.get_required_channel_override() is None
+
+
+async def test_control_required_channel_post_db_failure_keeps_previous(
+    aiohttp_client, make_admin_app, monkeypatch
+):
+    """A transient DB blip on upsert keeps the previous override in place."""
+    import force_join
+
+    force_join.clear_required_channel_override()
+    monkeypatch.setenv("REQUIRED_CHANNEL", "@env_chan")
+
+    # ``get_setting`` returns "@old" so both the GET-render refresh
+    # AND the post-write refresh hold the cache at "@old"; only the
+    # upsert raises. If the handler accidentally called
+    # ``set_required_channel_override`` BEFORE checking the upsert
+    # result, this test would pass anyway — so we additionally pin
+    # that the cache equals "@old" after the failed upsert (not "@new").
+    db = _stub_toggle_db()
+    db.upsert_setting = AsyncMock(side_effect=RuntimeError("DB down"))
+    db.get_setting = AsyncMock(return_value="@old")
+
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_control_csrf(client, "pw")
+    # After the GET, the cache should already be "@old" (loaded from
+    # the stubbed get_setting during refresh_required_channel_override_from_db).
+    assert force_join.get_required_channel_override() == "@old"
+
+    resp = await client.post(
+        "/admin/control/required-channel",
+        data={
+            "required_channel": "@new",
+            "action": "set",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/control"
+    # Override unchanged after a failed write.
+    assert force_join.get_required_channel_override() == "@old"
+    force_join.clear_required_channel_override()
+
+
+# =====================================================================
 # Stage-15-Step-F follow-up #6: per-loop manual "tick now" button
 # =====================================================================
 
