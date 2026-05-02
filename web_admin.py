@@ -1769,6 +1769,52 @@ def _build_referral_view() -> dict:
     }
 
 
+def _build_fx_refresh_view() -> dict:
+    """Snapshot of the resolved FX_REFRESH_INTERVAL_SECONDS knob.
+
+    Stage-15-Step-E #10b row 24. Same shape as
+    :func:`_build_min_topup_view` so the wallet-config page renders
+    one consistent breakdown for every DB-backed override (effective
+    / db / env / default).
+    """
+    import fx_refresh_config
+
+    override_value = fx_refresh_config.get_fx_refresh_interval_override()
+    env_raw = os.getenv("FX_REFRESH_INTERVAL_SECONDS", "").strip()
+    env_value: int | None = None
+    if env_raw:
+        env_value = fx_refresh_config._coerce_fx_refresh_interval(env_raw)
+    effective = int(fx_refresh_config.get_fx_refresh_interval_seconds())
+    return {
+        "effective": effective,
+        "effective_human": (
+            fx_refresh_config.format_interval_human(effective)
+        ),
+        "source": fx_refresh_config.get_fx_refresh_interval_source(),
+        "default_value": int(
+            fx_refresh_config.DEFAULT_FX_REFRESH_INTERVAL_SECONDS
+        ),
+        "default_human": fx_refresh_config.format_interval_human(
+            fx_refresh_config.DEFAULT_FX_REFRESH_INTERVAL_SECONDS
+        ),
+        "env_value": env_value,
+        "env_value_human": (
+            fx_refresh_config.format_interval_human(env_value)
+            if env_value is not None
+            else None
+        ),
+        "env_raw": env_raw,
+        "override_value": override_value,
+        "override_value_human": (
+            fx_refresh_config.format_interval_human(override_value)
+            if override_value is not None
+            else None
+        ),
+        "minimum": int(fx_refresh_config.FX_REFRESH_INTERVAL_MINIMUM),
+        "maximum": int(fx_refresh_config.FX_REFRESH_INTERVAL_MAXIMUM),
+    }
+
+
 def _build_free_messages_view() -> dict:
     """Snapshot of the resolved FREE_MESSAGES_PER_USER knob.
 
@@ -1854,6 +1900,7 @@ async def wallet_config_get(request: web.Request) -> web.StreamResponse:
     import payments
     import referral
     import free_trial
+    import fx_refresh_config
 
     if db is not None:
         try:
@@ -1896,16 +1943,32 @@ async def wallet_config_get(request: web.Request) -> web.StreamResponse:
                 "refresh_free_messages_per_user_override_from_db failed"
             )
             db_error = "Database query failed — see logs."
+        # Stage-15-Step-E #10b row 24: refresh the FX-refresh
+        # interval override on every render so a tweak made on a
+        # different replica is reflected here.
+        try:
+            await (
+                fx_refresh_config
+                .refresh_fx_refresh_interval_override_from_db(db)
+            )
+        except Exception:
+            log.exception(
+                "wallet_config_get: "
+                "refresh_fx_refresh_interval_override_from_db failed"
+            )
+            db_error = "Database query failed — see logs."
 
     toman_per_usd = await _read_toman_per_usd_from_db(db)
     min_topup_view = _build_min_topup_view(toman_per_usd)
     referral_view = _build_referral_view()
     free_messages_view = _build_free_messages_view()
+    fx_refresh_view = _build_fx_refresh_view()
 
     ctx = {
         "min_topup_view": min_topup_view,
         "referral_view": referral_view,
         "free_messages_view": free_messages_view,
+        "fx_refresh_view": fx_refresh_view,
         "db_error": db_error,
         "active_page": "wallet_config",
         "csrf_token": csrf_token_for(request),
@@ -2754,6 +2817,233 @@ async def wallet_config_free_messages_post(
 
 
 # ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 24: /admin/wallet-config — FX_REFRESH_INTERVAL_SECONDS
+# ---------------------------------------------------------------------
+
+
+async def wallet_config_fx_refresh_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/wallet-config/fx-refresh`` — update
+    ``FX_REFRESH_INTERVAL_SECONDS``.
+
+    Stage-15-Step-E #10b row 24. Operators were forced to redeploy
+    the bot to retune the USD→Toman refresher cadence because it was
+    env-only. This handler writes the override to the
+    ``system_settings`` overlay (DB-backed), refreshes the in-process
+    cache so the next iteration of the FX refresher loop picks up
+    the new sleep duration without a restart, and audit-logs a row
+    whose ``meta`` carries the diff.
+
+    Form keys:
+
+    * ``fx_refresh_interval_seconds`` — new effective interval, or
+      empty / blank to clear the override (fall through to env / default).
+
+    Validation order (mirrors :func:`wallet_config_min_topup_post`):
+
+    1. CSRF.
+    2. Integer parse via
+       :func:`fx_refresh_config._coerce_fx_refresh_interval`.
+    3. Range check ([``FX_REFRESH_INTERVAL_MINIMUM``,
+       ``FX_REFRESH_INTERVAL_MAXIMUM``]) — done by the coercer.
+    4. ``set_fx_refresh_interval_override`` defence-in-depth.
+    5. Persist via ``upsert_setting``.
+    6. Audit row.
+    7. Redirect with a flash banner.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app.get(APP_KEY_DB)
+    form = await request.post()
+
+    guard = _wallet_config_csrf_guard(request, form)
+    if guard is not None:
+        return guard
+
+    if db is None:
+        response = web.HTTPFound(location="/admin/wallet-config")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Database is not configured — FX-refresh interval "
+                "edits require a live DB connection."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    import fx_refresh_config
+
+    raw_value = str(form.get("fx_refresh_interval_seconds", "")).strip()
+    previous_effective = int(
+        fx_refresh_config.get_fx_refresh_interval_seconds()
+    )
+    previous_source = fx_refresh_config.get_fx_refresh_interval_source()
+
+    if not raw_value:
+        # Empty field == clear override and fall through to env / default.
+        try:
+            await db.delete_setting(
+                fx_refresh_config.FX_REFRESH_INTERVAL_SETTING_KEY,
+            )
+        except Exception:
+            log.exception(
+                "wallet_config_fx_refresh_post: delete_setting failed"
+            )
+            response = web.HTTPFound(location="/admin/wallet-config")
+            set_flash(
+                response, kind="error",
+                message=(
+                    "Failed to clear the override — see logs. "
+                    "The previous value is still in effect."
+                ),
+                secret=secret, cookie_secure=cookie_secure,
+            )
+            return response
+        fx_refresh_config.clear_fx_refresh_interval_override()
+        try:
+            await (
+                fx_refresh_config
+                .refresh_fx_refresh_interval_override_from_db(db)
+            )
+        except Exception:
+            log.exception(
+                "wallet_config_fx_refresh_post: refresh after clear failed"
+            )
+        new_effective = int(
+            fx_refresh_config.get_fx_refresh_interval_seconds()
+        )
+        await _record_audit_safe(
+            request, "wallet_config_fx_refresh_update",
+            target="fx_refresh_interval_seconds",
+            meta={
+                "action": "clear",
+                "before": previous_effective,
+                "before_source": previous_source,
+                "after": new_effective,
+                "after_source": (
+                    fx_refresh_config
+                    .get_fx_refresh_interval_source()
+                ),
+            },
+        )
+        response = web.HTTPFound(location="/admin/wallet-config")
+        set_flash(
+            response, kind="success",
+            message=(
+                f"FX-refresh interval override cleared. Effective "
+                f"interval is now "
+                f"{fx_refresh_config.format_interval_human(new_effective)} "
+                f"(source: "
+                f"{fx_refresh_config.get_fx_refresh_interval_source()})."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    parsed = fx_refresh_config._coerce_fx_refresh_interval(raw_value)
+    if parsed is None:
+        response = web.HTTPFound(location="/admin/wallet-config")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"FX-refresh interval must be an integer in "
+                f"[{fx_refresh_config.FX_REFRESH_INTERVAL_MINIMUM}, "
+                f"{fx_refresh_config.FX_REFRESH_INTERVAL_MAXIMUM}] "
+                f"seconds. Got: {raw_value!r}. No changes were made."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    # Persist + apply.
+    try:
+        await db.upsert_setting(
+            fx_refresh_config.FX_REFRESH_INTERVAL_SETTING_KEY,
+            str(parsed),
+        )
+    except Exception:
+        log.exception(
+            "wallet_config_fx_refresh_post: upsert_setting failed value=%r",
+            parsed,
+        )
+        response = web.HTTPFound(location="/admin/wallet-config")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Failed to persist the new interval — see logs. "
+                "The previous value is still in effect."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        fx_refresh_config.set_fx_refresh_interval_override(parsed)
+    except ValueError:
+        log.exception(
+            "wallet_config_fx_refresh_post: "
+            "set_fx_refresh_interval_override rejected %r after "
+            "upsert succeeded — refreshing from DB",
+            parsed,
+        )
+
+    # Re-read whatever ended up in the DB so the cache reflects the
+    # truth (in case e.g. the upsert wrote a sanitised value).
+    try:
+        await (
+            fx_refresh_config
+            .refresh_fx_refresh_interval_override_from_db(db)
+        )
+    except Exception:
+        log.exception(
+            "wallet_config_fx_refresh_post: refresh after upsert failed"
+        )
+
+    new_effective = int(
+        fx_refresh_config.get_fx_refresh_interval_seconds()
+    )
+    await _record_audit_safe(
+        request, "wallet_config_fx_refresh_update",
+        target="fx_refresh_interval_seconds",
+        meta={
+            "action": "set",
+            "before": previous_effective,
+            "before_source": previous_source,
+            "after": new_effective,
+            "after_source": (
+                fx_refresh_config.get_fx_refresh_interval_source()
+            ),
+        },
+    )
+    response = web.HTTPFound(location="/admin/wallet-config")
+    if new_effective == previous_effective:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"FX-refresh interval unchanged "
+                f"({fx_refresh_config.format_interval_human(new_effective)}). "
+                f"The override is now persisted in the DB."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    else:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"FX-refresh interval updated: "
+                f"{fx_refresh_config.format_interval_human(previous_effective)} "
+                f"→ "
+                f"{fx_refresh_config.format_interval_human(new_effective)}. "
+                f"The new cadence applies on the next FX refresher tick."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    return response
+
+
+# ---------------------------------------------------------------------
 # Stage-15-Step-E #10b row 8: /admin/memory-config
 # (MEMORY_CONTEXT_LIMIT + MEMORY_CONTENT_MAX_CHARS editors)
 # ---------------------------------------------------------------------
@@ -3311,6 +3601,14 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     # investigation can pin the cause to a knob tweak vs. unrelated
     # signup-funnel shifts.
     "wallet_config_free_messages_update": "Trial allowance updated",
+    # Stage-15-Step-E #10b row 24: FX_REFRESH_INTERVAL_SECONDS
+    # editor on ``/admin/wallet-config``. Recorded by
+    # :func:`wallet_config_fx_refresh_post`; the dropdown entry
+    # lets an operator filter the audit feed to "FX cadence
+    # changes only" so a "why is the wallet showing approximate
+    # rates?" investigation can pin the cause to a knob tweak vs.
+    # an upstream FX source outage.
+    "wallet_config_fx_refresh_update": "FX-refresh interval updated",
     # Stage-15-Step-E #10b row 21: BOT_HEALTH_ALERT_INTERVAL_SECONDS
     # editor on ``/admin/control``. Recorded by
     # :func:`control_alert_interval_post`; the dropdown entry lets
@@ -11568,6 +11866,16 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/wallet-config/free-messages",
         _require_role(ROLE_OPERATOR)(wallet_config_free_messages_post),
+    )
+    # Stage-15-Step-E #10b row 24: FX_REFRESH_INTERVAL_SECONDS editor
+    # on ``/admin/wallet-config``. Operator-floored: tuning the FX
+    # refresher cadence too aggressively can hammer Nobitex (or
+    # whichever upstream is configured) and get the API key
+    # rate-limited; tuning it too slowly can leave the wallet UI
+    # rendering stale "(approx)" rates for hours.
+    app.router.add_post(
+        "/admin/wallet-config/fx-refresh",
+        _require_role(ROLE_OPERATOR)(wallet_config_fx_refresh_post),
     )
 
     # Stage-15-Step-E #10b row 8: MEMORY_CONTEXT_LIMIT +

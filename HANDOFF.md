@@ -2154,7 +2154,7 @@ or unblock other work.
 | 21 | **Bot-health alert cadence** — `BOT_HEALTH_ALERT_INTERVAL_SECONDS`. | Env-only. | Editor on `/admin/control`. | P3 | **Shipped** (PR #173) |
 | 22 | **`I18N_LOCK`** — gate live string overrides during deploy. | Not implemented. | Toggle on `/admin/strings` that blocks the upsert form. | P3 | Pending |
 | 23 | **`MODEL_DISCOVERY_INTERVAL_SECONDS`** — catalog refresh cadence. | Env-only. | Editor on a new `/admin/models-config` page. | P3 | **Shipped** (this PR — new `model_discovery_config.py` module with DB-backed override for `DISCOVERY_INTERVAL_SECONDS`. New `/admin/models-config` page with sidebar link + discovery interval editor (breakdown table + set/clear form). Boot warm-up in `main.py`. Discovery loop re-reads DB-backed interval every tick. Audit slug `models_config_discovery_interval_update`. Bundled bug fix: `delete_setting` now strips NUL bytes from the key, mirroring `upsert_setting`.) |
-| 24 | **`FX_REFRESH_INTERVAL_SECONDS`** — USD→Toman refresh cadence. | Env-only. | Editor on `/admin/wallet-config`. | P3 | Pending |
+| 24 | **`FX_REFRESH_INTERVAL_SECONDS`** — USD→Toman refresh cadence. | Env-only. | Editor on `/admin/wallet-config`. | P3 | **Shipped** (this PR — new `fx_refresh_config.py` module with DB-backed override + boot warm-up. Editor card on `/admin/wallet-config` with breakdown (effective / db / env / default) and set/clear form. FX refresher loop re-reads the DB-backed interval every tick so a saved override is live without a redeploy. Audit slug `wallet_config_fx_refresh_update`. Bundled bug fix: new `fx_rates._sync_registered_cadence` helper pushes the resolved cadence into `bot_health.LOOP_CADENCES` at loop start and after every tick; pre-fix, an operator who set `FX_REFRESH_INTERVAL_SECONDS` to anything other than the 600 s compile-time default saw the `/admin/control` panel continuously flag `fx_refresh` as overdue because the panel's stale-threshold formula `2 × cadence + 60` used the registered 600 s rather than the resolved value. Mirrors the row-21 bot-health-alert fix.) |
 | 25 | **`ADMIN_PASSWORD`** rotation — currently env-only. | Env-only. | "Rotate password" form on `/admin` profile page. | P2 | Pending |
 | 26 | **`ADMIN_2FA_ENROLLMENT_TIMEOUT`** — TOTP enrollment window. | Env-only. | Editor on the existing `/admin/enroll_2fa` page. | P3 | Pending |
 | 27 | **CSV export bulk download** — full transactions / usage history. | Per-user only. | Top-level `/admin/exports` page that streams big CSVs. | P3 | Pending |
@@ -4232,7 +4232,22 @@ The user's process for this project — **do not deviate**:
     Audit slug `models_config_discovery_interval_update`. Bundled bug fix:
     `delete_setting` now strips NUL bytes, mirroring `upsert_setting`.
     47 new tests. Total suite: 3119 passing.
-29. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+29. **Stage-15-Step-E #10b row 24 OPENED** — FX_REFRESH_INTERVAL_SECONDS
+    editor on `/admin/wallet-config`. New `fx_refresh_config.py` module
+    (DB-backed override, range [60, 86400] — 1 minute to 1 day). FX
+    refresher loop re-reads interval every tick so a saved override is
+    live without a redeploy. Editor card on `/admin/wallet-config` with
+    breakdown (effective / db / env / default) and set/clear form. Audit
+    slug `wallet_config_fx_refresh_update`. Bundled bug fix: new
+    `fx_rates._sync_registered_cadence` helper pushes the resolved
+    cadence into `bot_health.LOOP_CADENCES` at loop start and after every
+    tick; pre-fix, an operator who set `FX_REFRESH_INTERVAL_SECONDS` to
+    anything other than the 600 s compile-time default saw the
+    `/admin/control` panel continuously flag `fx_refresh` as overdue
+    because the panel's stale-threshold formula `2 × cadence + 60` used
+    the registered 600 s rather than the resolved value. Mirrors the
+    row-21 bot-health-alert fix. 95 new tests. Total suite: 3336 passing.
+30. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-30. **Read the §11 working agreement before doing anything.**
+31. **Read the §11 working agreement before doing anything.**

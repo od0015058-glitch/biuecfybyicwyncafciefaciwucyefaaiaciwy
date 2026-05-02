@@ -593,6 +593,28 @@ async def main():
             "— falling through to env / compile-time default"
         )
 
+    # Stage-15-Step-E #10b row 24: warm the FX-refresh interval
+    # override so the first FX refresher tick uses the operator's
+    # saved cadence rather than the env / compile-time default.
+    try:
+        import fx_refresh_config
+        loaded_fx_interval = await (
+            fx_refresh_config
+            .refresh_fx_refresh_interval_override_from_db(db)
+        )
+        log.info(
+            "loaded FX_REFRESH_INTERVAL_SECONDS override from "
+            "system_settings: %s (source=%s, effective=%ds)",
+            loaded_fx_interval,
+            fx_refresh_config.get_fx_refresh_interval_source(),
+            fx_refresh_config.get_fx_refresh_interval_seconds(),
+        )
+    except Exception:
+        log.exception(
+            "failed to load FX_REFRESH_INTERVAL_SECONDS override "
+            "from DB — falling through to env / compile-time default"
+        )
+
     # Overwrite BotFather's cached slash-command list with the
     # canonical one. Without this, Telegram shows whatever was last
     # typed into the BotFather "Edit Commands" panel — including

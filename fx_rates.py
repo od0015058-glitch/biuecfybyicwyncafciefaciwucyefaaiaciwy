@@ -150,7 +150,49 @@ def _parse_float_env(name: str, default: float) -> float:
 
 
 def _get_interval_seconds() -> int:
-    return _parse_int_env("FX_REFRESH_INTERVAL_SECONDS", _DEFAULT_INTERVAL_SECONDS)
+    """Return the resolved FX-refresh interval in seconds.
+
+    Stage-15-Step-E #10b row 24: prefer the DB-backed override (set
+    from ``/admin/wallet-config``) over the env var. The override
+    layer falls through to env / default itself, so this helper is
+    a thin pass-through; callers that want the override value
+    directly should use
+    :func:`fx_refresh_config.get_fx_refresh_interval_seconds`.
+    """
+    from fx_refresh_config import get_fx_refresh_interval_seconds
+
+    return get_fx_refresh_interval_seconds()
+
+
+def _sync_registered_cadence(cadence_seconds: int) -> None:
+    """Push *cadence_seconds* into ``bot_health.LOOP_CADENCES`` so the
+    ``/admin/control`` panel's stale threshold tracks the loop's
+    actual sleep duration.
+
+    Bundled bug fix for the FX_REFRESH_INTERVAL_SECONDS editor
+    (Stage-15-Step-E #10b row 24): mirrors the row 21 fix for the
+    bot-health-alert loop. Pre-fix, an operator who set
+    ``FX_REFRESH_INTERVAL_SECONDS=1800`` (30 min) saw the panel
+    continuously flag ``fx_refresh`` as overdue, because the
+    threshold was computed from the registered 600s default while
+    the loop actually slept 1800s. Best-effort: a refusal from
+    :func:`bot_health.update_loop_cadence` (e.g. the test harness
+    cleared the registry between iterations) is logged and
+    swallowed; the loop's actual cadence already matches the
+    resolved value, so the worst case is the panel showing a stale
+    threshold for one extra tick.
+    """
+    try:
+        from bot_health import update_loop_cadence
+
+        update_loop_cadence("fx_refresh", cadence_seconds)
+    except Exception:
+        log.exception(
+            "fx_rates._sync_registered_cadence: update_loop_cadence "
+            "failed for cadence=%ds; panel will show stale threshold "
+            "based on registered default until next tick",
+            cadence_seconds,
+        )
 
 
 def _get_alert_threshold_pct() -> float:
@@ -463,6 +505,12 @@ async def refresh_usd_to_toman_loop(
     # tight loop works. ``0 or X == X`` would silently fall through to
     # the 600s default and hang the tests.
     interval = interval_seconds if interval_seconds is not None else _get_interval_seconds()
+    # Stage-15-Step-E #10b row 24 bundled bug fix: sync the
+    # registered cadence with the resolved value so the
+    # ``/admin/control`` panel's "stale threshold" matches the
+    # loop's actual sleep duration. See ``_sync_registered_cadence``.
+    if interval_seconds is None:
+        _sync_registered_cadence(interval)
     while True:
         try:
             await refresh_usd_to_toman_once(bot)
@@ -476,6 +524,14 @@ async def refresh_usd_to_toman_loop(
             from metrics import record_loop_tick
 
             record_loop_tick("fx_refresh")
+        # Stage-15-Step-E #10b row 24: re-read interval every tick
+        # so a DB override takes effect on the next sleep without a
+        # redeploy. Test-mode (``interval_seconds`` explicitly
+        # supplied) skips the re-read so a tight-loop test stays
+        # tight.
+        if interval_seconds is None:
+            interval = _get_interval_seconds()
+            _sync_registered_cadence(interval)
         try:
             await asyncio.sleep(interval)
         except asyncio.CancelledError:
