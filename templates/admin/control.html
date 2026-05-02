@@ -408,6 +408,105 @@
   </form>
 </div>
 
+<div class="control-card">
+  <h3>📢 Required channel (force-join gate)</h3>
+  <p>
+    Force every non-admin user to be a member of a Telegram channel
+    before the bot becomes interactive. Set this to a public handle
+    (<code>@MeowAssist_Channel</code>) or a numeric chat id
+    (<code>-1001234567890</code>) for a private channel. Save here
+    to override the <code>REQUIRED_CHANNEL</code> env var without a
+    redeploy; the new gate is live for every incoming Telegram update
+    on the next message.
+  </p>
+  <p style="margin-top: 4px; color: var(--text-muted); font-size: 12px;">
+    The "source" badge below shows where the currently-applied value
+    comes from. <code>db</code> = saved here, <code>env</code> =
+    process env var, <code>default</code> = no gate (every user passes
+    through). Saving an empty value through "Force OFF" disables the
+    gate even when the env var is set; "Clear DB override" drops the
+    saved row and falls back to env / default. The bot must be an
+    admin of the configured channel for membership lookups to succeed
+    — a misconfig fails OPEN with a logged warning rather than locking
+    every user out.
+  </p>
+  <table class="signals-table" style="margin-top: 12px;">
+    <thead>
+      <tr>
+        <td class="label">Field</td>
+        <td class="label">Value</td>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="label">Effective</td>
+        <td class="value">
+          {% if required_channel.effective %}
+            <code>{{ required_channel.effective }}</code>
+          {% else %}
+            <span style="color: var(--text-muted);">(gate disabled)</span>
+          {% endif %}
+        </td>
+      </tr>
+      <tr>
+        <td class="label">Source</td>
+        <td class="value">
+          {% if required_channel.source == 'db' %}
+            <span style="color: var(--success);">db</span>
+          {% elif required_channel.source == 'env' %}
+            <span style="color: var(--warn, #f9e2af);">env</span>
+          {% else %}
+            <span style="color: var(--text-muted);">default</span>
+          {% endif %}
+        </td>
+      </tr>
+      <tr>
+        <td class="label">DB override</td>
+        <td class="value">
+          {% if required_channel.override_value is none %}
+            <span style="color: var(--text-muted);">(not set)</span>
+          {% elif required_channel.override_value == '' %}
+            <span style="color: var(--warn, #f9e2af);">force OFF</span>
+          {% else %}
+            <code>{{ required_channel.override_value }}</code>
+          {% endif %}
+        </td>
+      </tr>
+      <tr>
+        <td class="label">Env value</td>
+        <td class="value">
+          {% if required_channel.env_value %}
+            <code>{{ required_channel.env_value }}</code>
+          {% else %}
+            <span style="color: var(--text-muted);">(unset)</span>
+          {% endif %}
+        </td>
+      </tr>
+    </tbody>
+  </table>
+  <form method="post" action="/admin/control/required-channel"
+        style="margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="text" name="required_channel"
+           maxlength="{{ required_channel.max_length }}"
+           value="{% if required_channel.override_value %}{{ required_channel.override_value }}{% endif %}"
+           placeholder="@channel or -1001234567890 (blank = force OFF)"
+           style="flex: 1 1 320px; min-width: 240px;">
+    <button type="submit" name="action" value="set" class="btn-confirm">
+      Save channel
+    </button>
+    <button type="submit" name="action" value="clear" class="btn-secondary"
+            style="background: transparent; border: 1px solid var(--border, #444); color: var(--text);">
+      Clear DB override
+    </button>
+  </form>
+  <p style="margin-top: 4px; color: var(--text-muted); font-size: 11px;">
+    Tip: leave the field blank and click "Save channel" to write a
+    force-OFF override (the gate stays disabled even if env is set).
+    Click "Clear DB override" to drop the saved row entirely.
+  </p>
+</div>
+
 <div class="control-card danger-zone">
   <h3>🛑 Force-stop bot</h3>
   <p>

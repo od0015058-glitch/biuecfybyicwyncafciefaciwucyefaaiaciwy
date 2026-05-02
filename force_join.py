@@ -83,9 +83,168 @@ _JOINED_STATUSES: frozenset[str] = frozenset(
 # can never collide with a future hub callback.
 FORCE_JOIN_CHECK_CALLBACK = "force_join_check"
 
+# Stage-15-Step-E #10b row 5: DB-backed override layer for
+# ``REQUIRED_CHANNEL``. Same overlay shape COST_MARKUP / MIN_TOPUP_USD
+# already use:
+#
+# 1. ``_REQUIRED_CHANNEL_OVERRIDE`` — process-local cache, populated
+#    from ``system_settings.REQUIRED_CHANNEL`` via
+#    :func:`refresh_required_channel_override_from_db` at boot and
+#    on every ``/admin/control`` render. The web admin form writes
+#    this row so an operator can re-target the force-join gate
+#    without a redeploy. ``None`` means "no DB override".
+# 2. ``REQUIRED_CHANNEL`` env var — same shape as before; remains the
+#    fallback for staging deploys that prefer env-only config.
+# 3. ``""`` (gate disabled) — compile-time fallback.
+#
+# The override is the canonicalised channel handle string (already run
+# through :func:`_normalise_channel`), so the read path stays a plain
+# attribute lookup. The empty-string sentinel inside the override slot
+# means "actively force the gate off" — distinct from ``None`` ("no
+# DB row, fall through to env"). That distinction lets an operator
+# turn off a force-join gate that's only configured in env without
+# editing the env file.
+REQUIRED_CHANNEL_SETTING_KEY: str = "REQUIRED_CHANNEL"
+# Cap on the channel-handle field length. Telegram public usernames
+# are 5–32 chars (with the ``@``); a numeric chat id is at most ~16
+# chars (``-100`` + 13-digit channel id). 64 is comfortably above
+# both and matches the cap on ``set_admin_role`` notes (which the
+# DB-layer NUL-strip applies the same defensive trim to).
+REQUIRED_CHANNEL_MAX_LENGTH: int = 64
+_REQUIRED_CHANNEL_OVERRIDE: str | None = None
+
+
+def _normalise_channel(raw: str) -> str:
+    """Canonicalise a ``REQUIRED_CHANNEL`` candidate.
+
+    Pulled out so the env path, the DB path, and the web admin form
+    validator all share the exact same rules. Returns ``""`` for any
+    blank input — the caller decides whether ``""`` means "gate off"
+    or "fall through to the next layer".
+
+    * ``""`` / whitespace-only → ``""``.
+    * ``@username`` → ``"@username"``.
+    * Bare ``username`` → ``"@username"``.
+    * Numeric ``-100…`` chat id → returned as-is.
+    * Anything longer than :data:`REQUIRED_CHANNEL_MAX_LENGTH` is
+      clamped to ``""`` (defence in depth — a 1 MB form field would
+      otherwise sail through as a "valid" handle).
+    """
+    if not isinstance(raw, str):
+        return ""
+    candidate = raw.strip()
+    if not candidate:
+        return ""
+    if len(candidate) > REQUIRED_CHANNEL_MAX_LENGTH:
+        return ""
+    # Numeric chat id (private channel / supergroup). Allow a leading
+    # ``-`` so ``-1001234567890`` parses without forcing the operator
+    # to wrap it in quotes.
+    stripped = candidate.lstrip("-")
+    if stripped.isdigit():
+        return candidate
+    if not candidate.startswith("@"):
+        return "@" + candidate
+    return candidate
+
+
+def _coerce_required_channel(value: object) -> str | None:
+    """Validate a ``REQUIRED_CHANNEL`` candidate for the override slot.
+
+    Returns the canonical form on success, or ``None`` if the value
+    is unusable (non-string, too long, blank). Never raises — the
+    caller (the web admin form, the DB warm-up, the ``set_*`` helper)
+    decides how to surface a rejection.
+
+    Note the ``""`` empty-string IS a valid override value here — it
+    represents "force the gate OFF even if env is set". The override
+    slot stores the empty string verbatim in that case; only ``None``
+    means "no override at all".
+    """
+    if isinstance(value, bool):
+        return None
+    if not isinstance(value, str):
+        return None
+    if len(value) > REQUIRED_CHANNEL_MAX_LENGTH:
+        return None
+    return _normalise_channel(value)
+
+
+def set_required_channel_override(value: str) -> None:
+    """Replace the in-process REQUIRED_CHANNEL override.
+
+    Validates against :func:`_coerce_required_channel`. Refuses
+    non-string / over-cap input with a :class:`ValueError` so a buggy
+    caller can't smuggle in a bool or a 1 MB handle.
+    """
+    global _REQUIRED_CHANNEL_OVERRIDE
+    coerced = _coerce_required_channel(value)
+    if coerced is None:
+        raise ValueError(
+            f"REQUIRED_CHANNEL override {value!r} must be a string up "
+            f"to {REQUIRED_CHANNEL_MAX_LENGTH} chars"
+        )
+    _REQUIRED_CHANNEL_OVERRIDE = coerced
+
+
+def clear_required_channel_override() -> bool:
+    """Drop the in-process override. Returns True if one was active."""
+    global _REQUIRED_CHANNEL_OVERRIDE
+    had = _REQUIRED_CHANNEL_OVERRIDE is not None
+    _REQUIRED_CHANNEL_OVERRIDE = None
+    return had
+
+
+def get_required_channel_override() -> str | None:
+    """Return the current in-process override (or ``None``)."""
+    return _REQUIRED_CHANNEL_OVERRIDE
+
+
+async def refresh_required_channel_override_from_db(db) -> str | None:
+    """Reload the override from the ``system_settings`` overlay.
+
+    Mirrors :func:`payments.refresh_min_topup_override_from_db`: a
+    transient DB error keeps the previous cache in place so a pool
+    blip can't accidentally revert to env / default mid-incident.
+    A malformed stored value (non-string / over-cap) is treated as
+    "no override" rather than crashing the bot.
+    """
+    global _REQUIRED_CHANNEL_OVERRIDE
+    if db is None:
+        return _REQUIRED_CHANNEL_OVERRIDE
+    try:
+        raw = await db.get_setting(REQUIRED_CHANNEL_SETTING_KEY)
+    except Exception:
+        log.exception(
+            "refresh_required_channel_override_from_db: get_setting "
+            "failed; keeping previous cache value=%r",
+            _REQUIRED_CHANNEL_OVERRIDE,
+        )
+        return _REQUIRED_CHANNEL_OVERRIDE
+    if raw is None:
+        _REQUIRED_CHANNEL_OVERRIDE = None
+        return None
+    coerced = _coerce_required_channel(raw)
+    if coerced is None:
+        log.warning(
+            "refresh_required_channel_override_from_db: rejected stored "
+            "value %r; clearing override",
+            raw,
+        )
+        _REQUIRED_CHANNEL_OVERRIDE = None
+        return None
+    _REQUIRED_CHANNEL_OVERRIDE = coerced
+    return coerced
+
 
 def get_required_channel() -> str:
     """Return the configured ``REQUIRED_CHANNEL`` value, normalised.
+
+    Resolution order (Stage-15-Step-E #10b row 5):
+
+    1. ``_REQUIRED_CHANNEL_OVERRIDE`` (DB ``system_settings`` row).
+    2. ``REQUIRED_CHANNEL`` env var.
+    3. ``""`` (gate disabled).
 
     * Empty / unset → ``""`` (gate disabled).
     * ``@username`` → ``"@username"`` (canonical Telegram public form).
@@ -94,23 +253,38 @@ def get_required_channel() -> str:
     * Numeric ``-100…`` chat id → returned as-is for use with
       ``bot.get_chat_member(chat_id=…)``.
 
-    We don't validate the value beyond stripping whitespace — Telegram
+    The override slot is the source of truth even when its value is
+    the empty string — that lets an operator force the gate OFF on a
+    deploy whose env var is set.
+
+    We don't validate the value beyond canonicalisation — Telegram
     will surface a misconfiguration as a ``Bad Request`` from
     ``get_chat_member``, which the middleware turns into a logged
     fail-open.
     """
-    raw = os.getenv("REQUIRED_CHANNEL", "").strip()
-    if not raw:
-        return ""
-    # Numeric chat id (private channel / supergroup). Allow a leading
-    # ``-`` so ``-1001234567890`` parses without forcing the operator
-    # to wrap it in quotes.
-    stripped = raw.lstrip("-")
-    if stripped.isdigit():
-        return raw
-    if not raw.startswith("@"):
-        return "@" + raw
-    return raw
+    if _REQUIRED_CHANNEL_OVERRIDE is not None:
+        return _REQUIRED_CHANNEL_OVERRIDE
+    return _normalise_channel(os.getenv("REQUIRED_CHANNEL", ""))
+
+
+def get_required_channel_source() -> str:
+    """Return ``db`` / ``env`` / ``default`` for the resolved value.
+
+    Mirrors :func:`payments.get_min_topup_source` — the ``/admin/control``
+    panel uses this badge to show operators where the live value is
+    coming from.
+
+    ``"db"`` is returned even when the override slot is the empty
+    string, because that's still an operator-applied decision (force
+    the gate off). ``"env"`` only fires when there's no DB row AND
+    the env var resolves to a non-empty canonical value.
+    """
+    if _REQUIRED_CHANNEL_OVERRIDE is not None:
+        return "db"
+    env_value = _normalise_channel(os.getenv("REQUIRED_CHANNEL", ""))
+    if env_value:
+        return "env"
+    return "default"
 
 
 def get_required_channel_invite_link() -> str:

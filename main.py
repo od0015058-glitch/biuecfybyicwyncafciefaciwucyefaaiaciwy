@@ -332,6 +332,30 @@ async def main():
             "falling through to env / compile-time default"
         )
 
+    # Stage-15-Step-E #10b row 5: warm the REQUIRED_CHANNEL override
+    # cache so the very first incoming update is gated against the
+    # operator's configured channel rather than the env / compile-time
+    # default. Same fail-soft shape as the markup / min-topup loads
+    # above. Best-effort — ``force_join.get_required_channel()`` falls
+    # through to env / "" if the refresh raises.
+    try:
+        import force_join
+        loaded_channel = await (
+            force_join.refresh_required_channel_override_from_db(db)
+        )
+        log.info(
+            "loaded REQUIRED_CHANNEL override from system_settings: %r "
+            "(source=%s, effective=%r)",
+            loaded_channel,
+            force_join.get_required_channel_source(),
+            force_join.get_required_channel(),
+        )
+    except Exception:
+        log.exception(
+            "failed to load REQUIRED_CHANNEL override from DB — "
+            "falling through to env / compile-time default"
+        )
+
     # Overwrite BotFather's cached slash-command list with the
     # canonical one. Without this, Telegram shows whatever was last
     # typed into the BotFather "Edit Commands" panel — including

@@ -2080,6 +2080,13 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     "view_as_deny": "Role-preview gate denied",
     # Stage-15-Step-F follow-up #4: bot-health threshold editor.
     "control_threshold_update": "Bot-health threshold updated",
+    # Stage-15-Step-E #10b row 5: REQUIRED_CHANNEL editor on
+    # ``/admin/control``. Recorded by
+    # :func:`control_required_channel_post`; the dropdown entry lets
+    # an operator filter "/admin/audit" to force-join gate retargets
+    # so a "why did onboarding traffic crater?" investigation can pin
+    # the cause to a channel change vs. unrelated activity.
+    "control_required_channel_update": "Required channel updated",
     # Stage-15-Step-E #10b row 2: COST_MARKUP editor on
     # ``/admin/monetization``. Recorded by
     # :func:`monetization_markup_post`; the dropdown entry lets an
@@ -7234,6 +7241,20 @@ async def control_get(request: web.Request) -> web.StreamResponse:
     except Exception:
         log.exception("control: refresh_threshold_overrides_from_db failed")
 
+    # Stage-15-Step-E #10b row 5: refresh the REQUIRED_CHANNEL
+    # override from the DB so a tweak made on a different replica
+    # is reflected on this page. Best-effort — a transient DB blip
+    # leaves the previous cache in place rather than reverting to
+    # env / default mid-incident.
+    if db is not None:
+        try:
+            import force_join
+            await force_join.refresh_required_channel_override_from_db(db)
+        except Exception:
+            log.exception(
+                "control: refresh_required_channel_override_from_db failed"
+            )
+
     # Read the bot-health alert loop's most-recent rate-windowed drop
     # count so the panel + the loop + Prometheus all classify
     # identically. The panel can't observe a rate-of-drops on its own
@@ -7259,6 +7280,7 @@ async def control_get(request: web.Request) -> web.StreamResponse:
     )
 
     thresholds_view = _build_thresholds_view()
+    required_channel_view = _build_required_channel_view()
 
     ctx = {
         "active_page": "control",
@@ -7267,6 +7289,7 @@ async def control_get(request: web.Request) -> web.StreamResponse:
         "status": status,
         "signals": signals,
         "thresholds": thresholds_view,
+        "required_channel": required_channel_view,
     }
     response = aiohttp_jinja2.render_template("control.html", request, ctx)
     flash = pop_flash(request, response)
@@ -7345,6 +7368,43 @@ def _build_thresholds_view() -> list[dict]:
             "minimum": bot_health.THRESHOLD_MINIMUMS.get(key, 1),
         })
     return rows
+
+
+def _build_required_channel_view() -> dict:
+    """Snapshot of the resolved REQUIRED_CHANNEL value + per-source
+    breakdown for the ``/admin/control`` panel.
+
+    Mirrors :func:`_build_thresholds_view` shape but returns a single
+    dict (one knob, not four). Same ``effective`` / ``source`` /
+    ``override_value`` / ``env_value`` structure so the template can
+    render the same "db / env / default" badge it already uses for
+    thresholds and the wallet-config min-topup card.
+
+    The override slot can legitimately store the empty string (operator
+    forcing the gate OFF on a deploy whose env is set), so the view
+    distinguishes between:
+
+    * ``override_value=None`` — no DB row, fall through to env / default.
+    * ``override_value=""`` — DB row says "force OFF".
+    * ``override_value="@channel"`` / ``"-100…"`` — DB row says "use this".
+    """
+    import force_join
+
+    override_value = force_join.get_required_channel_override()
+    env_raw = os.getenv("REQUIRED_CHANNEL", "").strip()
+    env_value = (
+        force_join._normalise_channel(env_raw) if env_raw else ""
+    )
+    effective = force_join.get_required_channel()
+    source = force_join.get_required_channel_source()
+    return {
+        "effective": effective,
+        "source": source,
+        "override_value": override_value,
+        "env_value": env_value,
+        "env_raw": env_raw,
+        "max_length": force_join.REQUIRED_CHANNEL_MAX_LENGTH,
+    }
 
 
 def _control_csrf_guard(
@@ -8033,6 +8093,232 @@ async def control_thresholds_post(
     return response
 
 
+async def control_required_channel_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/control/required-channel`` — update REQUIRED_CHANNEL.
+
+    Stage-15-Step-E #10b row 5. Operators were forced to redeploy the
+    bot to re-target the force-join gate because ``REQUIRED_CHANNEL``
+    was env-only. This handler writes the override to the
+    ``system_settings`` overlay (DB-backed), refreshes the in-process
+    cache so the next call to :func:`force_join.get_required_channel`
+    sees the new value without a restart, and audit-logs a row whose
+    ``meta`` carries the diff.
+
+    Form keys:
+
+    * ``required_channel`` — new channel handle (``@username`` or a
+      numeric ``-100…`` chat id), or empty / blank to fall through to
+      env / default.
+    * ``action`` — explicit operator intent. ``set`` writes the value;
+      ``clear`` drops the DB row and falls through to env. The form
+      uses two distinct submit buttons so the user can't accidentally
+      blank the field and trigger an unintended clear.
+
+    Validation order (mirrors :func:`wallet_config_min_topup_post`):
+
+    1. CSRF.
+    2. Action allowlist (``set`` / ``clear``).
+    3. Length cap (``REQUIRED_CHANNEL_MAX_LENGTH``) + canonicalisation
+       via :func:`force_join._coerce_required_channel`. The empty
+       string IS a valid override value (forces the gate OFF) — only
+       a non-string / over-cap value is rejected.
+    4. ``set_required_channel_override`` defence-in-depth.
+    5. Persist via ``upsert_setting`` / ``delete_setting``.
+    6. Audit row.
+    7. Redirect with a flash banner.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app.get(APP_KEY_DB)
+    form = await request.post()
+
+    guard = _control_csrf_guard(request, form)
+    if guard is not None:
+        return guard
+
+    if db is None:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Database is not configured — REQUIRED_CHANNEL edits "
+                "require a live DB connection."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    import force_join
+
+    action = str(form.get("action", "set")).strip().lower()
+    if action not in {"set", "clear"}:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Unknown REQUIRED_CHANNEL action {action!r}. "
+                "Expected 'set' or 'clear'. No changes were made."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    raw_value = str(form.get("required_channel", "")).strip()
+    previous_effective = force_join.get_required_channel()
+    previous_source = force_join.get_required_channel_source()
+
+    if action == "clear":
+        # Drop the DB override and fall through to env / default.
+        try:
+            await db.delete_setting(force_join.REQUIRED_CHANNEL_SETTING_KEY)
+        except Exception:
+            log.exception(
+                "control_required_channel_post: delete_setting failed"
+            )
+            response = web.HTTPFound(location="/admin/control")
+            set_flash(
+                response, kind="error",
+                message=(
+                    "Failed to clear the REQUIRED_CHANNEL override — "
+                    "see logs. The previous value is still in effect."
+                ),
+                secret=secret, cookie_secure=cookie_secure,
+            )
+            return response
+        force_join.clear_required_channel_override()
+        try:
+            await force_join.refresh_required_channel_override_from_db(db)
+        except Exception:
+            log.exception(
+                "control_required_channel_post: refresh after clear failed"
+            )
+        new_effective = force_join.get_required_channel()
+        new_source = force_join.get_required_channel_source()
+        await _record_audit_safe(
+            request, "control_required_channel_update",
+            target="required_channel",
+            meta={
+                "action": "clear",
+                "before": previous_effective,
+                "before_source": previous_source,
+                "after": new_effective,
+                "after_source": new_source,
+            },
+        )
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="success",
+            message=(
+                f"REQUIRED_CHANNEL override cleared. Effective channel "
+                f"is now {new_effective!r} (source: {new_source})."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    # action == "set". Validate + persist + apply.
+    coerced = force_join._coerce_required_channel(raw_value)
+    if coerced is None:
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                f"REQUIRED_CHANNEL must be a string up to "
+                f"{force_join.REQUIRED_CHANNEL_MAX_LENGTH} chars "
+                f"(got {raw_value!r}). No changes were made."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        await db.upsert_setting(
+            force_join.REQUIRED_CHANNEL_SETTING_KEY, coerced,
+        )
+    except Exception:
+        log.exception(
+            "control_required_channel_post: upsert_setting failed value=%r",
+            coerced,
+        )
+        response = web.HTTPFound(location="/admin/control")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Failed to persist the new REQUIRED_CHANNEL — see logs. "
+                "The previous value is still in effect."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        force_join.set_required_channel_override(coerced)
+    except ValueError:
+        log.exception(
+            "control_required_channel_post: set_required_channel_override "
+            "rejected %r after upsert succeeded — refreshing from DB",
+            coerced,
+        )
+
+    # Re-read whatever ended up in the DB so the cache reflects the
+    # truth (e.g. if upsert_setting NUL-stripped the value mid-flight).
+    try:
+        await force_join.refresh_required_channel_override_from_db(db)
+    except Exception:
+        log.exception(
+            "control_required_channel_post: refresh after upsert failed"
+        )
+
+    new_effective = force_join.get_required_channel()
+    new_source = force_join.get_required_channel_source()
+    await _record_audit_safe(
+        request, "control_required_channel_update",
+        target="required_channel",
+        meta={
+            "action": "set",
+            "before": previous_effective,
+            "before_source": previous_source,
+            "after": new_effective,
+            "after_source": new_source,
+        },
+    )
+
+    response = web.HTTPFound(location="/admin/control")
+    if new_effective == previous_effective:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"REQUIRED_CHANNEL unchanged ({new_effective!r}). "
+                "The override is now persisted in the DB."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    elif not new_effective:
+        # Operator explicitly forced the gate OFF.
+        set_flash(
+            response, kind="success",
+            message=(
+                "REQUIRED_CHANNEL force-OFF override applied. The "
+                "force-join gate is now disabled bot-wide regardless "
+                "of the env var."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    else:
+        set_flash(
+            response, kind="success",
+            message=(
+                f"REQUIRED_CHANNEL updated: {previous_effective!r} → "
+                f"{new_effective!r}. The new gate is live for every "
+                f"incoming Telegram update."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+    return response
+
+
 # ---------------------------------------------------------------------
 # Stage-15-Step-E #5 follow-up #4: per-template globals.
 # ---------------------------------------------------------------------
@@ -8515,6 +8801,13 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/control/thresholds",
         _require_role(ROLE_SUPER)(control_thresholds_post),
+    )
+    # Stage-15-Step-E #10b row 5: REQUIRED_CHANNEL editor on
+    # /admin/control. Lets an operator re-target (or force-OFF) the
+    # force-join gate without a redeploy.
+    app.router.add_post(
+        "/admin/control/required-channel",
+        _require_role(ROLE_SUPER)(control_required_channel_post),
     )
     # Stage-15-Step-F follow-up #6: per-loop manual "tick now" button.
     app.router.add_post(

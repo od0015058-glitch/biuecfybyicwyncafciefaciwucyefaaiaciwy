@@ -2135,7 +2135,7 @@ or unblock other work.
 | 2 | **`COST_MARKUP`** — global price multiplier. | Env-only, default 1.5×. | Editor on `/admin/monetization` with audit row + history table. | P1 | **Shipped** (this PR — editor + DB-backed override + audit row; history table is a separate row #12) |
 | 3 | **Bot-health severity thresholds** (`BOT_HEALTH_*`). | Env-only. | Editor on `/admin/control` with effective/source columns. | P1 | **Shipped** (Stage-15-Step-F follow-up #4 — this PR) |
 | 4 | **`MIN_TOPUP_USD` / `MIN_TOPUP_TOMAN`** — minimum allowed top-up amounts. | Env-only. | Editor on a new `/admin/wallet-config` page. | P2 | **Shipped** — PR-2a (PR #169) added the DB-backed override layer in `payments.py` + boot warm-up; PR-2b (this PR) added the `/admin/wallet-config` page with the MIN_TOPUP_USD editor, audit row (`wallet_config_min_topup_update`), 13 web tests, and sidebar nav link. `MIN_TOPUP_TOMAN` is not a separate knob — it's derived from MIN_TOPUP_USD × FX rate at request time, and the page renders that derived figure inline. |
-| 5 | **`REQUIRED_CHANNEL`** — force-join channel handle. | Env-only. | Editor on `/admin/control` (or new `/admin/access`). | P2 | Pending |
+| 5 | **`REQUIRED_CHANNEL`** — force-join channel handle. | Env-only. | Editor on `/admin/control` (or new `/admin/access`). | P2 | **Shipped** (this PR — DB-backed override layer in `force_join.py` + boot warm-up + `/admin/control` editor card with set / clear / force-OFF actions, audit row `control_required_channel_update`, sidebar source badge). |
 | 6 | **`FREE_MESSAGES_PER_USER`** — initial free-trial messages. | Env-only. | Editor on `/admin/wallet-config`. | P2 | Pending |
 | 7 | **`REFERRAL_BONUS_USD` + `REFERRAL_PERCENT`** — referral payouts. | Env-only. | Editor on `/admin/wallet-config`. | P2 | Pending |
 | 8 | **`MEMORY_CONTEXT_LIMIT` / `MEMORY_CONTENT_MAX_CHARS`** — conversation memory caps. | Env-only. | Editor on a new `/admin/memory-config` page. | P3 | Pending |
@@ -2249,6 +2249,73 @@ or any other DB-backed override editor:
   CSRF mismatch, happy path persists+refreshes+audit, blank
   clears override, parametrized invalid (NaN/Inf/-1/non-numeric),
   above-maximum rejected, and DB-failure-preserves-cache.
+
+---
+
+### §10b.2 — Row #5 (REQUIRED_CHANNEL web surface) — shipped
+
+**Context (closed 2026-05-02):** This PR shipped the full row in one
+swing — DB-backed override layer in `force_join.py`, boot warm-up in
+`main.py`, and the `/admin/control` editor card — because
+`REQUIRED_CHANNEL` is a single string knob (no derived figure to
+co-render the way `MIN_TOPUP_TOMAN` derives off `MIN_TOPUP_USD`), so
+splitting into PR-2a / PR-2b would have been ceremony.
+
+**What's wired:**
+
+- `_normalise_channel(raw)` — pulled out of the original
+  `get_required_channel()` so the env path, the DB path, and the
+  web admin form validator all share the exact same canonicalisation
+  rules (strip / `@`-prefix / numeric-id passthrough / 64-char cap).
+- `_coerce_required_channel(value)` — strict validator for the
+  override slot. Refuses non-string / over-cap. **Important: returns
+  the empty string verbatim** when the input is blank, because `""`
+  IS a valid override value (operator forcing the gate OFF). Only
+  `None` means "no override at all".
+- `set_required_channel_override(value)` /
+  `clear_required_channel_override()` /
+  `get_required_channel_override()` /
+  `refresh_required_channel_override_from_db(db)` /
+  `get_required_channel_source()` — full mirror of the
+  `payments.set_min_topup_override` / `pricing.set_markup_override`
+  surface.
+- `get_required_channel()` now consults `_REQUIRED_CHANNEL_OVERRIDE`
+  first; the env var is still the second-tier fallback.
+- `main.start_webhook_server` warms the override cache directly
+  after the `MIN_TOPUP_USD` warm-up. Fail-soft — a transient DB
+  blip leaves the cache empty and `get_required_channel()` falls
+  through to env / "" rather than crashing the boot.
+- `/admin/control` GET refreshes the override on every render
+  (mirror of the threshold-overrides refresh) so a tweak made on a
+  different replica lands on the panel without a restart.
+- `_build_required_channel_view()` returns the per-source breakdown
+  (effective / source / override_value / env_value / env_raw /
+  max_length). The override slot can store `None` ("not set"),
+  `""` ("force OFF"), or a canonical handle ("`@channel`" / numeric
+  id) — the template renders all three distinctly.
+- `control_required_channel_post` handles both the `set` and `clear`
+  actions. The form has two distinct submit buttons so an operator
+  can't accidentally blank the field and trigger an unintended
+  clear. Audit slug `control_required_channel_update` records
+  `before/before_source/after/after_source` plus the `action`.
+
+**Reusable patterns this shipment adds (on top of §10b.1) for any
+DB-backed override editor whose key is a STRING (not a number):**
+
+- Allow the override slot to legitimately store the empty string —
+  `""` distinct from `None` lets an operator force a feature OFF
+  without editing the env file.
+- Use two submit buttons (`action=set` / `action=clear`) instead of
+  conflating "blank field == clear" the way `MIN_TOPUP_USD` does.
+  The min-topup floor has a sensible default (`$2.00`); a force-join
+  channel handle does not — and conflating "operator wants to type
+  a new handle but tabbed past the field" with "operator wants to
+  drop the override entirely" is a footgun.
+- Cap the field length at module scope
+  (`REQUIRED_CHANNEL_MAX_LENGTH = 64`) and surface the cap on the
+  `<input maxlength=…>`. The DB column is `TEXT` so unbounded
+  values *would* persist; an explicit ceiling is defence in depth
+  matching the `set_admin_role` notes pattern.
 
 ---
 

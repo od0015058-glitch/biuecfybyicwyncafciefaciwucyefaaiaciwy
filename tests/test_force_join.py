@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiogram.exceptions import TelegramBadRequest
 
+import force_join
 from force_join import (
     FORCE_JOIN_CHECK_CALLBACK,
     RequiredChannelMiddleware,
@@ -435,3 +436,297 @@ async def test_render_join_prompt_callback_calls_edit_text():
         await render_join_prompt(cb, "@somechan")
     cb.message.edit_text.assert_awaited_once()
     cb.answer.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 5: DB-backed REQUIRED_CHANNEL override
+# ---------------------------------------------------------------------
+#
+# Mirrors :file:`tests/test_payments_min_topup_override.py`. Same fixture
+# (auto-clear cache between tests + scrub the env var), same coverage
+# matrix (set / clear / get, source reporting, refresh-from-db happy /
+# missing / error / none-db / malformed / out-of-range, plus the
+# resolution-order pin so future refactors can't accidentally swap the
+# override and env precedence).
+
+
+@pytest.fixture
+def _reset_required_channel_override(monkeypatch):
+    force_join.clear_required_channel_override()
+    monkeypatch.delenv("REQUIRED_CHANNEL", raising=False)
+    yield
+    force_join.clear_required_channel_override()
+
+
+# ---------- _normalise_channel / _coerce_required_channel ----------
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("", ""),
+        ("   ", ""),
+        ("@MeowAssist", "@MeowAssist"),
+        ("MeowAssist", "@MeowAssist"),
+        ("-1001234567890", "-1001234567890"),
+        ("  @padded  ", "@padded"),
+        # 65 chars > REQUIRED_CHANNEL_MAX_LENGTH (64).
+        ("a" * 65, ""),
+    ],
+)
+def test_normalise_channel_canonical_form(raw, expected):
+    assert force_join._normalise_channel(raw) == expected
+
+
+def test_normalise_channel_non_string_returns_empty():
+    assert force_join._normalise_channel(123) == ""  # type: ignore[arg-type]
+    assert force_join._normalise_channel(None) == ""  # type: ignore[arg-type]
+
+
+def test_coerce_required_channel_accepts_empty_string():
+    """The empty string is a VALID override value (force gate OFF)."""
+    assert force_join._coerce_required_channel("") == ""
+    assert force_join._coerce_required_channel("   ") == ""
+
+
+def test_coerce_required_channel_accepts_handle_and_id():
+    assert force_join._coerce_required_channel("@chan") == "@chan"
+    assert force_join._coerce_required_channel("chan") == "@chan"
+    assert (
+        force_join._coerce_required_channel("-1001234567890")
+        == "-1001234567890"
+    )
+
+
+def test_coerce_required_channel_rejects_non_string():
+    assert force_join._coerce_required_channel(123) is None
+    assert force_join._coerce_required_channel(None) is None
+    assert force_join._coerce_required_channel(True) is None
+    assert force_join._coerce_required_channel(False) is None
+
+
+def test_coerce_required_channel_rejects_over_cap():
+    """Raw input longer than the cap is rejected (returns None) — the
+    cap check happens BEFORE canonicalisation."""
+    too_long = "@" + ("x" * 64)  # 65 chars total
+    assert force_join._coerce_required_channel(too_long) is None
+
+
+# ---------- override set / clear / get ----------
+
+
+def test_set_required_channel_override_changes_get_required_channel(
+    _reset_required_channel_override, monkeypatch,
+):
+    monkeypatch.setenv("REQUIRED_CHANNEL", "@env_chan")
+    assert force_join.get_required_channel() == "@env_chan"
+    force_join.set_required_channel_override("@db_chan")
+    assert force_join.get_required_channel() == "@db_chan"
+    assert force_join.get_required_channel_override() == "@db_chan"
+
+
+def test_set_required_channel_override_empty_string_forces_off(
+    _reset_required_channel_override, monkeypatch,
+):
+    """The empty-string override forces the gate OFF even when env is set."""
+    monkeypatch.setenv("REQUIRED_CHANNEL", "@env_chan")
+    force_join.set_required_channel_override("")
+    assert force_join.get_required_channel() == ""
+    # ``""`` is distinct from ``None`` here — there IS an override active.
+    assert force_join.get_required_channel_override() == ""
+
+
+def test_clear_required_channel_override_falls_back_to_env(
+    _reset_required_channel_override, monkeypatch,
+):
+    monkeypatch.setenv("REQUIRED_CHANNEL", "@env_chan")
+    force_join.set_required_channel_override("@override")
+    force_join.clear_required_channel_override()
+    assert force_join.get_required_channel() == "@env_chan"
+    assert force_join.get_required_channel_override() is None
+
+
+def test_clear_required_channel_override_returns_had_value(
+    _reset_required_channel_override,
+):
+    force_join.set_required_channel_override("@chan")
+    assert force_join.clear_required_channel_override() is True
+    assert force_join.clear_required_channel_override() is False
+
+
+def test_set_required_channel_override_rejects_bool(
+    _reset_required_channel_override,
+):
+    with pytest.raises(ValueError):
+        force_join.set_required_channel_override(True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        force_join.set_required_channel_override(False)  # type: ignore[arg-type]
+
+
+def test_set_required_channel_override_rejects_over_cap(
+    _reset_required_channel_override,
+):
+    too_long = "@" + ("x" * 64)
+    with pytest.raises(ValueError):
+        force_join.set_required_channel_override(too_long)
+
+
+def test_set_required_channel_override_canonicalises_input(
+    _reset_required_channel_override,
+):
+    """Bare handles get the ``@`` prefix; numeric IDs pass through."""
+    force_join.set_required_channel_override("MyChan")
+    assert force_join.get_required_channel() == "@MyChan"
+    force_join.set_required_channel_override("-1001234567890")
+    assert force_join.get_required_channel() == "-1001234567890"
+
+
+# ---------- source reporting ----------
+
+
+def test_get_required_channel_source_default_when_unset(
+    _reset_required_channel_override, monkeypatch,
+):
+    monkeypatch.delenv("REQUIRED_CHANNEL", raising=False)
+    assert force_join.get_required_channel_source() == "default"
+
+
+def test_get_required_channel_source_env_when_env_set(
+    _reset_required_channel_override, monkeypatch,
+):
+    monkeypatch.setenv("REQUIRED_CHANNEL", "@env_chan")
+    assert force_join.get_required_channel_source() == "env"
+
+
+def test_get_required_channel_source_db_when_override_set(
+    _reset_required_channel_override, monkeypatch,
+):
+    monkeypatch.setenv("REQUIRED_CHANNEL", "@env_chan")
+    force_join.set_required_channel_override("@db_chan")
+    assert force_join.get_required_channel_source() == "db"
+
+
+def test_get_required_channel_source_db_for_force_off_override(
+    _reset_required_channel_override, monkeypatch,
+):
+    """A force-OFF override (`""`) is still ``source=db`` — that's
+    operator intent, not "no override"."""
+    monkeypatch.setenv("REQUIRED_CHANNEL", "@env_chan")
+    force_join.set_required_channel_override("")
+    assert force_join.get_required_channel_source() == "db"
+
+
+# ---------- refresh_required_channel_override_from_db ----------
+
+
+@pytest.mark.asyncio
+async def test_refresh_required_channel_override_from_db_loads_value(
+    _reset_required_channel_override,
+):
+    db = MagicMock()
+    db.get_setting = AsyncMock(return_value="@db_chan")
+    loaded = await force_join.refresh_required_channel_override_from_db(db)
+    assert loaded == "@db_chan"
+    assert force_join.get_required_channel() == "@db_chan"
+    db.get_setting.assert_awaited_once_with(
+        force_join.REQUIRED_CHANNEL_SETTING_KEY,
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_required_channel_override_from_db_loads_force_off(
+    _reset_required_channel_override, monkeypatch,
+):
+    """A stored empty string IS persisted as the force-OFF override."""
+    monkeypatch.setenv("REQUIRED_CHANNEL", "@env_chan")
+    db = MagicMock()
+    db.get_setting = AsyncMock(return_value="")
+    loaded = await force_join.refresh_required_channel_override_from_db(db)
+    assert loaded == ""
+    assert force_join.get_required_channel_override() == ""
+    assert force_join.get_required_channel() == ""
+
+
+@pytest.mark.asyncio
+async def test_refresh_required_channel_override_from_db_clears_when_row_missing(
+    _reset_required_channel_override,
+):
+    force_join.set_required_channel_override("@chan")
+    db = MagicMock()
+    db.get_setting = AsyncMock(return_value=None)
+    loaded = await force_join.refresh_required_channel_override_from_db(db)
+    assert loaded is None
+    assert force_join.get_required_channel_override() is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_required_channel_override_from_db_keeps_cache_on_error(
+    _reset_required_channel_override,
+):
+    """A transient DB blip must NOT clear an active override."""
+    force_join.set_required_channel_override("@chan")
+    db = MagicMock()
+    db.get_setting = AsyncMock(side_effect=RuntimeError("DB down"))
+    loaded = await force_join.refresh_required_channel_override_from_db(db)
+    assert loaded == "@chan"
+    assert force_join.get_required_channel_override() == "@chan"
+
+
+@pytest.mark.asyncio
+async def test_refresh_required_channel_override_from_db_handles_none_db(
+    _reset_required_channel_override,
+):
+    force_join.set_required_channel_override("@chan")
+    loaded = await force_join.refresh_required_channel_override_from_db(None)
+    assert loaded == "@chan"
+    assert force_join.get_required_channel_override() == "@chan"
+
+
+@pytest.mark.asyncio
+async def test_refresh_required_channel_override_from_db_rejects_malformed(
+    _reset_required_channel_override,
+):
+    """A malformed (non-string) DB row clears the override rather than
+    poisoning it."""
+    force_join.set_required_channel_override("@chan")
+    db = MagicMock()
+    db.get_setting = AsyncMock(return_value=12345)  # not a string
+    loaded = await force_join.refresh_required_channel_override_from_db(db)
+    assert loaded is None
+    assert force_join.get_required_channel_override() is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_required_channel_override_from_db_rejects_over_cap(
+    _reset_required_channel_override,
+):
+    db = MagicMock()
+    too_long = "@" + ("x" * 64)
+    db.get_setting = AsyncMock(return_value=too_long)
+    loaded = await force_join.refresh_required_channel_override_from_db(db)
+    assert loaded is None
+
+
+# ---------- resolution-order pin ----------
+
+
+def test_resolution_order_override_beats_env(
+    _reset_required_channel_override, monkeypatch,
+):
+    monkeypatch.setenv("REQUIRED_CHANNEL", "@env_chan")
+    force_join.set_required_channel_override("@db_chan")
+    assert force_join.get_required_channel() == "@db_chan"
+
+
+def test_resolution_order_env_beats_default(
+    _reset_required_channel_override, monkeypatch,
+):
+    monkeypatch.setenv("REQUIRED_CHANNEL", "@env_chan")
+    assert force_join.get_required_channel() == "@env_chan"
+
+
+def test_resolution_order_default_when_neither_set(
+    _reset_required_channel_override, monkeypatch,
+):
+    monkeypatch.delenv("REQUIRED_CHANNEL", raising=False)
+    assert force_join.get_required_channel() == ""
