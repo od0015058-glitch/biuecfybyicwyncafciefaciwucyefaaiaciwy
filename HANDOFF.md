@@ -2157,7 +2157,7 @@ or unblock other work.
 | 24 | **`FX_REFRESH_INTERVAL_SECONDS`** — USD→Toman refresh cadence. | Env-only. | Editor on `/admin/wallet-config`. | P3 | **Shipped** (this PR — new `fx_refresh_config.py` module with DB-backed override + boot warm-up. Editor card on `/admin/wallet-config` with breakdown (effective / db / env / default) and set/clear form. FX refresher loop re-reads the DB-backed interval every tick so a saved override is live without a redeploy. Audit slug `wallet_config_fx_refresh_update`. Bundled bug fix: new `fx_rates._sync_registered_cadence` helper pushes the resolved cadence into `bot_health.LOOP_CADENCES` at loop start and after every tick; pre-fix, an operator who set `FX_REFRESH_INTERVAL_SECONDS` to anything other than the 600 s compile-time default saw the `/admin/control` panel continuously flag `fx_refresh` as overdue because the panel's stale-threshold formula `2 × cadence + 60` used the registered 600 s rather than the resolved value. Mirrors the row-21 bot-health-alert fix.) |
 | 25 | **`ADMIN_PASSWORD`** rotation — currently env-only. | Env-only. | "Rotate password" form on `/admin` profile page. | P2 | **Shipped** (this PR — new `admin_password.py` module: scrypt-hashed password (n=2^15, r=8, p=1) stored in `system_settings.ADMIN_PASSWORD_HASH`, DB-backed override slot mirroring rows 4/6/8/20/21/23/24, login flow prefers DB hash → env back-compat → "deploy is misconfigured" refusal. New `/admin/profile` page with sidebar link, "current credential" provenance breakdown (db / env / unset), and password-rotation form (current + new + confirm) gated to `ROLE_SUPER`. Strength gate: ≥12 chars, must include letter + digit/symbol, refuses whitespace-only / unchanged. Boot warm-up in `main.py`; per-request refresh on login + on /admin/profile render. Audit slugs `profile_view`, `admin_password_rotated`, `admin_password_rotation_failed`. Bundled bug fix: `/admin/logout` now sweeps `meow_admin_view_as` AND `meow_flash` cookies in addition to the session cookie — previously a shared workstation leaked the prior operator's "viewing as <role>" preview into the next person's session.) |
 | 26 | **`ADMIN_2FA_ENROLLMENT_TIMEOUT`** — TOTP enrollment window. | Env-only. | Editor on the existing `/admin/enroll_2fa` page. | P3 | **Shipped** (this PR — new `enrollment_timeout.py` module with DB-backed override for `ADMIN_2FA_ENROLLMENT_TIMEOUT`. Editor card on `/admin/enroll_2fa` with breakdown table (effective / db / env / default), set / clear form, source badge. Suggested-secret mode renders a JavaScript countdown that auto-reloads when the window expires so an abandoned browser tab doesn't leak the secret indefinitely. Default 300 s (5 min), range [30, 3600]. Boot warm-up in `main.py`. Audit slug `enroll_2fa_timeout_update`. Env var documented in `.env.example`. Bundled bug fix: `memory_config_get` used the undefined `get_flash(request)` instead of `pop_flash(request, response)` — saving a memory-config override and landing back on `/admin/memory-config` would 500 with `NameError`.) |
-| 27 | **CSV export bulk download** — full transactions / usage history. | Per-user only. | Top-level `/admin/exports` page that streams big CSVs. | P3 | Pending |
+| 27 | **CSV export bulk download** — full transactions / usage history. | Per-user only. | Top-level `/admin/exports` page that streams big CSVs. | P3 | **Shipped — PR #188** (`/admin/exports` hub page links the existing transactions / monetization CSVs and exposes two new system-wide streaming endpoints: `/admin/exports/usage.csv` (every `usage_logs` row across every user, since/until/limit filters) and `/admin/exports/audit.csv` (every `admin_audit_log` row, action/actor/since/until/limit filters). Both stream via keyset-paginated async generators in batches of 5 k rows, capped at 1 M usage rows / 100 k audit rows, audit-logged under new `system_usage_export_csv` / `admin_audit_export_csv` slugs. Bundled bug fix: CSV-formula-injection defang (CWE-1236) latent since Stage-9 transactions CSV — `_csv_quote` now TAB-prepends any field whose first char is `=`, `+`, `@`, `\t`, `\r` so a malicious refund-reason like `=HYPERLINK("https://attacker", "click me")` can't execute when the CSV is opened in Excel / LibreOffice / Numbers / Sheets; negatives intentionally not defanged to keep accounting CSVs intact). |
 | 28 | **Refund presets** — predefined refund reasons / amounts. | Free-form text only. | Dropdown of presets + amount on `/admin/users/<id>/refund`. | P3 | **Shipped — PR #187** (operator-curated reason list, `/admin/refund-presets` editor + dropdown above the `/admin/transactions` refund form; bundled bug fix: `_scrub_audit_meta` keeps `record_admin_audit` / `record_payment_status_transition` lossless across `Decimal` / `datetime` / NaN / Infinity meta values that previously silently dropped audit rows). Per-preset amount field deferred — current refund form refunds full credited amount, ~95% of refunds want that. |
 | 29 | **Promo / gift code edit** — currently create-and-revoke, no edit. | None. | Inline edit on `/admin/promos` + `/admin/gifts`. | P3 | Pending |
 | 30 | **Disable individual models per-gateway** — e.g. block GPT-4o on Zarinpal-funded wallets. | None. | New cross-table on `/admin/models`. | P4 | Pending |
@@ -4323,7 +4323,47 @@ The user's process for this project — **do not deviate**:
     `get_flash(request)` instead of `pop_flash(request, response)` —
     saving a memory-config override would 500 with `NameError`. 76 new
     tests. Total suite: 3624 passing.
-34. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+34. **Stage-15-Step-E #10b row 27 SHIPPED — PR #188** — CSV bulk export hub.
+    New `/admin/exports` page (sidebar link 📦 Bulk exports) collects every
+    CSV download in one place: existing transactions / monetization
+    exporters PLUS two new system-wide streaming endpoints
+    (`/admin/exports/usage.csv` and `/admin/exports/audit.csv`). Each new
+    endpoint streams via a keyset-paginated async generator
+    (`Database.iter_system_usage_logs` / `Database.iter_admin_audit_log`)
+    in batches of 5 000 rows so a multi-MB pull doesn't pin a DB pool slot
+    for the whole download — every batch hands the connection back to the
+    pool before yielding to the network. Hard caps: 1 M usage rows /
+    100 k audit rows per export (operators who need more should narrow the
+    window with `since` / `until` filters; the inline form on the hub page
+    exposes them as `<input type="datetime-local">`). New
+    `Database.get_export_table_counts` returns lightweight
+    `COUNT(*)` for all three tables so the hub page renders accurate
+    "rows in DB" counts. Audit slugs `system_usage_export_csv` and
+    `admin_audit_export_csv` are pinned in `AUDIT_ACTION_LABELS` so they
+    surface in the action dropdown on `/admin/audit`. Bundled bug fix:
+    CSV / formula-injection defang (CWE-1236) latent since Stage-9
+    transactions CSV (Sept 2025) and Stage-15 monetization CSV. Excel,
+    LibreOffice Calc, Apple Numbers, and Google Sheets all evaluate any
+    cell whose first character is `=`, `+`, `@`, `\t`, or `\r` as a
+    formula, so a refund-reason of
+    `=HYPERLINK("https://attacker.example", "click me")` (or the more
+    sinister `+cmd|'/c calc'!A1`) turned every admin CSV download into a
+    drive-by exfil / RCE primitive the moment the operator double-clicked
+    the file. `_csv_quote` now prepends a `\t` to every field whose first
+    character matches the sentinel set; the TAB is stripped on display
+    by every spreadsheet tested but defeats formula-mode parsing because
+    `\t=…` is text-with-leading-whitespace, not a formula. Negatives
+    (`-`) are intentionally NOT defanged because every legitimate
+    accounting CSV emits negative dollar amounts (refund debits,
+    negative net profit, etc.) and false-flagging them would mangle
+    every quarterly close — the residual narrow `-cmd|…` attack
+    surface is documented inline in the
+    `_CSV_FORMULA_INJECTION_SENTINELS` comment block and matches the
+    trade-off Microsoft's own Power BI / Excel-export stack makes. The
+    fix flows through the existing transactions / monetization CSVs
+    too, not just the new endpoints. 31 new tests (20 web + 11 db).
+    Total suite: 3716 passing.
+35. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-35. **Read the §11 working agreement before doing anything.**
+36. **Read the §11 working agreement before doing anything.**

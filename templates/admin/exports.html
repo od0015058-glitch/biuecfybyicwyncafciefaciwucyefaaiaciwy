@@ -1,0 +1,188 @@
+{% extends "_layout.html" %}
+
+{% block title %}Bulk exports{% endblock %}
+
+{% block main %}
+<h2 style="margin: 0 0 0.5em 0;">Bulk CSV exports</h2>
+
+<p style="color: var(--text-muted); margin: 0 0 1em 0; font-size: 0.9em;">
+  Stage-15-Step-E #10b row 27. One-stop hub for every CSV / data
+  export this panel surfaces. Each card streams the underlying
+  table directly to your browser — no temp files, no in-memory
+  buffer. Filters narrow the export at the SQL layer so a small
+  pull doesn't have to download the whole table first.
+</p>
+
+{% if db_error %}
+<div class="alert alert-warn">{{ db_error }}</div>
+{% endif %}
+
+<div class="panel">
+  <h3>Transactions</h3>
+  <p style="margin: 0 0 0.5em 0;">
+    Every payment / refund / credit row.
+    {% if counts.transactions is not none %}
+    <strong>{{ counts.transactions }}</strong> rows in DB.
+    {% endif %}
+  </p>
+  <p style="margin: 0 0 0.75em 0; color: var(--text-muted); font-size: 0.9em;">
+    Same filter shape as the on-page browser: <code>gateway</code>,
+    <code>status</code>, and <code>telegram_id</code> are honoured;
+    pagination is ignored (CSV is always full-result, capped at
+    <code>TRANSACTIONS_CSV_MAX_ROWS</code>).
+  </p>
+  <p>
+    <a class="btn btn-primary" href="/admin/transactions?format=csv">
+      Download transactions CSV
+    </a>
+    &nbsp;
+    <a href="/admin/transactions" style="font-size: 0.85em;">
+      (open the browser to apply filters first &rarr;)
+    </a>
+  </p>
+</div>
+
+<div class="panel">
+  <h3>Monetization summary</h3>
+  <p style="margin: 0 0 0.5em 0;">
+    Lifetime + windowed P&amp;L: revenue, OpenRouter cost, gross
+    margin, top models, top spenders. Always full-result.
+  </p>
+  <p>
+    <a class="btn btn-primary" href="/admin/monetization/export.csv?window=7">
+      Last 7 days
+    </a>
+    &nbsp;
+    <a class="btn btn-primary" href="/admin/monetization/export.csv?window=30">
+      Last 30 days
+    </a>
+    &nbsp;
+    <a class="btn btn-primary" href="/admin/monetization/export.csv?window=90">
+      Last 90 days
+    </a>
+  </p>
+</div>
+
+<div class="panel">
+  <h3>System-wide usage logs (new)</h3>
+  <p style="margin: 0 0 0.5em 0;">
+    Every AI call across every user: model, token counts, per-call
+    cost, timestamp.
+    {% if counts.usage_logs is not none %}
+    <strong>{{ counts.usage_logs }}</strong> rows in DB.
+    {% endif %}
+    {% if system_usage_max_rows is not none %}
+    Hard-capped at <strong>{{ system_usage_max_rows }}</strong>
+    rows per export.
+    {% endif %}
+  </p>
+  <form method="get" action="/admin/exports/usage.csv"
+        style="display: flex; gap: 0.5em; align-items: end; flex-wrap: wrap; margin: 0 0 0.5em 0;">
+    <label style="display: flex; flex-direction: column; font-size: 0.85em;">
+      Since (UTC, optional)
+      <input type="datetime-local" name="since" style="font-size: 0.9em;">
+    </label>
+    <label style="display: flex; flex-direction: column; font-size: 0.85em;">
+      Until (UTC, optional)
+      <input type="datetime-local" name="until" style="font-size: 0.9em;">
+    </label>
+    <label style="display: flex; flex-direction: column; font-size: 0.85em;">
+      Row limit (optional)
+      <input type="number" name="limit" min="1"
+             {% if system_usage_max_rows is not none %}max="{{ system_usage_max_rows }}"{% endif %}
+             style="font-size: 0.9em; width: 8em;">
+    </label>
+    <button type="submit" class="btn btn-primary">
+      Download usage CSV
+    </button>
+  </form>
+  <p style="margin: 0; color: var(--text-muted); font-size: 0.85em;">
+    Streamed in keyset-paginated batches so a multi-MB export
+    doesn't pin a DB pool slot for the whole download. Empty
+    filters mean "everything, oldest first".
+  </p>
+</div>
+
+<div class="panel">
+  <h3>Admin audit log (new)</h3>
+  <p style="margin: 0 0 0.5em 0;">
+    Every admin action: actor, slug, target, IP, outcome, meta.
+    {% if counts.audit_log is not none %}
+    <strong>{{ counts.audit_log }}</strong> rows in DB.
+    {% endif %}
+    {% if audit_log_max_rows is not none %}
+    Hard-capped at <strong>{{ audit_log_max_rows }}</strong>
+    rows per export.
+    {% endif %}
+  </p>
+  <form method="get" action="/admin/exports/audit.csv"
+        style="display: flex; gap: 0.5em; align-items: end; flex-wrap: wrap; margin: 0 0 0.5em 0;">
+    <label style="display: flex; flex-direction: column; font-size: 0.85em;">
+      Action (slug, optional)
+      <input type="text" name="action" style="font-size: 0.9em;"
+             placeholder="e.g. credit_user">
+    </label>
+    <label style="display: flex; flex-direction: column; font-size: 0.85em;">
+      Actor (optional)
+      <input type="text" name="actor" style="font-size: 0.9em;"
+             placeholder="e.g. admin@1.2.3.4">
+    </label>
+    <label style="display: flex; flex-direction: column; font-size: 0.85em;">
+      Since (UTC, optional)
+      <input type="datetime-local" name="since" style="font-size: 0.9em;">
+    </label>
+    <label style="display: flex; flex-direction: column; font-size: 0.85em;">
+      Until (UTC, optional)
+      <input type="datetime-local" name="until" style="font-size: 0.9em;">
+    </label>
+    <label style="display: flex; flex-direction: column; font-size: 0.85em;">
+      Row limit (optional)
+      <input type="number" name="limit" min="1"
+             {% if audit_log_max_rows is not none %}max="{{ audit_log_max_rows }}"{% endif %}
+             style="font-size: 0.9em; width: 8em;">
+    </label>
+    <button type="submit" class="btn btn-primary">
+      Download audit CSV
+    </button>
+  </form>
+  <p style="margin: 0; color: var(--text-muted); font-size: 0.85em;">
+    Newest first. Empty filters mean "everything, newest first".
+  </p>
+</div>
+
+<details style="margin-top: 1em;">
+  <summary style="cursor: pointer; color: var(--text-muted); font-size: 0.9em;">
+    Notes for incident-response &amp; quarterly-close exports
+  </summary>
+  <ul style="font-size: 0.9em; color: var(--text-muted); margin: 0.5em 0 0 1.25em;">
+    <li>
+      Every export is recorded in the audit log with row count and
+      filters under the slugs <code>transactions_export_csv</code>,
+      <code>monetization_export_csv</code>,
+      <code>system_usage_export_csv</code>, and
+      <code>admin_audit_export_csv</code> so a forensic timeline
+      can answer "did anyone pull this data on Tuesday?".
+    </li>
+    <li>
+      All four exporters defang CSV-formula injection
+      (<code>=</code>, <code>+</code>, <code>@</code>,
+      <code>\t</code>, <code>\r</code> as the leading character) by
+      prepending a TAB so a malicious refund-reason like
+      <code>=HYPERLINK("https://attacker", "click me")</code> can't
+      execute when the operator opens the CSV in Excel. Negative
+      dollar amounts (<code>-</code>) are intentionally not
+      defanged because false-flagging them would mangle every
+      legitimate accounting CSV; the residual narrow attack
+      vector is documented in <code>web_admin._csv_quote</code>.
+    </li>
+    <li>
+      For exports larger than the per-endpoint row cap, slice the
+      timeline with <code>since</code> / <code>until</code> and
+      concatenate offline. The DB-side keyset pagination keeps
+      cost constant per batch, so a quarter-of-a-billion-row table
+      and a 100-row table cost the same per fetched row.
+    </li>
+  </ul>
+</details>
+
+{% endblock %}

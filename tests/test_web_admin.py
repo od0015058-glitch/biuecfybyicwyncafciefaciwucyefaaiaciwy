@@ -17004,3 +17004,440 @@ async def test_transactions_page_hides_dropdown_when_no_presets(
     assert 'name="reason_preset"' not in body
     # Free-text reason field still present.
     assert 'name="reason"' in body
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 27: /admin/exports bulk-export hub +
+# new /admin/exports/usage.csv and /admin/exports/audit.csv
+# streaming endpoints.
+# ---------------------------------------------------------------------
+
+
+def _stub_db_for_exports_hub(
+    *,
+    counts: dict | None = None,
+    counts_exception: Exception | None = None,
+):
+    """Stub DB pre-wired with ``get_export_table_counts`` for the
+    hub-page render. The stub also exposes the per-table cap
+    constants the template reads."""
+    db = _stub_db()
+    if counts_exception is not None:
+        db.get_export_table_counts = AsyncMock(
+            side_effect=counts_exception,
+        )
+    else:
+        db.get_export_table_counts = AsyncMock(
+            return_value=counts or {
+                "transactions": 12,
+                "usage_logs": 345,
+                "audit_log": 67,
+            },
+        )
+    db.SYSTEM_USAGE_EXPORT_MAX_ROWS = 1_000_000
+    db.AUDIT_LOG_EXPORT_MAX_ROWS = 100_000
+    return db
+
+
+def _stub_db_for_system_usage_csv(
+    *,
+    rows: list[dict] | None = None,
+    raise_after: int | None = None,
+):
+    """Stub DB pre-wired with ``iter_system_usage_logs`` async-iter."""
+    db = _stub_db()
+    rows = rows or []
+
+    async def _aiter(*, since=None, until=None, limit=None, batch=None):
+        for i, row in enumerate(rows):
+            if raise_after is not None and i >= raise_after:
+                raise RuntimeError("simulated mid-stream failure")
+            yield row
+
+    db.iter_system_usage_logs = _aiter
+    db.SYSTEM_USAGE_EXPORT_MAX_ROWS = 1_000_000
+    return db
+
+
+def _stub_db_for_admin_audit_csv(
+    *,
+    rows: list[dict] | None = None,
+    raise_after: int | None = None,
+):
+    """Stub DB pre-wired with ``iter_admin_audit_log`` async-iter."""
+    db = _stub_db()
+    rows = rows or []
+
+    async def _aiter(
+        *, action=None, actor=None, since=None, until=None,
+        limit=None, batch=None,
+    ):
+        for i, row in enumerate(rows):
+            if raise_after is not None and i >= raise_after:
+                raise RuntimeError("simulated mid-stream failure")
+            yield row
+
+    db.iter_admin_audit_log = _aiter
+    db.AUDIT_LOG_EXPORT_MAX_ROWS = 100_000
+    return db
+
+
+async def test_exports_hub_requires_auth(
+    aiohttp_client, make_admin_app,
+):
+    db = _stub_db_for_exports_hub()
+    client = await aiohttp_client(make_admin_app(password="x", db=db))
+    resp = await client.get("/admin/exports", allow_redirects=False)
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+
+
+async def test_exports_hub_renders_all_four_cards_and_counts(
+    aiohttp_client, make_admin_app,
+):
+    db = _stub_db_for_exports_hub(
+        counts={"transactions": 12, "usage_logs": 345, "audit_log": 67},
+    )
+    client = await aiohttp_client(make_admin_app(password="x", db=db))
+    await _login(client, "x")
+    resp = await client.get("/admin/exports")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    # All four cards present.
+    assert "Transactions" in body
+    assert "Monetization summary" in body
+    assert "System-wide usage logs" in body
+    assert "Admin audit log" in body
+    # Counts surfaced.
+    assert "<strong>12</strong>" in body
+    assert "<strong>345</strong>" in body
+    assert "<strong>67</strong>" in body
+    # Forms wired up.
+    assert 'action="/admin/exports/usage.csv"' in body
+    assert 'action="/admin/exports/audit.csv"' in body
+    # Sidebar link active class applied.
+    assert 'href="/admin/exports" class="active"' in body
+    # Cap constants surface so an admin sees the cap.
+    assert "1000000" in body or "1_000_000" in body
+    assert "100000" in body or "100_000" in body
+
+
+async def test_exports_hub_renders_with_db_count_failure(
+    aiohttp_client, make_admin_app,
+):
+    """A failing count fetch shows an alert but still renders the
+    page so the operator can still kick off a download."""
+    db = _stub_db_for_exports_hub(
+        counts_exception=RuntimeError("count failed"),
+    )
+    client = await aiohttp_client(make_admin_app(password="x", db=db))
+    await _login(client, "x")
+    resp = await client.get("/admin/exports")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Could not fetch row counts" in body
+    # Forms still rendered.
+    assert 'action="/admin/exports/usage.csv"' in body
+    assert 'action="/admin/exports/audit.csv"' in body
+
+
+async def test_system_usage_csv_requires_auth(
+    aiohttp_client, make_admin_app,
+):
+    db = _stub_db_for_system_usage_csv()
+    client = await aiohttp_client(make_admin_app(password="x", db=db))
+    resp = await client.get(
+        "/admin/exports/usage.csv", allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+
+
+async def test_system_usage_csv_streams_rows_with_header(
+    aiohttp_client, make_admin_app,
+):
+    rows = [
+        {
+            "id": 1,
+            "telegram_id": 100,
+            "model": "openrouter/auto",
+            "prompt_tokens": 10,
+            "completion_tokens": 20,
+            "total_tokens": 30,
+            "cost_usd": 0.012345,
+            "created_at": "2026-05-01T00:00:00+00:00",
+        },
+        {
+            "id": 2,
+            "telegram_id": 200,
+            "model": "anthropic/claude-3.5-sonnet",
+            "prompt_tokens": 50,
+            "completion_tokens": 80,
+            "total_tokens": 130,
+            "cost_usd": 0.5,
+            "created_at": "2026-05-02T01:02:03+00:00",
+        },
+    ]
+    db = _stub_db_for_system_usage_csv(rows=rows)
+    client = await aiohttp_client(make_admin_app(password="x", db=db))
+    await _login(client, "x")
+    resp = await client.get("/admin/exports/usage.csv")
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("text/csv")
+    assert "attachment" in resp.headers["Content-Disposition"]
+    assert "usage-logs-" in resp.headers["Content-Disposition"]
+    assert resp.headers["Cache-Control"] == "no-store, max-age=0"
+    body = await resp.text()
+    # Header row.
+    assert body.startswith(
+        "log_id,telegram_id,model,prompt_tokens,"
+        "completion_tokens,total_tokens,cost_usd,created_at\r\n"
+    )
+    # Both data rows present.
+    assert "1,100,openrouter/auto,10,20,30,0.012345" in body
+    assert "2,200,anthropic/claude-3.5-sonnet,50,80,130,0.500000" in body
+
+
+async def test_system_usage_csv_audits_export_with_filters(
+    aiohttp_client, make_admin_app,
+):
+    """Successful export records ``system_usage_export_csv`` with
+    the row count + filter shape."""
+    rows = [
+        {
+            "id": 7,
+            "telegram_id": 99,
+            "model": "openrouter/auto",
+            "prompt_tokens": 1,
+            "completion_tokens": 2,
+            "total_tokens": 3,
+            "cost_usd": 0.0,
+            "created_at": None,
+        },
+    ]
+    db = _stub_db_for_system_usage_csv(rows=rows)
+    db.record_admin_audit = AsyncMock(return_value=42)
+    client = await aiohttp_client(make_admin_app(password="x", db=db))
+    await _login(client, "x")
+    resp = await client.get(
+        "/admin/exports/usage.csv"
+        "?since=2026-01-01T00:00:00Z&until=2026-02-01T00:00:00Z"
+    )
+    assert resp.status == 200
+    await resp.read()  # drain the stream
+    db.record_admin_audit.assert_awaited()
+    call_kwargs = db.record_admin_audit.await_args.kwargs
+    assert call_kwargs["action"] == "system_usage_export_csv"
+    assert call_kwargs["target"] == "usage_logs"
+    assert call_kwargs["meta"]["rows"] == 1
+    assert call_kwargs["meta"]["since"].startswith("2026-01-01")
+    assert call_kwargs["meta"]["until"].startswith("2026-02-01")
+
+
+async def test_system_usage_csv_truncates_cleanly_on_db_failure(
+    aiohttp_client, make_admin_app,
+):
+    """Mid-stream DB failure logs but still returns the rows it had,
+    rather than aborting the response with a stack trace."""
+    rows = [
+        {
+            "id": i,
+            "telegram_id": 1,
+            "model": "openrouter/auto",
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "total_tokens": 2,
+            "cost_usd": 0.001,
+            "created_at": "2026-01-01T00:00:00+00:00",
+        }
+        for i in range(1, 6)
+    ]
+    db = _stub_db_for_system_usage_csv(rows=rows, raise_after=3)
+    client = await aiohttp_client(make_admin_app(password="x", db=db))
+    await _login(client, "x")
+    resp = await client.get("/admin/exports/usage.csv")
+    assert resp.status == 200
+    body = await resp.text()
+    # Only the first 3 rows came through cleanly.
+    for i in range(1, 4):
+        assert f"\n{i},1,openrouter/auto" in body
+    assert "\n5,1,openrouter/auto" not in body
+
+
+async def test_admin_audit_csv_requires_auth(
+    aiohttp_client, make_admin_app,
+):
+    db = _stub_db_for_admin_audit_csv()
+    client = await aiohttp_client(make_admin_app(password="x", db=db))
+    resp = await client.get(
+        "/admin/exports/audit.csv", allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+
+
+async def test_admin_audit_csv_streams_rows_with_meta_json_encoded(
+    aiohttp_client, make_admin_app,
+):
+    rows = [
+        {
+            "id": 1,
+            "ts": "2026-01-01T00:00:00+00:00",
+            "actor": "admin@1.2.3.4",
+            "action": "credit_user",
+            "target": "user:42",
+            "ip": "1.2.3.4",
+            "outcome": "ok",
+            "meta": {"amount_usd": 5.0, "reason": "promo"},
+        },
+        {
+            "id": 2,
+            "ts": "2026-01-02T01:02:03+00:00",
+            "actor": "admin@1.2.3.4",
+            "action": "logout",
+            "target": None,
+            "ip": "1.2.3.4",
+            "outcome": "ok",
+            "meta": None,
+        },
+    ]
+    db = _stub_db_for_admin_audit_csv(rows=rows)
+    client = await aiohttp_client(make_admin_app(password="x", db=db))
+    await _login(client, "x")
+    resp = await client.get("/admin/exports/audit.csv")
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("text/csv")
+    assert "attachment" in resp.headers["Content-Disposition"]
+    assert "admin-audit-" in resp.headers["Content-Disposition"]
+    body = await resp.text()
+    # Header row.
+    assert body.startswith(
+        "id,ts,actor,action,target,ip,outcome,meta\r\n"
+    )
+    # Row 1 with JSON-encoded meta (sort_keys=True so keys are
+    # alphabetised — amount_usd before reason).
+    assert (
+        '1,2026-01-01T00:00:00+00:00,admin@1.2.3.4,credit_user,'
+        'user:42,1.2.3.4,ok,'
+    ) in body
+    # Sort_keys=True puts amount_usd before reason.
+    assert '{""amount_usd"": 5.0, ""reason"": ""promo""}' in body
+    # Row 2 with empty meta.
+    assert (
+        '2,2026-01-02T01:02:03+00:00,admin@1.2.3.4,logout,,1.2.3.4,ok,'
+    ) in body
+
+
+async def test_admin_audit_csv_audits_export_with_filters(
+    aiohttp_client, make_admin_app,
+):
+    """Successful audit export records ``admin_audit_export_csv``
+    with the filter shape preserved."""
+    db = _stub_db_for_admin_audit_csv(rows=[])
+    db.record_admin_audit = AsyncMock(return_value=99)
+    client = await aiohttp_client(make_admin_app(password="x", db=db))
+    await _login(client, "x")
+    resp = await client.get(
+        "/admin/exports/audit.csv"
+        "?action=credit_user&actor=admin@1.2.3.4"
+        "&since=2026-01-01T00:00:00Z&limit=5000"
+    )
+    assert resp.status == 200
+    await resp.read()
+    db.record_admin_audit.assert_awaited()
+    call_kwargs = db.record_admin_audit.await_args.kwargs
+    assert call_kwargs["action"] == "admin_audit_export_csv"
+    assert call_kwargs["target"] == "admin_audit_log"
+    assert call_kwargs["meta"]["rows"] == 0
+    assert call_kwargs["meta"]["filters"]["action"] == "credit_user"
+    assert call_kwargs["meta"]["filters"]["actor"] == "admin@1.2.3.4"
+    assert call_kwargs["meta"]["filters"]["limit"] == 5000
+
+
+async def test_audit_action_labels_pin_new_export_slugs():
+    """Pin both new export slugs in the audit-action-label dropdown
+    so a future PR can't drop them."""
+    from web_admin import AUDIT_ACTION_LABELS
+    assert "system_usage_export_csv" in AUDIT_ACTION_LABELS
+    assert "admin_audit_export_csv" in AUDIT_ACTION_LABELS
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 27 bundled bug fix: CSV / formula
+# injection defang in ``_csv_quote``. Pure-function tests so the
+# attack vectors are pinned at the unit level.
+# ---------------------------------------------------------------------
+
+
+def test_csv_quote_defangs_leading_equals_for_excel_formula():
+    """``=HYPERLINK(...)`` becomes ``\"\\t=HYPERLINK(...)\"`` so
+    Excel renders it as text rather than a clickable link."""
+    from web_admin import _csv_quote
+    out = _csv_quote('=HYPERLINK("https://attacker", "click me")')
+    assert out.startswith('"\t=HYPERLINK')
+    assert out.endswith('"')
+
+
+def test_csv_quote_defangs_leading_plus():
+    from web_admin import _csv_quote
+    out = _csv_quote("+1+1")
+    # Defanged with TAB AND quoted (TAB triggers must-quote).
+    assert out == '"\t+1+1"'
+
+
+def test_csv_quote_defangs_leading_at_sign():
+    from web_admin import _csv_quote
+    out = _csv_quote("@SUM(A1:A100)")
+    assert out.startswith('"\t@SUM')
+
+
+def test_csv_quote_defangs_leading_tab():
+    from web_admin import _csv_quote
+    out = _csv_quote("\t=cmd")
+    # Defang prepends a TAB *to the existing TAB*, so the output
+    # starts with two tabs (then ``=cmd``). Both are stripped on
+    # display by Excel; we only care that the ``=`` is no longer
+    # the effective first character.
+    assert out.startswith('"\t\t=cmd')
+
+
+def test_csv_quote_defangs_leading_carriage_return():
+    from web_admin import _csv_quote
+    out = _csv_quote("\r=cmd")
+    assert out.startswith('"\t\r=cmd')
+
+
+def test_csv_quote_does_not_defang_negative_numbers():
+    """Negatives are common (refund debits, negative net profit) and
+    false-flagging them would mangle every accounting CSV. The
+    residual ``-cmd|...`` attack surface is documented in
+    :data:`web_admin._CSV_FORMULA_INJECTION_SENTINELS`."""
+    from web_admin import _csv_quote
+    assert _csv_quote("-2.5") == "-2.5"
+    assert _csv_quote("-100.0000") == "-100.0000"
+
+
+def test_csv_quote_normal_text_passthrough():
+    from web_admin import _csv_quote
+    assert _csv_quote("normal text") == "normal text"
+    assert _csv_quote("") == ""
+    assert _csv_quote(None) == ""
+    assert _csv_quote(42) == "42"
+
+
+def test_csv_quote_quotes_internal_commas_and_quotes():
+    from web_admin import _csv_quote
+    assert _csv_quote("a,b") == '"a,b"'
+    assert _csv_quote('he said "hi"') == '"he said ""hi"""'
+
+
+def test_csv_quote_defangs_then_quotes_when_internal_special_chars():
+    """A leading ``=`` plus an internal quote should still emit a
+    well-formed quoted CSV field."""
+    from web_admin import _csv_quote
+    out = _csv_quote('=HYPERLINK("a","b")')
+    # Defanged with TAB AND properly RFC-4180 quoted.
+    assert out.startswith('"\t=HYPERLINK')
+    # Internal quotes doubled.
+    assert '""a""' in out
+    assert '""b""' in out
