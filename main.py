@@ -689,6 +689,27 @@ async def main():
             "failed to load ADMIN_PASSWORD_HASH override from DB "
             "— falling through to env back-compat"
         )
+    # Stage-15-Step-E #10b row 26: warm the 2FA enrollment timeout
+    # override so the enroll_2fa page uses the operator's saved
+    # timeout immediately after restart.
+    try:
+        import enrollment_timeout
+        loaded_timeout = await (
+            enrollment_timeout
+            .refresh_enrollment_timeout_override_from_db(db)
+        )
+        log.info(
+            "loaded ADMIN_2FA_ENROLLMENT_TIMEOUT override from "
+            "system_settings: %s (active source=%s, effective=%ss)",
+            loaded_timeout,
+            enrollment_timeout.get_enrollment_timeout_source(),
+            enrollment_timeout.get_enrollment_timeout_seconds(),
+        )
+    except Exception:
+        log.exception(
+            "failed to load ADMIN_2FA_ENROLLMENT_TIMEOUT override "
+            "from DB — falling through to env/default"
+        )
     # Overwrite BotFather's cached slash-command list with the
     # canonical one. Without this, Telegram shows whatever was last
     # typed into the BotFather "Edit Commands" panel — including

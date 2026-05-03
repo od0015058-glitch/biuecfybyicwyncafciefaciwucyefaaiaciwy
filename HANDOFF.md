@@ -2156,9 +2156,9 @@ or unblock other work.
 | 23 | **`MODEL_DISCOVERY_INTERVAL_SECONDS`** — catalog refresh cadence. | Env-only. | Editor on a new `/admin/models-config` page. | P3 | **Shipped** (this PR — new `model_discovery_config.py` module with DB-backed override for `DISCOVERY_INTERVAL_SECONDS`. New `/admin/models-config` page with sidebar link + discovery interval editor (breakdown table + set/clear form). Boot warm-up in `main.py`. Discovery loop re-reads DB-backed interval every tick. Audit slug `models_config_discovery_interval_update`. Bundled bug fix: `delete_setting` now strips NUL bytes from the key, mirroring `upsert_setting`.) |
 | 24 | **`FX_REFRESH_INTERVAL_SECONDS`** — USD→Toman refresh cadence. | Env-only. | Editor on `/admin/wallet-config`. | P3 | **Shipped** (this PR — new `fx_refresh_config.py` module with DB-backed override + boot warm-up. Editor card on `/admin/wallet-config` with breakdown (effective / db / env / default) and set/clear form. FX refresher loop re-reads the DB-backed interval every tick so a saved override is live without a redeploy. Audit slug `wallet_config_fx_refresh_update`. Bundled bug fix: new `fx_rates._sync_registered_cadence` helper pushes the resolved cadence into `bot_health.LOOP_CADENCES` at loop start and after every tick; pre-fix, an operator who set `FX_REFRESH_INTERVAL_SECONDS` to anything other than the 600 s compile-time default saw the `/admin/control` panel continuously flag `fx_refresh` as overdue because the panel's stale-threshold formula `2 × cadence + 60` used the registered 600 s rather than the resolved value. Mirrors the row-21 bot-health-alert fix.) |
 | 25 | **`ADMIN_PASSWORD`** rotation — currently env-only. | Env-only. | "Rotate password" form on `/admin` profile page. | P2 | **Shipped** (this PR — new `admin_password.py` module: scrypt-hashed password (n=2^15, r=8, p=1) stored in `system_settings.ADMIN_PASSWORD_HASH`, DB-backed override slot mirroring rows 4/6/8/20/21/23/24, login flow prefers DB hash → env back-compat → "deploy is misconfigured" refusal. New `/admin/profile` page with sidebar link, "current credential" provenance breakdown (db / env / unset), and password-rotation form (current + new + confirm) gated to `ROLE_SUPER`. Strength gate: ≥12 chars, must include letter + digit/symbol, refuses whitespace-only / unchanged. Boot warm-up in `main.py`; per-request refresh on login + on /admin/profile render. Audit slugs `profile_view`, `admin_password_rotated`, `admin_password_rotation_failed`. Bundled bug fix: `/admin/logout` now sweeps `meow_admin_view_as` AND `meow_flash` cookies in addition to the session cookie — previously a shared workstation leaked the prior operator's "viewing as <role>" preview into the next person's session.) |
-| 26 | **`ADMIN_2FA_ENROLLMENT_TIMEOUT`** — TOTP enrollment window. | Env-only. | Editor on the existing `/admin/enroll_2fa` page. | P3 | Pending |
+| 26 | **`ADMIN_2FA_ENROLLMENT_TIMEOUT`** — TOTP enrollment window. | Env-only. | Editor on the existing `/admin/enroll_2fa` page. | P3 | **Shipped** (this PR — new `enrollment_timeout.py` module with DB-backed override for `ADMIN_2FA_ENROLLMENT_TIMEOUT`. Editor card on `/admin/enroll_2fa` with breakdown table (effective / db / env / default), set / clear form, source badge. Suggested-secret mode renders a JavaScript countdown that auto-reloads when the window expires so an abandoned browser tab doesn't leak the secret indefinitely. Default 300 s (5 min), range [30, 3600]. Boot warm-up in `main.py`. Audit slug `enroll_2fa_timeout_update`. Env var documented in `.env.example`. Bundled bug fix: `memory_config_get` used the undefined `get_flash(request)` instead of `pop_flash(request, response)` — saving a memory-config override and landing back on `/admin/memory-config` would 500 with `NameError`.) |
 | 27 | **CSV export bulk download** — full transactions / usage history. | Per-user only. | Top-level `/admin/exports` page that streams big CSVs. | P3 | Pending |
-| 28 | **Refund presets** — predefined refund reasons / amounts. | Free-form text only. | Dropdown of presets + amount on `/admin/users/<id>/refund`. | P3 | **Shipped — PR #186** (operator-curated reason list, `/admin/refund-presets` editor + dropdown above the `/admin/transactions` refund form; bundled bug fix: `_scrub_audit_meta` keeps `record_admin_audit` / `record_payment_status_transition` lossless across `Decimal` / `datetime` / NaN / Infinity meta values that previously silently dropped audit rows). Per-preset amount field deferred — current refund form refunds full credited amount, ~95% of refunds want that. |
+| 28 | **Refund presets** — predefined refund reasons / amounts. | Free-form text only. | Dropdown of presets + amount on `/admin/users/<id>/refund`. | P3 | **Shipped — PR #187** (operator-curated reason list, `/admin/refund-presets` editor + dropdown above the `/admin/transactions` refund form; bundled bug fix: `_scrub_audit_meta` keeps `record_admin_audit` / `record_payment_status_transition` lossless across `Decimal` / `datetime` / NaN / Infinity meta values that previously silently dropped audit rows). Per-preset amount field deferred — current refund form refunds full credited amount, ~95% of refunds want that. |
 | 29 | **Promo / gift code edit** — currently create-and-revoke, no edit. | None. | Inline edit on `/admin/promos` + `/admin/gifts`. | P3 | Pending |
 | 30 | **Disable individual models per-gateway** — e.g. block GPT-4o on Zarinpal-funded wallets. | None. | New cross-table on `/admin/models`. | P4 | Pending |
 
@@ -4281,7 +4281,7 @@ The user's process for this project — **do not deviate**:
     `amount_usd_credited` row.  Now scrubbed through
     `_is_finite_amount` the same way `get_user_spending_summary`
     already does.  22 new tests.  Total suite: 3565 passing.
-32. **Stage-15-Step-E #10b row 28 SHIPPED — PR #186** — Refund presets.
+32. **Stage-15-Step-E #10b row 28 SHIPPED — PR #187** — Refund presets.
     New `refund_presets.py` module: DB-backed override of the operator-
     curated refund-reason list, parsed via newline + pipe separator,
     case-insensitive dedupe, ≤5 entries × ≤40 chars each, JSON-encoded
@@ -4313,7 +4313,17 @@ The user's process for this project — **do not deviate**:
     `NaN` / `Infinity` literals that Postgres' `::jsonb` cast then
     silently rejects. 44 new tests (29 refund_presets + 6 audit-meta
     scrub + 9 web-admin integration). Total suite: 3609 passing.
-33. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+33. **Stage-15-Step-E #10b row 26 SHIPPED — PR #186** — `ADMIN_2FA_ENROLLMENT_TIMEOUT`
+    DB-backed override + editor card on `/admin/enroll_2fa` with breakdown
+    table, set / clear form, source badge. Suggested-secret mode shows a
+    JavaScript countdown that auto-reloads when the window expires.
+    Default 300 s (5 min), range [30, 3600]. Boot warm-up in `main.py`.
+    Audit slug `enroll_2fa_timeout_update`. Env var in `.env.example`.
+    Bundled bug fix: `memory_config_get` called the undefined
+    `get_flash(request)` instead of `pop_flash(request, response)` —
+    saving a memory-config override would 500 with `NameError`. 76 new
+    tests. Total suite: 3624 passing.
+34. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-34. **Read the §11 working agreement before doing anything.**
+35. **Read the §11 working agreement before doing anything.**

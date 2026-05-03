@@ -134,6 +134,14 @@ NowPayments crypto invoices.
   view-as cookie and the flash cookie in addition to the session
   cookie — prior impl leaked the prior operator's "viewing as
   &lt;role&gt;" preview into the next sign-in on a shared workstation.
+- **2FA enrollment timeout editor** on `/admin/enroll_2fa`
+  (Stage-15-Step-E #10b row 26) — DB-backed override for
+  `ADMIN_2FA_ENROLLMENT_TIMEOUT` (default 300 s / 5 min, range
+  [30, 3600]). Editor card with effective/db/env/default breakdown,
+  set / clear form, and source badge. Suggestion-mode pages render
+  a JavaScript countdown that auto-reloads when the window expires,
+  preventing an abandoned browser tab from leaking the suggested
+  TOTP secret indefinitely.
 - **Bot-text edit lock toggle** on `/admin/strings`
   (Stage-15-Step-E #10b row 22) — `ROLE_SUPER`-gated lock /
   unlock / clear-DB-override banner that gates the per-string
