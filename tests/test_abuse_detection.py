@@ -139,6 +139,41 @@ def test_classify_repetition_spam():
     assert classify("a" * 199) == "ok"
 
 
+def test_classify_newline_flood_caught_after_dotall_fix():
+    """Stage-16 row 19 PR — bundled bug fix.
+
+    Pre-fix, ``_REPETITION_PATTERN = re.compile(r"(.)\\1{199,}")``
+    used the default ``.`` semantics (newline NOT matched), so
+    a payload of 1000 ``\\n`` characters slipped past every
+    classifier layer (the length cap allows up to
+    ``ABUSE_MAX_PROMPT_CHARS`` — default 4 000 — and a 1000-char
+    newline run is well under that). The fix adds ``re.DOTALL``
+    so ``.`` matches newlines; this test pins the new behaviour.
+
+    Carriage returns (``\\r``) and CR-LF combinations were also
+    exempt pre-fix; we exercise both. A mixed-newline run is
+    NOT a single repeated character so the classifier correctly
+    leaves it alone (``\\n\\r\\n\\r…`` is sequence repetition,
+    which is a different signature).
+    """
+    # Pure newline flood — the canonical pre-fix bypass.
+    assert classify("\n" * 250) == "spam_repetition"
+    # Carriage-return flood — same family of whitespace-only payload.
+    assert classify("\r" * 250) == "spam_repetition"
+    # Newline-burst inside otherwise-normal text. Pre-fix this
+    # would also classify as "ok" because the run still didn't
+    # span a single ``.``-matchable group.
+    assert (
+        classify("hello" + ("\n" * 250) + "world") == "spam_repetition"
+    )
+    # Sanity: non-repeated newlines are fine.
+    assert classify("line1\nline2\nline3") == "ok"
+    # Sanity: tab/space floods (already caught pre-fix because
+    # ``.`` matches non-newline whitespace) still classify as spam.
+    assert classify("\t" * 250) == "spam_repetition"
+    assert classify(" " * 250) == "spam_repetition"
+
+
 def test_classify_legitimate_words_dont_false_positive():
     """The regex set is deliberately narrow — common SQL-y or
     programming words in normal text shouldn't trigger.
