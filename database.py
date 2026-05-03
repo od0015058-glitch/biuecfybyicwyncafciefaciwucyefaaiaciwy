@@ -3008,6 +3008,25 @@ class Database:
                 """,
                 telegram_id, limit,
             )
+        # Stage-15-Step-E #10b row 17 bundled bug fix:
+        # ``float(credited or 0)`` silently passes through
+        # ``Decimal('NaN')`` because ``NaN`` is truthy in Python —
+        # ``Decimal('NaN') or 0`` returns the NaN, then
+        # ``float(...)`` produces ``float('nan')``.  The admin
+        # user-detail page would render ``$nan`` for "Lifetime
+        # credited / spent" on any user whose transaction history
+        # includes a pre-PR-#75 NaN ``amount_usd_credited`` row.
+        # Scrub through ``_is_finite_amount`` the same way
+        # ``get_user_spending_summary`` already does.
+        def _scrub(raw: object) -> float:
+            if raw is None:
+                return 0.0
+            try:
+                v = float(raw)
+            except (TypeError, ValueError):
+                return 0.0
+            return v if _is_finite_amount(v) else 0.0
+
         return {
             "telegram_id": int(user_row["telegram_id"]),
             "username": user_row["username"],
@@ -3016,8 +3035,8 @@ class Database:
             "active_model": user_row["active_model"],
             "language_code": user_row["language_code"],
             "memory_enabled": bool(user_row["memory_enabled"]),
-            "total_credited_usd": float(credited or 0),
-            "total_spent_usd": float(spent or 0),
+            "total_credited_usd": _scrub(credited),
+            "total_spent_usd": _scrub(spent),
             "recent_transactions": [
                 {
                     "id": int(r["transaction_id"]),
@@ -3817,21 +3836,36 @@ class Database:
             ],
         }
 
+    # Stage-15-Step-E #10b row 17: valid bucket values for
+    # get_user_daily_spending.  Kept as a class-level frozenset so
+    # callers (and tests) can reference the canonical set without
+    # hard-coding strings.
+    SPENDING_BUCKETS: frozenset[str] = frozenset({"day", "week", "month"})
+
     async def get_user_daily_spending(
         self,
         telegram_id: int,
         *,
         days: int = 30,
+        bucket: str = "day",
     ) -> list[dict]:
         """Stage-15-Step-E #2 follow-up #3: per-day spending series.
 
-        Returns one row per day in the last *days* days that has at
+        Returns one row per bucket in the last *days* days that has at
         least one ``usage_logs`` row, oldest first::
 
             [
               {"date": "2026-04-25", "calls": int, "cost_usd": float},
               ...
             ]
+
+        Stage-15-Step-E #10b row 17: the *bucket* parameter controls
+        the ``date_trunc`` granularity.  Valid values are ``"day"``
+        (default, backwards-compatible), ``"week"`` (ISO weeks,
+        Monday-anchored), and ``"month"``.  Any other value raises
+        ``ValueError``.  The ``date`` key in each returned dict is
+        always the bucket's start date (e.g. the Monday of the week
+        or the 1st of the month).
 
         Days with zero usage are omitted from the result; the
         formatter is expected to pad missing days with zero-height
@@ -3846,10 +3880,7 @@ class Database:
         ' days')::interval``), same ``cost_deducted_usd`` scrub
         (NaN / Inf legacy rows are suppressed via the same
         ``_finite_float`` helper used above), same ``date_trunc``
-        bucket policy. Days are emitted as ISO ``YYYY-MM-DD``
-        strings so the Telegram renderer can drop them straight
-        into the rendered output without a server-time ↔ user-tz
-        round-trip.
+        bucket policy.
 
         Empty-data case: a user with zero rows in the window
         returns ``[]``. Callers should treat the empty list the
@@ -3871,12 +3902,18 @@ class Database:
                 "telegram_id is required and must be a positive integer; "
                 f"got {telegram_id!r}"
             )
+        bucket = str(bucket).strip().lower()
+        if bucket not in self.SPENDING_BUCKETS:
+            raise ValueError(
+                f"bucket must be one of {sorted(self.SPENDING_BUCKETS)}; "
+                f"got {bucket!r}"
+            )
         days = max(1, min(int(days), self.USER_STATS_WINDOW_DAYS_MAX))
         tid = int(telegram_id)
         async with self.pool.acquire() as connection:
             rows = await connection.fetch(
-                """
-                SELECT date_trunc('day', created_at)::date AS day,
+                f"""
+                SELECT date_trunc('{bucket}', created_at)::date AS day,
                        COUNT(*)::int AS calls,
                        COALESCE(SUM(cost_deducted_usd), 0) AS cost
                 FROM usage_logs

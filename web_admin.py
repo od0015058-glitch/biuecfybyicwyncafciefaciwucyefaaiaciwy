@@ -5046,6 +5046,100 @@ async def user_usage_get(request: web.Request) -> web.StreamResponse:
     )
 
 
+# Stage-15-Step-E #10b row 17: valid bucket choices + per-bucket
+# default window widths.  ``STATS_BUCKET_CHOICES`` is the canonical
+# tuple rendered as buttons in the template; the default *days*
+# window widens as the bucket grows so the chart has enough data
+# points to be useful (30 days for daily, 90 for weekly, 365 for
+# monthly).
+STATS_BUCKET_CHOICES: tuple[str, ...] = ("day", "week", "month")
+STATS_BUCKET_DEFAULT_DAYS: dict[str, int] = {
+    "day": 30,
+    "week": 90,
+    "month": 365,
+}
+STATS_BUCKET_LABELS: dict[str, str] = {
+    "day": "Daily",
+    "week": "Weekly",
+    "month": "Monthly",
+}
+
+
+async def user_stats_get(request: web.Request) -> web.StreamResponse:
+    """GET /admin/users/{telegram_id}/stats — spending stats with
+    day / week / month bucket selector.
+
+    Stage-15-Step-E #10b row 17. Renders a spending-series table
+    with aggregate tiles (total calls, total cost for the window)
+    and buttons for switching between daily, weekly, and monthly
+    bucketing. The default bucket is ``day`` with a 30-day window;
+    wider buckets automatically widen the window so the chart has
+    enough data points.
+    """
+    raw_id = request.match_info.get("telegram_id", "")
+    try:
+        user_id = int(raw_id)
+    except ValueError:
+        return web.HTTPFound(location="/admin/users")
+
+    bucket = request.rel_url.query.get("bucket", "day").strip().lower()
+    if bucket not in STATS_BUCKET_CHOICES:
+        bucket = "day"
+
+    try:
+        days = int(request.rel_url.query.get("days", "0"))
+    except (ValueError, TypeError):
+        days = 0
+    if days <= 0:
+        days = STATS_BUCKET_DEFAULT_DAYS.get(bucket, 30)
+    days = max(1, min(days, 365))
+
+    db = request.app.get(APP_KEY_DB)
+    series: list[dict] = []
+    db_error: str | None = None
+
+    if db is None:
+        db_error = "No database wired up (development mode)."
+    else:
+        try:
+            series = await db.get_user_daily_spending(
+                user_id, days=days, bucket=bucket,
+            )
+        except ValueError:
+            log.exception(
+                "user_stats_get: get_user_daily_spending refused "
+                "user=%s bucket=%s", user_id, bucket,
+            )
+            db_error = "Invalid request parameters."
+        except Exception:
+            log.exception(
+                "user_stats_get: get_user_daily_spending crashed "
+                "user=%s", user_id,
+            )
+            db_error = "Database query failed — see logs."
+
+    total_calls = sum(r.get("calls", 0) for r in series)
+    total_cost = sum(r.get("cost_usd", 0.0) for r in series)
+
+    return aiohttp_jinja2.render_template(
+        "user_stats.html",
+        request,
+        {
+            "active_page": "users",
+            "user_id": user_id,
+            "bucket": bucket,
+            "days": days,
+            "series": series,
+            "total_calls": total_calls,
+            "total_cost": total_cost,
+            "db_error": db_error,
+            "bucket_choices": STATS_BUCKET_CHOICES,
+            "bucket_labels": STATS_BUCKET_LABELS,
+            "bucket_default_days": STATS_BUCKET_DEFAULT_DAYS,
+        },
+    )
+
+
 async def user_adjust_post(request: web.Request) -> web.StreamResponse:
     """POST /admin/users/{telegram_id}/adjust — credit or debit.
 
@@ -12468,6 +12562,12 @@ def setup_admin_routes(
     app.router.add_get(
         "/admin/users/{telegram_id}/usage",
         _require_auth(user_usage_get),
+    )
+    # Stage-15-Step-E #10b row 17: per-user spending stats with
+    # day / week / month bucketing.
+    app.router.add_get(
+        "/admin/users/{telegram_id}/stats",
+        _require_auth(user_stats_get),
     )
 
     # Stage-8-Part-5: broadcast. Stage-15-Step-E #5 follow-up #4:

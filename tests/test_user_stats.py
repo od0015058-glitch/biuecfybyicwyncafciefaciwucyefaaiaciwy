@@ -1373,3 +1373,256 @@ def test_handler_empty_stats_snapshot_includes_daily_key():
 
     snapshot = _empty_stats_snapshot(window_days=30)
     assert snapshot["daily"] == []
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 17: bucket parameter for
+# get_user_daily_spending  +  /admin/users/{id}/stats web handler
+# ---------------------------------------------------------------------
+
+
+async def test_daily_spending_bucket_day_uses_date_trunc_day():
+    """Default ``bucket='day'`` keeps the existing SQL shape."""
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_user_daily_spending(telegram_id=1, days=30, bucket="day")
+
+    sql = conn.fetch.await_args.args[0]
+    assert "date_trunc('day'" in sql
+
+
+async def test_daily_spending_bucket_week_uses_date_trunc_week():
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_user_daily_spending(telegram_id=1, days=90, bucket="week")
+
+    sql = conn.fetch.await_args.args[0]
+    assert "date_trunc('week'" in sql
+
+
+async def test_daily_spending_bucket_month_uses_date_trunc_month():
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_user_daily_spending(telegram_id=1, days=365, bucket="month")
+
+    sql = conn.fetch.await_args.args[0]
+    assert "date_trunc('month'" in sql
+
+
+async def test_daily_spending_invalid_bucket_raises_value_error():
+    db = database_module.Database()
+    db.pool = _PoolStub(_make_conn())
+
+    with pytest.raises(ValueError, match="bucket must be one of"):
+        await db.get_user_daily_spending(
+            telegram_id=1, days=30, bucket="year",
+        )
+    with pytest.raises(ValueError, match="bucket must be one of"):
+        await db.get_user_daily_spending(
+            telegram_id=1, days=30, bucket="",
+        )
+
+
+async def test_daily_spending_bucket_case_insensitive():
+    """Upper/mixed-case bucket values should be accepted."""
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_user_daily_spending(telegram_id=1, days=30, bucket="Week")
+    sql = conn.fetch.await_args.args[0]
+    assert "date_trunc('week'" in sql
+
+
+async def test_daily_spending_bucket_whitespace_stripped():
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.get_user_daily_spending(telegram_id=1, days=30, bucket="  month  ")
+    sql = conn.fetch.await_args.args[0]
+    assert "date_trunc('month'" in sql
+
+
+def test_spending_buckets_frozenset_matches_choices():
+    """The class-level SPENDING_BUCKETS must agree with the
+    ``STATS_BUCKET_CHOICES`` tuple in web_admin."""
+    import web_admin
+    assert set(web_admin.STATS_BUCKET_CHOICES) == set(
+        database_module.Database.SPENDING_BUCKETS
+    )
+
+
+async def test_daily_spending_week_bucket_returns_valid_data():
+    """Weekly bucket returns rows with start-of-week dates."""
+    import datetime as dt
+    conn = _make_conn()
+    conn.fetch = AsyncMock(
+        return_value=[
+            {"day": dt.date(2026, 4, 20), "calls": 10, "cost": 1.5},
+            {"day": dt.date(2026, 4, 27), "calls": 5, "cost": 0.75},
+        ]
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    out = await db.get_user_daily_spending(
+        telegram_id=42, days=90, bucket="week",
+    )
+
+    assert len(out) == 2
+    assert out[0]["date"] == "2026-04-20"
+    assert out[0]["calls"] == 10
+    assert out[0]["cost_usd"] == pytest.approx(1.5)
+
+
+# -- Bug fix: get_user_admin_summary NaN scrub -------------------------
+
+
+async def test_user_admin_summary_scrubs_nan_credited():
+    """Bundled bug fix: ``get_user_admin_summary`` used
+    ``float(credited or 0)`` which silently passes
+    ``Decimal('NaN')`` through.  Must scrub to ``0.0``."""
+    import math
+    from decimal import Decimal
+
+    conn = _make_conn()
+    conn.fetchrow = AsyncMock(
+        return_value={
+            "telegram_id": 42,
+            "username": "test",
+            "balance_usd": Decimal("1.00"),
+            "free_messages_left": 5,
+            "active_model": "gpt-4",
+            "language_code": "en",
+            "memory_enabled": True,
+        }
+    )
+    conn.fetchval = AsyncMock(side_effect=[Decimal("NaN"), Decimal("0")])
+    conn.fetch = AsyncMock(return_value=[])
+
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    summary = await db.get_user_admin_summary(42)
+
+    assert summary is not None
+    assert math.isfinite(summary["total_credited_usd"])
+    assert summary["total_credited_usd"] == 0.0
+
+
+async def test_user_admin_summary_scrubs_inf_spent():
+    """Bundled bug fix: infinite ``total_spent_usd`` from a
+    corrupted ``SUM(cost_deducted_usd)`` must be clamped to 0."""
+    import math
+    from decimal import Decimal
+
+    conn = _make_conn()
+    conn.fetchrow = AsyncMock(
+        return_value={
+            "telegram_id": 42,
+            "username": "test",
+            "balance_usd": Decimal("1.00"),
+            "free_messages_left": 5,
+            "active_model": "gpt-4",
+            "language_code": "en",
+            "memory_enabled": True,
+        }
+    )
+    conn.fetchval = AsyncMock(
+        side_effect=[Decimal("10.00"), Decimal("Infinity")]
+    )
+    conn.fetch = AsyncMock(return_value=[])
+
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    summary = await db.get_user_admin_summary(42)
+
+    assert summary is not None
+    assert math.isfinite(summary["total_spent_usd"])
+    assert summary["total_spent_usd"] == 0.0
+    assert summary["total_credited_usd"] == pytest.approx(10.00)
+
+
+# -- Web handler: /admin/users/{id}/stats ------------------------------
+
+
+async def test_user_stats_handler_source_check():
+    """The user_stats_get handler MUST be registered at
+    ``/admin/users/{telegram_id}/stats``."""
+    import inspect
+    import web_admin
+
+    source = inspect.getsource(web_admin.setup_admin_routes)
+    assert "/admin/users/{telegram_id}/stats" in source
+    assert "user_stats_get" in source
+
+
+async def test_user_stats_handler_bucket_choices():
+    """The stats page exposes exactly day/week/month bucket
+    choices matching the DB-layer canonical set."""
+    import web_admin
+
+    assert web_admin.STATS_BUCKET_CHOICES == ("day", "week", "month")
+    assert set(web_admin.STATS_BUCKET_LABELS.keys()) == {"day", "week", "month"}
+    assert set(web_admin.STATS_BUCKET_DEFAULT_DAYS.keys()) == {"day", "week", "month"}
+
+
+async def test_user_stats_handler_default_bucket_is_day():
+    """When no ?bucket= query param is supplied, default to day."""
+    import web_admin
+
+    assert web_admin.STATS_BUCKET_DEFAULT_DAYS["day"] == 30
+
+
+async def test_user_stats_handler_week_defaults_90_days():
+    import web_admin
+
+    assert web_admin.STATS_BUCKET_DEFAULT_DAYS["week"] == 90
+
+
+async def test_user_stats_handler_month_defaults_365_days():
+    import web_admin
+
+    assert web_admin.STATS_BUCKET_DEFAULT_DAYS["month"] == 365
+
+
+def test_user_detail_template_links_to_stats():
+    """The user_detail.html template MUST contain a link to the
+    bucketed stats page."""
+    from pathlib import Path
+    tpl_path = Path(__file__).resolve().parent.parent / (
+        "templates/admin/user_detail.html"
+    )
+    html = tpl_path.read_text()
+    assert "/stats" in html
+    assert "Spending stats" in html
+
+
+def test_user_stats_template_exists_and_renders_bucket_bar():
+    """The user_stats.html template must exist and contain the
+    bucket selector bar."""
+    from pathlib import Path
+    tpl_path = Path(__file__).resolve().parent.parent / (
+        "templates/admin/user_stats.html"
+    )
+    assert tpl_path.exists(), "templates/admin/user_stats.html missing"
+    html = tpl_path.read_text()
+    assert "bucket_choices" in html
+    assert "bucket_labels" in html
+    assert "series" in html
+    # Aggregate tiles
+    assert "total_calls" in html
+    assert "total_cost" in html
