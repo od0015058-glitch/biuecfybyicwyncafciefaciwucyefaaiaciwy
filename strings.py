@@ -421,6 +421,11 @@ _STRINGS: dict[str, dict[str, str]] = {
         "ai_local_rate_limited": (
             "⏳ سرعت ارسال پیام‌های شما زیاد است. لطفاً یک لحظه صبر کنید."
         ),
+        # Stage-16 row 19: thumb-feedback toast messages.
+        "ai_feedback_thanks_positive": "🙏 ممنون از بازخورد مثبت شما!",
+        "ai_feedback_thanks_negative": "🙏 ممنون از بازخورد شما؛ تلاش می‌کنیم بهتر شود.",
+        "ai_feedback_already_recorded": "✅ بازخورد شما قبلاً ثبت شده است.",
+        "ai_feedback_unavailable": "❌ ثبت بازخورد ممکن نشد.",
         "ai_chat_busy": (
             "⏳ پاسخ پیام قبلی شما هنوز در حال پردازش است.\n"
             "لطفاً تا تکمیل آن صبر کنید و سپس پیام بعدی را بفرستید."
@@ -921,6 +926,11 @@ _STRINGS: dict[str, dict[str, str]] = {
         "ai_local_rate_limited": (
             "⏳ You're sending messages too quickly. Please wait a moment."
         ),
+        # Stage-16 row 19: thumb-feedback toast messages.
+        "ai_feedback_thanks_positive": "🙏 Thanks for the thumbs-up!",
+        "ai_feedback_thanks_negative": "🙏 Thanks for letting us know — we'll work on it.",
+        "ai_feedback_already_recorded": "✅ Your feedback was already recorded.",
+        "ai_feedback_unavailable": "❌ Could not record your feedback.",
         "ai_chat_busy": (
             "⏳ Your previous message is still being processed.\n"
             "Please wait for it to finish before sending another one."

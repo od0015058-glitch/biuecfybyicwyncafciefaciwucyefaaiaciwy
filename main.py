@@ -29,6 +29,7 @@ from model_discovery import discover_new_models_loop
 from payments import payment_webhook, refresh_min_amounts_loop
 from tetrapay import tetrapay_webhook
 from zarinpal import zarinpal_callback
+from ai_feedback import start_dissatisfaction_alert_task
 from bot_health_alert import start_bot_health_alert_task
 from pending_alert import start_pending_alert_task
 from pending_expiration import start_pending_expiration_task
@@ -810,6 +811,16 @@ async def main():
     # See bot_health_alert.py for the full contract.
     bot_health_alert_task = start_bot_health_alert_task(bot)
 
+    # Stage-16 row 19: per-model AI dissatisfaction-rate alert loop.
+    # Wakes every AI_FEEDBACK_LOOP_INTERVAL_SECONDS (default 300)
+    # and DMs admins when any model has >= AI_FEEDBACK_MIN_SAMPLES
+    # rated calls in the trailing window AND a negative-rate above
+    # AI_FEEDBACK_DISSATISFACTION_THRESHOLD_RATIO (default 30%).
+    # Per-model alert cooldown so a sustained spike DMs at most
+    # once per AI_FEEDBACK_ALERT_COOLDOWN_SECONDS (default 1h).
+    # See ai_feedback.py for the full contract.
+    ai_feedback_alert_task = start_dissatisfaction_alert_task(bot)
+
     # Stage-15-Step-E #10b row 20: background audit-log retention reaper.
     # Wakes every AUDIT_RETENTION_INTERVAL_HOURS (default 24) and
     # batch-deletes admin_audit_log rows older than the resolved
@@ -937,6 +948,13 @@ async def main():
             pass
         except Exception:
             log.exception("bot-health-alert loop exited with error")
+        ai_feedback_alert_task.cancel()
+        try:
+            await ai_feedback_alert_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("ai-feedback-alert loop exited with error")
         audit_retention_task.cancel()
         try:
             await audit_retention_task

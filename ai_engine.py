@@ -192,6 +192,7 @@ async def chat_with_model(
     user_prompt: str,
     *,
     image_data_uris: list[str] | None = None,
+    out_meta: dict | None = None,
 ) -> str:
     """Run one chat turn for ``telegram_id``.
 
@@ -206,6 +207,17 @@ async def chat_with_model(
     photo path) must opt in by name and the existing 19+ test
     callsites that pass positional args (``chat_with_model(42, "hi")``)
     keep working unchanged.
+
+    ``out_meta`` (Stage-16 row 19) is the **optional** per-call
+    metadata sink. When the caller passes a mutable dict, the
+    function populates ``out_meta["log_id"]`` with the
+    ``usage_logs.log_id`` of the row written by ``log_usage`` —
+    used by the chat handler to key the 👍/👎 feedback keyboard.
+    Free-tier turns and refused-cost INSERTs leave ``log_id``
+    absent (or ``None``); the handler checks for that and skips
+    the keyboard. Keeping this as an out-parameter — instead of
+    changing the return type to a tuple — keeps the 19+ existing
+    ``await chat_with_model(...)`` test callsites unchanged.
 
     Memory persistence stays text-only: the prompt text is
     persisted via ``db.append_conversation_message``, the image
@@ -631,7 +643,22 @@ async def chat_with_model(
                     telegram_id, cost,
                 )
             charged = cost if deducted else 0.0
-            await db.log_usage(telegram_id, active_model, prompt_tokens, completion_tokens, charged)
+            log_id = await db.log_usage(
+                telegram_id, active_model, prompt_tokens, completion_tokens, charged
+            )
+            # Stage-16 row 19: surface the just-inserted log_id to
+            # the chat handler so it can key the 👍/👎 feedback
+            # keyboard's callback_data on the row. ``out_meta`` is
+            # opt-in — the 19+ existing test callsites that don't
+            # pass it keep working unchanged. ``log_id`` may be
+            # ``None`` here on the refused-cost path; we still
+            # populate the dict so the caller can distinguish
+            # "didn't write a row" from "out_meta wasn't threaded
+            # through the cost-poisoning guard".
+            if out_meta is not None:
+                out_meta["log_id"] = (
+                    int(log_id) if log_id is not None else None
+                )
 
             # Stage-16 row 20: feed the spike tracker. Sync — the
             # tracker holds an in-memory deque, no network or DB

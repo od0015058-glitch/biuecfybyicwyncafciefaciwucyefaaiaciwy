@@ -60,6 +60,11 @@ from abuse_detection import (
     classify as classify_abuse,
     maybe_alert_spend_spike,
 )
+from ai_feedback import (
+    CALLBACK_PREFIXES as FEEDBACK_CALLBACK_PREFIXES,
+    build_feedback_keyboard,
+    parse_feedback_callback,
+)
 from rate_limit import (
     consume_chat_token,
     release_chat_slot,
@@ -3476,6 +3481,124 @@ async def process_final_invoice(callback: CallbackQuery, state: FSMContext):
 # ==========================================
 # AI chat (free-text outside any reserved button or FSM state)
 # ==========================================
+
+
+# Stage-16 row 19: 👍 / 👎 feedback on the AI reply.
+#
+# The keyboard is attached to the LAST chunk of the reply by
+# ``process_chat`` / ``process_photo``. A tap arrives here as a
+# CallbackQuery with ``data`` shaped ``fbp:<log_id>`` /
+# ``fbn:<log_id>``. We:
+#
+# 1. Decode the slug + log_id (defensive against malformed
+#    callback_data — Telegram round-trips through the user's
+#    client and a hand-rolled keyboard could send arbitrary
+#    strings).
+# 2. Persist the vote via ``db.record_usage_feedback`` which
+#    enforces (a) the per-user owner check (you can't rate
+#    someone else's reply by spoofing the log_id) and (b) the
+#    first-tap-wins idempotency (a second tap on the same row
+#    is a no-op, even if the user changes their mind from 👍
+#    to 👎).
+# 3. Surface a localised toast (positive/negative/already-recorded)
+#    via ``callback.answer`` so the user gets confirmation
+#    without the chat scrolling.
+# 4. Strip the keyboard from the message (``edit_reply_markup
+#    (reply_markup=None)``) so a second tap can't even be
+#    initiated. A ``TelegramAPIError`` here (rare — usually
+#    "message is not modified" because the user double-tapped)
+#    is logged and swallowed; the vote was already persisted.
+@router.callback_query(
+    F.data.startswith(FEEDBACK_CALLBACK_PREFIXES[0])
+    | F.data.startswith(FEEDBACK_CALLBACK_PREFIXES[1])
+)
+async def process_feedback_callback(callback: CallbackQuery):
+    parsed = parse_feedback_callback(callback.data)
+    if parsed is None:
+        # Malformed callback_data — show a toast but DON'T strip
+        # the keyboard, so the user can try a real button.
+        await callback.answer("Bad data", show_alert=False)
+        return
+
+    feedback_kind, log_id = parsed
+    user_id = (
+        callback.from_user.id if callback.from_user is not None else None
+    )
+    if user_id is None:
+        # Anonymous group admin / channel-attribution edge case —
+        # same defensive drop ``process_chat`` uses for None
+        # ``from_user``. We can't write a feedback row without a
+        # user_id and refuse silently.
+        await callback.answer()
+        return
+
+    lang = await _get_user_language(user_id)
+
+    try:
+        recorded = await db.record_usage_feedback(
+            log_id=log_id,
+            telegram_id=user_id,
+            feedback=feedback_kind,
+        )
+    except ValueError:
+        # ``record_usage_feedback`` raises for an unknown slug.
+        # Should be unreachable because ``parse_feedback_callback``
+        # already filters to {positive, negative}, but if it does
+        # happen, surface the unavailable toast instead of leaking
+        # the validator error.
+        log.exception(
+            "feedback callback received unexpected slug for "
+            "user_id=%s log_id=%s data=%r",
+            user_id, log_id, callback.data,
+        )
+        await callback.answer(
+            t(lang, "ai_feedback_unavailable"), show_alert=False
+        )
+        return
+    except Exception:
+        log.exception(
+            "record_usage_feedback raised for user_id=%s log_id=%s",
+            user_id, log_id,
+        )
+        await callback.answer(
+            t(lang, "ai_feedback_unavailable"), show_alert=False
+        )
+        return
+
+    if recorded:
+        if feedback_kind == "positive":
+            toast_key = "ai_feedback_thanks_positive"
+        else:
+            toast_key = "ai_feedback_thanks_negative"
+    else:
+        # Either a second tap (already-rated, owner mismatch) or
+        # a row that no longer exists (retention deleted it).
+        # Same toast for all of these: the user's takeaway is
+        # "your vote isn't being counted right now".
+        toast_key = "ai_feedback_already_recorded"
+
+    await callback.answer(t(lang, toast_key), show_alert=False)
+
+    # Strip the keyboard so the buttons can't be tapped again.
+    # Wrap in a try so a transient Telegram error doesn't
+    # surface as a poller-level crash — the vote is already
+    # persisted at this point.
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        # Most common cause: message was already edited (double-tap
+        # race) so the new ``reply_markup=None`` matches the
+        # current state and Telegram returns 400 "message is not
+        # modified". Safe to ignore.
+        pass
+    except TelegramAPIError:
+        log.warning(
+            "edit_reply_markup failed for feedback callback "
+            "user_id=%s log_id=%s",
+            user_id, log_id,
+        )
+
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def process_chat(message: Message):
     # Reserved-buttons guard: the bottom reply-keyboard buttons reach this
@@ -3548,7 +3671,18 @@ async def process_chat(message: Message):
         await message.bot.send_chat_action(
             chat_id=message.chat.id, action="typing"
         )
-        reply = await chat_with_model(user_id, message.text)
+        # Stage-16 row 19: pass an out-meta dict so ``chat_with_model``
+        # can surface the just-inserted ``usage_logs.log_id``. We
+        # key the 👍/👎 feedback keyboard's callback_data on this id
+        # so a tap finds the exact row to update. Free-tier turns
+        # leave ``log_id`` absent (chat_with_model only writes a
+        # row on the paid branch); the keyboard helper returns
+        # ``None`` for those and the handler falls back to a plain
+        # send.
+        chat_meta: dict = {}
+        reply = await chat_with_model(
+            user_id, message.text, out_meta=chat_meta
+        )
     finally:
         # Idempotent — release in a finally so an OpenRouter
         # exception, a TelegramAPIError on send_chat_action, or any
@@ -3586,8 +3720,19 @@ async def process_chat(message: Message):
     # ``TelegramBadRequest: message is too long``. Chunk on a
     # paragraph / line / hard boundary, in that order, so the split
     # falls on a natural break when possible.
-    for chunk in _split_for_telegram(reply, _TELEGRAM_MAX_MSG_CHARS):
-        await message.answer(chunk)
+    chunks = _split_for_telegram(reply, _TELEGRAM_MAX_MSG_CHARS)
+    # Stage-16 row 19: attach the 👍/👎 keyboard to the LAST chunk
+    # only. Earlier chunks are part of one logical reply; a per-
+    # chunk keyboard would clutter the chat and require N taps to
+    # rate one reply. The keyboard is silently skipped on free-tier
+    # turns (no ``log_id``) and when the feature is disabled.
+    feedback_kb = build_feedback_keyboard(chat_meta.get("log_id"))
+    last_idx = len(chunks) - 1
+    for idx, chunk in enumerate(chunks):
+        if idx == last_idx and feedback_kb is not None:
+            await message.answer(chunk, reply_markup=feedback_kb)
+        else:
+            await message.answer(chunk)
 
     # Stage-16 row 20: drain the spend-spike alert latch *after*
     # the user's reply is sent. A transient Telegram 5xx on the
@@ -3823,8 +3968,14 @@ async def process_photo(message: Message):
         # ``message.caption`` is optional — text-only photo turn
         # is allowed by ``build_multimodal_user_message``.
         prompt = (message.caption or "").strip()
+        # Stage-16 row 19: same out-meta thread as ``process_chat``
+        # so a paid photo turn surfaces the ``log_id`` for the
+        # 👍/👎 keyboard.
+        chat_meta: dict = {}
         reply = await chat_with_model(
-            user_id, prompt, image_data_uris=[data_uri],
+            user_id, prompt,
+            image_data_uris=[data_uri],
+            out_meta=chat_meta,
         )
     finally:
         await release_chat_slot(user_id)
@@ -3839,8 +3990,14 @@ async def process_photo(message: Message):
         await message.answer(t(lang, "ai_provider_unavailable"))
         return
 
-    for chunk in _split_for_telegram(reply, _TELEGRAM_MAX_MSG_CHARS):
-        await message.answer(chunk)
+    chunks = _split_for_telegram(reply, _TELEGRAM_MAX_MSG_CHARS)
+    feedback_kb = build_feedback_keyboard(chat_meta.get("log_id"))
+    last_idx = len(chunks) - 1
+    for idx, chunk in enumerate(chunks):
+        if idx == last_idx and feedback_kb is not None:
+            await message.answer(chunk, reply_markup=feedback_kb)
+        else:
+            await message.answer(chunk)
 
     # Stage-16 row 20: drain the spend-spike alert latch (same as
     # process_chat). Photo turns share the spike tracker with text

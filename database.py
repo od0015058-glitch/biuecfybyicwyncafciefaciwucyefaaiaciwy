@@ -814,8 +814,23 @@ class Database:
             new_balance = await connection.fetchval(query, cost_usd, telegram_id)
         return new_balance is not None
 
-    async def log_usage(self, telegram_id: int, model: str, prompt_tokens: int, completion_tokens: int, cost: float):
+    async def log_usage(
+        self,
+        telegram_id: int,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        cost: float,
+    ) -> int | None:
         """Logs the exact token usage for accounting.
+
+        Returns the newly inserted ``log_id`` so the caller can
+        thread it into the user-feedback keyboard (Stage-16 row 19
+        — ``ai_feedback.build_feedback_keyboard`` keys the 👍/👎
+        callback_data on the ``log_id``). Returns ``None`` when
+        the INSERT is refused by the cost-poisoning guard below;
+        callers that do not need the id can keep ignoring the
+        return value.
 
         Defense-in-depth: refuses non-finite (``NaN`` / ``±Infinity``)
         or negative ``cost`` and skips the INSERT with a logged error.
@@ -836,7 +851,8 @@ class Database:
         ``usage_logs`` finite-and-non-negative.
 
         Skipping vs raising: the call is fire-and-forget from
-        ``chat_with_model`` (return value unused) and the user has
+        ``chat_with_model`` (return value newly threaded for the
+        feedback keyboard but otherwise unused) and the user has
         already received their reply by this point. Skipping with a
         log line preserves the user's reply without poisoning the
         table; raising would either crash the handler (bad UX for
@@ -851,13 +867,144 @@ class Database:
                 "Row NOT inserted; investigate the caller.",
                 telegram_id, model, cost,
             )
-            return
+            return None
         query = """
             INSERT INTO usage_logs (telegram_id, model_used, prompt_tokens, completion_tokens, cost_deducted_usd)
             VALUES ($1, $2, $3, $4, $5)
+            RETURNING log_id
         """
         async with self.pool.acquire() as connection:
-            await connection.execute(query, telegram_id, model, prompt_tokens, completion_tokens, cost)
+            log_id = await connection.fetchval(
+                query, telegram_id, model, prompt_tokens, completion_tokens, cost
+            )
+        return int(log_id) if log_id is not None else None
+
+    async def record_usage_feedback(
+        self,
+        *,
+        log_id: int,
+        telegram_id: int,
+        feedback: str,
+    ) -> bool:
+        """Stage-16 row 19: persist a user's 👍 / 👎 vote on one
+        ``usage_logs`` row.
+
+        Three guards:
+
+        1. ``feedback`` must be ``'positive'`` or ``'negative'``.
+           A bad slug (a future-typo'd callback string, a poke
+           from the admin panel, a third-party automation) is
+           rejected with ``ValueError`` rather than silently
+           inserting a value that the table-level CHECK in
+           migration 0020 would then reject — surfacing the bug
+           at the call site, not at the SQL boundary.
+
+        2. The UPDATE filters on ``telegram_id`` so user A cannot
+           overwrite user B's vote by hand-crafting a callback
+           with B's ``log_id``. Telegram callback_data is
+           round-tripped through the user's client; treating it
+           as untrusted input is the right default.
+
+        3. The UPDATE filters on ``feedback IS NULL`` so the
+           **first** tap wins. Once a user has voted, a second
+           tap (e.g. they tap 👍, then 👎 to "fix" it, or the
+           keyboard message gets re-rendered after an edit) is a
+           no-op rather than re-overwriting and quietly skewing
+           the dissatisfaction-rate aggregate.
+
+        Returns ``True`` iff exactly one row was actually
+        updated. ``False`` covers all of: bad ``log_id``,
+        wrong owner, already-rated, row deleted by retention.
+        """
+        if feedback not in {"positive", "negative"}:
+            raise ValueError(
+                f"record_usage_feedback: feedback must be "
+                f"'positive' or 'negative'; got {feedback!r}"
+            )
+        async with self.pool.acquire() as connection:
+            result = await connection.execute(
+                """
+                UPDATE usage_logs
+                   SET feedback = $1
+                 WHERE log_id = $2
+                   AND telegram_id = $3
+                   AND feedback IS NULL
+                """,
+                feedback, int(log_id), int(telegram_id),
+            )
+        # ``execute`` returns a tag like ``'UPDATE 1'`` / ``'UPDATE 0'``.
+        return result.endswith(" 1")
+
+    async def get_recent_feedback_rates(
+        self,
+        *,
+        window_seconds: int,
+        min_samples: int = 1,
+    ) -> list[dict]:
+        """Stage-16 row 19: per-model dissatisfaction-rate snapshot.
+
+        Returns one row per model with at least ``min_samples``
+        rated calls in the trailing ``window_seconds``::
+
+            [
+              {
+                "model": str,
+                "total": int,         # rated calls in window
+                "negative": int,      # of which 👎
+                "negative_rate": float,  # negative / total in [0, 1]
+              },
+              ...
+            ]
+
+        Sorted by ``negative_rate DESC`` so the alert loop's first
+        entry is the worst offender. ``window_seconds`` is clamped
+        to ``>= 1`` to keep the SQL ``INTERVAL`` literal a positive
+        integer; ``min_samples`` is clamped to ``>= 1`` so the
+        ``HAVING`` filter is always meaningful.
+
+        The query is index-served by
+        ``idx_usage_logs_feedback_model_created`` (added in
+        migration 0020) — the partial index narrows the scan to
+        the (typically small) subset of rows where ``feedback IS
+        NOT NULL``, then range-scans by ``created_at DESC`` to
+        the window cutoff.
+        """
+        win = max(1, int(window_seconds))
+        min_n = max(1, int(min_samples))
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                f"""
+                SELECT model_used                                  AS model,
+                       COUNT(*)                                    AS total,
+                       COUNT(*) FILTER (
+                           WHERE feedback = 'negative'
+                       )                                           AS negative
+                  FROM usage_logs
+                 WHERE feedback IS NOT NULL
+                   AND created_at >= NOW() - INTERVAL '{win} seconds'
+              GROUP BY model_used
+                HAVING COUNT(*) >= $1
+              ORDER BY (
+                       COUNT(*) FILTER (WHERE feedback = 'negative')
+                   )::float / NULLIF(COUNT(*), 0) DESC,
+                       COUNT(*) DESC
+                """,
+                min_n,
+            )
+        out: list[dict] = []
+        for r in rows:
+            total = int(r["total"]) or 0
+            negative = int(r["negative"]) or 0
+            rate = (negative / total) if total > 0 else 0.0
+            out.append(
+                {
+                    "model": r["model"],
+                    "total": total,
+                    "negative": negative,
+                    "negative_rate": rate,
+                }
+            )
+        return out
 
     async def create_pending_transaction(
         self,

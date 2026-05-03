@@ -243,9 +243,22 @@ _INJECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
 # Threshold high enough that a code block of dashes / equals signs
 # (typical separator) doesn't false-positive. Keyboard-mashing
 # spam regularly hits 1000+.
+#
+# Bundled bug fix (Stage-16 row 19 PR): ``re.DOTALL`` is required
+# so ``.`` matches **every** character — including ``\n`` and
+# ``\r``. Pre-fix, the default ``.`` regex semantics (newline NOT
+# matched) silently exempted newline-flood spam: a payload of
+# 1000 ``\n`` characters in a row classified as ``"ok"`` and
+# reached :func:`chat_with_model`, where the user-message string
+# was forwarded to OpenRouter unchanged. The length-cap layer
+# (default 4 000 chars) gates 4 001+-byte payloads but a 200–4 000
+# byte run of newlines slipped through every layer. Adding
+# ``re.DOTALL`` closes the gap; tab / space repeats were already
+# caught (``.`` already matches non-newline whitespace).
 _REPETITION_THRESHOLD: Final[int] = 200
 _REPETITION_PATTERN: re.Pattern[str] = re.compile(
-    r"(.)\1{" + str(_REPETITION_THRESHOLD - 1) + r",}"
+    r"(.)\1{" + str(_REPETITION_THRESHOLD - 1) + r",}",
+    re.DOTALL,
 )
 
 

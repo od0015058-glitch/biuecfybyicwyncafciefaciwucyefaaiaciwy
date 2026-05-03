@@ -14,6 +14,26 @@ msgstr ""
 "⏳ Your previous message is still being processed.\n"
 "Please wait for it to finish before sending another one."
 
+#. ✅ بازخورد شما قبلاً ثبت شده است.
+#: strings.py:ai_feedback_already_recorded
+msgid "ai_feedback_already_recorded"
+msgstr "✅ Your feedback was already recorded."
+
+#. 🙏 ممنون از بازخورد شما؛ تلاش می‌کنیم بهتر شود.
+#: strings.py:ai_feedback_thanks_negative
+msgid "ai_feedback_thanks_negative"
+msgstr "🙏 Thanks for letting us know — we'll work on it."
+
+#. 🙏 ممنون از بازخورد مثبت شما!
+#: strings.py:ai_feedback_thanks_positive
+msgid "ai_feedback_thanks_positive"
+msgstr "🙏 Thanks for the thumbs-up!"
+
+#. ❌ ثبت بازخورد ممکن نشد.
+#: strings.py:ai_feedback_unavailable
+msgid "ai_feedback_unavailable"
+msgstr "❌ Could not record your feedback."
+
 #. 🖼️ این تصویر به‌صورت «فایل» ارسال شده است و من نمی‌توانم آن را تحلیل کنم. لطفاً همان تصویر را به‌صورت «عکس» (در تلگرام هنگام ارسال، گزینهٔ «Photo» نه «File») دوباره بفرستید تا یک مدل بینایی بتواند آن را ببیند. فرمت‌های HEIC / HEIF (پیش‌فرض آیفون) پشتیبانی نمی‌شوند؛ تلگرام هنگام ارسال به‌صورت «Photo» تصویر را به JPEG تبدیل می‌کند.
 #: strings.py:ai_image_document_instruction
 msgid "ai_image_document_instruction"

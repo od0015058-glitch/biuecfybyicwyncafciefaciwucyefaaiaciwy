@@ -2409,36 +2409,40 @@ async def test_log_usage_skips_insert_for_nan_cost(caplog):
     — log error + skip the INSERT. The user's reply is preserved
     (``log_usage`` is fire-and-forget from ``chat_with_model``);
     we just don't poison the table.
+
+    Note: as of Stage-16 row 19 ``log_usage`` issues the INSERT via
+    ``connection.fetchval`` (with ``RETURNING log_id``) instead of
+    ``connection.execute``; the not-awaited assertion targets that.
     """
     import logging
 
     conn = _make_conn()
-    conn.execute = AsyncMock()
     db = database_module.Database()
     db.pool = _PoolStub(conn)
 
     with caplog.at_level(logging.ERROR, logger="bot.database"):
-        await db.log_usage(
+        result = await db.log_usage(
             telegram_id=42, model="openai/gpt-4o-mini",
             prompt_tokens=10, completion_tokens=20,
             cost=float("nan"),
         )
-    conn.execute.assert_not_awaited()
+    conn.fetchval.assert_not_awaited()
+    assert result is None
     assert any("log_usage refused" in rec.message for rec in caplog.records)
 
 
 async def test_log_usage_skips_insert_for_positive_infinity_cost():
     conn = _make_conn()
-    conn.execute = AsyncMock()
     db = database_module.Database()
     db.pool = _PoolStub(conn)
 
-    await db.log_usage(
+    result = await db.log_usage(
         telegram_id=42, model="openai/gpt-4o-mini",
         prompt_tokens=10, completion_tokens=20,
         cost=float("inf"),
     )
-    conn.execute.assert_not_awaited()
+    conn.fetchval.assert_not_awaited()
+    assert result is None
 
 
 async def test_log_usage_skips_insert_for_negative_cost():
@@ -2448,16 +2452,16 @@ async def test_log_usage_skips_insert_for_negative_cost():
     shape so the only paths into ``usage_logs`` are non-negative.
     """
     conn = _make_conn()
-    conn.execute = AsyncMock()
     db = database_module.Database()
     db.pool = _PoolStub(conn)
 
-    await db.log_usage(
+    result = await db.log_usage(
         telegram_id=42, model="openai/gpt-4o-mini",
         prompt_tokens=10, completion_tokens=20,
         cost=-0.001,
     )
-    conn.execute.assert_not_awaited()
+    conn.fetchval.assert_not_awaited()
+    assert result is None
 
 
 async def test_log_usage_zero_cost_still_inserts():
@@ -2465,18 +2469,22 @@ async def test_log_usage_zero_cost_still_inserts():
     settlement (``chat_with_model`` calls through with cost=0 to
     keep ``log_usage`` honest about the call). MUST insert so the
     usage log is complete.
+
+    Stage-16 row 19 swapped ``execute`` for ``fetchval`` so the
+    INSERT can ``RETURNING log_id`` for the feedback keyboard.
     """
     conn = _make_conn()
-    conn.execute = AsyncMock()
+    conn.fetchval = AsyncMock(return_value=12345)
     db = database_module.Database()
     db.pool = _PoolStub(conn)
 
-    await db.log_usage(
+    log_id = await db.log_usage(
         telegram_id=42, model="openai/gpt-4o-mini",
         prompt_tokens=10, completion_tokens=20,
         cost=0.0,
     )
-    conn.execute.assert_awaited_once()
+    conn.fetchval.assert_awaited_once()
+    assert log_id == 12345
 
 
 async def test_log_usage_finite_positive_cost_inserts():
@@ -2485,16 +2493,17 @@ async def test_log_usage_finite_positive_cost_inserts():
     break every paid-message log.
     """
     conn = _make_conn()
-    conn.execute = AsyncMock()
+    conn.fetchval = AsyncMock(return_value=99)
     db = database_module.Database()
     db.pool = _PoolStub(conn)
 
-    await db.log_usage(
+    log_id = await db.log_usage(
         telegram_id=42, model="openai/gpt-4o-mini",
         prompt_tokens=10, completion_tokens=20,
         cost=0.0042,
     )
-    conn.execute.assert_awaited_once()
+    conn.fetchval.assert_awaited_once()
+    assert log_id == 99
 
 
 # ---------------------------------------------------------------------

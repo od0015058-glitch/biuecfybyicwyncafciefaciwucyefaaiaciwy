@@ -12,6 +12,22 @@ msgstr ""
 "⏳ پاسخ پیام قبلی شما هنوز در حال پردازش است.\n"
 "لطفاً تا تکمیل آن صبر کنید و سپس پیام بعدی را بفرستید."
 
+#: strings.py:ai_feedback_already_recorded
+msgid "ai_feedback_already_recorded"
+msgstr "✅ بازخورد شما قبلاً ثبت شده است."
+
+#: strings.py:ai_feedback_thanks_negative
+msgid "ai_feedback_thanks_negative"
+msgstr "🙏 ممنون از بازخورد شما؛ تلاش می‌کنیم بهتر شود."
+
+#: strings.py:ai_feedback_thanks_positive
+msgid "ai_feedback_thanks_positive"
+msgstr "🙏 ممنون از بازخورد مثبت شما!"
+
+#: strings.py:ai_feedback_unavailable
+msgid "ai_feedback_unavailable"
+msgstr "❌ ثبت بازخورد ممکن نشد."
+
 #: strings.py:ai_image_document_instruction
 msgid "ai_image_document_instruction"
 msgstr ""
