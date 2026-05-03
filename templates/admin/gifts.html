@@ -58,6 +58,20 @@
     opacity: 0.4;
     cursor: not-allowed;
   }
+  /* Stage-15-Step-E #10b row 29: edit link styled like promos.html. */
+  a.edit-link {
+    display: inline-block;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 12px;
+    text-decoration: none;
+    margin-right: 6px;
+  }
+  a.edit-link:hover {
+    background: rgba(79, 140, 255, 0.1);
+  }
   form.inline { display: inline; margin: 0; }
   .alert-success {
     background: rgba(74, 222, 128, 0.1);
@@ -152,6 +166,7 @@
           </td>
           <td>
             {% if r.is_active %}
+            <a class="edit-link" href="/admin/gifts/{{ r.code }}/edit">Edit</a>
             <form class="inline" method="post"
                   action="/admin/gifts/{{ r.code }}/revoke"
                   onsubmit="return confirm('Revoke gift code {{ r.code }}?');">

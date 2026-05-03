@@ -3528,6 +3528,9 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     "login_deny": "Login (denied)",
     "promo_create": "Promo created",
     "promo_revoke": "Promo revoked",
+    # Stage-15-Step-E #10b row 29: promo / gift code edit endpoints.
+    "promo_edit": "Promo edited",
+    "gift_edit": "Gift edited",
     "gift_create": "Gift created",
     "gift_revoke": "Gift revoked",
     "user_adjust": "Wallet credit / debit",
@@ -4303,6 +4306,286 @@ async def promos_revoke(request: web.Request) -> web.StreamResponse:
 
 
 # ---------------------------------------------------------------------
+# Promo / gift code edit (Stage-15-Step-E #10b row 29)
+# ---------------------------------------------------------------------
+#
+# Admins can edit an existing code's metadata in place rather than
+# being forced to revoke + recreate (which would also change the
+# user-facing code string and lose the paper trail). The form
+# replaces *every* editable field authoritatively — leaving
+# ``max_uses`` / ``expires_in_days`` blank resets them to unlimited /
+# never, exactly mirroring the create-form contract. Per-code
+# ``code`` itself is immutable (URL-keyed) and ``used_count`` /
+# ``is_active`` are managed by the redemption / revoke paths.
+
+
+def parse_promo_edit_form(form) -> dict | str:
+    """Parse the /admin/promos/<code>/edit form.
+
+    Same field validators as :func:`parse_promo_form` minus the
+    ``code`` field (the code is in the URL path, not the form body).
+    Returns the same shape as ``parse_promo_form`` minus ``code``.
+    """
+    kind = (form.get("discount_kind") or "").strip().lower()
+    if kind not in ("percent", "amount"):
+        return "bad_discount_kind"
+
+    raw_value = (form.get("discount_value") or "").strip()
+    if not raw_value:
+        return "missing_discount"
+
+    discount_percent: int | None = None
+    discount_amount: float | None = None
+    if kind == "percent":
+        cleaned = raw_value.rstrip("%").strip()
+        try:
+            pct = int(cleaned)
+        except ValueError:
+            return "bad_percent"
+        if not (1 <= pct <= 100):
+            return "bad_percent"
+        discount_percent = pct
+    else:
+        cleaned = raw_value.lstrip("$").strip()
+        try:
+            amount = float(cleaned)
+        except ValueError:
+            return "bad_amount"
+        if not (amount == amount) or amount in (
+            float("inf"), float("-inf")
+        ) or amount <= 0:
+            return "bad_amount"
+        if amount > DISCOUNT_AMOUNT_MAX:
+            return "discount_too_large"
+        discount_amount = round(amount, 4)
+
+    raw_max = (form.get("max_uses") or "").strip()
+    max_uses: int | None = None
+    if raw_max:
+        try:
+            max_uses = int(raw_max)
+        except ValueError:
+            return "bad_max_uses"
+        if max_uses <= 0:
+            return "bad_max_uses"
+        if max_uses > MAX_USES_CAP:
+            return "max_uses_too_large"
+
+    raw_days = (form.get("expires_in_days") or "").strip()
+    expires_in_days: int | None = None
+    if raw_days:
+        try:
+            expires_in_days = int(raw_days)
+        except ValueError:
+            return "bad_days"
+        if expires_in_days <= 0:
+            return "bad_days"
+        if expires_in_days > EXPIRES_IN_DAYS_MAX:
+            return "days_too_large"
+
+    return {
+        "discount_percent": discount_percent,
+        "discount_amount": discount_amount,
+        "max_uses": max_uses,
+        "expires_in_days": expires_in_days,
+    }
+
+
+async def promo_edit_get(request: web.Request) -> web.StreamResponse:
+    """GET /admin/promos/<code>/edit — render the edit form pre-filled
+    with the existing row's metadata.
+
+    A revoked code is read-only — the form renders but every input
+    is disabled and the submit button is missing. The operator can
+    inspect the existing values but must create a new code (under a
+    fresh code string) to issue more bonuses.
+    """
+    code = request.match_info.get("code", "").upper()
+    if not code or len(code) > 64 or not all(
+        (c.isascii() and c.isalnum()) or c in "_-" for c in code
+    ):
+        response = web.HTTPFound(location="/admin/promos")
+        secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+        cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+        set_flash(
+            response, kind="error", message="Invalid code in URL.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    db = request.app.get(APP_KEY_DB)
+    row: dict | None = None
+    db_error: str | None = None
+    if db is None:
+        db_error = "No database wired up (development mode)."
+    else:
+        try:
+            rows = await db.list_promo_codes(limit=10_000)
+            for r in rows:
+                if r["code"] == code:
+                    row = r
+                    break
+        except Exception:
+            log.exception("promo_edit_get: list_promo_codes failed")
+            db_error = "Database query failed — see logs."
+
+    if row is None and db_error is None:
+        response = web.HTTPFound(location="/admin/promos")
+        secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+        cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+        set_flash(
+            response, kind="error",
+            message=f"Promo code {code!r} not found.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    response = aiohttp_jinja2.render_template(
+        "promo_edit.html",
+        request,
+        {
+            "row": row,
+            "db_error": db_error,
+            "active_page": "promos",
+            "csrf_token": csrf_token_for(request),
+            "flash": None,
+        },
+    )
+    flash = pop_flash(request, response)
+    if flash is not None:
+        response = aiohttp_jinja2.render_template(
+            "promo_edit.html",
+            request,
+            {
+                "row": row,
+                "db_error": db_error,
+                "active_page": "promos",
+                "csrf_token": csrf_token_for(request),
+                "flash": flash,
+            },
+        )
+        response.del_cookie(FLASH_COOKIE, path="/admin/")
+    return response
+
+
+async def promo_edit_post(request: web.Request) -> web.StreamResponse:
+    """POST /admin/promos/<code>/edit — apply edits to an existing
+    promo code. Always 302s back to /admin/promos with a flash."""
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    response = web.HTTPFound(location="/admin/promos")
+
+    form = await request.post()
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning(
+            "promo_edit_post: CSRF token mismatch from %s", request.remote
+        )
+        set_flash(
+            response, kind="error",
+            message="Form submission was rejected (CSRF). Refresh and try again.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    code = request.match_info.get("code", "").upper()
+    if not code or len(code) > 64 or not all(
+        (c.isascii() and c.isalnum()) or c in "_-" for c in code
+    ):
+        set_flash(
+            response, kind="error", message="Invalid code in URL.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    parsed = parse_promo_edit_form(form)
+    if isinstance(parsed, str):
+        # Re-redirect to the edit page so the operator can fix the
+        # field rather than the list page (where the error context
+        # would be missing).
+        edit_response = web.HTTPFound(location=f"/admin/promos/{code}/edit")
+        set_flash(
+            edit_response, kind="error",
+            message=_PROMO_FORM_ERR_TEXT.get(
+                parsed, f"Invalid input ({parsed})."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return edit_response
+
+    db = request.app.get(APP_KEY_DB)
+    if db is None:
+        set_flash(
+            response, kind="error",
+            message="No database wired up — cannot edit.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    expires_at = None
+    if parsed["expires_in_days"] is not None:
+        expires_at = datetime.now(timezone.utc) + timedelta(
+            days=parsed["expires_in_days"]
+        )
+
+    try:
+        ok = await db.update_promo_code(
+            code,
+            discount_percent=parsed["discount_percent"],
+            discount_amount=parsed["discount_amount"],
+            max_uses=parsed["max_uses"],
+            expires_at=expires_at,
+        )
+    except ValueError as exc:
+        set_flash(
+            response, kind="error", message=str(exc),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+    except Exception:
+        log.exception("promo_edit_post: update_promo_code failed")
+        set_flash(
+            response, kind="error",
+            message="Database write failed — see logs.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    if not ok:
+        set_flash(
+            response, kind="error",
+            message=f"Promo code {code!r} not found.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    if parsed["discount_percent"] is not None:
+        disc = f"{parsed['discount_percent']}%"
+    else:
+        disc = f"${parsed['discount_amount']:.2f}"
+    log.info(
+        "web_admin promo_edit_post: code=%s disc=%s cap=%s",
+        code, disc, parsed["max_uses"],
+    )
+    await _record_audit_safe(
+        request,
+        "promo_edit",
+        target=f"promo:{code}",
+        meta={
+            "discount_percent": parsed["discount_percent"],
+            "discount_amount": parsed["discount_amount"],
+            "max_uses": parsed["max_uses"],
+            "expires_in_days": parsed["expires_in_days"],
+        },
+    )
+    set_flash(
+        response, kind="success",
+        message=f"Updated '{code}'.",
+        secret=secret, cookie_secure=cookie_secure,
+    )
+    return response
+
+
+# ---------------------------------------------------------------------
 # Gift codes (Stage-8-Part-3)
 # ---------------------------------------------------------------------
 #
@@ -4314,6 +4597,8 @@ async def promos_revoke(request: web.Request) -> web.StreamResponse:
 #   GET  /admin/gifts                             — list + create form
 #   POST /admin/gifts                             — create
 #   POST /admin/gifts/{code}/revoke               — soft-delete
+#   GET  /admin/gifts/{code}/edit                 — edit form (Stage-15)
+#   POST /admin/gifts/{code}/edit                 — apply edits  (Stage-15)
 
 
 # DB column is DECIMAL(10,4); cap a hair below the column max so the
@@ -4661,6 +4946,238 @@ async def gifts_revoke(request: web.Request) -> web.StreamResponse:
             secret=secret,
             cookie_secure=cookie_secure,
         )
+    return response
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 29: gift code edit
+# ---------------------------------------------------------------------
+
+
+def parse_gift_edit_form(form) -> dict | str:
+    """Parse the /admin/gifts/<code>/edit form.
+
+    Same field validators as :func:`parse_gift_form` minus the
+    ``code`` field. Returns the same shape as ``parse_gift_form``
+    minus ``code``.
+    """
+    raw_amount = (form.get("amount_usd") or "").strip()
+    if not raw_amount:
+        return "missing_amount"
+    cleaned = raw_amount.lstrip("$").strip()
+    try:
+        amount = float(cleaned)
+    except ValueError:
+        return "bad_amount"
+    if not (amount == amount) or amount in (
+        float("inf"), float("-inf")
+    ) or amount <= 0:
+        return "bad_amount"
+    if amount > GIFT_AMOUNT_MAX:
+        return "amount_too_large"
+
+    raw_max = (form.get("max_uses") or "").strip()
+    max_uses: int | None = None
+    if raw_max:
+        try:
+            max_uses = int(raw_max)
+        except ValueError:
+            return "bad_max_uses"
+        if max_uses <= 0:
+            return "bad_max_uses"
+        if max_uses > MAX_USES_CAP:
+            return "max_uses_too_large"
+
+    raw_days = (form.get("expires_in_days") or "").strip()
+    expires_in_days: int | None = None
+    if raw_days:
+        try:
+            expires_in_days = int(raw_days)
+        except ValueError:
+            return "bad_days"
+        if expires_in_days <= 0:
+            return "bad_days"
+        if expires_in_days > EXPIRES_IN_DAYS_MAX:
+            return "days_too_large"
+
+    return {
+        "amount_usd": round(amount, 4),
+        "max_uses": max_uses,
+        "expires_in_days": expires_in_days,
+    }
+
+
+async def gift_edit_get(request: web.Request) -> web.StreamResponse:
+    """GET /admin/gifts/<code>/edit — render the edit form pre-filled
+    with the existing row's metadata."""
+    code = request.match_info.get("code", "").upper()
+    if not _is_valid_gift_code(code):
+        response = web.HTTPFound(location="/admin/gifts")
+        secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+        cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+        set_flash(
+            response, kind="error", message="Invalid code in URL.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    db = request.app.get(APP_KEY_DB)
+    row: dict | None = None
+    db_error: str | None = None
+    if db is None:
+        db_error = "No database wired up (development mode)."
+    else:
+        try:
+            rows = await db.list_gift_codes(limit=10_000)
+            for r in rows:
+                if r["code"] == code:
+                    row = r
+                    break
+        except Exception:
+            log.exception("gift_edit_get: list_gift_codes failed")
+            db_error = "Database query failed — see logs."
+
+    if row is None and db_error is None:
+        response = web.HTTPFound(location="/admin/gifts")
+        secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+        cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+        set_flash(
+            response, kind="error",
+            message=f"Gift code {code!r} not found.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    response = aiohttp_jinja2.render_template(
+        "gift_edit.html",
+        request,
+        {
+            "row": row,
+            "db_error": db_error,
+            "active_page": "gifts",
+            "csrf_token": csrf_token_for(request),
+            "flash": None,
+        },
+    )
+    flash = pop_flash(request, response)
+    if flash is not None:
+        response = aiohttp_jinja2.render_template(
+            "gift_edit.html",
+            request,
+            {
+                "row": row,
+                "db_error": db_error,
+                "active_page": "gifts",
+                "csrf_token": csrf_token_for(request),
+                "flash": flash,
+            },
+        )
+        response.del_cookie(FLASH_COOKIE, path="/admin/")
+    return response
+
+
+async def gift_edit_post(request: web.Request) -> web.StreamResponse:
+    """POST /admin/gifts/<code>/edit — apply edits to a gift code."""
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    response = web.HTTPFound(location="/admin/gifts")
+
+    form = await request.post()
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning(
+            "gift_edit_post: CSRF token mismatch from %s", request.remote
+        )
+        set_flash(
+            response, kind="error",
+            message="Form submission was rejected (CSRF). Refresh and try again.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    code = request.match_info.get("code", "").upper()
+    if not _is_valid_gift_code(code):
+        set_flash(
+            response, kind="error", message="Invalid code in URL.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    parsed = parse_gift_edit_form(form)
+    if isinstance(parsed, str):
+        edit_response = web.HTTPFound(location=f"/admin/gifts/{code}/edit")
+        set_flash(
+            edit_response, kind="error",
+            message=_GIFT_FORM_ERR_TEXT.get(
+                parsed, f"Invalid input ({parsed})."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return edit_response
+
+    db = request.app.get(APP_KEY_DB)
+    if db is None:
+        set_flash(
+            response, kind="error",
+            message="No database wired up — cannot edit.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    expires_at = None
+    if parsed["expires_in_days"] is not None:
+        expires_at = datetime.now(timezone.utc) + timedelta(
+            days=parsed["expires_in_days"]
+        )
+
+    try:
+        ok = await db.update_gift_code(
+            code,
+            amount_usd=parsed["amount_usd"],
+            max_uses=parsed["max_uses"],
+            expires_at=expires_at,
+        )
+    except ValueError as exc:
+        set_flash(
+            response, kind="error", message=str(exc),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+    except Exception:
+        log.exception("gift_edit_post: update_gift_code failed")
+        set_flash(
+            response, kind="error",
+            message="Database write failed — see logs.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    if not ok:
+        set_flash(
+            response, kind="error",
+            message=f"Gift code {code!r} not found.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    log.info(
+        "web_admin gift_edit_post: code=%s amount=%s cap=%s",
+        code, parsed["amount_usd"], parsed["max_uses"],
+    )
+    await _record_audit_safe(
+        request,
+        "gift_edit",
+        target=f"gift:{code}",
+        meta={
+            "amount_usd": parsed["amount_usd"],
+            "max_uses": parsed["max_uses"],
+            "expires_in_days": parsed["expires_in_days"],
+        },
+    )
+    set_flash(
+        response, kind="success",
+        message=f"Updated '{code}'.",
+        secret=secret, cookie_secure=cookie_secure,
+    )
     return response
 
 
@@ -13780,6 +14297,17 @@ def setup_admin_routes(
         "/admin/promos/{code}/revoke",
         _require_role(ROLE_OPERATOR)(promos_revoke),
     )
+    # Stage-15-Step-E #10b row 29: promo edit. List view (GET edit
+    # form) stays viewer-readable; the write path is operator-only
+    # to match revoke / create.
+    app.router.add_get(
+        "/admin/promos/{code}/edit",
+        _require_auth(promo_edit_get),
+    )
+    app.router.add_post(
+        "/admin/promos/{code}/edit",
+        _require_role(ROLE_OPERATOR)(promo_edit_post),
+    )
 
     # Stage-8-Part-3: gift codes. Stage-15-Step-E #5 follow-up #4:
     # operator floor on writes; list / detail view stay viewer-readable.
@@ -13790,6 +14318,16 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/gifts/{code}/revoke",
         _require_role(ROLE_OPERATOR)(gifts_revoke),
+    )
+    # Stage-15-Step-E #10b row 29: gift edit (mirrors the promo
+    # edit endpoint).
+    app.router.add_get(
+        "/admin/gifts/{code}/edit",
+        _require_auth(gift_edit_get),
+    )
+    app.router.add_post(
+        "/admin/gifts/{code}/edit",
+        _require_role(ROLE_OPERATOR)(gift_edit_post),
     )
     # Stage-12-Step-D: per-code redemption drilldown.
     app.router.add_get(
