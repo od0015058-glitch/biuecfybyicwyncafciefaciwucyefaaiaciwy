@@ -403,6 +403,11 @@ _STRINGS: dict[str, dict[str, str]] = {
         "ai_insufficient_balance": "⚠️ اعتبار شما کافی نیست. لطفا از منوی کیف پول، حساب خود را شارژ کنید.",
         "ai_model_disabled": "⚠️ مدل فعلی شما توسط ادمین غیرفعال شده است. لطفاً از منوی مدل‌ها یک مدل دیگر انتخاب کنید.",
         "gateway_disabled": "⚠️ این روش پرداخت در حال حاضر غیرفعال است.",
+        # Stage-15-Step-E #10b row 30: per-gateway model disable.
+        "gateway_disabled_for_model": (
+            "⚠️ این روش پرداخت برای مدل فعلی شما در دسترس نیست. "
+            "لطفاً مدل دیگری انتخاب کنید یا از روش پرداخت دیگری استفاده کنید."
+        ),
         "ai_provider_unavailable": "❌ سرور هوش مصنوعی موقتاً در دسترس نیست. لطفاً دوباره تلاش کنید.",
         "ai_rate_limited": (
             "⏳ این مدل در حال حاضر در سمت سرور با محدودیت نرخ مواجه شده است.\n"
@@ -897,6 +902,12 @@ _STRINGS: dict[str, dict[str, str]] = {
         "ai_insufficient_balance": "⚠️ Insufficient balance. Please top up from the wallet menu.",
         "ai_model_disabled": "⚠️ Your active model has been disabled by the admin. Please choose another model from the Models menu.",
         "gateway_disabled": "⚠️ This payment method is currently disabled.",
+        # Stage-15-Step-E #10b row 30: per-gateway model disable.
+        "gateway_disabled_for_model": (
+            "⚠️ This payment method isn't available for your current "
+            "model. Please pick a different model or try another "
+            "payment method."
+        ),
         "ai_provider_unavailable": "❌ AI provider is temporarily unavailable. Please try again.",
         "ai_rate_limited": (
             "⏳ This model is currently rate-limited upstream.\n"

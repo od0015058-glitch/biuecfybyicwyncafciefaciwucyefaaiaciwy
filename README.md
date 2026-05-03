@@ -288,6 +288,56 @@ NowPayments crypto invoices.
   gift would see the promo refuse at 00:00:00.000000 and the gift
   accept until the next tick. Harmonised both to `<=` so the
   cutoff instant is consistently treated as already-expired.
+- **Per-gateway model exceptions** on `/admin/models`
+  (Stage-15-Step-E #10b row 30) — block a specific *(model,
+  gateway)* pair without disabling either parent globally. Useful
+  for policy carve-outs ("expensive vision models can't be funded
+  via Zarinpal, but every other gateway is fine") without taking
+  the model or the gateway off the menu for everyone else. Backed
+  by a new `disabled_model_per_gateway` cross-table (alembic 0019)
+  with append-only INSERT-to-disable / DELETE-to-enable semantics
+  — same shape as the parent `disabled_models` and
+  `disabled_gateways` tables, no boolean flips. The new
+  "Per-gateway model exceptions" section sits below the global
+  model toggles with a model+gateway dropdown form and a table
+  listing every blocked pair (with `disabled_at`, `disabled_by`,
+  Unblock button). Enforcement is on the bot's invoice-creation
+  hot path: when the user picks a payment method, both the
+  custom-amount path (`process_custom_currency_selection`) and
+  the fixed-preset path (`process_final_invoice`) cross-check the
+  user's `active_model` against the disabled-pairs cache and
+  refuse with the new model-aware copy "this payment method isn't
+  available for your current model. Please pick a different model
+  or try another payment method." The cache (`admin_toggles._disabled_pairs`)
+  is warmed at boot via `load_disabled_pairs` and refreshed
+  fail-soft after each admin toggle via `refresh_disabled_pairs`
+  — same resilience pattern as the parent caches. Hot-path
+  optimisation: both invoice handlers short-circuit on an empty
+  cache so deploys with zero pairs configured don't pay an extra
+  `db.get_user` round-trip per invoice click. The cross-table
+  allowlist `_PAIR_GATEWAY_KEYS` covers the cards (TetraPay /
+  Zarinpal) plus every concrete crypto ticker but intentionally
+  excludes the `nowpayments` provider master switch — operators
+  express "block this model for crypto" by toggling the relevant
+  per-ticker pairs since the master switch's "every crypto"
+  semantics would create ambiguous policy. New audit slugs
+  `model_pair_disable` / `model_pair_enable` carry
+  `{model_id, gateway_key}` meta so the audit log shows the full
+  policy delta. POST routes `/admin/models/pair/disable` and
+  `/admin/models/pair/enable` are CSRF-checked under the SUPER
+  role floor (same as the global model toggles). Bundled bug fix:
+  `process_final_invoice` (the fixed-amount preset path) was
+  missing the `is_gateway_disabled("nowpayments")` master-switch
+  check that `process_custom_currency_selection` (the
+  custom-amount path) gained in row 14. A user with a stale
+  `pay_<crypto>_<amount>` keyboard rendered before the operator
+  flipped the master switch off would still create a NowPayments
+  invoice (and either succeed if the API key was still valid or
+  fail with a cryptic upstream error). The check now mirrors the
+  row-14 pattern: card gateways pass through, non-card currencies
+  are rejected with the same `gateway_disabled` flash. The two
+  invoice paths now agree on the master-switch contract by
+  construction, not by coincidence.
 - Telegram-side admin commands (`/admin`, `/admin_metrics`,
   `/admin_credit`, `/admin_broadcast`, …) for ops via DMs.
 - **Canonical slash-command menu** — on every startup the bot

@@ -12,7 +12,11 @@ import i18n_runtime
 import strings
 from admin import parse_admin_user_ids, router as admin_router
 from admin_roles import ensure_env_admins_have_roles
-from admin_toggles import load_disabled_gateways, load_disabled_models
+from admin_toggles import (
+    load_disabled_gateways,
+    load_disabled_models,
+    load_disabled_pairs,
+)
 from bot_commands import publish_bot_commands
 from database import db
 from handlers import SUPPORTED_PAY_CURRENCIES, router
@@ -296,6 +300,8 @@ async def main():
     # gateways are filtered from the very first request.
     await load_disabled_models(db)
     await load_disabled_gateways(db)
+    # Stage-15-Step-E #10b row 30: per-gateway model disable cache.
+    await load_disabled_pairs(db)
 
     # Stage-15-Step-E #10b row 2: warm the COST_MARKUP override
     # cache so the very first paid request sees the operator's

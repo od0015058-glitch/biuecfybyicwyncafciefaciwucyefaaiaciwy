@@ -62,6 +62,62 @@
     color: var(--text);
     font-size: 14px;
   }
+  /* Stage-15-Step-E #10b row 30: per-gateway model disable section. */
+  .pair-section { margin-top: 32px; }
+  .pair-section h2 {
+    margin: 0 0 8px;
+    font-size: 16px;
+  }
+  .pair-section .summary { margin-bottom: 12px; }
+  .pair-form {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    padding: 12px;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-bottom: 16px;
+  }
+  .pair-form select, .pair-form input[type="text"] {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px 10px;
+    font-size: 13px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    min-width: 200px;
+  }
+  .pair-form .btn-add {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    padding: 6px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .pair-table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  .pair-table th, .pair-table td {
+    padding: 8px 10px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .pair-table th { color: var(--text-muted); font-weight: 600; }
+  .pair-table td.col-mono {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  .pair-empty {
+    color: var(--text-muted);
+    font-style: italic;
+    padding: 12px 0;
+  }
 </style>
 {% endblock %}
 
@@ -118,4 +174,78 @@ document.getElementById('modelFilter').addEventListener('input', function() {
   });
 });
 </script>
+
+{# Stage-15-Step-E #10b row 30: per-gateway model disable cross-table.
+   Sits below the global model toggles so the operator's mental model
+   is "first decide if a model is allowed at all, then layer on
+   per-gateway exceptions". #}
+<div class="pair-section">
+  <h2>Per-gateway model exceptions</h2>
+  <p class="summary">
+    Block a specific <strong>model × gateway</strong> pair without
+    disabling either parent globally. When a user with the matching
+    active model picks the matching payment method, the bot refuses
+    with "this payment method isn't available for your current model"
+    and the user is steered to a different model or a different
+    gateway. Useful for policy carve-outs (e.g. expensive vision
+    models that shouldn't be funded via card-only gateways) without
+    taking the model or the gateway off the menu for everyone else.
+  </p>
+
+  <form class="pair-form" method="post" action="/admin/models/pair/disable">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <select name="model_id" required>
+      <option value="" disabled selected>Pick a model…</option>
+      {% for provider, models in providers %}
+      <optgroup label="{{ provider_labels.get(provider, provider) }}">
+        {% for m in models %}
+        <option value="{{ m.id }}">{{ m.id }}</option>
+        {% endfor %}
+      </optgroup>
+      {% endfor %}
+    </select>
+    <select name="gateway_key" required>
+      <option value="" disabled selected>Pick a gateway…</option>
+      {% for key, label in gateway_choices %}
+      <option value="{{ key }}">{{ label }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit" class="btn-add">Block pair</button>
+  </form>
+
+  {% if pair_rows %}
+  <table class="pair-table">
+    <thead>
+      <tr>
+        <th>Model</th>
+        <th>Gateway</th>
+        <th>Blocked at</th>
+        <th>By</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in pair_rows %}
+      <tr>
+        <td class="col-mono">{{ r.model_id }}</td>
+        <td class="col-mono">{{ r.gateway_label }}</td>
+        <td>{{ r.disabled_at_display }}</td>
+        <td>{{ r.disabled_by }}</td>
+        <td>
+          <form class="inline" method="post"
+                action="/admin/models/pair/enable">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="model_id" value="{{ r.model_id }}">
+            <input type="hidden" name="gateway_key" value="{{ r.gateway_key }}">
+            <button type="submit" class="btn-enable">Unblock</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="pair-empty">No per-gateway exceptions configured.</p>
+  {% endif %}
+</div>
 {% endblock %}

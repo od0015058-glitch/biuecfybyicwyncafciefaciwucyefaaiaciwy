@@ -5,6 +5,8 @@ Stage-14. The module is pure in-memory; these tests never touch the DB.
 
 from __future__ import annotations
 
+import pytest
+
 import admin_toggles
 
 
@@ -12,6 +14,22 @@ def _reset():
     """Reset the module-level caches to empty before each test."""
     admin_toggles._disabled_models = set()
     admin_toggles._disabled_gateways = set()
+    # Stage-15-Step-E #10b row 30: per-gateway model disable cache.
+    admin_toggles._disabled_pairs = set()
+
+
+@pytest.fixture(autouse=True)
+def _clear_admin_toggles_caches_after_test():
+    """Restore the module-level caches to empty AFTER each test in this
+    file so a populated cache (e.g. from
+    ``test_load_disabled_pairs_happy_path`` or
+    ``test_refresh_disabled_pairs_happy_path_replaces_cache``) can't
+    leak into other test files. The bot's hot-path checks look up
+    these globals directly, so any pollution would surface as a
+    spurious DB round-trip in unrelated FSM tests.
+    """
+    yield
+    _reset()
 
 
 # ---- is_model_disabled ---------------------------------------------
@@ -177,8 +195,6 @@ def test_currency_grid_layout():
 
 import asyncio
 
-import pytest
-
 
 class _FailingDB:
     """Stub asyncpg-shaped DB that raises on the SELECT calls."""
@@ -192,19 +208,31 @@ class _FailingDB:
     async def get_disabled_gateways(self):  # noqa: D401 — DB shape
         raise self._exc
 
+    async def get_disabled_model_per_gateway(self):  # noqa: D401 — DB shape
+        raise self._exc
+
 
 class _OkDB:
     """Stub DB that returns canned snapshots."""
 
-    def __init__(self, models: set[str], gateways: set[str]):
+    def __init__(
+        self,
+        models: set[str],
+        gateways: set[str],
+        pairs: set[tuple[str, str]] | None = None,
+    ):
         self._models = models
         self._gateways = gateways
+        self._pairs = pairs or set()
 
     async def get_disabled_models(self):
         return set(self._models)
 
     async def get_disabled_gateways(self):
         return set(self._gateways)
+
+    async def get_disabled_model_per_gateway(self):
+        return set(self._pairs)
 
 
 async def test_refresh_disabled_models_fail_soft_preserves_cache():
@@ -279,3 +307,129 @@ async def test_refresh_disabled_models_does_not_swallow_cancelled_error():
 
     # Cache still preserved (CancelledError raised before assignment).
     assert admin_toggles._disabled_models == {"sentinel/model"}
+
+
+# ---- _disabled_pairs (Stage-15-Step-E #10b row 30) ------------------
+#
+# Per-gateway model disable cross-table. The cache stores
+# ``(model_id, gateway_key)`` tuples and is consulted on the
+# invoice-creation hot path via ``is_pair_disabled``.
+
+
+def test_pair_not_disabled_by_default():
+    _reset()
+    assert admin_toggles.is_pair_disabled("openai/gpt-4o", "btc") is False
+
+
+def test_pair_disabled_after_cache_set():
+    _reset()
+    admin_toggles._disabled_pairs = {
+        ("openai/gpt-4o", "btc"),
+        ("anthropic/claude-3", "zarinpal"),
+    }
+    # Both directions match exactly — the lookup is a tuple-membership
+    # test, so order matters and a flipped (gateway, model) tuple
+    # would correctly miss.
+    assert admin_toggles.is_pair_disabled("openai/gpt-4o", "btc") is True
+    assert admin_toggles.is_pair_disabled("anthropic/claude-3", "zarinpal") is True
+    assert admin_toggles.is_pair_disabled("openai/gpt-4o", "eth") is False
+    assert admin_toggles.is_pair_disabled("google/gemini-2", "btc") is False
+    # Sanity: the reversed tuple must NOT be considered disabled — a
+    # cache that conflated (model, gateway) with (gateway, model)
+    # would silently produce false positives for any user whose
+    # ``active_model`` happened to share a string with a ticker.
+    assert admin_toggles.is_pair_disabled("btc", "openai/gpt-4o") is False
+
+
+def test_get_disabled_pairs_snapshot():
+    _reset()
+    admin_toggles._disabled_pairs = {("a", "b"), ("c", "d")}
+    result = admin_toggles.get_disabled_pairs()
+    assert isinstance(result, frozenset)
+    assert result == frozenset({("a", "b"), ("c", "d")})
+
+
+async def test_load_disabled_pairs_happy_path():
+    """Boot-time warmup pulls the canonical set from the DB and pins
+    it into the in-memory cache. Mirrors ``load_disabled_models``."""
+    _reset()
+    ok = _OkDB(
+        models=set(),
+        gateways=set(),
+        pairs={("openai/gpt-4o", "btc"), ("openai/gpt-4o", "eth")},
+    )
+    await admin_toggles.load_disabled_pairs(ok)
+    assert admin_toggles._disabled_pairs == {
+        ("openai/gpt-4o", "btc"),
+        ("openai/gpt-4o", "eth"),
+    }
+    assert admin_toggles.is_pair_disabled("openai/gpt-4o", "btc") is True
+
+
+async def test_load_disabled_pairs_fail_soft_starts_empty():
+    """If the boot-time SELECT fails (typically because the migration
+    hasn't run yet on a fresh deploy), warmup must NOT crash the bot
+    — it should leave the cache empty and let the next successful
+    refresh repopulate it. Mirrors ``load_disabled_models``."""
+    _reset()
+    failing = _FailingDB(RuntimeError("simulated boot-time DB outage"))
+    await admin_toggles.load_disabled_pairs(failing)
+    # Cache is empty; ``is_pair_disabled`` returns False for everything
+    # — fail-open at boot, which is the correct UX for "operator
+    # never blocked any pair yet" vs. "we lost the table briefly".
+    assert admin_toggles._disabled_pairs == set()
+    assert admin_toggles.is_pair_disabled("openai/gpt-4o", "btc") is False
+
+
+async def test_refresh_disabled_pairs_fail_soft_preserves_cache():
+    """Transient DB error after an admin toggle must NOT clobber the
+    cache. Pre-existing pairs stay disabled until a refresh succeeds."""
+    _reset()
+    admin_toggles._disabled_pairs = {
+        ("openai/gpt-4o", "btc"),
+        ("anthropic/claude-3", "zarinpal"),
+    }
+    failing = _FailingDB(RuntimeError("simulated DB outage"))
+    await admin_toggles.refresh_disabled_pairs(failing)
+
+    # Cache preserved — both pairs still considered disabled.
+    assert admin_toggles._disabled_pairs == {
+        ("openai/gpt-4o", "btc"),
+        ("anthropic/claude-3", "zarinpal"),
+    }
+    assert admin_toggles.is_pair_disabled("openai/gpt-4o", "btc") is True
+
+
+async def test_refresh_disabled_pairs_happy_path_replaces_cache():
+    """A successful refresh swaps the cache for the new snapshot."""
+    _reset()
+    admin_toggles._disabled_pairs = {("old/model", "btc")}
+
+    ok = _OkDB(
+        models=set(),
+        gateways=set(),
+        pairs={("new/model-a", "eth"), ("new/model-b", "tetrapay")},
+    )
+    await admin_toggles.refresh_disabled_pairs(ok)
+
+    assert admin_toggles._disabled_pairs == {
+        ("new/model-a", "eth"),
+        ("new/model-b", "tetrapay"),
+    }
+    assert admin_toggles.is_pair_disabled("old/model", "btc") is False
+    assert admin_toggles.is_pair_disabled("new/model-a", "eth") is True
+
+
+async def test_refresh_disabled_pairs_does_not_swallow_cancelled_error():
+    """``asyncio.CancelledError`` must propagate even with the
+    fail-soft try/except. Mirrors the test for ``refresh_disabled_models``.
+    """
+    _reset()
+    admin_toggles._disabled_pairs = {("sentinel/model", "btc")}
+
+    failing = _FailingDB(asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await admin_toggles.refresh_disabled_pairs(failing)
+
+    # Cache still preserved (CancelledError raised before assignment).
+    assert admin_toggles._disabled_pairs == {("sentinel/model", "btc")}

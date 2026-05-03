@@ -2160,7 +2160,7 @@ or unblock other work.
 | 27 | **CSV export bulk download** — full transactions / usage history. | Per-user only. | Top-level `/admin/exports` page that streams big CSVs. | P3 | **Shipped — PR #188** (`/admin/exports` hub page links the existing transactions / monetization CSVs and exposes two new system-wide streaming endpoints: `/admin/exports/usage.csv` (every `usage_logs` row across every user, since/until/limit filters) and `/admin/exports/audit.csv` (every `admin_audit_log` row, action/actor/since/until/limit filters). Both stream via keyset-paginated async generators in batches of 5 k rows, capped at 1 M usage rows / 100 k audit rows, audit-logged under new `system_usage_export_csv` / `admin_audit_export_csv` slugs. Bundled bug fix: CSV-formula-injection defang (CWE-1236) latent since Stage-9 transactions CSV — `_csv_quote` now TAB-prepends any field whose first char is `=`, `+`, `@`, `\t`, `\r` so a malicious refund-reason like `=HYPERLINK("https://attacker", "click me")` can't execute when the CSV is opened in Excel / LibreOffice / Numbers / Sheets; negatives intentionally not defanged to keep accounting CSVs intact). |
 | 28 | **Refund presets** — predefined refund reasons / amounts. | Free-form text only. | Dropdown of presets + amount on `/admin/users/<id>/refund`. | P3 | **Shipped — PR #187** (operator-curated reason list, `/admin/refund-presets` editor + dropdown above the `/admin/transactions` refund form; bundled bug fix: `_scrub_audit_meta` keeps `record_admin_audit` / `record_payment_status_transition` lossless across `Decimal` / `datetime` / NaN / Infinity meta values that previously silently dropped audit rows). Per-preset amount field deferred — current refund form refunds full credited amount, ~95% of refunds want that. |
 | 29 | **Promo / gift code edit** — currently create-and-revoke, no edit. | None. | Inline edit on `/admin/promos` + `/admin/gifts`. | P3 | **Shipped** (this PR — new `Database.update_promo_code` and `Database.update_gift_code` methods (same XOR / amount / max_uses / expires_at validation as the create methods, but `code` is immutable and `used_count` / `is_active` are NOT touched). New web routes `/admin/promos/<code>/edit` and `/admin/gifts/<code>/edit` (GET shows form pre-filled, POST applies edits). Edit forms reuse the same submission-replaces-all contract as the create forms — blank `max_uses` / `expires_in_days` reset to unlimited / never. Revoked codes render the form read-only with a banner explaining that creating a new code is the path forward (revoked codes cannot be un-revoked, preserving the paper trail). Edit links surfaced on `/admin/promos` and `/admin/gifts` listing tables next to Revoke for active codes only. New audit slugs `promo_edit` / `gift_edit` with full meta payload (discount kind / value, new caps, new expiration). Operator-floor on the POST routes (matches create / revoke); list view of the edit form stays viewer-readable. Bundled bug fix: `Database.redeem_gift_code`'s expiration check used `expires_at < NOW()` while `Database.validate_promo_code` used `expires_at <= NOW()` — at the exact instant a code expired, the gift remained redeemable for one more tick while the equivalent promo would already refuse. Operationally a microsecond window most of the time, but a real parity bug between two flows that share the same `expires_at` semantics in the admin UI: setting `expires_at = "2026-01-01 00:00:00 UTC"` on both a promo and a gift would see the promo refuse at 00:00:00.000000 and the gift accept until the next tick. Harmonised both to `<=` so the cutoff instant is consistently treated as already-expired across both code types.) |
-| 30 | **Disable individual models per-gateway** — e.g. block GPT-4o on Zarinpal-funded wallets. | None. | New cross-table on `/admin/models`. | P4 | Pending |
+| 30 | **Disable individual models per-gateway** — e.g. block GPT-4o on Zarinpal-funded wallets. | None. | New cross-table on `/admin/models`. | P4 | **Shipped** (this PR — new `disabled_model_per_gateway` cross-table (alembic 0019) lets the operator block a specific *(model, gateway)* pair without disabling either parent globally. `Database.{get,disable,enable,list}_model_for_gateway` mirror the parent tables' append-only style (INSERT to disable, DELETE to enable, no boolean flips). `admin_toggles._disabled_pairs` cache + `is_pair_disabled()` O(1) lookup on the bot's hot path; `load_disabled_pairs` warmup at boot in `main.py`, fail-soft `refresh_disabled_pairs` after each admin toggle. New "Per-gateway model exceptions" section on `/admin/models` with a model+gateway dropdown form and a table listing every blocked pair (with `disabled_at`, `disabled_by`, Unblock button). New POST routes `/admin/models/pair/disable` and `/admin/models/pair/enable` under the SUPER role floor (same as global model toggles), CSRF-checked, with model-id and gateway-key validation. Audit slugs `model_pair_disable` / `model_pair_enable`. Enforcement at invoice-creation time in BOTH `process_custom_currency_selection` (custom-amount) and `process_final_invoice` (fixed-amount preset) refuses the gateway with the new model-aware "this payment method isn't available for your current model" string when the user's `active_model` matches a blocked pair. The cross-table allowlist `_PAIR_GATEWAY_KEYS` covers the cards (TetraPay / Zarinpal) plus every concrete crypto ticker but intentionally excludes the `nowpayments` provider master switch — operators express "block this model for crypto" by toggling the relevant per-ticker pairs, since the master switch's "every crypto" semantics would create ambiguous policy. Hot-path optimisation: both invoice handlers short-circuit on an empty cache so deploys with zero pairs configured don't pay an extra `db.get_user` round-trip per invoice click. **Bundled bug fix:** `process_final_invoice` (the fixed-amount preset path) was missing the `is_gateway_disabled("nowpayments")` master-switch check that `process_custom_currency_selection` (the custom-amount path) gained in row 14 — a user with a stale `pay_<crypto>_<amount>` keyboard rendered before the operator flipped the master switch off would still create a NowPayments invoice (and either succeed or fail with a cryptic upstream error). The check now mirrors the row-14 pattern: card gateways pass through, non-card currencies are rejected with the same `gateway_disabled` flash. 8 new tests on `_disabled_pairs` (load, refresh fail-soft, refresh happy-path, snapshot, hot-path lookup, CancelledError propagation), `tests/test_admin_toggles.py` gets an autouse fixture so cache-populating tests can't leak into other files. Total suite: 3790 passing.) |
 
 Constraints / non-goals (called out so the next AI doesn't waste
 a slot):
@@ -4363,7 +4363,108 @@ The user's process for this project — **do not deviate**:
     fix flows through the existing transactions / monetization CSVs
     too, not just the new endpoints. 31 new tests (20 web + 11 db).
     Total suite: 3716 passing.
-35. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+35. **Stage-15-Step-E #10b row 16 SHIPPED — PR #189** — Admin-side
+    multi-part conversation export. New `/admin/users/<telegram_id>/conversations`
+    hub page (one row per `.txt` part with kept-count, byte-count,
+    canonical filename, download button) + sibling
+    `/admin/users/<telegram_id>/conversations.txt?part=N` streaming
+    endpoint. Each download writes one `admin_conversation_export`
+    audit row. Re-uses the existing `format_history_as_text_multipart`
+    renderer so the bot side and admin side cannot drift on header
+    shape, trim semantics, or filename. Bundled bug fix:
+    `format_history_as_text_multipart` previously called
+    `datetime.now(timezone.utc)` once *per part* inside
+    `_build_header_lines`, so a multi-part export rendered across a
+    second boundary minted different `Exported:` timestamps on each
+    part of the *same* export. Now the function captures one `now`
+    at entry and threads it through every `_build_part_text` call
+    (also exposed as a public `now=` kwarg so tests can pin the
+    stamp deterministically). 18 new tests. Total suite: 3734 passing.
+36. **Stage-15-Step-E #10b row 14 SHIPPED — PR #190** — Per-currency
+    gateway granularity + provider master switch + Zarinpal panel
+    row. `_GATEWAY_PROVIDER_LIST` master-switch section at the top
+    of `/admin/gateways` exposes `nowpayments` so the operator can
+    flip the entire crypto pool off in one click without overwriting
+    the per-currency disable state — re-enabling the master restores
+    the previous picker layout. `_GATEWAY_CARD_LIST` now includes
+    `zarinpal` (the hot-path picker in `handlers.py` already honoured
+    `is_gateway_disabled("zarinpal")` via Stage-15-Step-E #8 follow-up
+    #1; the panel just had no row for it).
+    `handlers._active_pay_currencies` short-circuits to `[]` when
+    `is_gateway_disabled("nowpayments")` so the picker keyboard
+    hides every crypto button at render time.
+    `process_custom_currency_selection` adds a defense-in-depth check
+    so a stale rendered keyboard can't sneak a `cur_<crypto>` callback
+    past the master switch. Bundled bug fix: the gateway-toggle POST
+    handler previously took whatever `gateway_key` came in on the
+    form body verbatim, so a tampered POST or a future client-side
+    bug could write an unknown / mistyped / uppercase key into
+    `disabled_gateways` where nothing in the hot-path's lowercase
+    ticker check would ever match it. Now we validate against the
+    canonical `_GATEWAY_ALLOWED_KEYS` allowlist and reject unknown
+    keys with a flash error, skipping the DB write entirely. Total
+    suite: 3760 passing.
+37. **Stage-15-Step-E #10b row 29 SHIPPED — PR #191** — Promo / gift
+    code edit endpoints. New `Database.update_promo_code` and
+    `Database.update_gift_code` methods (same XOR / amount /
+    max_uses / expires_at validation as the create methods, but
+    `code` is immutable and `used_count` / `is_active` are NOT
+    touched). New web routes `/admin/promos/<code>/edit` and
+    `/admin/gifts/<code>/edit` (GET shows form pre-filled, POST
+    applies edits). Revoked codes render the form read-only with
+    a banner. Edit links surfaced on `/admin/promos` and
+    `/admin/gifts` listing tables next to Revoke for active codes
+    only. New audit slugs `promo_edit` / `gift_edit` with full meta
+    payload. Operator-floor on the POST routes. Bundled bug fix:
+    `Database.redeem_gift_code`'s expiration check used
+    `expires_at < NOW()` while `Database.validate_promo_code` used
+    `expires_at <= NOW()` — at the exact instant a code expired,
+    the gift remained redeemable for one more tick while the
+    equivalent promo would already refuse. Harmonised both to `<=`
+    so the cutoff instant is consistently treated as already-expired
+    across both code types. Total suite: 3782 passing.
+38. **Stage-15-Step-E #10b row 30 SHIPPED — this PR** — Per-gateway
+    model disable cross-table. New `disabled_model_per_gateway` table
+    (alembic 0019) blocks specific *(model, gateway)* pairs without
+    disabling either parent globally. `Database.{get,disable,enable,list}_model_for_gateway`
+    mirror the parent tables' append-only style. New
+    `admin_toggles._disabled_pairs` cache + `is_pair_disabled()` O(1)
+    lookup; `load_disabled_pairs` warmup in `main.py`, fail-soft
+    `refresh_disabled_pairs` after each admin toggle. New
+    "Per-gateway model exceptions" section on `/admin/models` with
+    a model+gateway dropdown form and a table listing every blocked
+    pair (with `disabled_at`, `disabled_by`, Unblock button). New
+    POST routes `/admin/models/pair/disable` and
+    `/admin/models/pair/enable` under the SUPER role floor, CSRF-
+    checked, with model-id and gateway-key validation. Audit slugs
+    `model_pair_disable` / `model_pair_enable`. Enforcement at
+    invoice-creation time in BOTH `process_custom_currency_selection`
+    (custom-amount) and `process_final_invoice` (fixed-amount preset)
+    refuses the gateway with the new model-aware
+    `gateway_disabled_for_model` string when the user's `active_model`
+    matches a blocked pair. The cross-table allowlist
+    `_PAIR_GATEWAY_KEYS` covers the cards plus every concrete crypto
+    ticker but intentionally excludes the `nowpayments` master
+    switch (operators express "block this model for crypto" by
+    toggling the relevant per-ticker pairs since the master switch's
+    "every crypto" semantics would create ambiguous policy). Hot-path
+    optimisation: both invoice handlers short-circuit on an empty
+    cache so deploys with zero pairs configured don't pay an extra
+    `db.get_user` round-trip per invoice click. **Bundled bug fix:**
+    `process_final_invoice` (the fixed-amount preset path) was
+    missing the `is_gateway_disabled("nowpayments")` master-switch
+    check that `process_custom_currency_selection` (the custom-amount
+    path) gained in row 14 — a user with a stale
+    `pay_<crypto>_<amount>` keyboard rendered before the operator
+    flipped the master switch off would still create a NowPayments
+    invoice. The check now mirrors the row-14 pattern: card gateways
+    pass through, non-card currencies are rejected with the same
+    `gateway_disabled` flash. 8 new tests on `_disabled_pairs`
+    (load, refresh fail-soft, refresh happy-path, snapshot, hot-path
+    lookup, CancelledError propagation), `tests/test_admin_toggles.py`
+    gets an autouse fixture so cache-populating tests can't leak into
+    other files. Total suite: 3790 passing.
+39. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-36. **Read the §11 working agreement before doing anything.**
+40. **Read the §11 working agreement before doing anything.**

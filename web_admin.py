@@ -3553,6 +3553,9 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     "model_enable": "AI model enabled",
     "gateway_disable": "Gateway disabled",
     "gateway_enable": "Gateway enabled",
+    # Stage-15-Step-E #10b row 30: per-gateway model disable.
+    "model_pair_disable": "(model, gateway) pair blocked",
+    "model_pair_enable": "(model, gateway) pair unblocked",
     # Stage-15-Step-F first slice: emergency control panel.
     # These slugs were already being recorded by ``record_admin_audit``
     # at the kill-switch / force-stop call sites in this module, but
@@ -9761,6 +9764,28 @@ _GATEWAY_ALLOWED_KEYS: frozenset[str] = frozenset(
     + [gw["key"] for gw in _GATEWAY_CRYPTO_LIST]
 )
 
+# Stage-15-Step-E #10b row 30: per-gateway model disable. The
+# cross-table allowlist intentionally **excludes** the
+# ``nowpayments`` provider master-switch key — blocking a (model,
+# nowpayments) pair would have ambiguous semantics (does it block
+# the model on every NowPayments crypto, or only on the master
+# switch?). The operator can express the same intent precisely by
+# blocking the model on each individual crypto ticker. Cards
+# (``tetrapay`` / ``zarinpal``) and concrete crypto tickers are
+# the only meaningful per-pair targets.
+_PAIR_GATEWAY_KEYS: frozenset[str] = frozenset(
+    [gw["key"] for gw in _GATEWAY_CARD_LIST]
+    + [gw["key"] for gw in _GATEWAY_CRYPTO_LIST]
+)
+_PAIR_GATEWAY_LABELS: dict[str, str] = {
+    gw["key"]: gw["label"]
+    for gw in (_GATEWAY_CARD_LIST + _GATEWAY_CRYPTO_LIST)
+}
+_PAIR_GATEWAY_CHOICES: list[tuple[str, str]] = [
+    (gw["key"], gw["label"])
+    for gw in (_GATEWAY_CARD_LIST + _GATEWAY_CRYPTO_LIST)
+]
+
 # Provider display labels reused from handlers.py; importing them would
 # create a circular import (handlers → web_admin), so duplicate the
 # small map here.
@@ -10263,6 +10288,7 @@ async def models_get(request: web.Request) -> web.StreamResponse:
     from admin_toggles import get_disabled_models
     from models_catalog import get_catalog
 
+    db = request.app[APP_KEY_DB]
     disabled = get_disabled_models()
     catalog = await get_catalog()
 
@@ -10273,6 +10299,31 @@ async def models_get(request: web.Request) -> web.StreamResponse:
 
     total_models = sum(len(ms) for _, ms in providers)
 
+    # Stage-15-Step-E #10b row 30: per-gateway model disable. Pull
+    # the cross-table directly so the admin sees the canonical
+    # state even if the in-memory cache is briefly stale (the cache
+    # is a perf optimisation for the bot's hot path; the panel can
+    # afford one extra round-trip on a page render).
+    pair_dicts = await db.list_disabled_model_per_gateway()
+    pair_rows: list[dict] = []
+    for r in pair_dicts:
+        gw_key = r["gateway_key"]
+        disabled_at = r["disabled_at"]
+        pair_rows.append(
+            {
+                "model_id": r["model_id"],
+                "gateway_key": gw_key,
+                "gateway_label": _PAIR_GATEWAY_LABELS.get(gw_key, gw_key),
+                "disabled_at": disabled_at,
+                "disabled_at_display": (
+                    disabled_at.strftime("%Y-%m-%d %H:%M UTC")
+                    if disabled_at is not None
+                    else "—"
+                ),
+                "disabled_by": r["disabled_by"],
+            }
+        )
+
     ctx = {
         "active_page": "models",
         "csrf_token": csrf_token_for(request),
@@ -10282,6 +10333,9 @@ async def models_get(request: web.Request) -> web.StreamResponse:
         "disabled": disabled,
         "disabled_count": len(disabled),
         "total_models": total_models,
+        # Stage-15-Step-E #10b row 30 context.
+        "gateway_choices": _PAIR_GATEWAY_CHOICES,
+        "pair_rows": pair_rows,
     }
     response = aiohttp_jinja2.render_template("models.html", request, ctx)
     flash = pop_flash(request, response)
@@ -10381,6 +10435,138 @@ async def models_disable_post(request: web.Request) -> web.StreamResponse:
 async def models_enable_post(request: web.Request) -> web.StreamResponse:
     """POST /admin/models/enable."""
     return await _models_toggle_post(request, enable=True)
+
+
+# Stage-15-Step-E #10b row 30: per-gateway model disable toggles.
+
+
+async def _models_pair_toggle_post(
+    request: web.Request, *, enable: bool,
+) -> web.StreamResponse:
+    """Shared POST for ``/admin/models/pair/{disable,enable}``.
+
+    Reads ``model_id`` and ``gateway_key`` from the form body. The
+    model id is validated against the live catalog so a tampered
+    POST can't insert a row referencing a model the bot doesn't
+    know about (which would never match the bot's lookup of the
+    user's active model and silently no-op). The gateway key is
+    validated against ``_PAIR_GATEWAY_KEYS`` — the cards + concrete
+    crypto tickers, intentionally excluding the ``nowpayments``
+    provider master switch (see comment on ``_PAIR_GATEWAY_KEYS``
+    for why).
+
+    DB writes are wrapped in ``try`` / ``except`` so a transient
+    connection blip surfaces as a flash error rather than a 500
+    page; the audit row + cache refresh only run on a successful
+    write so the in-memory cache stays consistent with the DB
+    state. Mirrors the resilience pattern in
+    :func:`_models_toggle_post`.
+    """
+    from admin_toggles import refresh_disabled_pairs
+    from models_catalog import get_catalog
+
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app[APP_KEY_DB]
+    form = await request.post()
+
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning(
+            "models_pair_toggle: CSRF token mismatch from %s", request.remote
+        )
+        response = web.HTTPFound(location="/admin/models")
+        set_flash(
+            response, kind="error",
+            message="Form submission was rejected (CSRF). Refresh and try again.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    model_id = str(form.get("model_id", "")).strip()
+    gateway_key = str(form.get("gateway_key", "")).strip()
+    response = web.HTTPFound(location="/admin/models")
+
+    if not model_id or not gateway_key:
+        set_flash(
+            response, kind="warn",
+            message="Missing model id or gateway key.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    if gateway_key not in _PAIR_GATEWAY_KEYS:
+        set_flash(
+            response, kind="error",
+            message=f"Unknown gateway key: {gateway_key!r}.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    # Validate model id against the live catalog. A row referencing
+    # an unknown model would be invisible to the bot's enforcement
+    # (which compares against the user's active model id) and
+    # would just sit in the DB confusing the operator.
+    catalog = await get_catalog()
+    if catalog.get(model_id) is None:
+        set_flash(
+            response, kind="error",
+            message=f"Unknown model id: {model_id!r}.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        if enable:
+            await db.enable_model_for_gateway(model_id, gateway_key)
+        else:
+            await db.disable_model_for_gateway(model_id, gateway_key)
+    except Exception:
+        log.exception(
+            "models_pair_toggle: %s pair (%r, %r) failed; rendering "
+            "flash error",
+            "enable" if enable else "disable",
+            model_id, gateway_key,
+        )
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Failed to {'unblock' if enable else 'block'} the "
+                "(model, gateway) pair — DB error, see logs."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    await refresh_disabled_pairs(db)
+    audit_action = "model_pair_enable" if enable else "model_pair_disable"
+    await _record_audit_safe(
+        request,
+        audit_action,
+        target=f"{model_id}|{gateway_key}",
+        meta={"model_id": model_id, "gateway_key": gateway_key},
+    )
+    verb = "Unblocked" if enable else "Blocked"
+    label = _PAIR_GATEWAY_LABELS.get(gateway_key, gateway_key)
+    set_flash(
+        response, kind="success",
+        message=f"{verb} {model_id} on {label}.",
+        secret=secret, cookie_secure=cookie_secure,
+    )
+    return response
+
+
+async def models_pair_disable_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """POST /admin/models/pair/disable — block a (model, gateway) pair."""
+    return await _models_pair_toggle_post(request, enable=False)
+
+
+async def models_pair_enable_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """POST /admin/models/pair/enable — unblock a (model, gateway) pair."""
+    return await _models_pair_toggle_post(request, enable=True)
 
 
 async def openrouter_keys_get(request: web.Request) -> web.StreamResponse:
@@ -14544,6 +14730,17 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/models/enable",
         _require_role(ROLE_SUPER)(models_enable_post),
+    )
+    # Stage-15-Step-E #10b row 30: per-gateway model disable.
+    # Same SUPER floor as the global model toggles — the cross-table
+    # is policy plumbing on the same risk surface.
+    app.router.add_post(
+        "/admin/models/pair/disable",
+        _require_role(ROLE_SUPER)(models_pair_disable_post),
+    )
+    app.router.add_post(
+        "/admin/models/pair/enable",
+        _require_role(ROLE_SUPER)(models_pair_enable_post),
     )
     app.router.add_get("/admin/gateways", _require_auth(gateways_get))
     app.router.add_post(
