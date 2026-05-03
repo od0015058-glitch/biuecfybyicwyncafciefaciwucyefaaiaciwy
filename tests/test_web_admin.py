@@ -9294,6 +9294,329 @@ async def test_user_detail_links_to_usage_page(
     body = await resp.text()
     assert 'href="/admin/users/100/usage"' in body
     assert "View AI usage log" in body
+
+
+# =========================================================================
+# Stage-15-Step-E #10b row 16: per-user multi-part conversation export
+# =========================================================================
+
+
+def _stub_db_for_conversation_export(
+    *,
+    summary: dict | None = None,
+    rows: list | Exception | None = None,
+):
+    """Stub Database with the two methods the row-16 handler calls.
+
+    ``summary`` populates ``get_user_admin_summary``;
+    ``rows`` populates ``get_full_conversation``. Pass an Exception
+    instance to either to simulate a DB failure.
+    """
+    db = _stub_db(user_summary_result=summary)
+    if isinstance(rows, Exception):
+        db.get_full_conversation = AsyncMock(side_effect=rows)
+    else:
+        db.get_full_conversation = AsyncMock(
+            return_value=rows if rows is not None else []
+        )
+    return db
+
+
+def _conv_summary(telegram_id: int, *, username: str | None = "alice",
+                  memory_enabled: bool = True) -> dict:
+    return {
+        "telegram_id": telegram_id,
+        "username": username,
+        "language_code": "en",
+        "active_model": "openrouter/auto",
+        "balance_usd": 5.0,
+        "free_messages_left": 0,
+        "total_credited_usd": 10.0,
+        "total_spent_usd": 5.0,
+        "memory_enabled": memory_enabled,
+        "is_admin": False,
+        "is_banned": False,
+        "ban_reason": None,
+        "recent_transactions": [],
+    }
+
+
+def _conv_msg(role: str, content: str, *, ts="2026-04-28T12:00:00+00:00",
+              has_images: bool = False) -> dict:
+    from datetime import datetime
+    out: dict = {
+        "role": role,
+        "content": content,
+        "created_at": datetime.fromisoformat(ts),
+    }
+    if has_images:
+        out["has_images"] = True
+    return out
+
+
+async def test_user_conversations_requires_auth(
+    aiohttp_client, make_admin_app
+):
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    resp = await client.get(
+        "/admin/users/100/conversations", allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+
+
+async def test_user_conversations_txt_requires_auth(
+    aiohttp_client, make_admin_app
+):
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    resp = await client.get(
+        "/admin/users/100/conversations.txt", allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+
+
+async def test_user_conversations_invalid_id_redirects_to_users(
+    aiohttp_client, make_admin_app
+):
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    await _login(client, "pw")
+    resp = await client.get(
+        "/admin/users/not-an-int/conversations", allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/users"
+
+
+async def test_user_conversations_txt_invalid_id_redirects_to_users(
+    aiohttp_client, make_admin_app
+):
+    client = await aiohttp_client(make_admin_app(password="pw"))
+    await _login(client, "pw")
+    resp = await client.get(
+        "/admin/users/not-an-int/conversations.txt", allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/users"
+
+
+async def test_user_conversations_renders_empty_state(
+    aiohttp_client, make_admin_app
+):
+    """A user with no persisted buffer renders a friendly empty state
+    + a single placeholder part with the standard header."""
+    db = _stub_db_for_conversation_export(
+        summary=_conv_summary(777, username="bob"),
+        rows=[],
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/777/conversations")
+    assert resp.status == 200
+    body = await resp.text()
+    # Breadcrumb back to user detail.
+    assert 'href="/admin/users/777"' in body
+    # Empty-state copy.
+    assert "No persisted conversation buffer" in body
+    db.get_user_admin_summary.assert_awaited()
+    db.get_full_conversation.assert_awaited_once_with(777)
+
+
+async def test_user_conversations_renders_parts_table(
+    aiohttp_client, make_admin_app
+):
+    """A populated buffer renders one row per part with kept count
+    and a download link to the .txt sibling endpoint."""
+    rows = [
+        _conv_msg("user", "hello"),
+        _conv_msg("assistant", "hi"),
+    ]
+    db = _stub_db_for_conversation_export(
+        summary=_conv_summary(100, username="alice"),
+        rows=rows,
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/100/conversations")
+    assert resp.status == 200
+    body = await resp.text()
+    # Hub renders aggregate tiles + at least one download link.
+    assert "Conversation history" in body
+    assert "Messages exported" in body
+    assert (
+        '/admin/users/100/conversations.txt?part=1' in body
+    )
+
+
+async def test_user_conversations_db_error_renders_friendly_banner(
+    aiohttp_client, make_admin_app
+):
+    """A DB exception while fetching the buffer must render a banner,
+    not bubble a 500 to the operator."""
+    db = _stub_db_for_conversation_export(
+        summary=_conv_summary(100),
+        rows=Exception("db boom"),
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/100/conversations")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Database query failed" in body
+
+
+async def test_user_conversations_txt_streams_first_part(
+    aiohttp_client, make_admin_app
+):
+    """The .txt endpoint defaults to part 1 and streams the rendered
+    multipart text with the canonical filename."""
+    rows = [
+        _conv_msg("user", "ping"),
+        _conv_msg("assistant", "pong"),
+    ]
+    db = _stub_db_for_conversation_export(
+        summary=_conv_summary(100, username="alice"),
+        rows=rows,
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/100/conversations.txt")
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("text/plain")
+    cd = resp.headers["Content-Disposition"]
+    assert "attachment;" in cd
+    assert "meowassist-history-100-" in cd
+    assert cd.endswith('.txt"')
+    body = await resp.text()
+    # Header line lists the @username so the operator can sanity-check
+    # which file they grabbed.
+    assert "@alice" in body
+    # The user / assistant messages are rendered into the body.
+    assert "ping" in body
+    assert "pong" in body
+
+
+async def test_user_conversations_txt_part_out_of_range_returns_404(
+    aiohttp_client, make_admin_app
+):
+    """Asking for ``?part=99`` on a single-part export returns 404."""
+    rows = [_conv_msg("user", "hi")]
+    db = _stub_db_for_conversation_export(
+        summary=_conv_summary(100), rows=rows,
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get(
+        "/admin/users/100/conversations.txt?part=99",
+    )
+    assert resp.status == 404
+    body = await resp.text()
+    assert "Part 99 not found" in body
+
+
+async def test_user_conversations_txt_negative_part_clamped_to_one(
+    aiohttp_client, make_admin_app
+):
+    """Out-of-range ``?part=`` values are clamped to 1, matching the
+    defensive clamp in the user-side /history command."""
+    rows = [_conv_msg("user", "hi")]
+    db = _stub_db_for_conversation_export(
+        summary=_conv_summary(100), rows=rows,
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get(
+        "/admin/users/100/conversations.txt?part=-5",
+    )
+    assert resp.status == 200
+
+
+async def test_user_conversations_txt_records_audit_row(
+    aiohttp_client, make_admin_app
+):
+    """Each download writes one ``admin_conversation_export`` audit
+    row with the user_id, part_index, total_parts and kept count."""
+    rows = [_conv_msg("user", "hi"), _conv_msg("assistant", "hello")]
+    db = _stub_db_for_conversation_export(
+        summary=_conv_summary(100), rows=rows,
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/100/conversations.txt")
+    assert resp.status == 200
+    db.record_admin_audit.assert_awaited()
+    last_call = db.record_admin_audit.await_args
+    assert last_call.kwargs["action"] == "admin_conversation_export"
+    assert "telegram_id=100" in last_call.kwargs["target"]
+    meta = last_call.kwargs["meta"]
+    assert meta["telegram_id"] == 100
+    assert meta["part_index"] == 1
+    assert meta["total_parts"] >= 1
+    assert meta["kept_in_part"] >= 1
+
+
+async def test_user_detail_links_to_conversations_page(
+    aiohttp_client, make_admin_app
+):
+    """The user detail page must include a link to the row-16
+    conversation export hub so an operator can find it without
+    knowing the URL."""
+    db = _stub_db(user_summary_result=_conv_summary(100))
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+    resp = await client.get("/admin/users/100")
+    body = await resp.text()
+    assert 'href="/admin/users/100/conversations"' in body
+    assert "Conversation history" in body
+
+
+def test_user_conversations_template_exists():
+    """The user_conversations.html template must exist and reference
+    the public symbols the handler passes in."""
+    from pathlib import Path
+    tpl_path = Path(__file__).resolve().parent.parent / (
+        "templates/admin/user_conversations.html"
+    )
+    assert tpl_path.exists(), (
+        "templates/admin/user_conversations.html missing"
+    )
+    html = tpl_path.read_text()
+    # Aggregate tiles
+    assert "parts" in html
+    assert "total_kept" in html
+    assert "total_bytes" in html
+    # Per-part download link
+    assert "/conversations.txt?part=" in html
+
+
+def test_audit_action_labels_pin_admin_conversation_export():
+    """Pin the audit-dropdown label so a future refactor can't drop
+    the slug from the filter UI without a regression test catching
+    it (mirrors the same pin-the-label pattern used for
+    transactions_export_csv / monetization_export_csv etc.)."""
+    import web_admin
+    assert (
+        "admin_conversation_export"
+        in web_admin.AUDIT_ACTION_LABELS
+    )
+    assert (
+        web_admin.AUDIT_ACTION_LABELS["admin_conversation_export"]
+        == "Per-user conversation export"
+    )
+
+
+def test_setup_admin_routes_registers_conversations_routes():
+    """Both the hub page and the .txt download endpoint must be
+    registered in :func:`setup_admin_routes`."""
+    import inspect
+    import web_admin
+    source = inspect.getsource(web_admin.setup_admin_routes)
+    assert "/admin/users/{telegram_id}/conversations" in source
+    assert "/admin/users/{telegram_id}/conversations.txt" in source
+    assert "user_conversations_get" in source
+    assert "user_conversations_txt_get" in source
+
+
 # Stage-9-Step-6: soft-cancel running broadcasts + retry_after cap
 # =========================================================================
 

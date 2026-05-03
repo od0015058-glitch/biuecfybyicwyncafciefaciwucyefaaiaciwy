@@ -90,6 +90,12 @@ from admin_roles import (
     normalize_role,
     role_at_least,
 )
+from conversation_export import (
+    EXPORT_MAX_PARTS,
+    EXPORT_PART_MAX_BYTES,
+    export_filename_for_part,
+    format_history_as_text_multipart,
+)
 from database import Database
 from formatting import format_usd
 from rate_limit import (
@@ -3594,6 +3600,13 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     # label test pattern so a future refactor can't drop them.
     "system_usage_export_csv": "System-wide usage CSV exported",
     "admin_audit_export_csv": "Admin-audit CSV exported",
+    # Stage-15-Step-E #10b row 16: per-user multi-part conversation
+    # export. Recorded by ``user_conversations_txt_get`` once per
+    # downloaded part (so an operator pulling a 5-part archive
+    # gets 5 audit rows). Same pin-the-label regression-test
+    # pattern so a future refactor can't drop the slug from the
+    # dropdown.
+    "admin_conversation_export": "Per-user conversation export",
     # Stage-15-Step-E #4 follow-up #2: DB-backed OpenRouter key
     # registry. These slugs are recorded by the new POST handlers
     # in this module; surfacing them in the dropdown lets an
@@ -5153,6 +5166,234 @@ async def user_stats_get(request: web.Request) -> web.StreamResponse:
             "bucket_default_days": STATS_BUCKET_DEFAULT_DAYS,
         },
     )
+
+
+async def _load_user_conversation_parts(
+    db: object | None, user_id: int,
+) -> tuple[list[tuple[str, int]], str | None, bool, str | None]:
+    """Helper for the row-16 admin conversation-export pages.
+
+    Returns ``(parts, user_handle, memory_off, db_error)``.
+
+    ``parts`` is the list of ``(text, kept_in_part)`` pairs the
+    multi-part renderer produced — empty input still yields a
+    one-part placeholder export, matching :func:`format_history_as_text_multipart`'s
+    public contract.
+
+    ``user_handle`` is the user's Telegram ``@username`` (without
+    the ``@``) or ``None`` if the row doesn't exist or the
+    username column is empty. Used in the rendered file header so
+    the operator can identify the file when it lands in their
+    downloads folder.
+
+    ``memory_off`` reflects the user's ``memory_enabled`` flag —
+    surfaced on the empty-state of the hub page so an operator
+    pulling a "this user has no history" report knows whether the
+    blank export is because the user disabled memory vs. just
+    hasn't talked yet.
+
+    ``db_error`` is non-``None`` when either DB call failed; the
+    caller renders it as a banner instead of crashing.
+    """
+    if db is None:
+        return [], None, False, "No database wired up (development mode)."
+    user_handle: str | None = None
+    memory_off = False
+    try:
+        summary = await db.get_user_admin_summary(user_id, recent_tx_limit=1)
+    except Exception:
+        log.exception(
+            "user_conversations: get_user_admin_summary failed user=%s",
+            user_id,
+        )
+        return [], None, False, "Database query failed — see logs."
+    if summary is not None:
+        raw_handle = summary.get("username")
+        if isinstance(raw_handle, str) and raw_handle.strip():
+            user_handle = raw_handle.strip()
+        memory_off = not bool(summary.get("memory_enabled", True))
+    try:
+        rows = await db.get_full_conversation(user_id)
+    except Exception:
+        log.exception(
+            "user_conversations: get_full_conversation failed user=%s",
+            user_id,
+        )
+        return [], user_handle, memory_off, "Database query failed — see logs."
+    parts = format_history_as_text_multipart(rows, user_handle=user_handle)
+    return parts, user_handle, memory_off, None
+
+
+async def user_conversations_get(
+    request: web.Request,
+) -> web.StreamResponse:
+    """GET /admin/users/{telegram_id}/conversations — admin-side
+    multi-part conversation-export hub.
+
+    Stage-15-Step-E #10b row 16. Renders the parts breakdown for
+    a user's persisted conversation buffer (one row per part with
+    message count, byte count, filename, and a download link).
+    The actual ``.txt`` download lives at the sibling endpoint
+    :func:`user_conversations_txt_get` below.
+
+    Mirrors the user-facing ``/history`` command (Stage-15-Step-E
+    #1 follow-up #2) which already paginated for the bot side; the
+    admin web panel was the missing surface so an operator
+    handling a "delete my data" or refund-investigation ticket
+    couldn't pull the user's full conversation buffer through the
+    admin UI without impersonating from a Telegram session.
+
+    Viewer-readable: same role floor as ``/admin/users/<id>/usage``
+    and ``/admin/users/<id>/stats``. The data was already
+    accessible to the same role through the per-user audit
+    surfaces; this just surfaces it as a downloadable archive.
+    """
+    raw_id = request.match_info.get("telegram_id", "")
+    try:
+        user_id = int(raw_id)
+    except ValueError:
+        return web.HTTPFound(location="/admin/users")
+
+    db = request.app.get(APP_KEY_DB)
+    parts, user_handle, memory_off, db_error = (
+        await _load_user_conversation_parts(db, user_id)
+    )
+
+    total_kept = sum(kept for _, kept in parts)
+    total_bytes = sum(len(text.encode("utf-8")) for text, _ in parts)
+    total_parts = len(parts)
+    part_rows = []
+    for index, (text, kept) in enumerate(parts, start=1):
+        part_rows.append({
+            "index": index,
+            "kept": kept,
+            "bytes": len(text.encode("utf-8")),
+            "filename": export_filename_for_part(
+                user_id, index, total_parts,
+            ),
+        })
+    # ``dropped`` is the trim count surfaced in part 1's header by
+    # :func:`format_history_as_text_multipart`. We re-derive it
+    # without re-running the formatter by parsing the part-1
+    # header — keeps the helper interface narrow and avoids
+    # plumbing a second return value through the renderer.
+    dropped = 0
+    if parts:
+        first_part_text, _ = parts[0]
+        for line in first_part_text.split("\n"):
+            if line.startswith("Messages: ") and "(trimmed " in line:
+                marker = "(trimmed "
+                start = line.find(marker)
+                if start != -1:
+                    rest = line[start + len(marker):]
+                    end = rest.find(" oldest)")
+                    if end != -1:
+                        try:
+                            dropped = int(rest[:end])
+                        except ValueError:
+                            dropped = 0
+                break
+
+    return aiohttp_jinja2.render_template(
+        "user_conversations.html",
+        request,
+        {
+            "active_page": "users",
+            "user_id": user_id,
+            "user_handle": user_handle,
+            "user_memory_off": memory_off,
+            "parts": parts,
+            "part_rows": part_rows,
+            "total_kept": total_kept,
+            "total_bytes": total_bytes,
+            "dropped": dropped,
+            "db_error": db_error,
+            "part_max_bytes": EXPORT_PART_MAX_BYTES,
+            "max_parts": EXPORT_MAX_PARTS,
+        },
+    )
+
+
+async def user_conversations_txt_get(
+    request: web.Request,
+) -> web.StreamResponse:
+    """GET /admin/users/{telegram_id}/conversations.txt — download
+    one ``.txt`` part of a user's conversation export.
+
+    Stage-15-Step-E #10b row 16. Query params:
+
+    * ``part`` — 1-based part index (default 1). Out-of-range
+      values return 404.
+
+    Records an audit row (``admin_conversation_export``) with
+    the user_id, part_index, total_parts, and per-part kept
+    count so a forensic timeline can answer "did anyone pull
+    this user's conversation history on Tuesday?".
+
+    Viewer-readable for the same reasons as the hub page above.
+    """
+    raw_id = request.match_info.get("telegram_id", "")
+    try:
+        user_id = int(raw_id)
+    except ValueError:
+        return web.HTTPFound(location="/admin/users")
+
+    raw_part = request.rel_url.query.get("part", "1")
+    try:
+        part_index = int(raw_part)
+    except (ValueError, TypeError):
+        part_index = 1
+    if part_index < 1:
+        part_index = 1
+
+    db = request.app.get(APP_KEY_DB)
+    parts, _user_handle, _memory_off, db_error = (
+        await _load_user_conversation_parts(db, user_id)
+    )
+    if db_error is not None:
+        return web.Response(status=503, text=db_error)
+    if part_index > len(parts):
+        return web.Response(
+            status=404,
+            text=(
+                f"Part {part_index} not found "
+                f"({len(parts)} total)."
+            ),
+        )
+
+    text, kept = parts[part_index - 1]
+    body = text.encode("utf-8")
+    filename = export_filename_for_part(user_id, part_index, len(parts))
+    response = web.Response(
+        body=body,
+        content_type="text/plain",
+        charset="utf-8",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{filename}"'
+            ),
+            "Cache-Control": "no-store, max-age=0",
+        },
+    )
+
+    await _record_audit_safe(
+        request,
+        "admin_conversation_export",
+        target=f"telegram_id={user_id}",
+        meta={
+            "telegram_id": user_id,
+            "part_index": part_index,
+            "total_parts": len(parts),
+            "kept_in_part": kept,
+            "total_kept": sum(k for _, k in parts),
+            "bytes": len(body),
+        },
+    )
+    log.info(
+        "user_conversations_txt_get: user=%s part=%d/%d kept=%d bytes=%d",
+        user_id, part_index, len(parts), kept, len(body),
+    )
+    return response
 
 
 async def user_adjust_post(request: web.Request) -> web.StreamResponse:
@@ -13523,6 +13764,21 @@ def setup_admin_routes(
     app.router.add_get(
         "/admin/users/{telegram_id}/stats",
         _require_auth(user_stats_get),
+    )
+    # Stage-15-Step-E #10b row 16: per-user multi-part
+    # conversation export. The hub page lists parts; the .txt
+    # endpoint streams a specific part. Both viewer-readable —
+    # same role floor as ``/admin/users/<id>/usage`` /
+    # ``/admin/users/<id>/stats`` (no new data, just a downloadable
+    # archive of the per-user buffer the operator could already
+    # browse via the admin Telegram /history command).
+    app.router.add_get(
+        "/admin/users/{telegram_id}/conversations",
+        _require_auth(user_conversations_get),
+    )
+    app.router.add_get(
+        "/admin/users/{telegram_id}/conversations.txt",
+        _require_auth(user_conversations_txt_get),
     )
 
     # Stage-8-Part-5: broadcast. Stage-15-Step-E #5 follow-up #4:
