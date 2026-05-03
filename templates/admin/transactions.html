@@ -227,6 +227,22 @@
                 onsubmit="return confirm('Refund transaction #{{ r.id }} (debit ${{ '%.4f' | format(r.amount_usd) }} from user {{ r.telegram_id }})? This is bookkeeping only — settle the user off-platform separately.');"
                 style="display:flex;gap:6px;align-items:center;margin:0;">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            {# Stage-15-Step-E #10b row 28: optional preset dropdown
+               above the free-text reason. Selecting a preset seeds
+               the textarea, but the operator can still edit / clear
+               it; saving an empty preset list on /admin/refund-presets
+               hides the dropdown without affecting the legacy form. #}
+            {% if refund_preset_choices %}
+            <select name="reason_preset"
+                    onchange="var t=this.form.querySelector('input[name=reason]'); if(this.value){t.value=this.value;t.focus();}"
+                    style="font-size:12px;padding:4px 6px;max-width:160px;"
+                    title="Pick a canned reason; you can still edit it before submitting.">
+              <option value="">— preset —</option>
+              {% for preset in refund_preset_choices %}
+              <option value="{{ preset }}">{{ preset }}</option>
+              {% endfor %}
+            </select>
+            {% endif %}
             <input type="text"
                    name="reason"
                    required

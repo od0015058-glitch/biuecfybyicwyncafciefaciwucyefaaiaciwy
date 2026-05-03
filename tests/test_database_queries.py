@@ -1065,6 +1065,181 @@ async def test_record_admin_audit_omits_meta_when_none():
     assert args[5] is None  # meta param
 
 
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 28 bundled bug fix:
+# _scrub_audit_meta keeps the audit feed lossless across Decimal /
+# datetime / non-finite-float meta payloads.
+# ---------------------------------------------------------------------
+
+
+async def test_record_admin_audit_serializes_decimal_meta():
+    """A caller passing ``Decimal`` (every money-handling code path
+    produces these from asyncpg ``numeric`` reads) used to crash
+    the JSON dump and silently lose the audit row. After the
+    Step-E #10b row 28 scrub fix, the value round-trips as a
+    JSON ``float``."""
+    import json
+    from decimal import Decimal
+
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=42)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    new_id = await db.record_admin_audit(
+        actor="web",
+        action="refund_issued",
+        meta={
+            "telegram_id": 123,
+            "amount_refunded_usd": Decimal("5.25"),
+            "new_balance_usd": Decimal("10.00"),
+        },
+    )
+    assert new_id == 42
+    args = conn.fetchval.await_args.args[1:]
+    decoded = json.loads(args[5])
+    assert decoded == {
+        "telegram_id": 123,
+        "amount_refunded_usd": 5.25,
+        "new_balance_usd": 10.0,
+    }
+
+
+async def test_record_admin_audit_drops_nan_and_infinity():
+    """NaN / ±Infinity in a meta float used to land as
+    Postgres-rejected ``NaN`` / ``Infinity`` JSON literals (not
+    standard JSON), causing the whole audit row to vanish on the
+    ``::jsonb`` cast. After the scrub fix, those values are
+    coerced to JSON ``null`` so the row survives — the operator
+    can still see "we tried to log this" and the affected fields
+    are explicit nulls."""
+    import json
+    import math
+
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=99)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    new_id = await db.record_admin_audit(
+        actor="web",
+        action="bot_health",
+        meta={
+            "score": math.nan,
+            "ok_score": 0.85,
+            "infinity": math.inf,
+            "neg_infinity": -math.inf,
+        },
+    )
+    assert new_id == 99
+    args = conn.fetchval.await_args.args[1:]
+    decoded = json.loads(args[5])
+    assert decoded == {
+        "score": None,
+        "ok_score": 0.85,
+        "infinity": None,
+        "neg_infinity": None,
+    }
+
+
+async def test_record_admin_audit_serializes_datetime_meta():
+    """``datetime`` / ``date`` / ``time`` in meta used to crash
+    ``json.dumps`` with ``TypeError`` and silently lose the row.
+    After the scrub fix, they round-trip as ISO-8601 strings."""
+    import datetime
+    import json
+
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=7)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    when = datetime.datetime(2025, 4, 15, 12, 30, 45)
+    delta = datetime.timedelta(seconds=90)
+    await db.record_admin_audit(
+        actor="reaper",
+        action="pending_expired",
+        meta={
+            "ts": when,
+            "interval": delta,
+            "date_only": datetime.date(2025, 4, 15),
+        },
+    )
+    args = conn.fetchval.await_args.args[1:]
+    decoded = json.loads(args[5])
+    assert decoded["ts"] == "2025-04-15T12:30:45"
+    assert decoded["interval"] == 90.0
+    assert decoded["date_only"] == "2025-04-15"
+
+
+async def test_record_admin_audit_recursively_scrubs_nested_dict_and_list():
+    """Nested structures inherit the scrub policy so a caller can
+    pass arbitrary diff payloads without per-call coercion."""
+    import json
+    from decimal import Decimal
+
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=1)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    await db.record_admin_audit(
+        actor="web",
+        action="referral_update",
+        meta={
+            "before": {"percent": Decimal("10"), "max_usd": Decimal("5")},
+            "after": {"percent": Decimal("12.5"), "max_usd": Decimal("7.5")},
+            "targets": ("alice", "bob"),  # tuple → list
+            "snapshot": [Decimal("0.1"), Decimal("0.2")],
+        },
+    )
+    args = conn.fetchval.await_args.args[1:]
+    decoded = json.loads(args[5])
+    assert decoded["before"] == {"percent": 10.0, "max_usd": 5.0}
+    assert decoded["after"] == {"percent": 12.5, "max_usd": 7.5}
+    assert decoded["targets"] == ["alice", "bob"]
+    assert decoded["snapshot"] == [0.1, 0.2]
+
+
+def test_scrub_audit_meta_unscrubbable_object_falls_back_to_string():
+    """A custom object that isn't otherwise handled lands as a
+    sentinel-tagged string so it's grep-able rather than crashing."""
+    class Custom:
+        def __str__(self):
+            return "weird-object"
+
+    out = database_module._scrub_audit_meta(Custom())
+    assert isinstance(out, str)
+    assert "<unscrubbable" in out
+    assert "Custom" in out
+
+
+async def test_record_payment_status_transition_serializes_decimal_meta():
+    """Sibling fix: the IPN-side helper used to crash on
+    ``Decimal`` meta which would propagate up to the IPN handler
+    (the method intentionally re-raises) and cause the gateway to
+    mark the IPN as failed for no good reason. After the scrub
+    fix, Decimals are coerced to JSON floats."""
+    import json
+    from decimal import Decimal
+
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(return_value=10)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    new_id = await db.record_payment_status_transition(
+        gateway_invoice_id="inv-1",
+        payment_status="finished",
+        outcome="applied",
+        meta={"price_amount": Decimal("12.34")},
+    )
+    assert new_id == 10
+    args = conn.fetchval.await_args.args[1:]
+    decoded = json.loads(args[3])
+    assert decoded == {"price_amount": 12.34}
+
+
 async def test_list_admin_audit_log_default_no_filters():
     conn = _make_conn()
     conn.fetch = AsyncMock(return_value=[])
