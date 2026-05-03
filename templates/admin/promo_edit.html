@@ -1,0 +1,177 @@
+{% extends "_layout.html" %}
+
+{% block title %}Edit promo — {{ row.code if row else "?" }}{% endblock %}
+
+{% block extra_head %}
+<style>
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 500;
+  }
+  .badge-active {
+    background: rgba(74, 222, 128, 0.12);
+    color: var(--success);
+    border: 1px solid rgba(74, 222, 128, 0.3);
+  }
+  .badge-revoked {
+    background: rgba(255, 107, 107, 0.12);
+    color: var(--danger);
+    border: 1px solid rgba(255, 107, 107, 0.3);
+  }
+  code.code {
+    background: var(--bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+  }
+  select {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 9px 11px;
+    color: var(--text);
+    font-size: 14px;
+    font-family: inherit;
+  }
+  .hint {
+    color: var(--text-muted);
+    font-size: 11px;
+    margin-top: 4px;
+  }
+  .meta-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .meta-row:last-child { border-bottom: 0; }
+  .meta-row .label { color: var(--text-muted); }
+</style>
+{% endblock %}
+
+{% block main %}
+<h2>Edit promo {% if row %}<code class="code">{{ row.code }}</code>{% endif %}</h2>
+
+<p style="color: var(--text-muted); margin-bottom: 16px;">
+  <a href="/admin/promos">&larr; Back to promo codes</a>
+</p>
+
+{% if flash %}
+<div class="alert alert-{{ flash.kind }}">{{ flash.message }}</div>
+{% endif %}
+
+{% if db_error %}
+<div class="alert alert-warn">{{ db_error }}</div>
+{% endif %}
+
+{% if row %}
+<div class="panel">
+  <h3>Current state</h3>
+  <div class="meta-row">
+    <span class="label">Code</span>
+    <span><code class="code">{{ row.code }}</code></span>
+  </div>
+  <div class="meta-row">
+    <span class="label">Used / cap</span>
+    <span>
+      {{ row.used_count }} /
+      {% if row.max_uses is not none %}{{ row.max_uses }}{% else %}∞{% endif %}
+    </span>
+  </div>
+  <div class="meta-row">
+    <span class="label">Status</span>
+    <span>
+      {% if not row.is_active %}
+        <span class="badge badge-revoked">revoked</span>
+      {% else %}
+        <span class="badge badge-active">active</span>
+      {% endif %}
+    </span>
+  </div>
+  <div class="meta-row">
+    <span class="label">Created</span>
+    <span>{{ row.created_at[:19] if row.created_at else "—" }}</span>
+  </div>
+</div>
+
+{% if row.is_active %}
+<div class="panel" style="margin-top: 16px;">
+  <h3>Update fields</h3>
+  <p style="color: var(--text-muted); font-size: 12px; margin: 0 0 12px;">
+    Submitting replaces all editable fields. Blank <em>max&nbsp;uses</em> resets
+    the cap to <strong>unlimited</strong>; blank <em>days&nbsp;until&nbsp;expiry</em>
+    resets the expiration to <strong>never</strong>. To recompute the bonus from
+    a percent rather than a fixed amount (or vice versa), pick the new kind
+    below — only one of <code class="code">discount_percent</code> /
+    <code class="code">discount_amount</code> can be set per the DB
+    <code class="code">CHECK</code> constraint.
+  </p>
+  <form method="post" action="/admin/promos/{{ row.code }}/edit">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+    <div class="field">
+      <label for="discount_kind">Discount type</label>
+      <select id="discount_kind" name="discount_kind" required>
+        <option value="percent"
+          {% if row.discount_percent is not none %}selected{% endif %}>
+          Percent of top-up (%)
+        </option>
+        <option value="amount"
+          {% if row.discount_amount is not none %}selected{% endif %}>
+          Fixed bonus amount (USD)
+        </option>
+      </select>
+    </div>
+
+    <div class="field">
+      <label for="discount_value">Discount value</label>
+      <input type="text" id="discount_value" name="discount_value"
+             placeholder="20 or $5" required
+             value="{% if row.discount_percent is not none %}{{ row.discount_percent }}{% elif row.discount_amount is not none %}{{ '%.2f' % row.discount_amount }}{% endif %}">
+      <div class="hint">Either 1-100 (for percent) or a positive USD number (for amount).</div>
+    </div>
+
+    <div class="field">
+      <label for="max_uses">Max uses (optional)</label>
+      <input type="number" id="max_uses" name="max_uses"
+             placeholder="leave blank = unlimited" min="1"
+             value="{% if row.max_uses is not none %}{{ row.max_uses }}{% endif %}">
+      <div class="hint">
+        Lowering below the current used count ({{ row.used_count }}) is
+        allowed and immediately marks the code exhausted.
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="expires_in_days">Expires in N days (optional)</label>
+      <input type="number" id="expires_in_days" name="expires_in_days"
+             placeholder="leave blank = never expires" min="1">
+      <div class="hint">
+        Counted from now. Blank means the expiration is cleared
+        regardless of any previously-set value.
+        {% if row.expires_at %}
+          Currently expires <strong>{{ row.expires_at[:10] }}</strong>.
+        {% else %}
+          Currently <strong>never expires</strong>.
+        {% endif %}
+      </div>
+    </div>
+
+    <button type="submit" class="primary">Save changes</button>
+  </form>
+</div>
+{% else %}
+<div class="alert alert-warn" style="margin-top: 16px;">
+  This promo code is revoked. Edits are disabled — create a new code
+  with a fresh code string to issue more bonuses.
+</div>
+{% endif %}
+{% else %}
+<div class="alert alert-error">Promo code not found.</div>
+{% endif %}
+{% endblock %}

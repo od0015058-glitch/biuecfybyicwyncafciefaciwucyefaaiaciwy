@@ -2129,6 +2129,272 @@ async def test_redeem_gift_code_finite_amount_proceeds_to_credit():
 
 
 # ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 29 bundled bug fix:
+# redeem_gift_code expiration boundary parity with validate_promo_code
+# ---------------------------------------------------------------------
+
+
+async def test_redeem_gift_code_uses_le_for_expiration_boundary():
+    """Stage-15-Step-E #10b row 29 bundled bug fix: gift codes used
+    ``expires_at < NOW()`` while promo codes used ``expires_at <=
+    NOW()``. At the exact instant a code expires, gift was still
+    redeemable for one more tick while the equivalent promo would
+    already refuse. Harmonised — both use ``<=`` now. This pin
+    verifies the SQL string sent to PG still reads ``<=`` so a
+    future refactor can't quietly regress to the old behavior.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+
+    conn = MagicMock()
+    conn.fetchrow = AsyncMock(return_value={
+        "amount_usd": 5.0,
+        "max_uses": None,
+        "used_count": 0,
+        "expires_at": _dt(2026, 1, 1, tzinfo=_tz.utc),
+        "is_active": True,
+    })
+    # ``fetchval`` is called once for the expiration check, then
+    # short-circuits on True. Side-effect: the SELECT $1 <= NOW()
+    # returns True (expired).
+    conn.fetchval = AsyncMock(return_value=True)
+    conn.execute = AsyncMock()
+
+    class _TxCtx:
+        async def __aenter__(self_inner):
+            return None
+
+        async def __aexit__(self_inner, *a):
+            return False
+
+    conn.transaction = MagicMock(return_value=_TxCtx())
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    result = await db.redeem_gift_code("GIFT5", 777)
+    assert result["status"] == "expired"
+    # The expiration SQL must use ``<=`` so an instant-on-the-boundary
+    # is treated as already expired (matching ``validate_promo_code``).
+    expiration_calls = [
+        c for c in conn.fetchval.await_args_list
+        if "<=" in c.args[0] and "NOW()" in c.args[0]
+    ]
+    assert expiration_calls, (
+        "redeem_gift_code expiration check no longer uses '<= NOW()' — "
+        "harmonisation with validate_promo_code regressed"
+    )
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 29: update_promo_code / update_gift_code
+# ---------------------------------------------------------------------
+
+
+async def test_update_promo_code_rejects_both_discount_kinds():
+    """XOR enforced: passing both percent and amount must raise."""
+    db = database_module.Database()
+    db.pool = _PoolStub(MagicMock())
+    with pytest.raises(ValueError, match="Exactly one"):
+        await db.update_promo_code(
+            "FOO",
+            discount_percent=10,
+            discount_amount=5.0,
+            max_uses=None,
+            expires_at=None,
+        )
+
+
+async def test_update_promo_code_rejects_neither_discount_kind():
+    db = database_module.Database()
+    db.pool = _PoolStub(MagicMock())
+    with pytest.raises(ValueError, match="Exactly one"):
+        await db.update_promo_code(
+            "FOO",
+            discount_percent=None,
+            discount_amount=None,
+            max_uses=None,
+            expires_at=None,
+        )
+
+
+async def test_update_promo_code_rejects_out_of_range_percent():
+    db = database_module.Database()
+    db.pool = _PoolStub(MagicMock())
+    with pytest.raises(ValueError, match="between 1 and 100"):
+        await db.update_promo_code(
+            "FOO", discount_percent=200, max_uses=None, expires_at=None,
+        )
+    with pytest.raises(ValueError, match="between 1 and 100"):
+        await db.update_promo_code(
+            "FOO", discount_percent=0, max_uses=None, expires_at=None,
+        )
+
+
+async def test_update_promo_code_rejects_nan_amount():
+    db = database_module.Database()
+    db.pool = _PoolStub(MagicMock())
+    with pytest.raises(ValueError, match="finite"):
+        await db.update_promo_code(
+            "FOO", discount_amount=float("nan"),
+            max_uses=None, expires_at=None,
+        )
+    with pytest.raises(ValueError, match="finite"):
+        await db.update_promo_code(
+            "FOO", discount_amount=float("inf"),
+            max_uses=None, expires_at=None,
+        )
+
+
+async def test_update_promo_code_rejects_negative_amount():
+    db = database_module.Database()
+    db.pool = _PoolStub(MagicMock())
+    with pytest.raises(ValueError, match="positive"):
+        await db.update_promo_code(
+            "FOO", discount_amount=-1.0,
+            max_uses=None, expires_at=None,
+        )
+
+
+async def test_update_promo_code_rejects_oversize_amount():
+    db = database_module.Database()
+    db.pool = _PoolStub(MagicMock())
+    with pytest.raises(ValueError, match="DECIMAL"):
+        await db.update_promo_code(
+            "FOO", discount_amount=1_000_000.0,
+            max_uses=None, expires_at=None,
+        )
+
+
+async def test_update_promo_code_rejects_non_positive_max_uses():
+    db = database_module.Database()
+    db.pool = _PoolStub(MagicMock())
+    with pytest.raises(ValueError, match="positive"):
+        await db.update_promo_code(
+            "FOO", discount_percent=10,
+            max_uses=0, expires_at=None,
+        )
+
+
+async def test_update_promo_code_happy_path_returns_true():
+    """Successful UPDATE returns True (the row exists)."""
+    conn = MagicMock()
+    conn.fetchval = AsyncMock(return_value="WELCOME20")
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    ok = await db.update_promo_code(
+        "welcome20",  # uppercase coercion exercised
+        discount_percent=15,
+        max_uses=100,
+        expires_at=None,
+    )
+    assert ok is True
+    # Code uppercased before the SQL call.
+    args = conn.fetchval.await_args.args
+    assert "UPDATE promo_codes" in args[0]
+    assert args[1] == "WELCOME20"
+    assert args[2] == 15
+    assert args[3] is None  # discount_amount cleared
+    assert args[4] == 100
+    assert args[5] is None
+
+
+async def test_update_promo_code_returns_false_when_row_missing():
+    """Code that doesn't exist → fetchval returns None → False."""
+    conn = MagicMock()
+    conn.fetchval = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    ok = await db.update_promo_code(
+        "GHOST", discount_percent=15, max_uses=None, expires_at=None,
+    )
+    assert ok is False
+
+
+async def test_update_gift_code_rejects_nan_amount():
+    db = database_module.Database()
+    db.pool = _PoolStub(MagicMock())
+    with pytest.raises(ValueError, match="finite"):
+        await db.update_gift_code(
+            "FOO", amount_usd=float("nan"),
+            max_uses=None, expires_at=None,
+        )
+    with pytest.raises(ValueError, match="finite"):
+        await db.update_gift_code(
+            "FOO", amount_usd=float("inf"),
+            max_uses=None, expires_at=None,
+        )
+
+
+async def test_update_gift_code_rejects_non_positive_amount():
+    db = database_module.Database()
+    db.pool = _PoolStub(MagicMock())
+    with pytest.raises(ValueError, match="positive"):
+        await db.update_gift_code(
+            "FOO", amount_usd=0.0,
+            max_uses=None, expires_at=None,
+        )
+    with pytest.raises(ValueError, match="positive"):
+        await db.update_gift_code(
+            "FOO", amount_usd=-5.0,
+            max_uses=None, expires_at=None,
+        )
+
+
+async def test_update_gift_code_rejects_oversize_amount():
+    db = database_module.Database()
+    db.pool = _PoolStub(MagicMock())
+    with pytest.raises(ValueError, match="DECIMAL"):
+        await db.update_gift_code(
+            "FOO", amount_usd=database_module.Database.GIFT_AMOUNT_MAX + 1,
+            max_uses=None, expires_at=None,
+        )
+
+
+async def test_update_gift_code_rejects_non_positive_max_uses():
+    db = database_module.Database()
+    db.pool = _PoolStub(MagicMock())
+    with pytest.raises(ValueError, match="positive"):
+        await db.update_gift_code(
+            "FOO", amount_usd=5.0,
+            max_uses=-1, expires_at=None,
+        )
+
+
+async def test_update_gift_code_happy_path_returns_true():
+    conn = MagicMock()
+    conn.fetchval = AsyncMock(return_value="BIRTHDAY5")
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    ok = await db.update_gift_code(
+        "birthday5",  # uppercase coercion exercised
+        amount_usd=10.0,
+        max_uses=None,
+        expires_at=None,
+    )
+    assert ok is True
+    args = conn.fetchval.await_args.args
+    assert "UPDATE gift_codes" in args[0]
+    assert args[1] == "BIRTHDAY5"
+    assert args[2] == 10.0
+    assert args[3] is None
+    assert args[4] is None
+
+
+async def test_update_gift_code_returns_false_when_row_missing():
+    conn = MagicMock()
+    conn.fetchval = AsyncMock(return_value=None)
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+
+    ok = await db.update_gift_code(
+        "GHOST", amount_usd=5.0, max_uses=None, expires_at=None,
+    )
+    assert ok is False
+
+
+# ---------------------------------------------------------------------
 # log_usage: defense-in-depth non-finite / negative guard (this PR)
 # ---------------------------------------------------------------------
 

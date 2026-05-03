@@ -137,6 +137,9 @@ def _stub_db(
     promo_rows: list | None = None,
     create_promo_result: bool | Exception = True,
     revoke_promo_result: bool | Exception = True,
+    # Stage-15-Step-E #10b row 29: edit endpoints for promo / gift codes.
+    update_promo_result: bool | Exception = True,
+    update_gift_result: bool | Exception = True,
     gift_rows: list | None = None,
     create_gift_result: bool | Exception = True,
     revoke_gift_result: bool | Exception = True,
@@ -210,6 +213,11 @@ def _stub_db(
         db.revoke_promo_code = AsyncMock(side_effect=revoke_promo_result)
     else:
         db.revoke_promo_code = AsyncMock(return_value=revoke_promo_result)
+    # Stage-15-Step-E #10b row 29: edit endpoint plumbing.
+    if isinstance(update_promo_result, Exception):
+        db.update_promo_code = AsyncMock(side_effect=update_promo_result)
+    else:
+        db.update_promo_code = AsyncMock(return_value=update_promo_result)
     db.list_gift_codes = AsyncMock(
         return_value=gift_rows if gift_rows is not None else []
     )
@@ -221,6 +229,11 @@ def _stub_db(
         db.revoke_gift_code = AsyncMock(side_effect=revoke_gift_result)
     else:
         db.revoke_gift_code = AsyncMock(return_value=revoke_gift_result)
+    # Stage-15-Step-E #10b row 29: edit endpoint plumbing.
+    if isinstance(update_gift_result, Exception):
+        db.update_gift_code = AsyncMock(side_effect=update_gift_result)
+    else:
+        db.update_gift_code = AsyncMock(return_value=update_gift_result)
     if isinstance(search_users_result, Exception):
         db.search_users = AsyncMock(side_effect=search_users_result)
     else:
@@ -5484,6 +5497,260 @@ async def test_promos_revoke_invalid_url_code(aiohttp_client, make_admin_app):
     db.revoke_promo_code.assert_not_awaited()
 
 
+# Stage-15-Step-E #10b row 29: /admin/promos/{code}/edit
+# ---------------------------------------------------------------------
+
+
+def _promo_row_for_edit(**overrides):
+    """Helper: minimal promo row matching ``Database.list_promo_codes``."""
+    base = {
+        "code": "WELCOME20",
+        "discount_percent": 20,
+        "discount_amount": None,
+        "max_uses": 100,
+        "used_count": 5,
+        "expires_at": None,
+        "is_active": True,
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    base.update(overrides)
+    return base
+
+
+async def test_promo_edit_get_renders_form_with_existing_values(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(promo_rows=[_promo_row_for_edit()])
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login_and_get_csrf(client, "pw")
+    resp = await client.get("/admin/promos/WELCOME20/edit")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Edit promo" in body
+    assert "WELCOME20" in body
+    # Pre-filled with current discount.
+    assert 'value="20"' in body
+    # Pre-filled max_uses.
+    assert 'value="100"' in body
+
+
+async def test_promo_edit_get_unknown_code_redirects_with_flash(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(promo_rows=[_promo_row_for_edit()])
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login_and_get_csrf(client, "pw")
+    resp = await client.get(
+        "/admin/promos/NOSUCH/edit", allow_redirects=False
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/promos"
+    resp2 = await client.get("/admin/promos")
+    body = await resp2.text()
+    assert "alert-error" in body
+    assert "not found" in body
+
+
+async def test_promo_edit_get_revoked_code_renders_disabled_form(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(promo_rows=[_promo_row_for_edit(is_active=False)])
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login_and_get_csrf(client, "pw")
+    resp = await client.get("/admin/promos/WELCOME20/edit")
+    assert resp.status == 200
+    body = await resp.text()
+    # No save button when revoked.
+    assert "Save changes" not in body
+    # Banner explaining why.
+    assert "revoked" in body
+    assert "Edits are disabled" in body
+
+
+async def test_promo_edit_post_happy_path(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        promo_rows=[_promo_row_for_edit()], update_promo_result=True,
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/promos/WELCOME20/edit",
+        data={
+            "csrf_token": csrf,
+            "discount_kind": "percent",
+            "discount_value": "30",
+            "max_uses": "50",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/promos"
+    db.update_promo_code.assert_awaited_once()
+    args, kwargs = db.update_promo_code.await_args
+    assert args == ("WELCOME20",)
+    assert kwargs["discount_percent"] == 30
+    assert kwargs["discount_amount"] is None
+    assert kwargs["max_uses"] == 50
+    assert kwargs["expires_at"] is None
+    resp2 = await client.get("/admin/promos")
+    body = await resp2.text()
+    assert "alert-success" in body
+    assert "Updated" in body and "WELCOME20" in body
+
+
+async def test_promo_edit_post_validation_redirects_back_to_edit(
+    aiohttp_client, make_admin_app
+):
+    """Bad form input redirects back to /admin/promos/<code>/edit
+    rather than the list, so the operator sees the failing field."""
+    db = _stub_db(promo_rows=[_promo_row_for_edit()])
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/promos/WELCOME20/edit",
+        data={
+            "csrf_token": csrf,
+            "discount_kind": "percent",
+            "discount_value": "200",  # out of 1-100 range
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/promos/WELCOME20/edit"
+    db.update_promo_code.assert_not_awaited()
+
+
+async def test_promo_edit_post_rejects_missing_csrf(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.post(
+        "/admin/promos/WELCOME20/edit",
+        data={
+            "discount_kind": "percent",
+            "discount_value": "10",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.update_promo_code.assert_not_awaited()
+
+
+async def test_promo_edit_post_unknown_code_shows_flash(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(update_promo_result=False)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/promos/NOSUCH/edit",
+        data={
+            "csrf_token": csrf,
+            "discount_kind": "percent",
+            "discount_value": "10",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/promos"
+    resp2 = await client.get("/admin/promos")
+    body = await resp2.text()
+    assert "alert-error" in body
+    assert "not found" in body
+
+
+async def test_promo_edit_post_db_value_error_shows_flash(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        update_promo_result=ValueError("DECIMAL(10,4) limit"),
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/promos/WELCOME20/edit",
+        data={
+            "csrf_token": csrf,
+            "discount_kind": "amount",
+            "discount_value": "5",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    resp2 = await client.get("/admin/promos")
+    body = await resp2.text()
+    assert "alert-error" in body
+    assert "DECIMAL" in body
+
+
+async def test_promo_edit_post_with_expires_in_days_passes_datetime(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(update_promo_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/promos/WELCOME20/edit",
+        data={
+            "csrf_token": csrf,
+            "discount_kind": "percent",
+            "discount_value": "10",
+            "expires_in_days": "30",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    kwargs = db.update_promo_code.await_args.kwargs
+    assert kwargs["expires_at"] is not None
+    delta = kwargs["expires_at"] - datetime.now(timezone.utc)
+    assert timedelta(days=29, hours=23) < delta < timedelta(days=30, minutes=2)
+
+
+async def test_promo_edit_post_blank_max_uses_resets_to_unlimited(
+    aiohttp_client, make_admin_app
+):
+    """Stage-15-Step-E #10b row 29: blank ``max_uses`` resets the cap
+    to NULL (unlimited), not preserves the previous value. Mirrors
+    the create-form contract."""
+    db = _stub_db(update_promo_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/promos/WELCOME20/edit",
+        data={
+            "csrf_token": csrf,
+            "discount_kind": "percent",
+            "discount_value": "10",
+            "max_uses": "",
+            "expires_in_days": "",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    kwargs = db.update_promo_code.await_args.kwargs
+    assert kwargs["max_uses"] is None
+    assert kwargs["expires_at"] is None
+
+
+async def test_promo_edit_get_invalid_url_code_redirects(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login_and_get_csrf(client, "pw")
+    long_code = "A" * 80
+    resp = await client.get(
+        f"/admin/promos/{long_code}/edit", allow_redirects=False,
+    )
+    assert resp.status == 302
+
+
 # Flash cookie round-trip
 # ---------------------------------------------------------------------
 
@@ -6234,6 +6501,252 @@ async def test_gifts_revoke_invalid_url_code(aiohttp_client, make_admin_app):
     )
     assert resp.status == 302
     db.revoke_gift_code.assert_not_awaited()
+
+
+# Stage-15-Step-E #10b row 29: /admin/gifts/{code}/edit
+# ---------------------------------------------------------------------
+
+
+def _gift_row_for_edit(**overrides):
+    """Helper: minimal gift row matching ``Database.list_gift_codes``."""
+    base = {
+        "code": "BIRTHDAY5",
+        "amount_usd": 5.0,
+        "max_uses": 50,
+        "used_count": 3,
+        "expires_at": None,
+        "is_active": True,
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    base.update(overrides)
+    return base
+
+
+async def test_gift_edit_get_renders_form_with_existing_values(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(gift_rows=[_gift_row_for_edit()])
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login_and_get_gift_csrf(client, "pw")
+    resp = await client.get("/admin/gifts/BIRTHDAY5/edit")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Edit gift" in body
+    assert "BIRTHDAY5" in body
+    assert 'value="5.00"' in body
+    assert 'value="50"' in body
+
+
+async def test_gift_edit_get_unknown_code_redirects_with_flash(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(gift_rows=[_gift_row_for_edit()])
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login_and_get_gift_csrf(client, "pw")
+    resp = await client.get(
+        "/admin/gifts/NOSUCH/edit", allow_redirects=False
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/gifts"
+    resp2 = await client.get("/admin/gifts")
+    body = await resp2.text()
+    assert "alert-error" in body
+    assert "not found" in body
+
+
+async def test_gift_edit_get_revoked_renders_disabled_form(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(gift_rows=[_gift_row_for_edit(is_active=False)])
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login_and_get_gift_csrf(client, "pw")
+    resp = await client.get("/admin/gifts/BIRTHDAY5/edit")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Save changes" not in body
+    assert "revoked" in body
+    assert "Edits are disabled" in body
+
+
+async def test_gift_edit_post_happy_path(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(
+        gift_rows=[_gift_row_for_edit()], update_gift_result=True,
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_gift_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/gifts/BIRTHDAY5/edit",
+        data={
+            "csrf_token": csrf,
+            "amount_usd": "10",
+            "max_uses": "200",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/gifts"
+    db.update_gift_code.assert_awaited_once()
+    args, kwargs = db.update_gift_code.await_args
+    assert args == ("BIRTHDAY5",)
+    assert kwargs["amount_usd"] == 10.0
+    assert kwargs["max_uses"] == 200
+    assert kwargs["expires_at"] is None
+    resp2 = await client.get("/admin/gifts")
+    body = await resp2.text()
+    assert "alert-success" in body
+    assert "Updated" in body and "BIRTHDAY5" in body
+
+
+async def test_gift_edit_post_validation_redirects_back_to_edit(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(gift_rows=[_gift_row_for_edit()])
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_gift_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/gifts/BIRTHDAY5/edit",
+        data={
+            "csrf_token": csrf,
+            "amount_usd": "-10",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/gifts/BIRTHDAY5/edit"
+    db.update_gift_code.assert_not_awaited()
+
+
+async def test_gift_edit_post_rejects_missing_csrf(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.post(
+        "/admin/gifts/BIRTHDAY5/edit",
+        data={"amount_usd": "5"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.update_gift_code.assert_not_awaited()
+
+
+async def test_gift_edit_post_unknown_code_shows_flash(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(update_gift_result=False)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_gift_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/gifts/NOSUCH/edit",
+        data={"csrf_token": csrf, "amount_usd": "5"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/gifts"
+    resp2 = await client.get("/admin/gifts")
+    body = await resp2.text()
+    assert "alert-error" in body
+    assert "not found" in body
+
+
+async def test_gift_edit_post_db_value_error_shows_flash(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(update_gift_result=ValueError("DECIMAL(10,4) limit"))
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_gift_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/gifts/BIRTHDAY5/edit",
+        data={"csrf_token": csrf, "amount_usd": "5"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    resp2 = await client.get("/admin/gifts")
+    body = await resp2.text()
+    assert "alert-error" in body
+    assert "DECIMAL" in body
+
+
+async def test_gift_edit_post_with_expires_in_days_passes_datetime(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(update_gift_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_gift_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/gifts/BIRTHDAY5/edit",
+        data={
+            "csrf_token": csrf,
+            "amount_usd": "10",
+            "expires_in_days": "14",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    kwargs = db.update_gift_code.await_args.kwargs
+    assert kwargs["expires_at"] is not None
+    delta = kwargs["expires_at"] - datetime.now(timezone.utc)
+    assert timedelta(days=13, hours=23) < delta < timedelta(days=14, minutes=2)
+
+
+async def test_gift_edit_post_blank_max_uses_resets_to_unlimited(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(update_gift_result=True)
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_gift_csrf(client, "pw")
+    resp = await client.post(
+        "/admin/gifts/BIRTHDAY5/edit",
+        data={
+            "csrf_token": csrf,
+            "amount_usd": "5",
+            "max_uses": "",
+            "expires_in_days": "",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    kwargs = db.update_gift_code.await_args.kwargs
+    assert kwargs["max_uses"] is None
+    assert kwargs["expires_at"] is None
+
+
+async def test_promos_page_renders_edit_link_for_active_codes(
+    aiohttp_client, make_admin_app
+):
+    """Stage-15-Step-E #10b row 29: the listing must surface an Edit
+    link next to Revoke for active codes (and hide it for revoked)."""
+    db = _stub_db(promo_rows=[
+        _promo_row_for_edit(code="ACTIVE_ONE", is_active=True),
+        _promo_row_for_edit(code="REVOKED_ONE", is_active=False),
+    ])
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login_and_get_csrf(client, "pw")
+    resp = await client.get("/admin/promos")
+    body = await resp.text()
+    assert '/admin/promos/ACTIVE_ONE/edit' in body
+    # Revoked codes don't get an edit link.
+    assert '/admin/promos/REVOKED_ONE/edit' not in body
+
+
+async def test_gifts_page_renders_edit_link_for_active_codes(
+    aiohttp_client, make_admin_app
+):
+    db = _stub_db(gift_rows=[
+        _gift_row_for_edit(code="ACTIVE_ONE", is_active=True),
+        _gift_row_for_edit(code="REVOKED_ONE", is_active=False),
+    ])
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login_and_get_gift_csrf(client, "pw")
+    resp = await client.get("/admin/gifts")
+    body = await resp.text()
+    assert '/admin/gifts/ACTIVE_ONE/edit' in body
+    assert '/admin/gifts/REVOKED_ONE/edit' not in body
 
 
 # ---------------------------------------------------------------------
@@ -16223,6 +16736,13 @@ async def test_role_gates_on_routes_module_definition():
         '"/admin/broadcast"',
         '"/admin/promos"',
         '"/admin/gifts"',
+        # Stage-15-Step-E #10b row 29: edit endpoints are operator-only
+        # on the write side (POST). The list comprehension below picks
+        # up at least one ``_require_role(ROLE_OPERATOR)`` occurrence
+        # anywhere within 200 chars of the literal — for these routes,
+        # the POST registration matches.
+        '"/admin/promos/{code}/edit"',
+        '"/admin/gifts/{code}/edit"',
     ]
     for route in operator_routes:
         # POST handler line follows the GET line. Search for the POST.

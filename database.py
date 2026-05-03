@@ -2368,6 +2368,79 @@ class Database:
             for r in rows
         ]
 
+    async def update_promo_code(
+        self,
+        code: str,
+        *,
+        discount_percent: int | None = None,
+        discount_amount: float | None = None,
+        max_uses: int | None,
+        expires_at=None,
+    ) -> bool:
+        """Update an existing promo code's metadata. Returns False if
+        the code doesn't exist.
+
+        Stage-15-Step-E #10b row 29: edit endpoint for promo codes.
+
+        Whatever the caller passes is the new authoritative state of
+        the code — a ``None`` ``max_uses`` resets the cap to unlimited
+        and a ``None`` ``expires_at`` resets the expiration to never.
+        Discount must be exactly one of ``discount_percent`` /
+        ``discount_amount`` (same XOR rule as :meth:`create_promo_code`).
+
+        ``used_count`` and ``is_active`` are NOT touched — those are
+        managed by the redemption / revoke paths, not by edits. To
+        re-activate a revoked code, recreate it (the create path
+        already refuses to clobber an existing ``code``, so the
+        operator has to pick a fresh code rather than silently
+        un-revoking a paper trail).
+
+        The same validation rules as :meth:`create_promo_code` apply.
+        Lowering ``max_uses`` below the current ``used_count`` is
+        allowed and immediately marks the code as exhausted in the
+        next :meth:`validate_promo_code` call (no surprise — the
+        comparison is ``used_count >= max_uses``).
+        """
+        code = code.upper()
+        if (discount_percent is None) == (discount_amount is None):
+            raise ValueError(
+                "Exactly one of discount_percent / discount_amount must be set"
+            )
+        if discount_percent is not None and not (1 <= discount_percent <= 100):
+            raise ValueError("discount_percent must be between 1 and 100")
+        if discount_amount is not None:
+            if not _is_finite_amount(discount_amount):
+                raise ValueError(
+                    "discount_amount must be a finite number "
+                    "(NaN / ±Infinity rejected)"
+                )
+            if discount_amount <= 0:
+                raise ValueError("discount_amount must be positive")
+            if discount_amount > 999_999.9999:
+                raise ValueError(
+                    "discount_amount must be at most 999999.9999 "
+                    "(DECIMAL(10,4) column limit)"
+                )
+        if max_uses is not None and max_uses <= 0:
+            raise ValueError(
+                "max_uses must be positive (or None for unlimited)"
+            )
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchval(
+                """
+                UPDATE promo_codes
+                SET discount_percent = $2,
+                    discount_amount = $3,
+                    max_uses = $4,
+                    expires_at = $5
+                WHERE code = $1
+                RETURNING code
+                """,
+                code, discount_percent, discount_amount,
+                max_uses, expires_at,
+            )
+        return row is not None
+
     async def revoke_promo_code(self, code: str) -> bool:
         """Mark a promo code as inactive (soft-delete).
 
@@ -2533,6 +2606,64 @@ class Database:
                 if row["created_at"] is not None else None
             ),
         }
+
+    async def update_gift_code(
+        self,
+        code: str,
+        *,
+        amount_usd: float,
+        max_uses: int | None,
+        expires_at=None,
+    ) -> bool:
+        """Update an existing gift code's metadata. Returns False if
+        the code doesn't exist.
+
+        Stage-15-Step-E #10b row 29: edit endpoint for gift codes.
+
+        Same submission semantics as :meth:`update_promo_code`: every
+        field is replaced authoritatively. ``None`` for ``max_uses``
+        resets the cap to unlimited, ``None`` for ``expires_at``
+        resets the expiration to never.
+
+        ``used_count`` and ``is_active`` are NOT touched. The
+        :meth:`redeem_gift_code` flow reads ``amount_usd`` /
+        ``max_uses`` / ``expires_at`` from the locked row at
+        redemption time so an edit between two redemptions takes
+        effect on the next caller — we don't need a separate
+        invalidation path.
+        """
+        code = code.upper()
+        if amount_usd is None:
+            raise ValueError("amount_usd must be positive")
+        if not _is_finite_amount(amount_usd):
+            raise ValueError(
+                "amount_usd must be a finite number "
+                "(NaN / ±Infinity rejected)"
+            )
+        if amount_usd <= 0:
+            raise ValueError("amount_usd must be positive")
+        if amount_usd > self.GIFT_AMOUNT_MAX:
+            raise ValueError(
+                f"amount_usd must be at most {self.GIFT_AMOUNT_MAX} "
+                "(DECIMAL(10,4) column limit)"
+            )
+        if max_uses is not None and max_uses <= 0:
+            raise ValueError(
+                "max_uses must be positive (or None for unlimited)"
+            )
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchval(
+                """
+                UPDATE gift_codes
+                SET amount_usd = $2,
+                    max_uses = $3,
+                    expires_at = $4
+                WHERE code = $1
+                RETURNING code
+                """,
+                code, amount_usd, max_uses, expires_at,
+            )
+        return row is not None
 
     async def revoke_gift_code(self, code: str) -> bool:
         """Soft-delete a gift code. Returns True iff flipped active→inactive."""
@@ -2798,8 +2929,25 @@ class Database:
                         "new_balance_usd": None, "transaction_id": None,
                     }
                 if row["expires_at"] is not None:
+                    # Stage-15-Step-E #10b row 29 bundled bug fix:
+                    # promo codes use ``expires_at <= NOW()`` (see
+                    # ``validate_promo_code``) but gift codes used
+                    # ``expires_at < NOW()`` — at the exact instant
+                    # ``expires_at == NOW()`` the gift was still
+                    # redeemable for one more tick while the
+                    # equivalent promo would already be rejected.
+                    # Operationally invisible most of the time
+                    # (microsecond window), but it created a real
+                    # parity bug between the two flows: an
+                    # operator setting ``expires_at = "2026-01-01
+                    # 00:00:00 UTC"`` on both a promo and a gift
+                    # would see the promo refuse at
+                    # ``00:00:00.000000`` and the gift accept until
+                    # the next tick. Harmonised to ``<=`` so the
+                    # cutoff instant is consistently treated as
+                    # already-expired across both code types.
                     expired = await connection.fetchval(
-                        "SELECT $1 < NOW()", row["expires_at"]
+                        "SELECT $1 <= NOW()", row["expires_at"]
                     )
                     if expired:
                         return {

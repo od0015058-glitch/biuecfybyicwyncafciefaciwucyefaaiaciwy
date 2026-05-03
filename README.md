@@ -260,6 +260,34 @@ NowPayments crypto invoices.
   (also exposed as a public `now=` kwarg so tests can pin the
   stamp deterministically). Naive `datetime` inputs are coerced to
   UTC; aware non-UTC inputs are converted to UTC.
+- **Promo / gift code edit** on `/admin/promos/<code>/edit` and
+  `/admin/gifts/<code>/edit` (Stage-15-Step-E #10b row 29) —
+  previously the admin panel could only create + revoke promo / gift
+  codes. New per-row Edit button on the listing tables opens a
+  pre-filled form: promos accept `discount_kind` /
+  `discount_value` / `max_uses` / `expires_in_days`; gifts accept
+  `amount_usd` / `max_uses` / `expires_in_days`. Same validation as
+  the create forms, same submission-replaces-all contract (blank
+  `max_uses` / `expires_in_days` reset to unlimited / never).
+  Revoked codes render the form read-only with a banner explaining
+  that revocation is one-way (preserves the audit trail —
+  un-revoking would resurrect a redemption surface that the
+  operator already declared dead). Code itself is immutable
+  (URL-keyed, same as the revoke route). New audit slugs
+  `promo_edit` / `gift_edit` carry the full new metadata payload.
+  POST routes are operator-floored; the GET form is viewer-readable
+  to match the rest of the promos / gifts pages. Bundled bug fix:
+  `Database.redeem_gift_code`'s expiration check used
+  `expires_at < NOW()` while `Database.validate_promo_code` used
+  `expires_at <= NOW()` — at the exact instant a code expired, the
+  gift remained redeemable for one more tick while the equivalent
+  promo would already refuse. Operationally a microsecond window
+  most of the time, but a real parity bug between two flows that
+  share the same `expires_at` semantics in the admin UI: setting
+  `expires_at = "2026-01-01 00:00:00 UTC"` on both a promo and a
+  gift would see the promo refuse at 00:00:00.000000 and the gift
+  accept until the next tick. Harmonised both to `<=` so the
+  cutoff instant is consistently treated as already-expired.
 - Telegram-side admin commands (`/admin`, `/admin_metrics`,
   `/admin_credit`, `/admin_broadcast`, …) for ops via DMs.
 - **Canonical slash-command menu** — on every startup the bot
@@ -292,9 +320,9 @@ NowPayments crypto invoices.
   edits language, active model, memory toggle, free-message counter,
   and username (allow-listed via `Database.USER_EDITABLE_FIELDS`) in
   addition to balance credit/debit. Every admin POST (login, promo
-  create/revoke, gift create/revoke, user adjust, user edit, broadcast
-  start, string save/revert) writes a row to the new `admin_audit_log`
-  table. View the feed at `${WEBHOOK_BASE_URL}/admin/audit` with
+  create/revoke/edit, gift create/revoke/edit, user adjust, user
+  edit, broadcast start, string save/revert) writes a row to the new
+  `admin_audit_log` table. View the feed at `${WEBHOOK_BASE_URL}/admin/audit` with
   optional action/actor filters. Audit writes are best-effort — a
   failed audit insert never blocks the underlying admin operation.
 - **Wallet shows USD + live Toman equivalent** — Iranian users see
