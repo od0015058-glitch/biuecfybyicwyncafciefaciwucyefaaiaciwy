@@ -23,6 +23,7 @@ from handlers import SUPPORTED_PAY_CURRENCIES, router
 from middlewares import UserUpsertMiddleware
 from force_join import RequiredChannelMiddleware, get_required_channel
 from fx_rates import refresh_usd_to_toman_loop
+from health import install_health_route
 from metrics import install_metrics_route
 from model_discovery import discover_new_models_loop
 from payments import payment_webhook, refresh_min_amounts_loop
@@ -103,6 +104,16 @@ async def start_webhook_server(
     # third-party ``prometheus_client`` dependency — the exposition
     # format is rendered by hand in ``metrics.render_metrics``.
     install_metrics_route(app)
+
+    # Stage-16 row 17: real ``/health`` endpoint (and ``/healthz``
+    # alias) that probes Postgres, Redis, OpenRouter, and every
+    # registered background loop. Public-safe response (no secrets,
+    # no URLs with credentials) so an external uptime monitor can
+    # hit it every 60s without authentication. Mounted unconditionally
+    # — works in both polling and webhook modes, which the older
+    # ``/telegram-webhook/healthz`` couldn't do because it was scoped
+    # to webhook mode only.
+    install_health_route(app, db=db)
 
     # Mount the web admin panel under /admin/. Same aiohttp app, same
     # process — one less thing to deploy. Auth is HMAC-cookie based,

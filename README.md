@@ -500,6 +500,33 @@ NowPayments crypto invoices.
     expr: time() - meowassist_pending_reaper_last_run_epoch > 900
     for: 5m
   ```
+- **`/health` endpoint** (Stage-16 row 17) — the same aiohttp server
+  also publishes a public-safe `GET /health` (and `GET /healthz`
+  alias) that probes every dependency for an external uptime monitor
+  (UptimeRobot, BetterStack, Pingdom). Mounted unconditionally — works
+  in both polling and webhook modes (the older
+  `/telegram-webhook/healthz` only mounted when webhook mode was on).
+  Probes:
+  * Postgres `SELECT 1` (3s timeout; failure ⇒ overall `down` ⇒ HTTP 503).
+  * Redis `PING` if `REDIS_URL` is configured (`degraded` on failure;
+    bot still operates without Redis).
+  * OpenRouter `GET /api/v1/models` if `OPENROUTER_API_KEY` is set
+    (`degraded` on 5xx/4xx/timeout).
+  * Every registered background loop's `last_tick_epoch` vs its
+    stale threshold (`bot_health.loop_stale_threshold_seconds`).
+  Returns JSON with per-component status (`ok` / `degraded` / `down` /
+  `skipped` / `never_ticked`). HTTP status is 200 for `ok`/`degraded`
+  and 503 only for `down` so a TCP-status-line monitor still pages.
+  Body never echoes secrets, hostnames, or env-var values — safe to
+  expose publicly. In-process snapshot cache for `HEALTH_CACHE_SECONDS`
+  (default 5s) absorbs polling-monitor floods without proxy-storming
+  the DB; the `X-Health-Cache: hit/miss` response header lets a
+  debugging operator distinguish fresh probes from cached ones.
+  Knobs: `HEALTH_CACHE_SECONDS`, `HEALTH_PROBE_TIMEOUT_SECONDS`.
+  Sample UptimeRobot setup: HTTP keyword monitor, URL
+  `https://your-bot/health`, expected keyword `"status": "ok"` (use
+  `"status": "down"` keyword + "alert when keyword exists" for a
+  true outage page).
 - **IPN-health dashboard tile** — `/admin/` shows a per-process
   drop-counter table for NowPayments, TetraPay, and Zarinpal so an
   operator can spot a misconfigured webhook (signature mismatch,
@@ -1456,6 +1483,7 @@ don't need to do this themselves. Once the locale is wired up, the
 | `referral.py` | Stage-13-Step-C. Env-var config (`BOT_USERNAME` / `REFERRAL_BONUS_PERCENT` / `REFERRAL_BONUS_MAX_USD`), the `/start <payload>` parser (the bundled bug-fix that finally inspects the deep-link payload `cmd_start` ignored pre-PR-110), the share-URL builder, and the thin wrapper around `Database._grant_referral_in_tx` that the finalize-payment open-TX calls. The DB-layer primitives (`get_or_create_referral_code`, `claim_referral`, `_grant_referral_in_tx`, `get_referral_stats`) live in `database.py`. |
 | `rate_limit.py` | Token-bucket primitives + `consume_chat_token` (per-user throughput throttle) + `try_claim_chat_slot` / `release_chat_slot` (per-user in-flight cap) + `chat_inflight_count` (read-only accessor for the Stage-15-Step-A metrics gauge) and `webhook_rate_limit_middleware` (per-IP). Guards the AI chat path against runaway OpenRouter spend on both axes (sustained rate and burst concurrency) and the `/nowpayments-webhook` endpoint against DoS bursts. |
 | `metrics.py` | Stage-15-Step-A. Prometheus `/metrics` exposition mounted on the existing aiohttp server. Process-local loop heartbeat registry (`record_loop_tick` / `get_loop_last_tick`) instrumented from every forever-loop's success-path. CIDR allowlist parser (`parse_ip_allowlist`) gated by `METRICS_IP_ALLOWLIST` (default `127.0.0.1,::1`, fail-closed on empty). No third-party `prometheus_client` dependency — exposition format rendered by hand in `render_metrics`. |
+| `health.py` | Stage-16 row 17. Real `/health` (and `/healthz` alias) endpoint that probes Postgres, Redis, OpenRouter, and every registered background loop in parallel. Per-probe 3s timeout (`HEALTH_PROBE_TIMEOUT_SECONDS`) plus a 5s in-process snapshot cache (`HEALTH_CACHE_SECONDS`) so a polling-monitor flood can't proxy-storm the DB. HTTP 503 when Postgres is down, 200 otherwise. Public-safe response (no secrets, no hostnames). Mounted unconditionally — works in both polling and webhook modes. |
 | `strings.py` | Two-locale (fa/en) compiled string table + `t(lang, key, **kwargs)` helper. Layered with a runtime override cache populated from the `bot_strings` DB table — admin edits at `/admin/strings` shadow the compiled defaults until reverted. Missing-slug lookups now log a one-shot WARNING per `(lang, key)` instead of silently returning the bare slug. |
 | `wallet_display.py` | Stage-11-Step-D. `format_toman_annotation(lang, balance_usd, snap)` returns the `\n≈ N تومان` (fa) / `\n≈ N TMN` (en) line spliced onto every wallet view's `$X.YZ` figure when an FX snapshot is cached. Stale snapshots get the `(نرخ تقریبی)` / `(approx)` suffix; cold cache returns `""` so the wallet still renders without the line; non-finite balances and arithmetic-overflow products are rejected with `""` rather than rendering `≈ nan تومان`. `format_balance_block(lang, balance_usd, snap)` packages `$X.YZ` + the annotation for callers (post-credit DMs, future wallet sub-screens) that don't go through `strings.t` — and substitutes `$0.00` for the head string on a non-finite balance so a corrupted upstream can't leak `$nan` either (the annotation guard already covered the Toman line). |
 | `wallet_receipts.py` | **Stage-12-Step-C.** Renders the new "🧾 Recent top-ups" wallet sub-screen. `get_receipts_page_size()` reads the `RECEIPTS_PAGE_SIZE` env var (default 5, max 20). `format_receipt_line(row, lang)` renders one row as `<status badge> — $X.YZ — <gateway label> — YYYY-MM-DD`; TetraPay rows append `(≈ N TMN)` using the per-transaction `gateway_locked_rate_toman_per_usd` (NOT the live snapshot — the user verifies against what they actually paid). Same NaN-defense policy as `wallet_display`: a non-finite `amount_usd` renders `$0.00`, a non-finite locked rate omits the Toman annotation. Backed by `Database.list_user_transactions(*, telegram_id, limit, before_id=None)`, which **hard-codes the `WHERE telegram_id = …` clause** and `raise ValueError` on a missing/zero/negative `telegram_id` — separate method from the admin-side `list_transactions` so a future buggy caller can't drop the user-scope filter and leak someone else's transactions. Cursor pagination via `before_id` over `transaction_id` (stable when fresh top-ups land mid-browse). Status whitelist is `{"SUCCESS", "PARTIAL", "REFUNDED"}` — PENDING / EXPIRED / FAILED are operational state, not user-facing receipts. |
