@@ -11728,6 +11728,188 @@ async def test_gateways_enable_post_renders_500_to_flash_on_db_failure(
     assert "Failed to enable gateway" in body
 
 
+# =====================================================================
+# Stage-15-Step-E #10b row 14: gateways admin panel — provider master
+# switch (NowPayments), zarinpal card row, and gateway_key validation
+# =====================================================================
+
+
+async def test_gateways_page_renders_zarinpal_row(aiohttp_client, make_admin_app):
+    """Stage-15-Step-E #10b row 14: the panel surfaces a Zarinpal
+    toggle next to TetraPay. Until this PR, ``handlers.py`` already
+    honoured ``is_gateway_disabled("zarinpal")`` (Stage-15-Step-E
+    #8 follow-up #1) but the panel had no row for it — the only way
+    to disable Zarinpal was to write the DB row by hand.
+    """
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.get("/admin/gateways")
+    body = await resp.text()
+    assert resp.status == 200
+    # The label and the canonical key both appear so the row is
+    # recognisable to a reader who knows either one.
+    assert "Zarinpal" in body
+    # The form posts the canonical lowercase key.
+    assert 'value="zarinpal"' in body
+
+
+async def test_gateways_page_renders_provider_master_switch(
+    aiohttp_client, make_admin_app
+):
+    """Stage-15-Step-E #10b row 14: a "Provider master switches"
+    section at the top of the panel exposes the ``nowpayments``
+    master toggle so the operator can flip the entire crypto pool
+    off in one click without overwriting the per-currency state.
+    """
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    resp = await client.get("/admin/gateways")
+    body = await resp.text()
+    assert resp.status == 200
+    assert "Provider master switches" in body
+    assert "NowPayments (all crypto)" in body
+    assert 'value="nowpayments"' in body
+
+
+async def test_gateways_page_warns_when_nowpayments_master_disabled(
+    aiohttp_client, make_admin_app
+):
+    """When the NowPayments master switch is disabled, the panel
+    explains that every crypto button is hidden regardless of the
+    individual per-currency toggles below — so a confused operator
+    doesn't think those toggles are sticky-on while the master is
+    off. The per-currency rows still render so the operator can
+    review and adjust the configuration that will reactivate the
+    moment the master is flipped back on.
+    """
+    db = _stub_toggle_db()
+    db.get_disabled_gateways = AsyncMock(return_value={"nowpayments"})
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await client.post(
+        "/admin/login", data={"password": "pw"}, allow_redirects=False
+    )
+    # Warm the in-memory cache so the panel renders the disabled set.
+    import admin_toggles
+    admin_toggles._disabled_gateways = {"nowpayments"}
+    try:
+        resp = await client.get("/admin/gateways")
+        body = await resp.text()
+    finally:
+        admin_toggles._disabled_gateways = set()
+    assert resp.status == 200
+    assert "disabled at the provider level" in body
+
+
+async def test_gateways_toggle_rejects_unknown_gateway_key(
+    aiohttp_client, make_admin_app
+):
+    """Stage-15-Step-E #10b row 14 bundled bug fix: validate
+    ``gateway_key`` against the canonical allowlist.
+
+    Pre-fix the handler took the form value verbatim, so a tampered
+    POST (or a future client-side bug) could write an unknown /
+    mistyped / uppercase key into ``disabled_gateways`` where
+    nothing in the hot-path would ever match it — silently a
+    no-op. The handler now rejects unknown keys with a flash error
+    and skips the DB write entirely.
+    """
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_gateways_csrf(client, "pw")
+    db.disable_gateway.reset_mock()
+    db.enable_gateway.reset_mock()
+    db.record_admin_audit.reset_mock()
+
+    # Each of these would silently no-op pre-fix because the bot's
+    # hot-path ``is_gateway_disabled(...)`` check uses the canonical
+    # lowercase ticker.
+    bogus_keys = ["BTC", "bitcoin", "Bitcoin", "now-payments", "totally-fake"]
+    for key in bogus_keys:
+        resp = await client.post(
+            "/admin/gateways/disable",
+            data={"csrf_token": csrf, "gateway_key": key},
+            allow_redirects=False,
+        )
+        assert resp.status == 302, await resp.text()
+        assert resp.headers["Location"] == "/admin/gateways"
+
+    db.disable_gateway.assert_not_awaited()
+    db.enable_gateway.assert_not_awaited()
+    db.record_admin_audit.assert_not_awaited()
+
+    resp_view = await client.get("/admin/gateways")
+    body = await resp_view.text()
+    assert "Unknown gateway key" in body
+
+
+async def test_gateways_toggle_accepts_every_canonical_key(
+    aiohttp_client, make_admin_app
+):
+    """Pin every canonical gateway key as POST-able. This catches
+    drift between the panel's ``_GATEWAY_*_LIST`` constants and
+    the validation allowlist (which is built from the same
+    constants, but a future refactor that splits them apart could
+    leak the divergence past unit tests on either side alone).
+    """
+    db = _stub_toggle_db()
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    csrf = await _login_and_get_gateways_csrf(client, "pw")
+
+    from web_admin import _GATEWAY_ALLOWED_KEYS
+
+    # Sanity: the allowlist isn't trivially empty / shrunk to a
+    # subset that would mask a regression where keys go missing.
+    expected_minimum = {
+        "tetrapay", "zarinpal", "nowpayments",
+        "btc", "eth", "ltc", "ton", "trx",
+        "usdttrc20", "usdterc20", "usdtbsc", "usdtton",
+    }
+    assert expected_minimum.issubset(_GATEWAY_ALLOWED_KEYS), (
+        f"Missing canonical keys: "
+        f"{expected_minimum - _GATEWAY_ALLOWED_KEYS}"
+    )
+
+    for key in sorted(_GATEWAY_ALLOWED_KEYS):
+        db.disable_gateway.reset_mock()
+        resp = await client.post(
+            "/admin/gateways/disable",
+            data={"csrf_token": csrf, "gateway_key": key},
+            allow_redirects=False,
+        )
+        assert resp.status == 302
+        db.disable_gateway.assert_awaited_once_with(key)
+
+
+async def test_gateway_allowed_keys_match_advertised_lists():
+    """Pin: every key in the three advertised lists must appear
+    in the allowlist, and vice-versa. Otherwise an admin sees a
+    button on the panel that the POST handler refuses (or has a
+    validated key with no UI surface)."""
+    from web_admin import (
+        _GATEWAY_ALLOWED_KEYS,
+        _GATEWAY_CARD_LIST,
+        _GATEWAY_CRYPTO_LIST,
+        _GATEWAY_PROVIDER_LIST,
+    )
+
+    listed = set()
+    for source in (
+        _GATEWAY_PROVIDER_LIST,
+        _GATEWAY_CARD_LIST,
+        _GATEWAY_CRYPTO_LIST,
+    ):
+        for gw in source:
+            listed.add(gw["key"])
+
+    assert listed == set(_GATEWAY_ALLOWED_KEYS)
+
+
 async def test_models_disable_post_handles_model_id_with_slash(
     aiohttp_client, make_admin_app
 ):

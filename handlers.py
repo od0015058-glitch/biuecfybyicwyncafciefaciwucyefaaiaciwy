@@ -145,12 +145,21 @@ def _active_pay_currencies() -> list[tuple[str, str]]:
     showing only TetraPay (Rial) when this filter empties the crypto
     list, which is the correct UX for a deploy that hasn't yet
     enabled NowPayments.
+
+    Stage-15-Step-E #10b row 14: also short-circuit to empty when the
+    ``"nowpayments"`` provider master switch is disabled — admin
+    operators can flip the entire crypto pool off in one click without
+    overwriting the individual per-currency disable state, so
+    re-enabling the master switch restores the previous picker layout.
     """
-    nowpayments_on = _nowpayments_configured()
+    if not _nowpayments_configured():
+        return []
+    if is_gateway_disabled("nowpayments"):
+        return []
     return [
         (label, ticker)
         for label, ticker in SUPPORTED_PAY_CURRENCIES
-        if not is_gateway_disabled(ticker) and nowpayments_on
+        if not is_gateway_disabled(ticker)
     ]
 
 
@@ -3118,6 +3127,20 @@ async def process_custom_currency_selection(callback: CallbackQuery, state: FSMC
     lang = await _get_user_language(callback.from_user.id)
 
     if is_gateway_disabled(currency):
+        await callback.answer(t(lang, "gateway_disabled"), show_alert=True)
+        return
+
+    # Stage-15-Step-E #10b row 14: defense in depth for the NowPayments
+    # provider master switch. The picker keyboard already filters
+    # crypto buttons through ``_active_pay_currencies`` (which honours
+    # the master switch), but a user with a stale rendered keyboard
+    # could still land a ``cur_<ticker>`` callback on a master-disabled
+    # crypto. ``tetrapay`` and ``zarinpal`` are card gateways and are
+    # NOT covered by the NowPayments master switch — they have their
+    # own per-gateway toggles already enforced by the
+    # ``is_gateway_disabled(currency)`` check above.
+    is_card_gateway = currency in {"tetrapay", "zarinpal"}
+    if not is_card_gateway and is_gateway_disabled("nowpayments"):
         await callback.answer(t(lang, "gateway_disabled"), show_alert=True)
         return
 

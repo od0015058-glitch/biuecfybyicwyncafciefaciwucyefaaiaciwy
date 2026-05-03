@@ -9191,9 +9191,30 @@ async def profile_password_post(request: web.Request) -> web.StreamResponse:
 # ---------------------------------------------------------------------
 
 # Gateway labels for the admin UI. Matches handlers.SUPPORTED_PAY_CURRENCIES
-# plus "tetrapay" for the Rial card gateway.
+# plus the card gateways ("tetrapay" / "zarinpal") and the
+# Stage-15-Step-E #10b row 14 provider master switch
+# ("nowpayments" — flips every NowPayments crypto off in one click
+# without losing the per-currency disable state, so re-enabling the
+# provider restores the previous configuration).
+_GATEWAY_PROVIDER_LIST: list[dict[str, str]] = [
+    {
+        "key": "nowpayments",
+        "label": "NowPayments (all crypto)",
+        "description": (
+            "Master switch for the entire NowPayments crypto pool. "
+            "Disabling this hides every crypto button in the picker "
+            "without overwriting the individual per-currency toggles."
+        ),
+    },
+]
 _GATEWAY_CARD_LIST: list[dict[str, str]] = [
     {"key": "tetrapay", "label": "TetraPay (Rial card)"},
+    # Stage-15-Step-E #10b row 14: surface the Zarinpal toggle on
+    # the panel. The hot-path picker in ``handlers.py`` already
+    # checks ``is_gateway_disabled("zarinpal")`` (Stage-15-Step-E
+    # #8 follow-up #1); the panel just didn't expose the lever
+    # until this PR.
+    {"key": "zarinpal", "label": "Zarinpal (Rial card)"},
 ]
 _GATEWAY_CRYPTO_LIST: list[dict[str, str]] = [
     {"key": "btc", "label": "₿ Bitcoin"},
@@ -9206,6 +9227,22 @@ _GATEWAY_CRYPTO_LIST: list[dict[str, str]] = [
     {"key": "usdtbsc", "label": "💵 USDT (BEP20)"},
     {"key": "usdtton", "label": "💵 USDT (TON)"},
 ]
+
+# Stage-15-Step-E #10b row 14 bundled bug fix: the gateway-toggle
+# POST handler used to take whatever ``gateway_key`` came in on the
+# form body verbatim, so a tampered POST (or a future client-side
+# bug) could write an unknown / mistyped / uppercase key into
+# ``disabled_gateways`` where nothing in the hot-path would ever
+# match it — silently a no-op. Worse, a typo like ``"bitcoin"``
+# instead of ``"btc"`` would land a row that looks correct in the
+# DB but never disables the actual ticker the bot checks. Now we
+# validate against the canonical allowlist below and reject unknown
+# keys with a flash error.
+_GATEWAY_ALLOWED_KEYS: frozenset[str] = frozenset(
+    [gw["key"] for gw in _GATEWAY_PROVIDER_LIST]
+    + [gw["key"] for gw in _GATEWAY_CARD_LIST]
+    + [gw["key"] for gw in _GATEWAY_CRYPTO_LIST]
+)
 
 # Provider display labels reused from handlers.py; importing them would
 # create a circular import (handlers → web_admin), so duplicate the
@@ -10657,6 +10694,7 @@ async def gateways_get(request: web.Request) -> web.StreamResponse:
         "active_page": "gateways",
         "csrf_token": csrf_token_for(request),
         "flash": None,
+        "provider_gateways": _GATEWAY_PROVIDER_LIST,
         "card_gateways": _GATEWAY_CARD_LIST,
         "crypto_gateways": _GATEWAY_CRYPTO_LIST,
         "disabled": disabled,
@@ -10698,6 +10736,23 @@ async def _gateways_toggle_post(
     if not gateway_key:
         set_flash(response, kind="warn", message="Missing gateway key.",
                   secret=secret, cookie_secure=cookie_secure)
+        return response
+    # Stage-15-Step-E #10b row 14 bundled bug fix: validate the key
+    # against the canonical allowlist. See ``_GATEWAY_ALLOWED_KEYS``
+    # docstring for rationale.
+    if gateway_key not in _GATEWAY_ALLOWED_KEYS:
+        log.warning(
+            "gateways_toggle: rejecting unknown gateway_key %r from %s",
+            gateway_key, request.remote,
+        )
+        set_flash(
+            response, kind="error",
+            message=(
+                f"Unknown gateway key: {gateway_key!r}. The toggle did "
+                "not take effect. Refresh the page and try again."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
         return response
 
     from admin_toggles import refresh_disabled_gateways
