@@ -187,6 +187,42 @@ NowPayments crypto invoices.
   serialiser uses `allow_nan=False` so a future scrub miss raises
   loudly instead of silently emitting non-standard `NaN` /
   `Infinity` literals that Postgres' `::jsonb` cast then rejects.
+- **Bulk CSV export hub** on `/admin/exports`
+  (Stage-15-Step-E #10b row 27) — one-stop hub linking every CSV
+  download in the panel: existing transactions / monetization
+  exporters PLUS two new system-wide streaming endpoints,
+  `/admin/exports/usage.csv` (every `usage_logs` row across every
+  user, since/until/limit query filters) and
+  `/admin/exports/audit.csv` (every `admin_audit_log` row,
+  action/actor/since/until/limit filters). Both stream via
+  keyset-paginated async generators
+  (`Database.iter_system_usage_logs` /
+  `Database.iter_admin_audit_log`) in batches of 5 000 rows so a
+  multi-MB pull doesn't pin a DB pool slot for the whole download
+  — every batch hands the connection back to the pool before
+  yielding to the network. Hard caps: 1 M usage rows / 100 k
+  audit rows per export (operators who need more should narrow
+  the window with `since` / `until`; the inline form on the hub
+  page exposes them as `<input type="datetime-local">`). Audit
+  slugs `system_usage_export_csv` and `admin_audit_export_csv`
+  carry the row count + filter shape for forensics. Bundled bug
+  fix: CSV / formula-injection defang (CWE-1236) latent since
+  Stage-9 transactions CSV (Sept 2025) and Stage-15 monetization
+  CSV. Excel, LibreOffice Calc, Numbers, and Sheets all evaluate
+  any cell whose first character is `=`, `+`, `@`, `\t`, or `\r`
+  as a formula, so a refund-reason of
+  `=HYPERLINK("https://attacker", "click me")` turned every admin
+  CSV into a drive-by exfil / RCE primitive the moment the
+  operator double-clicked the file. `_csv_quote` now prepends a
+  TAB to every field whose first character matches the sentinel
+  set; the TAB is stripped on display by every spreadsheet but
+  defeats formula-mode parsing because `\t=…` is text-with-
+  leading-whitespace, not a formula. Negatives (`-`) are
+  intentionally NOT defanged because every legitimate accounting
+  CSV emits negative dollar amounts and false-flagging them would
+  mangle every quarterly close (matches Microsoft's own Power BI
+  export trade-off). The fix also flows through the existing
+  transactions / monetization CSVs.
 - **Spending stats with bucketing** on `/admin/users/{id}/stats`
   (Stage-15-Step-E #10b row 17) — new admin page with day / week /
   month bucket selector, aggregate tiles (bucket count, total calls,

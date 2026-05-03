@@ -3572,6 +3572,29 @@ class Database:
     # is smaller, but the DB cap protects the connection from a
     # buggy caller passing ``limit=10**9``.
     USAGE_LOGS_EXPORT_MAX_ROWS: int = 50_000
+    # Stage-15-Step-E #10b row 27: system-wide usage-log export
+    # batch size used by the streaming CSV exporter at
+    # ``/admin/exports/usage.csv``. Per-batch fetch keeps the
+    # asyncpg cursor / pool slot from being held across the
+    # whole multi-MB stream — every batch hands the connection
+    # back to the pool before yielding to the network. 5 000 is
+    # ~750 kB of CSV data per batch, well under the per-batch
+    # write buffer aiohttp uses by default.
+    SYSTEM_USAGE_EXPORT_BATCH_ROWS: int = 5_000
+    # Hard absolute cap to keep an unbounded export from
+    # tar-pitting the bot. 1 M rows × ~150 bytes / row = ~150 MB
+    # CSV, which a determined operator can still pull but bounds
+    # the worst case. Operators who need more should add
+    # since/until filters; the current admin-panel form exposes
+    # those.
+    SYSTEM_USAGE_EXPORT_MAX_ROWS: int = 1_000_000
+    # Audit-log export hard cap. The audit table is much smaller
+    # than usage_logs (an admin action emits a row, not every AI
+    # call) but we still cap to keep the worst case bounded. 100 k
+    # rows × ~250 bytes / row (the meta JSONB blob is the biggest
+    # column) = ~25 MB CSV.
+    AUDIT_LOG_EXPORT_MAX_ROWS: int = 100_000
+    AUDIT_LOG_EXPORT_BATCH_ROWS: int = 5_000
 
     async def list_user_usage_logs(
         self,
@@ -3696,6 +3719,259 @@ class Database:
                 effective_limit,
             )
         return [_coerce_usage_log_row(r) for r in rows]
+
+    async def iter_system_usage_logs(
+        self,
+        *,
+        since: "datetime | None" = None,
+        until: "datetime | None" = None,
+        limit: int | None = None,
+        batch: int | None = None,
+    ):
+        """Stage-15-Step-E #10b row 27: async generator yielding
+        every ``usage_logs`` row across **every** user in chunks
+        suitable for streaming to a CSV download.
+
+        Each yielded value is a coerced row dict in the same shape
+        as :meth:`export_user_usage_logs` plus the ``telegram_id``
+        column (the per-user export omits it because the URL pins
+        the user). Sorted ``log_id ASC`` so a CSV imported into a
+        spreadsheet reads top-to-bottom in chronological order
+        (and so a future "resume from log_id N" query is trivial).
+
+        ``since`` / ``until`` are optional UTC ``datetime`` filters
+        on ``created_at`` so an operator can pull "last 24 h" or
+        "first half of March" without exporting the full table.
+
+        ``limit`` defaults to :attr:`SYSTEM_USAGE_EXPORT_MAX_ROWS`
+        and is clamped to ``[1, SYSTEM_USAGE_EXPORT_MAX_ROWS]``;
+        ``batch`` defaults to :attr:`SYSTEM_USAGE_EXPORT_BATCH_ROWS`
+        and is clamped to ``[1, SYSTEM_USAGE_EXPORT_MAX_ROWS]``.
+        Each batch acquires the pool connection, fetches up to
+        ``batch`` rows, releases the connection, then yields the
+        rows — so a slow CSV reader on the wire can't pin a pool
+        slot for the whole multi-MB export.
+
+        Pagination is keyset (``log_id > last_seen``) rather than
+        ``OFFSET`` so the cost is constant per batch even at
+        offset 1 000 000 — backed by the existing
+        ``usage_logs_pkey`` ordered scan.
+        """
+        max_rows = self.SYSTEM_USAGE_EXPORT_MAX_ROWS
+        if limit is None:
+            effective_limit = max_rows
+        else:
+            try:
+                effective_limit = max(1, min(int(limit), max_rows))
+            except (TypeError, ValueError):
+                effective_limit = max_rows
+        if batch is None:
+            effective_batch = self.SYSTEM_USAGE_EXPORT_BATCH_ROWS
+        else:
+            try:
+                effective_batch = max(1, min(int(batch), max_rows))
+            except (TypeError, ValueError):
+                effective_batch = self.SYSTEM_USAGE_EXPORT_BATCH_ROWS
+
+        # Build the WHERE clause once; ``last_log_id`` slot is
+        # rebound every batch.
+        clauses: list[str] = ["log_id > $1"]
+        params_template: list[object] = [0]  # last_log_id seed
+        if since is not None:
+            params_template.append(since)
+            clauses.append(f"created_at >= ${len(params_template)}")
+        if until is not None:
+            params_template.append(until)
+            clauses.append(f"created_at < ${len(params_template)}")
+        where = "WHERE " + " AND ".join(clauses)
+
+        emitted = 0
+        last_log_id = 0
+        while emitted < effective_limit:
+            this_batch = min(
+                effective_batch, effective_limit - emitted,
+            )
+            params = list(params_template)
+            params[0] = last_log_id
+            params.append(this_batch)
+            sql = f"""
+                SELECT log_id, telegram_id, model_used,
+                       prompt_tokens, completion_tokens,
+                       cost_deducted_usd, created_at
+                  FROM usage_logs
+                  {where}
+                 ORDER BY log_id ASC
+                 LIMIT ${len(params)}
+            """
+            async with self.pool.acquire() as connection:
+                rows = await connection.fetch(sql, *params)
+            if not rows:
+                break
+            for r in rows:
+                coerced = _coerce_usage_log_row(r)
+                # ``_coerce_usage_log_row`` doesn't carry telegram_id
+                # because per-user callers pin it via URL; carry it
+                # explicitly for the system-wide variant.
+                coerced["telegram_id"] = (
+                    int(r["telegram_id"])
+                    if r["telegram_id"] is not None else None
+                )
+                last_log_id = int(r["log_id"])
+                yield coerced
+                emitted += 1
+                if emitted >= effective_limit:
+                    return
+            if len(rows) < this_batch:
+                # Fewer rows than asked for — table exhausted.
+                break
+
+    async def iter_admin_audit_log(
+        self,
+        *,
+        action: str | None = None,
+        actor: str | None = None,
+        since: "datetime | None" = None,
+        until: "datetime | None" = None,
+        limit: int | None = None,
+        batch: int | None = None,
+    ):
+        """Stage-15-Step-E #10b row 27: async generator yielding
+        ``admin_audit_log`` rows (newest first) for the
+        ``/admin/exports/audit.csv`` streaming exporter.
+
+        Mirrors :meth:`list_admin_audit_log` filter shape (action /
+        actor) but adds ``since`` / ``until`` UTC ``datetime``
+        bounds on the ``ts`` column so an operator can pull
+        "every action in the last 7 days" without dumping the full
+        retention window.
+
+        Sorted ``ts DESC, id DESC`` (matches the on-page audit
+        table). Keyset-paginated on ``id`` so each batch is O(log n)
+        rather than O(N + offset). ``limit`` clamped to
+        :attr:`AUDIT_LOG_EXPORT_MAX_ROWS`; ``batch`` clamped to
+        :attr:`AUDIT_LOG_EXPORT_BATCH_ROWS`. Each batch hands the
+        pool connection back so a slow downloader can't tar-pit
+        the pool.
+
+        The yielded ``meta`` field is always a dict (or ``None``)
+        — :func:`_decode_jsonb_meta` already handles asyncpg's
+        bytes / str / dict inconsistency so the exporter doesn't
+        have to think about it.
+        """
+        max_rows = self.AUDIT_LOG_EXPORT_MAX_ROWS
+        if limit is None:
+            effective_limit = max_rows
+        else:
+            try:
+                effective_limit = max(1, min(int(limit), max_rows))
+            except (TypeError, ValueError):
+                effective_limit = max_rows
+        if batch is None:
+            effective_batch = self.AUDIT_LOG_EXPORT_BATCH_ROWS
+        else:
+            try:
+                effective_batch = max(1, min(int(batch), max_rows))
+            except (TypeError, ValueError):
+                effective_batch = self.AUDIT_LOG_EXPORT_BATCH_ROWS
+
+        emitted = 0
+        # Seed with a value that beats every real audit id —
+        # ``id`` is a serial bigint so 9_223_372_036_854_775_807
+        # (max bigint) safely sits above any plausible row.
+        last_id = 9_223_372_036_854_775_807
+        while emitted < effective_limit:
+            this_batch = min(
+                effective_batch, effective_limit - emitted,
+            )
+            clauses: list[str] = ["id < $1"]
+            params: list[object] = [last_id]
+            if action:
+                params.append(action)
+                clauses.append(f"action = ${len(params)}")
+            if actor:
+                params.append(actor)
+                clauses.append(f"actor = ${len(params)}")
+            if since is not None:
+                params.append(since)
+                clauses.append(f"ts >= ${len(params)}")
+            if until is not None:
+                params.append(until)
+                clauses.append(f"ts < ${len(params)}")
+            params.append(this_batch)
+            sql = f"""
+                SELECT id, ts, actor, action, target, ip, outcome, meta
+                  FROM admin_audit_log
+                 WHERE {' AND '.join(clauses)}
+                 ORDER BY id DESC
+                 LIMIT ${len(params)}
+            """
+            async with self.pool.acquire() as connection:
+                rows = await connection.fetch(sql, *params)
+            if not rows:
+                break
+            for r in rows:
+                last_id = int(r["id"])
+                yield {
+                    "id": last_id,
+                    "ts": (
+                        r["ts"].isoformat()
+                        if r["ts"] is not None else None
+                    ),
+                    "actor": r["actor"],
+                    "action": r["action"],
+                    "target": r["target"],
+                    "ip": r["ip"],
+                    "outcome": r["outcome"],
+                    "meta": _decode_jsonb_meta(r["meta"]),
+                }
+                emitted += 1
+                if emitted >= effective_limit:
+                    return
+            if len(rows) < this_batch:
+                break
+
+    async def get_export_table_counts(self) -> dict:
+        """Stage-15-Step-E #10b row 27: lightweight row counts for
+        the ``/admin/exports`` hub page.
+
+        Returns ``{"transactions": int, "usage_logs": int,
+        "audit_log": int}``. Each ``COUNT(*)`` is on a small,
+        well-indexed table — these queries take low single-digit
+        milliseconds in production. Best-effort: any per-table
+        failure leaves that key as ``None`` rather than blowing up
+        the whole hub render.
+        """
+        out: dict[str, int | None] = {
+            "transactions": None,
+            "usage_logs": None,
+            "audit_log": None,
+        }
+        async with self.pool.acquire() as connection:
+            try:
+                out["transactions"] = int(
+                    await connection.fetchval(
+                        "SELECT COUNT(*) FROM transactions"
+                    ) or 0
+                )
+            except Exception:
+                pass
+            try:
+                out["usage_logs"] = int(
+                    await connection.fetchval(
+                        "SELECT COUNT(*) FROM usage_logs"
+                    ) or 0
+                )
+            except Exception:
+                pass
+            try:
+                out["audit_log"] = int(
+                    await connection.fetchval(
+                        "SELECT COUNT(*) FROM admin_audit_log"
+                    ) or 0
+                )
+            except Exception:
+                pass
+        return out
 
     async def get_user_usage_aggregates(self, telegram_id: int) -> dict:
         """Stage-9-Step-8: lightweight aggregates rendered above the

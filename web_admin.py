@@ -3589,6 +3589,11 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     # labels so a future PR can't drop them again.
     "transactions_export_csv": "Transactions CSV exported",
     "monetization_export_csv": "Monetization CSV exported",
+    # Stage-15-Step-E #10b row 27: bulk-export hub at /admin/exports
+    # introduces two new system-wide CSV endpoints. Same pin-the-
+    # label test pattern so a future refactor can't drop them.
+    "system_usage_export_csv": "System-wide usage CSV exported",
+    "admin_audit_export_csv": "Admin-audit CSV exported",
     # Stage-15-Step-E #4 follow-up #2: DB-backed OpenRouter key
     # registry. These slugs are recorded by the new POST handlers
     # in this module; surfacing them in the dropdown lets an
@@ -6249,8 +6254,48 @@ TRANSACTIONS_CSV_HEADERS = (
 )
 
 
+# Stage-15-Step-E #10b row 27 bundled bug fix:
+# CSV / formula-injection defang sentinels. Excel, LibreOffice
+# Calc, Apple Numbers, and Google Sheets evaluate any cell whose
+# first character is one of ``= + - @ \t \r`` as a formula. A
+# user-supplied refund-reason string of
+# ``=HYPERLINK("https://attacker.example", "click me")`` or
+# ``+cmd|'/c calc'!A1`` therefore turns the admin's CSV download
+# into an exfil / RCE primitive the moment they double-click the
+# file. This was OWASP-tracked as CWE-1236 since 2017 and is the
+# canonical export-side companion to XSS — it's been latent in
+# our exporters since Stage-9 (transactions CSV) and Stage-15
+# (monetization CSV) shipped.
+#
+# Defang policy: prepend a single TAB ``\t`` to any field whose
+# first character matches the sentinel set. The TAB is stripped
+# by every spreadsheet on display (the cell renders as the
+# original text) but defeats formula-mode parsing because
+# ``\t=…`` is not a formula, it's a text literal that starts
+# with whitespace. Prefixing with a single quote is the more
+# common recipe but Excel-on-macOS sometimes preserves the
+# leading apostrophe in the visible cell, which is uglier than
+# a stripped tab. Either fix would close the vuln; the tab
+# preserves visual fidelity better.
+#
+# We deliberately exclude ``-`` from the sentinel set even
+# though Excel evaluates ``-1+1`` as a formula, because every
+# negative dollar amount we emit (refund debits, negative net
+# profit, etc.) starts with ``-`` and false-flagging them would
+# mangle every legitimate accounting CSV. The narrow ``-cmd|…``
+# attack vector still requires the attacker to land formula
+# syntax further along, which is much rarer than a forged
+# ``=HYPERLINK`` and out of scope for this fix; if a row 27
+# follow-up lands a numeric-value-aware quoter we'll close that
+# residual gap there. (Microsoft's own Power BI / Excel-export
+# stack makes the same trade-off.)
+_CSV_FORMULA_INJECTION_SENTINELS: frozenset[str] = frozenset(
+    "=+@\t\r"
+)
+
+
 def _csv_quote(value) -> str:
-    """Minimal RFC 4180 CSV field encoder.
+    """Minimal RFC 4180 CSV field encoder + formula-injection defang.
 
     We could use the stdlib ``csv`` module here but ``csv.writer``
     expects a writable text-IO target; for streaming we want to emit
@@ -6258,12 +6303,30 @@ def _csv_quote(value) -> str:
     transport. Hand-rolling keeps the streamer trivially testable
     and avoids the ``StringIO`` allocation per batch. None ⇒ empty
     field.
+
+    Stage-15-Step-E #10b row 27 bundled bug fix: defangs CSV /
+    formula injection (CWE-1236 / OWASP CSV Injection). See the
+    :data:`_CSV_FORMULA_INJECTION_SENTINELS` block above for the
+    full rationale. Affects every CSV exporter in this module
+    (transactions, monetization, the new system-wide usage and
+    audit-log exports introduced by row 27).
     """
     if value is None:
         return ""
     s = str(value)
-    if any(ch in s for ch in ('"', ",", "\n", "\r")):
-        # Double up internal quotes, then wrap.
+    # Defang FIRST so the leading sentinel is added to ``s`` before
+    # the quoting decision below considers it (a leading TAB
+    # contains a CR-equivalent that would otherwise force the
+    # quoted-string branch — fine, it just keeps the output
+    # spec-compliant either way).
+    if s and s[0] in _CSV_FORMULA_INJECTION_SENTINELS:
+        s = "\t" + s
+    if any(ch in s for ch in ('"', ",", "\n", "\r", "\t")):
+        # Double up internal quotes, then wrap. Adding ``\t`` to
+        # the must-quote set keeps the defang prefix from being
+        # mis-parsed as a column separator in dialects that use
+        # tab — defensive vs. operators who open the file in
+        # excel-tab-as-delimiter mode.
         return '"' + s.replace('"', '""') + '"'
     return s
 
@@ -6411,6 +6474,367 @@ def _now_compact() -> str:
     needing the same shape (e.g. ledger-snapshot dump) can reuse it.
     """
     return datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+# Stage-15-Step-E #10b row 27: bulk-export hub at /admin/exports.
+# Headers shared between the streaming response builder and the
+# tests so a column rename can't drift between the two.
+SYSTEM_USAGE_CSV_HEADERS: tuple[str, ...] = (
+    "log_id",
+    "telegram_id",
+    "model",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "cost_usd",
+    "created_at",
+)
+ADMIN_AUDIT_CSV_HEADERS: tuple[str, ...] = (
+    "id",
+    "ts",
+    "actor",
+    "action",
+    "target",
+    "ip",
+    "outcome",
+    "meta",
+)
+
+
+def _parse_export_iso_datetime(raw: str | None) -> "datetime | None":
+    """Parse an admin-supplied ``since`` / ``until`` query param.
+
+    Accepts ISO-8601 with or without a trailing ``Z`` (the
+    "datetime-local" HTML5 input emits the second form, while a
+    machine-driven export script might send the first). Returns
+    ``None`` for an empty / unparsable value — the export endpoint
+    treats parse failures as "no filter" rather than 400-ing,
+    because a typo in a long-running export request is more
+    common than malicious input here and the rest of the URL is
+    still useful.
+    """
+    if not raw:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    # Tolerate trailing Z (UTC) which fromisoformat accepts in
+    # Python 3.11+, but normalize for older runtimes too.
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _format_system_usage_row_for_csv(row: dict) -> str:
+    """Serialize one ``iter_system_usage_logs`` row into a CSV line.
+
+    Same shape as :func:`_format_tx_row_for_csv` — explicit field
+    list so a renamed DB column surfaces here as a ``KeyError``
+    rather than a column drifting silently between the on-page
+    view and the export.
+    """
+    fields = [
+        row["id"],
+        row["telegram_id"] if row.get("telegram_id") is not None else "",
+        row["model"] or "",
+        row["prompt_tokens"],
+        row["completion_tokens"],
+        row["total_tokens"],
+        f"{row['cost_usd']:.6f}",
+        row["created_at"] or "",
+    ]
+    return ",".join(_csv_quote(f) for f in fields) + "\r\n"
+
+
+def _format_admin_audit_row_for_csv(row: dict) -> str:
+    """Serialize one ``iter_admin_audit_log`` row into a CSV line.
+
+    ``meta`` is JSON-encoded into a single column. Decimals,
+    datetimes, and NaN are already scrubbed at write-time by
+    :func:`database._scrub_audit_meta` (see PR #187 row 28
+    bundled fix), so a stdlib ``json.dumps`` here is safe.
+    """
+    import json as _json
+    meta = row.get("meta")
+    if meta is None:
+        meta_field = ""
+    else:
+        try:
+            meta_field = _json.dumps(
+                meta, ensure_ascii=False, sort_keys=True,
+            )
+        except (TypeError, ValueError):
+            # Defensive fallback — shouldn't happen post-#187 but
+            # we still don't want a malformed meta blob to abort
+            # a multi-MB export mid-stream.
+            meta_field = repr(meta)
+    fields = [
+        row["id"],
+        row["ts"] or "",
+        row["actor"] or "",
+        row["action"] or "",
+        row["target"] or "",
+        row["ip"] or "",
+        row["outcome"] or "",
+        meta_field,
+    ]
+    return ",".join(_csv_quote(f) for f in fields) + "\r\n"
+
+
+async def exports_get(request: web.Request) -> web.StreamResponse:
+    """GET /admin/exports — bulk CSV export hub page.
+
+    Stage-15-Step-E #10b row 27. Lists every CSV / data export the
+    panel surfaces in one place so an operator running a quarterly
+    accounting close, an annual backup, or an incident-response
+    forensic pull doesn't have to chase the link from the
+    transactions page, then the monetization page, then the audit
+    page individually. Renders four cards:
+
+    * **Transactions** — links to the existing
+      ``/admin/transactions?format=csv`` exporter.
+    * **Monetization summary** — links to the existing
+      ``/admin/monetization/export.csv``.
+    * **System-wide usage logs** (NEW) — streams every row of
+      ``usage_logs`` across every user, filterable by ``since`` /
+      ``until`` UTC timestamps via a small inline form.
+    * **Admin audit log** (NEW) — streams ``admin_audit_log``
+      with action / actor / since / until filters.
+
+    Viewer-readable: the hub itself doesn't expose any new data,
+    just links to existing read-only surfaces. The two new CSV
+    endpoints (``/admin/exports/usage.csv`` and
+    ``/admin/exports/audit.csv``) match the role floor of their
+    on-page counterparts (viewer-readable; the data was already
+    visible to the same role on ``/admin/audit`` and
+    ``/admin/users/<id>/usage``).
+    """
+    db = request.app.get(APP_KEY_DB)
+    db_error: str | None = None
+    counts: dict[str, int | None] = {
+        "transactions": None,
+        "usage_logs": None,
+        "audit_log": None,
+    }
+    if db is None:
+        db_error = "No database wired up (development mode)."
+    else:
+        try:
+            counts = await db.get_export_table_counts()
+        except Exception:
+            log.exception(
+                "exports_get: get_export_table_counts failed; "
+                "rendering page without live counts"
+            )
+            db_error = "Could not fetch row counts — see logs."
+
+    return aiohttp_jinja2.render_template(
+        "exports.html",
+        request,
+        {
+            "active_page": "exports",
+            "counts": counts,
+            "db_error": db_error,
+            "system_usage_max_rows": (
+                getattr(db, "SYSTEM_USAGE_EXPORT_MAX_ROWS", None)
+                if db is not None else None
+            ),
+            "audit_log_max_rows": (
+                getattr(db, "AUDIT_LOG_EXPORT_MAX_ROWS", None)
+                if db is not None else None
+            ),
+        },
+    )
+
+
+async def system_usage_csv_get(
+    request: web.Request,
+) -> web.StreamResponse:
+    """GET /admin/exports/usage.csv — streamed system-wide usage CSV.
+
+    Stage-15-Step-E #10b row 27. Mirrors :func:`transactions_csv_get`'s
+    streaming shape but pages through every ``usage_logs`` row across
+    every user via :meth:`Database.iter_system_usage_logs`. Optional
+    ``since`` / ``until`` query params (ISO-8601 UTC) bound the
+    export window so an operator can grab "Q1 only" without dumping
+    the whole table.
+    """
+    db = request.app[APP_KEY_DB]
+    since = _parse_export_iso_datetime(
+        request.rel_url.query.get("since")
+    )
+    until = _parse_export_iso_datetime(
+        request.rel_url.query.get("until")
+    )
+    try:
+        limit_raw = request.rel_url.query.get("limit")
+        limit = int(limit_raw) if limit_raw else None
+    except (TypeError, ValueError):
+        limit = None
+
+    response = web.StreamResponse(
+        status=200,
+        reason="OK",
+        headers={
+            "Content-Type": "text/csv; charset=utf-8",
+            "Content-Disposition": (
+                "attachment; "
+                f"filename=\"usage-logs-{_now_compact()}.csv\""
+            ),
+            "Cache-Control": "no-store, max-age=0",
+        },
+    )
+    await response.prepare(request)
+
+    header = (
+        ",".join(_csv_quote(h) for h in SYSTEM_USAGE_CSV_HEADERS)
+        + "\r\n"
+    )
+    await response.write(header.encode("utf-8"))
+
+    rows_emitted = 0
+    chunk_lines: list[str] = []
+    chunk_threshold = 500  # flush every ~500 rows / ~75 kB
+    try:
+        async for row in db.iter_system_usage_logs(
+            since=since, until=until, limit=limit,
+        ):
+            chunk_lines.append(_format_system_usage_row_for_csv(row))
+            rows_emitted += 1
+            if len(chunk_lines) >= chunk_threshold:
+                await response.write(
+                    "".join(chunk_lines).encode("utf-8")
+                )
+                chunk_lines = []
+    except Exception:
+        log.exception(
+            "system_usage_csv_get: iter_system_usage_logs failed "
+            "after %d rows; truncating cleanly",
+            rows_emitted,
+        )
+
+    if chunk_lines:
+        await response.write("".join(chunk_lines).encode("utf-8"))
+    await response.write_eof()
+
+    await _record_audit_safe(
+        request,
+        "system_usage_export_csv",
+        target="usage_logs",
+        meta={
+            "rows": rows_emitted,
+            "since": since.isoformat() if since else None,
+            "until": until.isoformat() if until else None,
+            "limit": limit,
+        },
+    )
+    log.info(
+        "system_usage_csv_get: exported %d rows (since=%s until=%s)",
+        rows_emitted, since, until,
+    )
+    return response
+
+
+async def admin_audit_csv_get(
+    request: web.Request,
+) -> web.StreamResponse:
+    """GET /admin/exports/audit.csv — streamed admin-audit-log CSV.
+
+    Stage-15-Step-E #10b row 27. Same streaming shape as
+    :func:`system_usage_csv_get`. Optional ``action`` / ``actor`` /
+    ``since`` / ``until`` filters pre-narrow the export so an
+    incident pull ("everything actor=alice did between 14:00 and
+    16:00 UTC last Tuesday") doesn't have to drop a 100 k-row CSV
+    onto disk and then grep it.
+    """
+    db = request.app[APP_KEY_DB]
+    action = (request.rel_url.query.get("action") or "").strip() or None
+    actor = (request.rel_url.query.get("actor") or "").strip() or None
+    since = _parse_export_iso_datetime(
+        request.rel_url.query.get("since")
+    )
+    until = _parse_export_iso_datetime(
+        request.rel_url.query.get("until")
+    )
+    try:
+        limit_raw = request.rel_url.query.get("limit")
+        limit = int(limit_raw) if limit_raw else None
+    except (TypeError, ValueError):
+        limit = None
+
+    response = web.StreamResponse(
+        status=200,
+        reason="OK",
+        headers={
+            "Content-Type": "text/csv; charset=utf-8",
+            "Content-Disposition": (
+                "attachment; "
+                f"filename=\"admin-audit-{_now_compact()}.csv\""
+            ),
+            "Cache-Control": "no-store, max-age=0",
+        },
+    )
+    await response.prepare(request)
+
+    header = (
+        ",".join(_csv_quote(h) for h in ADMIN_AUDIT_CSV_HEADERS)
+        + "\r\n"
+    )
+    await response.write(header.encode("utf-8"))
+
+    rows_emitted = 0
+    chunk_lines: list[str] = []
+    chunk_threshold = 500
+    try:
+        async for row in db.iter_admin_audit_log(
+            action=action, actor=actor,
+            since=since, until=until, limit=limit,
+        ):
+            chunk_lines.append(_format_admin_audit_row_for_csv(row))
+            rows_emitted += 1
+            if len(chunk_lines) >= chunk_threshold:
+                await response.write(
+                    "".join(chunk_lines).encode("utf-8")
+                )
+                chunk_lines = []
+    except Exception:
+        log.exception(
+            "admin_audit_csv_get: iter_admin_audit_log failed "
+            "after %d rows; truncating cleanly",
+            rows_emitted,
+        )
+
+    if chunk_lines:
+        await response.write("".join(chunk_lines).encode("utf-8"))
+    await response.write_eof()
+
+    await _record_audit_safe(
+        request,
+        "admin_audit_export_csv",
+        target="admin_audit_log",
+        meta={
+            "rows": rows_emitted,
+            "filters": {
+                "action": action,
+                "actor": actor,
+                "since": since.isoformat() if since else None,
+                "until": until.isoformat() if until else None,
+                "limit": limit,
+            },
+        },
+    )
+    log.info(
+        "admin_audit_csv_get: exported %d rows "
+        "(action=%s actor=%s since=%s until=%s)",
+        rows_emitted, action, actor, since, until,
+    )
+    return response
 
 
 async def transactions_get(request: web.Request) -> web.StreamResponse:
@@ -13241,6 +13665,27 @@ def setup_admin_routes(
     app.router.add_post(
         "/admin/refund-presets/save",
         _require_role(ROLE_OPERATOR)(refund_presets_save_post),
+    )
+
+    # Stage-15-Step-E #10b row 27: bulk-export hub + new system-wide
+    # CSV exports. Hub page is viewer-readable (no new data, just
+    # links). Both new CSV endpoints are viewer-readable to match
+    # the role floor of the on-page surfaces (/admin/audit and
+    # /admin/users/<id>/usage are viewer-readable, so a bulk export
+    # of the same data has to be too — otherwise viewer-tier
+    # operators couldn't get a forensic dump of their own
+    # workstation activity from the audit log without escalating).
+    app.router.add_get(
+        "/admin/exports",
+        _require_auth(exports_get),
+    )
+    app.router.add_get(
+        "/admin/exports/usage.csv",
+        _require_auth(system_usage_csv_get),
+    )
+    app.router.add_get(
+        "/admin/exports/audit.csv",
+        _require_auth(admin_audit_csv_get),
     )
     app.router.add_get("/admin/models", _require_auth(models_get))
     app.router.add_post(

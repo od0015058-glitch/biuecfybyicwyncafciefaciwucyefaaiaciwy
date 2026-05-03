@@ -4683,3 +4683,270 @@ def test_finite_float_or_none_rejects_bool():
     silently corrupt audit-log meta parsing."""
     assert database_module._finite_float_or_none(True) is None
     assert database_module._finite_float_or_none(False) is None
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 27: system-wide CSV export iter helpers
+# (iter_system_usage_logs / iter_admin_audit_log / get_export_table_counts).
+# ---------------------------------------------------------------------
+
+
+async def test_iter_system_usage_logs_yields_coerced_rows_with_telegram_id():
+    """Each yielded row carries the per-user shape
+    (id/model/prompt_tokens/...) PLUS a ``telegram_id`` field —
+    the per-user export omits ``telegram_id`` because the URL pins
+    it; the system-wide export needs it for downstream join."""
+    conn = _make_conn()
+    conn.fetch = AsyncMock(
+        side_effect=[
+            [
+                {
+                    "log_id": 1,
+                    "telegram_id": 100,
+                    "model_used": "openai/gpt-4o",
+                    "prompt_tokens": 5,
+                    "completion_tokens": 10,
+                    "cost_deducted_usd": 0.001,
+                    "created_at": None,
+                },
+                {
+                    "log_id": 2,
+                    "telegram_id": 200,
+                    "model_used": "anthropic/claude",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 2,
+                    "cost_deducted_usd": 0.0005,
+                    "created_at": None,
+                },
+            ],
+            # Empty second batch → exhausted.
+            [],
+        ]
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    out = []
+    async for row in db.iter_system_usage_logs():
+        out.append(row)
+    assert len(out) == 2
+    assert out[0]["id"] == 1
+    assert out[0]["telegram_id"] == 100
+    assert out[0]["model"] == "openai/gpt-4o"
+    assert out[0]["total_tokens"] == 15
+    assert out[1]["telegram_id"] == 200
+
+
+async def test_iter_system_usage_logs_keyset_paginates_using_log_id():
+    """Each batch's ``last_log_id`` becomes the next batch's
+    ``log_id > $1`` lower bound so cost is constant per batch."""
+    conn = _make_conn()
+    # Batch 1: rows 1-3. Batch 2: rows 4-5. Batch 3: empty.
+    conn.fetch = AsyncMock(
+        side_effect=[
+            [
+                {
+                    "log_id": i,
+                    "telegram_id": 100,
+                    "model_used": "x",
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "cost_deducted_usd": 0.0,
+                    "created_at": None,
+                }
+                for i in (1, 2, 3)
+            ],
+            [
+                {
+                    "log_id": i,
+                    "telegram_id": 100,
+                    "model_used": "x",
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "cost_deducted_usd": 0.0,
+                    "created_at": None,
+                }
+                for i in (4, 5)
+            ],
+        ]
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    out = []
+    async for row in db.iter_system_usage_logs(batch=3):
+        out.append(row)
+    assert len(out) == 5
+    # First call: log_id > 0
+    first_call_args = conn.fetch.await_args_list[0].args
+    assert first_call_args[1] == 0
+    # Second call: log_id > 3 (last id from batch 1).
+    second_call_args = conn.fetch.await_args_list[1].args
+    assert second_call_args[1] == 3
+
+
+async def test_iter_system_usage_logs_clamps_limit_to_max():
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    async for _ in db.iter_system_usage_logs(limit=10**12, batch=10):
+        pass
+    # Still respects batch even though limit is huge — first batch
+    # binds limit value 10 (the per-batch slice).
+    last_arg = conn.fetch.await_args.args[-1]
+    assert last_arg == 10
+
+
+async def test_iter_system_usage_logs_stops_at_limit():
+    """The async-iter respects a small explicit ``limit`` even when
+    the DB still has more rows."""
+    conn = _make_conn()
+    conn.fetch = AsyncMock(
+        return_value=[
+            {
+                "log_id": i,
+                "telegram_id": 100,
+                "model_used": "x",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "cost_deducted_usd": 0.0,
+                "created_at": None,
+            }
+            for i in range(1, 11)
+        ]
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    out = []
+    async for row in db.iter_system_usage_logs(limit=3, batch=10):
+        out.append(row)
+    assert len(out) == 3
+    assert [r["id"] for r in out] == [1, 2, 3]
+
+
+async def test_iter_system_usage_logs_applies_since_until_filters():
+    from datetime import datetime, timezone
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    since = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    until = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    async for _ in db.iter_system_usage_logs(since=since, until=until):
+        pass
+    sql = conn.fetch.await_args.args[0]
+    assert "created_at >= $2" in sql
+    assert "created_at < $3" in sql
+
+
+async def test_iter_admin_audit_log_yields_decoded_meta_dicts():
+    conn = _make_conn()
+    conn.fetch = AsyncMock(
+        side_effect=[
+            [
+                {
+                    "id": 100,
+                    "ts": None,
+                    "actor": "alice",
+                    "action": "credit_user",
+                    "target": "user:1",
+                    "ip": "1.2.3.4",
+                    "outcome": "ok",
+                    "meta": '{"foo": 1}',
+                },
+            ],
+            [],
+        ]
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    out = []
+    async for row in db.iter_admin_audit_log():
+        out.append(row)
+    assert len(out) == 1
+    assert out[0]["actor"] == "alice"
+    assert out[0]["meta"] == {"foo": 1}
+
+
+async def test_iter_admin_audit_log_keyset_paginates_using_id():
+    conn = _make_conn()
+    conn.fetch = AsyncMock(
+        side_effect=[
+            [
+                {
+                    "id": i,
+                    "ts": None,
+                    "actor": "a",
+                    "action": "x",
+                    "target": None,
+                    "ip": None,
+                    "outcome": "ok",
+                    "meta": None,
+                }
+                for i in (50, 49, 48)
+            ],
+            [],
+        ]
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    out = []
+    async for row in db.iter_admin_audit_log(batch=3):
+        out.append(row)
+    assert len(out) == 3
+    # Second call uses last_id=48 (smallest id from batch 1, since
+    # we order DESC).
+    second_call_args = conn.fetch.await_args_list[1].args
+    assert second_call_args[1] == 48
+
+
+async def test_iter_admin_audit_log_applies_action_actor_filters():
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    async for _ in db.iter_admin_audit_log(
+        action="credit_user", actor="alice",
+    ):
+        pass
+    sql = conn.fetch.await_args.args[0]
+    assert "action = $2" in sql
+    assert "actor = $3" in sql
+
+
+async def test_iter_admin_audit_log_clamps_limit_to_max():
+    conn = _make_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    async for _ in db.iter_admin_audit_log(limit=10**12, batch=10):
+        pass
+    last_arg = conn.fetch.await_args.args[-1]
+    assert last_arg == 10
+
+
+async def test_get_export_table_counts_returns_three_keys():
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(side_effect=[7, 1234, 56])
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    out = await db.get_export_table_counts()
+    assert out == {
+        "transactions": 7,
+        "usage_logs": 1234,
+        "audit_log": 56,
+    }
+
+
+async def test_get_export_table_counts_tolerates_per_table_error():
+    """A failure on one table leaves that key as None but doesn't
+    blow up the whole hub render."""
+    conn = _make_conn()
+    conn.fetchval = AsyncMock(
+        side_effect=[7, RuntimeError("boom"), 56],
+    )
+    db = database_module.Database()
+    db.pool = _PoolStub(conn)
+    out = await db.get_export_table_counts()
+    assert out["transactions"] == 7
+    assert out["usage_logs"] is None
+    assert out["audit_log"] == 56
