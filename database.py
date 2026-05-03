@@ -197,6 +197,105 @@ def _finite_float_or_zero(value) -> float:
     return f
 
 
+def _scrub_audit_meta(value):
+    """Coerce *value* into a JSONB-safe shape for ``record_admin_audit``.
+
+    Stage-15-Step-E #10b row 28 bundled bug fix. Without this, any
+    audit-log caller that ever passes a ``Decimal`` (every money-
+    handling code path produces these from asyncpg numeric reads),
+    a ``datetime`` / ``date`` (every "X happened at" meta field), or
+    a non-finite ``float`` (NaN / ±Infinity from a corrupted balance
+    column) silently loses the audit row: ``json.dumps`` raises
+    ``TypeError`` for the first two and emits non-standard
+    ``NaN`` / ``Infinity`` literals for the third (which Postgres'
+    ``::jsonb`` cast then rejects with ``invalid input syntax for
+    type json``). Both failure modes are caught by the bare
+    ``except Exception`` in :meth:`Database.record_admin_audit`,
+    return ``None``, and the audit feed quietly forgets the event
+    ever happened. That's exactly the wrong shape for an audit log
+    whose entire job is "do not lose anything".
+
+    The scrub policy:
+
+    * ``None`` / ``bool`` / ``int`` / ``str`` round-trip unchanged.
+    * Non-finite ``float`` (NaN, ±Infinity) → ``None`` with a tag
+      so the operator can see the field was scrubbed (the wrapping
+      ``dict`` keeps the key; the value is an explanatory string).
+    * Finite ``float`` → unchanged.
+    * ``Decimal`` → finite-coerced ``float`` (same NaN scrub as
+      above).
+    * ``datetime`` / ``date`` / ``time`` / ``timedelta`` →
+      ISO-8601 string via ``.isoformat()`` /
+      ``timedelta.total_seconds()``. Round-trippable on the read
+      side via ``datetime.fromisoformat``.
+    * ``set`` / ``frozenset`` / ``tuple`` → list (JSON has no
+      tuple / set type).
+    * ``dict`` / ``list`` → recursively scrubbed.
+    * Anything else → ``str(value)`` as a defensive last resort
+      with a sentinel marker prefix so it's grep-able in the
+      audit feed.
+
+    The helper is intentionally permissive: an audit row that
+    rounds an extra digit off a ``Decimal`` is infinitely more
+    valuable than a missing audit row.
+    """
+    import datetime
+    from decimal import Decimal
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        # bool is a subclass of int — keep it literal so the audit
+        # feed renders "true" / "false" instead of 0 / 1.
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+    if isinstance(value, Decimal):
+        try:
+            f = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        # Defensive: an audit caller passing bytes is almost
+        # certainly a bug, but stringifying is harmless and keeps
+        # the row queryable.
+        try:
+            return value.decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            return f"<bytes:{len(value)}>"
+    if isinstance(value, datetime.timedelta):
+        return value.total_seconds()
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        out: dict = {}
+        for k, v in value.items():
+            try:
+                key = str(k) if not isinstance(k, str) else k
+            except Exception:  # noqa: BLE001
+                key = repr(k)
+            out[key] = _scrub_audit_meta(v)
+        return out
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_scrub_audit_meta(v) for v in value]
+    # Last-resort fallback. Tag the string so an operator grepping
+    # the audit feed for "<unscrubbable" can find these and add a
+    # proper coercion above.
+    try:
+        return f"<unscrubbable:{type(value).__name__}:{value!s}>"
+    except Exception:  # noqa: BLE001
+        return f"<unscrubbable:{type(value).__name__}>"
+
+
 def _finite_float_or_none(value) -> float | None:
     """Coerce ``value`` to a finite float, fallback ``None``.
 
@@ -4899,9 +4998,28 @@ class Database:
         try/except so an audit-write failure never blocks the
         underlying admin operation. We log the exception here as well
         so the failure is double-visible in ops logs.
+
+        Stage-15-Step-E #10b row 28 bundled bug fix: ``meta`` is run
+        through :func:`_scrub_audit_meta` before serialising so
+        ``Decimal`` (every money-handling caller produces these),
+        ``datetime`` / ``date``, and non-finite ``float``
+        (NaN / ±Infinity) values no longer cause the entire audit
+        row to be silently dropped on a ``json.dumps`` ``TypeError``
+        or a Postgres ``invalid input syntax for type json`` cast
+        rejection. See ``_scrub_audit_meta``'s docstring for the
+        exact policy.
         """
         import json as _json
-        meta_json = _json.dumps(meta) if meta is not None else None
+        if meta is not None:
+            scrubbed = _scrub_audit_meta(meta)
+            # Belt-and-suspenders: ``allow_nan=False`` makes the
+            # serialiser raise rather than emit non-standard
+            # ``NaN`` / ``Infinity`` literals if the scrub above
+            # ever misses something; the surrounding except still
+            # catches it but at least the new failure mode is loud.
+            meta_json = _json.dumps(scrubbed, allow_nan=False)
+        else:
+            meta_json = None
         try:
             async with self.pool.acquire() as connection:
                 row_id = await connection.fetchval(
@@ -5004,9 +5122,23 @@ class Database:
         caller MUST decide whether to fail-closed (e.g. signature
         verification path) or fail-open (e.g. a transient pool blip
         for an idempotent IPN).
+
+        Stage-15-Step-E #10b row 28 bundled bug fix: ``meta`` is run
+        through :func:`_scrub_audit_meta` before serialising for the
+        same Decimal / datetime / non-finite-float reasons documented
+        on :meth:`record_admin_audit`. Until this fix, an IPN handler
+        passing the gateway-reported ``Decimal`` price would crash
+        the whole transition write with ``TypeError``, the bare
+        re-raise would propagate it to the IPN caller, and the
+        gateway would mark the IPN as failed and back off — leaving
+        the user with a stuck PENDING invoice for no good reason.
         """
         import json as _json
-        meta_json = _json.dumps(meta) if meta is not None else None
+        if meta is not None:
+            scrubbed = _scrub_audit_meta(meta)
+            meta_json = _json.dumps(scrubbed, allow_nan=False)
+        else:
+            meta_json = None
         async with self.pool.acquire() as connection:
             row_id = await connection.fetchval(
                 """

@@ -2158,7 +2158,7 @@ or unblock other work.
 | 25 | **`ADMIN_PASSWORD`** rotation — currently env-only. | Env-only. | "Rotate password" form on `/admin` profile page. | P2 | **Shipped** (this PR — new `admin_password.py` module: scrypt-hashed password (n=2^15, r=8, p=1) stored in `system_settings.ADMIN_PASSWORD_HASH`, DB-backed override slot mirroring rows 4/6/8/20/21/23/24, login flow prefers DB hash → env back-compat → "deploy is misconfigured" refusal. New `/admin/profile` page with sidebar link, "current credential" provenance breakdown (db / env / unset), and password-rotation form (current + new + confirm) gated to `ROLE_SUPER`. Strength gate: ≥12 chars, must include letter + digit/symbol, refuses whitespace-only / unchanged. Boot warm-up in `main.py`; per-request refresh on login + on /admin/profile render. Audit slugs `profile_view`, `admin_password_rotated`, `admin_password_rotation_failed`. Bundled bug fix: `/admin/logout` now sweeps `meow_admin_view_as` AND `meow_flash` cookies in addition to the session cookie — previously a shared workstation leaked the prior operator's "viewing as <role>" preview into the next person's session.) |
 | 26 | **`ADMIN_2FA_ENROLLMENT_TIMEOUT`** — TOTP enrollment window. | Env-only. | Editor on the existing `/admin/enroll_2fa` page. | P3 | Pending |
 | 27 | **CSV export bulk download** — full transactions / usage history. | Per-user only. | Top-level `/admin/exports` page that streams big CSVs. | P3 | Pending |
-| 28 | **Refund presets** — predefined refund reasons / amounts. | Free-form text only. | Dropdown of presets + amount on `/admin/users/<id>/refund`. | P3 | Pending |
+| 28 | **Refund presets** — predefined refund reasons / amounts. | Free-form text only. | Dropdown of presets + amount on `/admin/users/<id>/refund`. | P3 | **Shipped — PR #186** (operator-curated reason list, `/admin/refund-presets` editor + dropdown above the `/admin/transactions` refund form; bundled bug fix: `_scrub_audit_meta` keeps `record_admin_audit` / `record_payment_status_transition` lossless across `Decimal` / `datetime` / NaN / Infinity meta values that previously silently dropped audit rows). Per-preset amount field deferred — current refund form refunds full credited amount, ~95% of refunds want that. |
 | 29 | **Promo / gift code edit** — currently create-and-revoke, no edit. | None. | Inline edit on `/admin/promos` + `/admin/gifts`. | P3 | Pending |
 | 30 | **Disable individual models per-gateway** — e.g. block GPT-4o on Zarinpal-funded wallets. | None. | New cross-table on `/admin/models`. | P4 | Pending |
 
@@ -4281,7 +4281,39 @@ The user's process for this project — **do not deviate**:
     `amount_usd_credited` row.  Now scrubbed through
     `_is_finite_amount` the same way `get_user_spending_summary`
     already does.  22 new tests.  Total suite: 3565 passing.
-32. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+32. **Stage-15-Step-E #10b row 28 SHIPPED — PR #186** — Refund presets.
+    New `refund_presets.py` module: DB-backed override of the operator-
+    curated refund-reason list, parsed via newline + pipe separator,
+    case-insensitive dedupe, ≤5 entries × ≤40 chars each, JSON-encoded
+    into `system_settings.REFUND_PRESETS` (worst-case 216 chars fits
+    the 255-char column with headroom). New `/admin/refund-presets`
+    editor page with sidebar link (↩️ Refund presets) and the standard
+    effective / db / env / default breakdown. The transactions
+    refund form now renders a `<select name="reason_preset">` above
+    the free-text reason — picking a preset seeds the textarea via
+    inline JS so the operator can still edit before submitting; an
+    empty-list override hides the dropdown for backwards-compat.
+    Boot warm-up in `main.py` (refresh_refund_presets_override_from_db).
+    Audit slug `refund_presets_update` carries before/after lists +
+    sources for full forensics. Bundled bug fix: new
+    `_scrub_audit_meta` in `database.py` makes `record_admin_audit`
+    AND `record_payment_status_transition` lossless across `Decimal`
+    (every money-handling caller produces these from asyncpg numeric
+    reads), `datetime` / `date` / `time` / `timedelta` (every "X
+    happened at" meta field), and non-finite `float` (NaN / ±Infinity
+    from a corrupted balance). Pre-fix, any of those silently
+    crashed `json.dumps`, the bare `except` swallowed the row, and
+    the audit feed forgot the event ever happened — exactly the
+    wrong shape for an audit log whose entire job is "do not lose
+    anything". Walks dicts + lists recursively; tuples / sets → list;
+    bytes → utf-8 decoded; non-finite floats → JSON null; unknown
+    types → tagged `<unscrubbable:Type:repr>` string for grep-ability.
+    Belt-and-suspenders: serialiser now uses `allow_nan=False` so
+    a future scrub miss raises loudly instead of emitting non-standard
+    `NaN` / `Infinity` literals that Postgres' `::jsonb` cast then
+    silently rejects. 44 new tests (29 refund_presets + 6 audit-meta
+    scrub + 9 web-admin integration). Total suite: 3609 passing.
+33. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
-33. **Read the §11 working agreement before doing anything.**
+34. **Read the §11 working agreement before doing anything.**

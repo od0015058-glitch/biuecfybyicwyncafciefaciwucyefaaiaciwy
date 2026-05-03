@@ -1,0 +1,128 @@
+{% extends "_layout.html" %}
+
+{% block title %}Refund presets{% endblock %}
+
+{% block main %}
+<h2 style="margin: 0 0 0.5em 0;">Refund presets</h2>
+
+<p style="color: var(--text-muted); margin: 0 0 1em 0; font-size: 0.9em;">
+  Canned reasons surfaced as a dropdown above the
+  <a href="/admin/transactions">transactions</a> refund form. The
+  operator can still type a custom reason in the textarea — the
+  dropdown only seeds it. Changes take effect on the next page
+  load — no redeploy required. Save an empty list to hide the
+  dropdown entirely.
+</p>
+
+{% if db_error %}
+<div class="alert alert-warn">{{ db_error }}</div>
+{% endif %}
+
+{% if flash %}
+<div class="alert alert-{{ flash.kind }}">{{ flash.message }}</div>
+{% endif %}
+
+<div class="panel">
+  <h3>Active presets</h3>
+  <p style="margin: 0 0 0.75em 0;">
+    Effective:
+    <strong>{{ refund_presets_view.effective_count }}</strong>
+    {{ "preset" if refund_presets_view.effective_count == 1 else "presets" }}
+    &nbsp;<span class="badge badge-{{ refund_presets_view.source }}">source: {{ refund_presets_view.source }}</span>
+  </p>
+
+  {% if refund_presets_view.effective %}
+  <ul style="margin: 0 0 0.75em 0; padding-left: 1.25em;">
+    {% for preset in refund_presets_view.effective %}
+    <li style="margin: 0.15em 0;"><code>{{ preset }}</code></li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p style="margin: 0 0 0.75em 0; color: var(--text-muted); font-size: 0.9em;">
+    No active presets — the refund form renders only the free-text reason field.
+  </p>
+  {% endif %}
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-muted); font-size: 0.9em;">
+      Edit presets (operator+)
+    </summary>
+    <table style="margin: 0.75em 0; font-size: 0.9em; max-width: 42em;">
+      <tbody>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;">DB override</td>
+          <td>
+            {% if refund_presets_view.override_value is not none %}
+              {% if refund_presets_view.override_value %}
+                <strong>{{ refund_presets_view.override_value | length }}</strong>
+                preset(s):
+                <code>{{ refund_presets_view.override_value | join(" | ") }}</code>
+              {% else %}
+                <strong>0</strong>
+                — operator explicitly hid the dropdown.
+              {% endif %}
+            {% else %}
+              <span style="color: var(--text-muted);">(none — fall through to env / default)</span>
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;">Env (<code>REFUND_PRESETS</code>)</td>
+          <td>
+            {% if refund_presets_view.env_value %}
+              <code>{{ refund_presets_view.env_value | join(" | ") }}</code>
+            {% else %}
+              <span style="color: var(--text-muted);">(unset)</span>
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;">Compile-time default</td>
+          <td>
+            <code>{{ refund_presets_view.default_value | join(" | ") }}</code>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 0.15em 0.5em 0.15em 0;"><strong>Effective</strong></td>
+          <td>
+            {% if refund_presets_view.effective %}
+              <strong>{{ refund_presets_view.effective | join(" | ") }}</strong>
+              (source: {{ refund_presets_view.source }})
+            {% else %}
+              <em>(empty — dropdown hidden)</em>
+              (source: {{ refund_presets_view.source }})
+            {% endif %}
+          </td>
+        </tr>
+      </tbody>
+    </table>
+    <form method="post"
+          action="/admin/refund-presets/save"
+          style="display: flex; flex-direction: column; gap: 0.75em; max-width: 42em;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>
+        One preset per line (or pipe-separated). Max
+        {{ refund_presets_view.max_count }} entries × {{ refund_presets_view.max_length }} chars.
+        <textarea name="refund_presets"
+                  rows="6"
+                  style="width: 100%; font-family: ui-monospace, monospace; font-size: 0.95em;"
+                  placeholder="One reason per line, e.g.&#10;Duplicate payment&#10;User-requested cancellation&#10;…">{% if refund_presets_view.override_value is not none %}{% for preset in refund_presets_view.override_value %}{{ preset }}{% if not loop.last %}
+{% endif %}{% endfor %}{% endif %}</textarea>
+      </label>
+      <div style="display: flex; gap: 0.75em; align-items: baseline; flex-wrap: wrap;">
+        <button type="submit" name="action" value="save">Save presets</button>
+        <button type="submit"
+                name="action"
+                value="clear"
+                onclick="return confirm('Clear the DB override? The dropdown will fall through to the env / compile-time default.');">
+          Clear DB override
+        </button>
+        <span style="color: var(--text-muted); font-size: 0.85em;">
+          Saving an empty textarea hides the dropdown entirely;
+          clearing the override falls through to env / default.
+        </span>
+      </div>
+    </form>
+  </details>
+</div>
+{% endblock %}

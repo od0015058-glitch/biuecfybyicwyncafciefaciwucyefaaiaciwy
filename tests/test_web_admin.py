@@ -16630,3 +16630,377 @@ async def test_logout_clears_flash_cookie(
             ):
                 cleared[key] = True
     assert all(cleared.values()), (set_cookie_headers, cleared)
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 28: /admin/refund-presets editor +
+# dropdown surfacing on /admin/transactions refund form.
+# ---------------------------------------------------------------------
+
+
+def _reset_refund_presets_override_for_web():
+    """Scrub the in-process cache so each test sees a clean baseline."""
+    import refund_presets
+    refund_presets.clear_refund_presets_override()
+
+
+def _stub_db_for_refund_presets(
+    *,
+    upsert_setting_result=None,
+    delete_setting_result=True,
+    get_setting_result=None,
+):
+    """Stub DB pre-wired with the system_settings CRUD needed by the
+    refund-presets editor. Mirrors :func:`_stub_db_for_wallet_config`
+    but trimmed to only the bits ``refund_presets_save_post`` /
+    ``refund_presets_get`` exercise."""
+    db = _stub_db()
+    if isinstance(upsert_setting_result, Exception):
+        db.upsert_setting = AsyncMock(side_effect=upsert_setting_result)
+    else:
+        db.upsert_setting = AsyncMock(return_value=upsert_setting_result)
+    if isinstance(delete_setting_result, Exception):
+        db.delete_setting = AsyncMock(side_effect=delete_setting_result)
+    else:
+        db.delete_setting = AsyncMock(return_value=delete_setting_result)
+    if isinstance(get_setting_result, Exception):
+        db.get_setting = AsyncMock(side_effect=get_setting_result)
+    else:
+        db.get_setting = AsyncMock(return_value=get_setting_result)
+    return db
+
+
+async def _login_and_get_refund_presets_csrf(
+    client, password: str = "letmein",
+) -> str:
+    """Log in, fetch /admin/refund-presets, scrape its CSRF token."""
+    await client.post(
+        "/admin/login", data={"password": password}, allow_redirects=False,
+    )
+    resp = await client.get("/admin/refund-presets")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    import re
+
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+    assert m, "Expected CSRF token on /admin/refund-presets editor"
+    return m.group(1)
+
+
+async def test_refund_presets_get_requires_auth(
+    aiohttp_client, make_admin_app,
+):
+    """Unauth requests redirect to /admin/login."""
+    _reset_refund_presets_override_for_web()
+    db = _stub_db_for_refund_presets()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    resp = await client.get("/admin/refund-presets", allow_redirects=False)
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/admin/login")
+
+
+async def test_refund_presets_get_renders_default_list(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """No DB override + no env → page shows the compile-time default
+    list and labels the source as 'default'."""
+    monkeypatch.delenv("REFUND_PRESETS", raising=False)
+    _reset_refund_presets_override_for_web()
+    db = _stub_db_for_refund_presets(get_setting_result=None)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await _login(client, "letmein")
+
+    resp = await client.get("/admin/refund-presets")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    # Source badge surfaces 'default'.
+    assert "source: default" in body
+    # All five compile-time defaults render.
+    import refund_presets
+    for preset in refund_presets.DEFAULT_REFUND_PRESETS:
+        assert preset in body
+    # CSRF token + form action wired up.
+    assert 'name="csrf_token"' in body
+    assert 'action="/admin/refund-presets/save"' in body
+
+
+async def test_refund_presets_save_post_persists_value_and_audit(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """Happy path: POST a textarea → DB upsert + audit row + cache
+    refresh + flash banner. The audit meta carries the before / after
+    diff so /admin/audit answers 'what changed'."""
+    monkeypatch.delenv("REFUND_PRESETS", raising=False)
+    _reset_refund_presets_override_for_web()
+    saved = {"value": None}
+
+    async def _upsert(key, value):
+        saved["value"] = value
+
+    async def _get(key):
+        return saved["value"]
+
+    db = _stub_db_for_refund_presets()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_refund_presets_csrf(client)
+
+    resp = await client.post(
+        "/admin/refund-presets/save",
+        data={
+            "refund_presets": "Custom A\nCustom B|Custom C",
+            "action": "save",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/refund-presets"
+
+    # The encoded JSON list landed in system_settings.
+    import json
+    assert saved["value"] is not None
+    decoded = json.loads(saved["value"])
+    assert decoded == ["Custom A", "Custom B", "Custom C"]
+
+    # Cache refreshed from the upserted value.
+    import refund_presets
+    assert refund_presets.get_refund_presets() == [
+        "Custom A", "Custom B", "Custom C",
+    ]
+    assert refund_presets.get_refund_presets_source() == "db"
+
+    # Audit row recorded with before/after diff.
+    audit_calls = db.record_admin_audit.await_args_list
+    matching = [
+        c for c in audit_calls
+        if c.kwargs.get("action") == "refund_presets_update"
+    ]
+    assert matching, audit_calls
+    meta = matching[-1].kwargs["meta"]
+    assert meta["action"] == "save"
+    assert meta["before"] is None  # no prior override
+    assert meta["after"] == ["Custom A", "Custom B", "Custom C"]
+    assert meta["after_source"] == "db"
+
+
+async def test_refund_presets_save_post_empty_textarea_hides_dropdown(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """An empty textarea is the operator's explicit 'hide the
+    dropdown' choice. Saved as ``[]`` so the resolution stays at
+    the override layer rather than falling through to env / default."""
+    monkeypatch.setenv("REFUND_PRESETS", "Env A\nEnv B")
+    _reset_refund_presets_override_for_web()
+    saved = {"value": None}
+
+    async def _upsert(key, value):
+        saved["value"] = value
+
+    async def _get(key):
+        return saved["value"]
+
+    db = _stub_db_for_refund_presets()
+    db.upsert_setting = AsyncMock(side_effect=_upsert)
+    db.get_setting = AsyncMock(side_effect=_get)
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_refund_presets_csrf(client)
+
+    resp = await client.post(
+        "/admin/refund-presets/save",
+        data={
+            "refund_presets": "",
+            "action": "save",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+
+    import json
+    assert json.loads(saved["value"]) == []
+
+    import refund_presets
+    assert refund_presets.get_refund_presets() == []
+    assert refund_presets.get_refund_presets_source() == "db"
+
+
+async def test_refund_presets_save_post_clear_drops_override(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """``action=clear`` deletes the row → override falls through to
+    env / default. Audit row records the action with the previous
+    override as 'before'."""
+    monkeypatch.setenv("REFUND_PRESETS", "Env A\nEnv B")
+    _reset_refund_presets_override_for_web()
+    import refund_presets
+    refund_presets.set_refund_presets_override(["Old A", "Old B"])
+
+    db = _stub_db_for_refund_presets(
+        delete_setting_result=True, get_setting_result=None,
+    )
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    csrf = await _login_and_get_refund_presets_csrf(client)
+
+    resp = await client.post(
+        "/admin/refund-presets/save",
+        data={
+            "refund_presets": "",
+            "action": "clear",
+            "csrf_token": csrf,
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    db.delete_setting.assert_awaited_once_with(
+        refund_presets.REFUND_PRESETS_SETTING_KEY,
+    )
+    db.upsert_setting.assert_not_awaited()
+    # Override cleared; resolution falls through to env.
+    assert refund_presets.get_refund_presets_override() is None
+    assert refund_presets.get_refund_presets() == ["Env A", "Env B"]
+    assert refund_presets.get_refund_presets_source() == "env"
+
+    # Audit captures the clear action with the previous override.
+    audit_calls = db.record_admin_audit.await_args_list
+    matching = [
+        c for c in audit_calls
+        if c.kwargs.get("action") == "refund_presets_update"
+    ]
+    assert matching
+    meta = matching[-1].kwargs["meta"]
+    assert meta["action"] == "clear"
+
+
+async def test_refund_presets_save_post_rejects_csrf_mismatch(
+    aiohttp_client, make_admin_app,
+):
+    """Wrong CSRF → redirect without touching the DB."""
+    _reset_refund_presets_override_for_web()
+    db = _stub_db_for_refund_presets()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    await _login(client, "letmein")
+
+    resp = await client.post(
+        "/admin/refund-presets/save",
+        data={
+            "refund_presets": "anything",
+            "action": "save",
+            "csrf_token": "totally_wrong_token",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/admin/refund-presets"
+    db.upsert_setting.assert_not_awaited()
+    db.delete_setting.assert_not_awaited()
+
+
+async def test_refund_presets_save_post_requires_auth(
+    aiohttp_client, make_admin_app,
+):
+    """Unauth POST → /admin/login."""
+    _reset_refund_presets_override_for_web()
+    db = _stub_db_for_refund_presets()
+    client = await aiohttp_client(make_admin_app(password="letmein", db=db))
+    resp = await client.post(
+        "/admin/refund-presets/save",
+        data={"refund_presets": "x", "action": "save"},
+        allow_redirects=False,
+    )
+    assert resp.status in (302, 303)
+    assert resp.headers["Location"].startswith("/admin/login")
+
+
+async def test_transactions_page_renders_refund_preset_dropdown(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """The /admin/transactions refund form on a SUCCESS row carries
+    the operator-curated preset dropdown above the free-text field."""
+    monkeypatch.delenv("REFUND_PRESETS", raising=False)
+    _reset_refund_presets_override_for_web()
+    import refund_presets
+    refund_presets.set_refund_presets_override(
+        ["Bot error", "Stuck invoice"]
+    )
+    rows = [
+        {
+            "id": 555,
+            "telegram_id": 9,
+            "gateway": "nowpayments",
+            "currency": "USDT",
+            "amount_crypto_or_rial": 1.0,
+            "amount_usd": 9.99,
+            "status": "SUCCESS",
+            "gateway_invoice_id": "inv-1",
+            "created_at": "2026-04-28T12:00:00+00:00",
+            "completed_at": "2026-04-28T12:05:00+00:00",
+            "notes": None,
+        },
+    ]
+    db = _stub_db(
+        list_transactions_result={
+            "rows": rows, "total": 1, "page": 1,
+            "per_page": 50, "total_pages": 1,
+        },
+    )
+    db.get_setting = AsyncMock(
+        return_value='["Bot error", "Stuck invoice"]'
+    )
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+
+    resp = await client.get("/admin/transactions")
+    assert resp.status == 200, await resp.text()
+    body = await resp.text()
+    # The dropdown is wired up with both preset options.
+    assert 'name="reason_preset"' in body
+    assert ">Bot error<" in body
+    assert ">Stuck invoice<" in body
+    # And the free-text reason field is still there.
+    assert 'name="reason"' in body
+
+
+async def test_transactions_page_hides_dropdown_when_no_presets(
+    aiohttp_client, make_admin_app, monkeypatch,
+):
+    """An explicit empty-list override hides the dropdown — only the
+    free-text reason field renders. This is the legacy shape, so
+    deploys that don't want presets stay backwards compatible."""
+    monkeypatch.delenv("REFUND_PRESETS", raising=False)
+    _reset_refund_presets_override_for_web()
+    import refund_presets
+    refund_presets.set_refund_presets_override([])
+
+    rows = [
+        {
+            "id": 556,
+            "telegram_id": 9,
+            "gateway": "nowpayments",
+            "currency": "USDT",
+            "amount_crypto_or_rial": 1.0,
+            "amount_usd": 1.50,
+            "status": "SUCCESS",
+            "gateway_invoice_id": "inv-2",
+            "created_at": "2026-04-28T12:00:00+00:00",
+            "completed_at": "2026-04-28T12:05:00+00:00",
+            "notes": None,
+        },
+    ]
+    db = _stub_db(
+        list_transactions_result={
+            "rows": rows, "total": 1, "page": 1,
+            "per_page": 50, "total_pages": 1,
+        },
+    )
+    db.get_setting = AsyncMock(return_value="[]")
+    client = await aiohttp_client(make_admin_app(password="pw", db=db))
+    await _login(client, "pw")
+
+    resp = await client.get("/admin/transactions")
+    assert resp.status == 200
+    body = await resp.text()
+    assert 'name="reason_preset"' not in body
+    # Free-text reason field still present.
+    assert 'name="reason"' in body

@@ -638,6 +638,33 @@ async def main():
             "from DB — falling through to env / compile-time default"
         )
 
+    # Stage-15-Step-E #10b row 28: warm the refund-presets override
+    # so the very first GET on /admin/transactions after restart
+    # already shows the operator's saved dropdown rather than the
+    # env / compile-time default. The transactions page also
+    # refreshes-per-render, so the worst-case lag without this
+    # warm-up is one page load — but warming keeps the
+    # Prometheus-scraped audit feed consistent across replicas
+    # (every worker boots with the same cache snapshot).
+    try:
+        import refund_presets
+        loaded_presets = await (
+            refund_presets.refresh_refund_presets_override_from_db(db)
+        )
+        log.info(
+            "loaded REFUND_PRESETS override from system_settings: "
+            "count=%s (source=%s, effective_count=%d)",
+            (len(loaded_presets) if loaded_presets is not None
+             else None),
+            refund_presets.get_refund_presets_source(),
+            len(refund_presets.get_refund_presets()),
+        )
+    except Exception:
+        log.exception(
+            "failed to load REFUND_PRESETS override from DB — "
+            "falling through to env / compile-time default"
+        )
+
     # Stage-15-Step-E #10b row 25: warm the admin-password hash
     # override so the first sign-in after restart uses the operator's
     # rotated credential rather than the env back-compat fallback.

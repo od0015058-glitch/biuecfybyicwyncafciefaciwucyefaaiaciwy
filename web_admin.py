@@ -3696,6 +3696,14 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     "i18n_lock_cleared": "Bot text edits unlocked",
     "string_save_blocked_locked": "Bot text save refused (locked)",
     "string_revert_blocked_locked": "Bot text revert refused (locked)",
+    # Stage-15-Step-E #10b row 28: refund presets editor on
+    # /admin/refund-presets surfaces the dropdown above the
+    # /admin/transactions refund text field. Every save / clear
+    # writes a ``refund_presets_update`` row carrying the
+    # before/after lists in ``meta`` so an "is this preset list
+    # in production?" question can be answered straight from the
+    # audit feed.
+    "refund_presets_update": "Refund presets updated",
 }
 
 
@@ -6459,6 +6467,20 @@ async def transactions_get(request: web.Request) -> web.StreamResponse:
         csv_query_parts + "&format=csv" if csv_query_parts else "format=csv"
     )
 
+    # Stage-15-Step-E #10b row 28: surface the operator-curated
+    # refund-reason presets on every SUCCESS row's refund form.
+    # Refresh from the DB on each render so a save on
+    # /admin/refund-presets reflects without a page-cache flush.
+    import refund_presets as _refund_presets
+    try:
+        await _refund_presets.refresh_refund_presets_override_from_db(db)
+    except Exception:
+        log.exception(
+            "transactions_get: refresh_refund_presets_override_from_db "
+            "failed; rendering with whatever cache the worker has"
+        )
+    refund_preset_choices = _refund_presets.get_refund_presets()
+
     context = {
         "active_page": "transactions",
         "filters": filters,
@@ -6475,6 +6497,7 @@ async def transactions_get(request: web.Request) -> web.StreamResponse:
         # ``gateway_choices`` / ``status_choices`` pattern above).
         "refundable_gateways": sorted(Database.REFUNDABLE_GATEWAYS),
         "refund_reason_max_chars": REFUND_REASON_MAX_CHARS,
+        "refund_preset_choices": refund_preset_choices,
         "csrf_token": csrf_token_for(request),
         "flash": None,
     }
@@ -8276,6 +8299,261 @@ _ADMIN_PROVIDER_LABELS: dict[str, str] = {
     "x-ai": "⚫ xAI",
     "deepseek": "🐋 DeepSeek",
 }
+
+
+# ---------------------------------------------------------------------
+# Refund presets page (Stage-15-Step-E #10b row 28)
+# ---------------------------------------------------------------------
+
+
+def _build_refund_presets_view() -> dict:
+    """Snapshot of the resolved refund-presets list per source.
+
+    Returns the same ``effective / db / env / default / source``
+    shape the rest of the §10b knobs use. Lists are returned as
+    plain ``list[str]`` so the Jinja template can join them
+    without an extra coerce step.
+    """
+    import refund_presets as rp
+
+    override_value = rp.get_refund_presets_override()
+    env_value = rp._read_env_presets()
+    return {
+        "effective": rp.get_refund_presets(),
+        "effective_count": len(rp.get_refund_presets()),
+        "source": rp.get_refund_presets_source(),
+        "default_value": list(rp.DEFAULT_REFUND_PRESETS),
+        "env_value": env_value,
+        "override_value": override_value,
+        "max_count": rp.MAX_PRESET_COUNT,
+        "max_length": rp.MAX_PRESET_LENGTH,
+    }
+
+
+async def refund_presets_get(request: web.Request) -> web.StreamResponse:
+    """``GET /admin/refund-presets`` — render the editor page.
+
+    Always refreshes from the DB before rendering so two operators
+    on different workers see each other's saves without a redeploy.
+    Mirrors :func:`models_config_get` for the discovery-interval
+    knob.
+    """
+    db = request.app.get(APP_KEY_DB)
+    db_error: str | None = None
+    if db is not None:
+        import refund_presets as rp
+        try:
+            await rp.refresh_refund_presets_override_from_db(db)
+        except Exception:
+            log.exception(
+                "refund_presets_get: "
+                "refresh_refund_presets_override_from_db failed"
+            )
+            db_error = "Database query failed — see logs."
+
+    context = {
+        "active_page": "refund_presets",
+        "csrf_token": csrf_token_for(request),
+        "refund_presets_view": _build_refund_presets_view(),
+        "db_error": db_error,
+        "flash": None,
+    }
+    response = aiohttp_jinja2.render_template(
+        "refund_presets.html", request, context,
+    )
+    flash = pop_flash(request, response)
+    if flash is not None:
+        context["flash"] = flash
+        response = aiohttp_jinja2.render_template(
+            "refund_presets.html", request, context,
+        )
+    return response
+
+
+async def refund_presets_save_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """``POST /admin/refund-presets/save`` — save / clear the
+    operator-curated preset list.
+
+    Two actions on the same form so the editor renders one save
+    panel instead of two:
+
+    * ``action=save`` — read the textarea, parse via
+      :func:`refund_presets.parse_refund_presets_text`, write the
+      JSON-encoded list to ``system_settings``. An empty textarea
+      is a deliberate "hide the dropdown" choice and is saved as
+      ``"[]"``.
+    * ``action=clear`` — delete the ``system_settings`` row so
+      the resolution falls through to env / compile-time default.
+
+    Always redirects back to ``/admin/refund-presets`` with a
+    flash banner describing the outcome.
+    """
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+    db = request.app.get(APP_KEY_DB)
+    form = await request.post()
+
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning(
+            "refund_presets_save_post: CSRF mismatch from %s",
+            request.remote,
+        )
+        response = web.HTTPFound(location="/admin/refund-presets")
+        set_flash(
+            response, kind="error",
+            message="CSRF token mismatch — please reload and try again.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    if db is None:
+        response = web.HTTPFound(location="/admin/refund-presets")
+        set_flash(
+            response, kind="error",
+            message="Database is not configured.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    import refund_presets as rp
+
+    action = str(form.get("action", "save")).strip().lower()
+    if action not in ("save", "clear"):
+        action = "save"
+
+    previous_effective = rp.get_refund_presets()
+    previous_source = rp.get_refund_presets_source()
+    previous_override = rp.get_refund_presets_override()
+
+    if action == "clear":
+        try:
+            await db.delete_setting(rp.REFUND_PRESETS_SETTING_KEY)
+        except Exception:
+            log.exception(
+                "refund_presets_save_post: delete_setting failed"
+            )
+            response = web.HTTPFound(location="/admin/refund-presets")
+            set_flash(
+                response, kind="error",
+                message="Failed to clear the override — see logs.",
+                secret=secret, cookie_secure=cookie_secure,
+            )
+            return response
+        rp.clear_refund_presets_override()
+        try:
+            await rp.refresh_refund_presets_override_from_db(db)
+        except Exception:
+            log.exception(
+                "refund_presets_save_post: refresh after clear failed"
+            )
+        new_effective = rp.get_refund_presets()
+        await _record_audit_safe(
+            request, "refund_presets_update",
+            target="refund_presets",
+            meta={
+                "action": "clear",
+                "before": previous_override,
+                "before_source": previous_source,
+                "after": None,
+                "after_source": rp.get_refund_presets_source(),
+                "after_effective": new_effective,
+            },
+        )
+        response = web.HTTPFound(location="/admin/refund-presets")
+        set_flash(
+            response, kind="success",
+            message=(
+                f"Override cleared. Effective list now has "
+                f"{len(new_effective)} preset(s) "
+                f"(source: {rp.get_refund_presets_source()})."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    raw_textarea = str(form.get("refund_presets", ""))
+    parsed = rp.parse_refund_presets_text(raw_textarea)
+
+    encoded = rp.encode_refund_presets_for_storage(parsed)
+    if len(encoded) > 255:
+        # Should be unreachable given the in-module clamps
+        # (MAX_PRESET_COUNT × MAX_PRESET_LENGTH stays well below
+        # 255 chars) — but the column cap is a hard contract, so
+        # log loudly and bail rather than crash the upsert.
+        log.error(
+            "refund_presets_save_post: encoded payload %d chars "
+            "exceeds 255-char column cap; refusing save",
+            len(encoded),
+        )
+        response = web.HTTPFound(location="/admin/refund-presets")
+        set_flash(
+            response, kind="error",
+            message=(
+                "Encoded preset payload exceeds 255 chars — "
+                "shorten individual entries and try again."
+            ),
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    try:
+        await db.upsert_setting(rp.REFUND_PRESETS_SETTING_KEY, encoded)
+    except Exception:
+        log.exception(
+            "refund_presets_save_post: upsert_setting failed "
+            "value=%r",
+            encoded,
+        )
+        response = web.HTTPFound(location="/admin/refund-presets")
+        set_flash(
+            response, kind="error",
+            message="Failed to persist — see logs.",
+            secret=secret, cookie_secure=cookie_secure,
+        )
+        return response
+
+    rp.set_refund_presets_override(parsed)
+
+    try:
+        await rp.refresh_refund_presets_override_from_db(db)
+    except Exception:
+        log.exception(
+            "refund_presets_save_post: refresh after upsert failed"
+        )
+
+    new_effective = rp.get_refund_presets()
+    await _record_audit_safe(
+        request, "refund_presets_update",
+        target="refund_presets",
+        meta={
+            "action": "save",
+            "before": previous_override,
+            "before_source": previous_source,
+            "before_effective": previous_effective,
+            "after": list(parsed),
+            "after_source": rp.get_refund_presets_source(),
+            "after_effective": new_effective,
+        },
+    )
+    response = web.HTTPFound(location="/admin/refund-presets")
+    if not parsed:
+        msg = (
+            "Saved an empty preset list — the dropdown will be "
+            "hidden on the transactions refund form."
+        )
+    else:
+        msg = (
+            f"Saved {len(parsed)} preset(s). The dropdown is "
+            "live on the transactions refund form."
+        )
+    set_flash(
+        response, kind="success",
+        message=msg,
+        secret=secret, cookie_secure=cookie_secure,
+    )
+    return response
 
 
 # ---------------------------------------------------------------------
@@ -12691,6 +12969,20 @@ def setup_admin_routes(
         _require_role(ROLE_OPERATOR)(
             models_config_discovery_interval_post
         ),
+    )
+    # Stage-15-Step-E #10b row 28: refund presets editor + dropdown
+    # on the /admin/transactions refund form. The list view is
+    # viewer-readable so the operator can copy presets out without
+    # the operator-tier write floor; the save / clear endpoint
+    # carries the operator role floor that matches every other
+    # config knob in the panel.
+    app.router.add_get(
+        "/admin/refund-presets",
+        _require_auth(refund_presets_get),
+    )
+    app.router.add_post(
+        "/admin/refund-presets/save",
+        _require_role(ROLE_OPERATOR)(refund_presets_save_post),
     )
     app.router.add_get("/admin/models", _require_auth(models_get))
     app.router.add_post(
