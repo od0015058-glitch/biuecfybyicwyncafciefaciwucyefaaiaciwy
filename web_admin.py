@@ -3165,7 +3165,7 @@ async def memory_config_get(request: web.Request) -> web.StreamResponse:
     response = aiohttp_jinja2.render_template(
         "memory_config.html", request, ctx,
     )
-    flash = get_flash(request)
+    flash = pop_flash(request, response)
     if flash:
         ctx["flash"] = flash
         response = aiohttp_jinja2.render_template(
@@ -3530,6 +3530,8 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     "string_save": "Bot text override saved",
     "string_revert": "Bot text override reverted",
     "enroll_2fa_view": "2FA enrolment page viewed",
+    # Stage-15-Step-E #10b row 26: enrollment timeout editor.
+    "enroll_2fa_timeout_update": "2FA enrollment timeout updated",
     # Stage-15-Step-E #10b row 25: admin password rotation.
     "profile_view": "Admin profile page viewed",
     "admin_password_rotated": "Admin panel password rotated",
@@ -7939,7 +7941,13 @@ async def enroll_2fa_get(request: web.Request) -> web.StreamResponse:
     the QR after losing their device) and, when nothing is configured,
     suggests a freshly-generated random secret to copy into the env
     file. Restarting the bot is required to pick the new value up.
+
+    Stage-15-Step-E #10b row 26: the page now also includes an
+    enrollment-timeout editor card (set/clear) from the
+    ``enrollment_timeout`` module.
     """
+    import enrollment_timeout
+
     issuer = request.app.get(APP_KEY_TOTP_ISSUER, "Meowassist Admin") or "Meowassist Admin"
     configured_secret = request.app.get(APP_KEY_TOTP_SECRET, "")
 
@@ -7947,35 +7955,280 @@ async def enroll_2fa_get(request: web.Request) -> web.StreamResponse:
         secret = configured_secret
         is_suggestion = False
     else:
-        # No secret on the running app — generate one so the operator
-        # has something to paste into ``ADMIN_2FA_SECRET``. We
-        # deliberately do NOT cache it server-side: the next page load
-        # gets a fresh suggestion. That way an operator who eyeballs
-        # the page without copying the secret can't be locked into a
-        # value an attacker also saw via, e.g., a screenshot in chat.
         secret = pyotp.random_base32()
         is_suggestion = True
 
     uri = build_otpauth_uri(secret, issuer=issuer)
     qr_svg = render_qr_svg(uri)
 
+    # Stage-15-Step-E #10b row 26: refresh enrollment timeout from
+    # DB on every page view so a sibling worker's edit lands within
+    # one request (same refresh-on-GET policy as the i18n_lock toggle).
+    db = request.app.get(APP_KEY_DB)
+    if db is not None:
+        try:
+            await enrollment_timeout.refresh_enrollment_timeout_override_from_db(db)
+        except Exception:
+            log.exception(
+                "enroll_2fa_get: enrollment-timeout refresh failed; "
+                "using cached value",
+            )
+
+    timeout_seconds = enrollment_timeout.get_enrollment_timeout_seconds()
+    timeout_view = _build_enrollment_timeout_view()
+
     await _record_audit_safe(
         request,
         "enroll_2fa_view",
         meta={"is_suggestion": is_suggestion},
     )
-    return aiohttp_jinja2.render_template(
-        "enroll_2fa.html",
-        request,
-        {
-            "active_page": "enroll_2fa",
-            "secret": secret,
-            "issuer": issuer,
-            "uri": uri,
-            "qr_svg": qr_svg,
-            "is_suggestion": is_suggestion,
+    ctx = {
+        "active_page": "enroll_2fa",
+        "secret": secret,
+        "issuer": issuer,
+        "uri": uri,
+        "qr_svg": qr_svg,
+        "is_suggestion": is_suggestion,
+        "csrf_token": csrf_token_for(request),
+        "timeout_seconds": timeout_seconds,
+        "timeout_view": timeout_view,
+        "flash": None,
+    }
+    response = aiohttp_jinja2.render_template(
+        "enroll_2fa.html", request, ctx,
+    )
+    flash = pop_flash(request, response)
+    if flash is not None:
+        ctx["flash"] = flash
+        response = aiohttp_jinja2.render_template(
+            "enroll_2fa.html", request, ctx,
+        )
+    return response
+
+
+def _build_enrollment_timeout_view() -> dict:
+    """Snapshot of the live enrollment-timeout provenance."""
+    import enrollment_timeout
+
+    effective = enrollment_timeout.get_enrollment_timeout_seconds()
+    db_val = enrollment_timeout.get_enrollment_timeout_override()
+    env_raw = os.getenv("ADMIN_2FA_ENROLLMENT_TIMEOUT")
+    env_val = (
+        enrollment_timeout._coerce_enrollment_timeout(env_raw)
+        if env_raw is not None
+        else None
+    )
+    return {
+        "effective": effective,
+        "effective_human": enrollment_timeout.format_timeout_human(effective),
+        "db": db_val,
+        "db_human": (
+            enrollment_timeout.format_timeout_human(db_val)
+            if db_val is not None
+            else None
+        ),
+        "env": env_val,
+        "env_human": (
+            enrollment_timeout.format_timeout_human(env_val)
+            if env_val is not None
+            else None
+        ),
+        "default": enrollment_timeout.DEFAULT_ENROLLMENT_TIMEOUT_SECONDS,
+        "default_human": enrollment_timeout.format_timeout_human(
+            enrollment_timeout.DEFAULT_ENROLLMENT_TIMEOUT_SECONDS,
+        ),
+        "source": enrollment_timeout.get_enrollment_timeout_source(),
+        "minimum": enrollment_timeout.ENROLLMENT_TIMEOUT_MINIMUM,
+        "maximum": enrollment_timeout.ENROLLMENT_TIMEOUT_MAXIMUM,
+    }
+
+
+async def enroll_2fa_timeout_post(
+    request: web.Request,
+) -> web.StreamResponse:
+    """POST /admin/enroll_2fa/timeout — set or clear the enrollment
+    timeout override.
+
+    Stage-15-Step-E #10b row 26. Same shape as
+    :func:`wallet_config_fx_refresh_post`.
+    """
+    import enrollment_timeout
+
+    secret = request.app.get(APP_KEY_SESSION_SECRET, "")
+    cookie_secure = request.app.get(APP_KEY_COOKIE_SECURE, True)
+
+    form = await request.post()
+    redirect_url = "/admin/enroll_2fa"
+    response = web.HTTPFound(location=redirect_url)
+
+    if not verify_csrf_token(request, str(form.get("csrf_token", ""))):
+        log.warning(
+            "enroll_2fa_timeout_post: CSRF mismatch from %s",
+            request.remote,
+        )
+        set_flash(
+            response,
+            kind="error",
+            message="CSRF token mismatch — try again.",
+            secret=secret,
+            secure=cookie_secure,
+        )
+        return response
+
+    action = str(form.get("action", "")).strip()
+    db = request.app.get(APP_KEY_DB)
+
+    # -------- CLEAR --------
+    if action == "clear":
+        if db is not None:
+            try:
+                await db.delete_setting(
+                    enrollment_timeout.ENROLLMENT_TIMEOUT_SETTING_KEY,
+                )
+            except Exception:
+                log.exception(
+                    "enroll_2fa_timeout_post: delete_setting failed"
+                )
+                response = web.HTTPFound(location=redirect_url)
+                set_flash(
+                    response,
+                    kind="error",
+                    message="DB error clearing override — see logs.",
+                    secret=secret,
+                    secure=cookie_secure,
+                )
+                return response
+
+        enrollment_timeout.clear_enrollment_timeout_override()
+        try:
+            await enrollment_timeout.refresh_enrollment_timeout_override_from_db(db)
+        except Exception:
+            log.exception(
+                "enroll_2fa_timeout_post: refresh after clear failed"
+            )
+        new_effective = int(
+            enrollment_timeout.get_enrollment_timeout_seconds()
+        )
+        await _record_audit_safe(
+            request, "enroll_2fa_timeout_update",
+            target="enrollment_timeout",
+            meta={
+                "action": "clear",
+                "new_effective": new_effective,
+                "new_source": enrollment_timeout.get_enrollment_timeout_source(),
+            },
+        )
+        set_flash(
+            response,
+            kind="success",
+            message=(
+                f"DB override cleared. Effective timeout: "
+                f"{enrollment_timeout.format_timeout_human(new_effective)}."
+            ),
+            secret=secret,
+            secure=cookie_secure,
+        )
+        return response
+
+    # -------- SET --------
+    raw_value = str(form.get("value", "")).strip()
+    if not raw_value:
+        set_flash(
+            response,
+            kind="error",
+            message="Value is required.",
+            secret=secret,
+            secure=cookie_secure,
+        )
+        return response
+
+    try:
+        parsed = int(raw_value)
+    except (ValueError, TypeError):
+        set_flash(
+            response,
+            kind="error",
+            message=f"Invalid integer: {raw_value!r}.",
+            secret=secret,
+            secure=cookie_secure,
+        )
+        return response
+
+    coerced = enrollment_timeout._coerce_enrollment_timeout(parsed)
+    if coerced is None:
+        set_flash(
+            response,
+            kind="error",
+            message=(
+                f"Value {parsed} out of range "
+                f"[{enrollment_timeout.ENROLLMENT_TIMEOUT_MINIMUM}, "
+                f"{enrollment_timeout.ENROLLMENT_TIMEOUT_MAXIMUM}]."
+            ),
+            secret=secret,
+            secure=cookie_secure,
+        )
+        return response
+
+    if db is not None:
+        try:
+            await db.upsert_setting(
+                enrollment_timeout.ENROLLMENT_TIMEOUT_SETTING_KEY,
+                str(coerced),
+            )
+        except Exception:
+            log.exception(
+                "enroll_2fa_timeout_post: upsert_setting failed "
+                "value=%r",
+                parsed,
+            )
+            response = web.HTTPFound(location=redirect_url)
+            set_flash(
+                response,
+                kind="error",
+                message="DB error saving override — see logs.",
+                secret=secret,
+                secure=cookie_secure,
+            )
+            return response
+
+    try:
+        enrollment_timeout.set_enrollment_timeout_override(coerced)
+    except ValueError:
+        log.exception(
+            "enroll_2fa_timeout_post: "
+            "set_enrollment_timeout_override rejected %r after "
+            "upsert succeeded — refreshing from DB",
+            coerced,
+        )
+        try:
+            await enrollment_timeout.refresh_enrollment_timeout_override_from_db(db)
+        except Exception:
+            log.exception(
+                "enroll_2fa_timeout_post: refresh after upsert failed"
+            )
+
+    new_effective = enrollment_timeout.get_enrollment_timeout_seconds()
+    await _record_audit_safe(
+        request, "enroll_2fa_timeout_update",
+        target="enrollment_timeout",
+        meta={
+            "action": "set",
+            "value": coerced,
+            "new_effective": new_effective,
+            "new_source": enrollment_timeout.get_enrollment_timeout_source(),
         },
     )
+    set_flash(
+        response,
+        kind="success",
+        message=(
+            f"Enrollment timeout set to "
+            f"{enrollment_timeout.format_timeout_human(coerced)}."
+        ),
+        secret=secret,
+        secure=cookie_secure,
+    )
+    return response
 
 
 # ---------------------------------------------------------------------
@@ -12661,6 +12914,11 @@ def setup_admin_routes(
     app.router.add_get(
         "/admin/enroll_2fa",
         _require_auth(enroll_2fa_get),
+    )
+    # Stage-15-Step-E #10b row 26: enrollment timeout editor.
+    app.router.add_post(
+        "/admin/enroll_2fa/timeout",
+        _require_role(ROLE_OPERATOR)(enroll_2fa_timeout_post),
     )
 
     # Stage-15-Step-E #10b row 25: admin profile + password rotation.

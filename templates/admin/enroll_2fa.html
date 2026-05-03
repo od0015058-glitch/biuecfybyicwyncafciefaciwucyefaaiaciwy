@@ -2,8 +2,68 @@
 
 {% block title %}2FA setup{% endblock %}
 
+{% block extra_head %}
+<style>
+  .countdown {
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    color: var(--accent);
+  }
+  .countdown.expired { color: var(--danger); }
+  .breakdown-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+    margin-bottom: 12px;
+  }
+  .breakdown-table td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  .breakdown-table td:first-child {
+    color: var(--text-muted);
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: 0.4px;
+    width: 120px;
+  }
+  .source-badge {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    vertical-align: middle;
+    margin-left: 4px;
+  }
+  .source-badge.db { background: rgba(79, 140, 255, 0.15); color: var(--accent); }
+  .source-badge.env { background: rgba(250, 204, 21, 0.15); color: #ca8a04; }
+  .source-badge.default { background: rgba(148, 163, 184, 0.15); color: var(--text-muted); }
+  .timeout-form {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+    flex-wrap: wrap;
+  }
+  .timeout-form .field { margin-bottom: 0; min-width: 120px; }
+  .timeout-form button {
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-weight: 600;
+    font-size: 13px;
+    cursor: pointer;
+    border: 0;
+  }
+  .timeout-form button.primary { background: var(--accent); color: #fff; }
+  .timeout-form button.secondary { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); }
+</style>
+{% endblock %}
+
 {% block main %}
 <h2>Two-factor authentication</h2>
+
+{% if flash %}
+<div class="alert alert-{{ flash.kind }}">{{ flash.message }}</div>
+{% endif %}
 
 {% if is_suggestion %}
 <div class="alert alert-warn">
@@ -18,6 +78,16 @@
   <strong>2FA is currently enabled.</strong>
   The QR / secret below matches the value in
   <code>ADMIN_2FA_SECRET</code>. Re-scan to add another device.
+</div>
+{% endif %}
+
+{% if is_suggestion %}
+<div class="panel">
+  <p>
+    This secret expires in
+    <span class="countdown" id="countdown">{{ timeout_seconds }}</span> seconds.
+    The page will auto-reload when the window closes.
+  </p>
 </div>
 {% endif %}
 
@@ -59,5 +129,79 @@
     <li>Restart the bot — the next login will require a TOTP code.</li>
   </ol>
 </div>
+{% endif %}
+
+{# Stage-15-Step-E #10b row 26: enrollment timeout editor card #}
+<div class="panel">
+  <h3>Enrollment timeout</h3>
+  <p class="muted" style="margin-bottom: 12px;">
+    How long a suggested TOTP secret stays valid on this page before
+    auto-reloading with a fresh one. Applies only when 2FA is not yet
+    configured (suggestion mode).
+  </p>
+
+  <table class="breakdown-table">
+    <tr>
+      <td>Effective</td>
+      <td>
+        <strong>{{ timeout_view.effective_human }}</strong>
+        ({{ timeout_view.effective }}s)
+        <span class="source-badge {{ timeout_view.source }}">{{ timeout_view.source }}</span>
+      </td>
+    </tr>
+    <tr>
+      <td>DB override</td>
+      <td>{% if timeout_view.db is not none %}{{ timeout_view.db_human }} ({{ timeout_view.db }}s){% else %}&mdash;{% endif %}</td>
+    </tr>
+    <tr>
+      <td>Env</td>
+      <td>{% if timeout_view.env is not none %}{{ timeout_view.env_human }} ({{ timeout_view.env }}s){% else %}&mdash;{% endif %}</td>
+    </tr>
+    <tr>
+      <td>Default</td>
+      <td>{{ timeout_view.default_human }} ({{ timeout_view.default }}s)</td>
+    </tr>
+  </table>
+
+  <form class="timeout-form" method="post" action="/admin/enroll_2fa/timeout">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="action" value="set">
+    <div class="field">
+      <label for="timeout_value">Seconds ({{ timeout_view.minimum }}&ndash;{{ timeout_view.maximum }})</label>
+      <input type="number" id="timeout_value" name="value"
+             min="{{ timeout_view.minimum }}" max="{{ timeout_view.maximum }}"
+             value="{{ timeout_view.effective }}"
+             style="width: 100%;">
+    </div>
+    <button type="submit" class="primary">Save</button>
+  </form>
+  {% if timeout_view.db is not none %}
+  <form class="timeout-form" method="post" action="/admin/enroll_2fa/timeout" style="margin-top: 8px;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="action" value="clear">
+    <button type="submit" class="secondary">Clear DB override</button>
+  </form>
+  {% endif %}
+</div>
+
+{% if is_suggestion %}
+<script>
+(function() {
+  var left = {{ timeout_seconds }};
+  var el = document.getElementById('countdown');
+  if (!el) return;
+  var timer = setInterval(function() {
+    left--;
+    if (left <= 0) {
+      clearInterval(timer);
+      el.textContent = '0';
+      el.classList.add('expired');
+      location.reload();
+      return;
+    }
+    el.textContent = left;
+  }, 1000);
+})();
+</script>
 {% endif %}
 {% endblock %}
