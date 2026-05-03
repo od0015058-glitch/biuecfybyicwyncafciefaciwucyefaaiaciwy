@@ -959,3 +959,83 @@ def test_format_history_refuses_bool_content_to_avoid_ambiguity():
     # empty line.
     assert "\n1\n" not in body
     assert "\n0\n" not in body
+
+
+# ---------------------------------------------------------------------
+# Stage-15-Step-E #10b row 16 bundled bug fix: the multi-part
+# renderer must mint exactly ONE ``Exported:`` timestamp across every
+# part it produces. Pre-fix ``_build_header_lines`` called
+# ``datetime.now`` per part, so a multi-part export rendered across a
+# second boundary would land different ``Exported:`` stamps on each
+# part of the same export — minor user-facing inconsistency, but
+# exactly the kind of "two timestamps for the same export" smell that
+# trips audit-trail readers.
+# ---------------------------------------------------------------------
+
+
+def test_format_multipart_uses_single_exported_timestamp_across_parts():
+    """All parts in a multi-part export share one ``Exported:`` stamp.
+
+    Previously each part rendered its header with a fresh
+    ``datetime.now`` call. Capturing one ``now`` at the top of
+    :func:`format_history_as_text_multipart` and threading it through
+    every :func:`_build_part_text` call pins the stamp across the
+    parts. We test by passing an explicit ``now`` (which is now part
+    of the public function signature) — pre-fix this kwarg didn't
+    exist and the test would land different stamps even with monkeypatch
+    of ``datetime.now``.
+    """
+    ts = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    big = "x" * 100_000
+    rows = [
+        {"role": "user", "content": big, "created_at": ts}
+        for _ in range(20)
+    ]
+    pinned = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
+    parts = format_history_as_text_multipart(rows, now=pinned)
+    assert len(parts) >= 2  # multi-part case is what we need to pin
+
+    expected = "Exported: 2026-04-28 12:34:56 UTC"
+    seen = []
+    for text, _ in parts:
+        match = next(
+            (line for line in text.splitlines()
+             if line.startswith("Exported: ")),
+            None,
+        )
+        assert match is not None
+        seen.append(match)
+    assert len(set(seen)) == 1, (
+        f"All parts must share one Exported: stamp, got {set(seen)}"
+    )
+    assert seen[0] == expected
+
+
+def test_format_multipart_naive_now_is_treated_as_utc():
+    """A naive ``now`` (no tzinfo) is coerced to UTC rather than
+    falling through to the deploy host's local time. Same defensive
+    contract :func:`_format_timestamp` already enforces on the
+    per-message stamps."""
+    ts = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    rows = [{"role": "user", "content": "hi", "created_at": ts}]
+    naive = datetime(2026, 4, 28, 12, 34, 56)  # tzinfo=None
+    parts = format_history_as_text_multipart(rows, now=naive)
+    assert len(parts) == 1
+    text, _ = parts[0]
+    assert "Exported: 2026-04-28 12:34:56 UTC" in text
+
+
+def test_format_multipart_aware_non_utc_now_converts_to_utc():
+    """A timezone-aware ``now`` in a non-UTC zone (e.g. an operator
+    capturing the timestamp in their local TZ before calling the
+    formatter) is converted to UTC before rendering."""
+    from datetime import timedelta as _td
+    ts = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    rows = [{"role": "user", "content": "hi", "created_at": ts}]
+    # 12:34:56 in UTC+02:00 == 10:34:56 UTC.
+    tz_plus_2 = timezone(_td(hours=2))
+    aware_local = datetime(2026, 4, 28, 12, 34, 56, tzinfo=tz_plus_2)
+    parts = format_history_as_text_multipart(rows, now=aware_local)
+    assert len(parts) == 1
+    text, _ = parts[0]
+    assert "Exported: 2026-04-28 10:34:56 UTC" in text

@@ -179,6 +179,7 @@ def _build_header_lines(
     dropped: int,
     part_index: int | None = None,
     total_parts: int | None = None,
+    now: datetime | None = None,
 ) -> list[str]:
     """Render the file header.
 
@@ -188,13 +189,30 @@ def _build_header_lines(
     contains several parts side-by-side. Single-file exports omit
     the ``Part:`` line entirely so the legacy header shape is
     preserved bit-for-bit.
+
+    ``now`` lets the caller pin the ``Exported:`` timestamp to a
+    single value across every part in a multi-part export
+    (Stage-15-Step-E #10b row 16 bundled fix). When omitted (the
+    legacy single-file path), we fall back to ``datetime.now``
+    so the public single-call shape is unchanged.
     """
     handle_line = f" for @{user_handle}" if user_handle else ""
     lines = [f"Conversation history{handle_line}"]
     if part_index is not None and total_parts is not None and total_parts > 1:
         lines.append(f"Part: {part_index}/{total_parts}")
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        # Defensive: a caller passing a naive ``datetime`` would
+        # render as the deploy host's local time which is hostile
+        # when the bot host's TZ differs from the user's. Same
+        # contract :func:`_format_timestamp` enforces on the
+        # per-message stamps.
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
     lines.append(
-        f"Exported: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        f"Exported: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}"
     )
     suffix = f" (trimmed {dropped} oldest)" if dropped else ""
     lines.append(f"Messages: {kept}{suffix}")
@@ -212,6 +230,7 @@ def _build_part_text(
     dropped: int,
     part_index: int | None = None,
     total_parts: int | None = None,
+    now: datetime | None = None,
 ) -> str:
     header = _build_header_lines(
         user_handle=user_handle,
@@ -219,6 +238,7 @@ def _build_part_text(
         dropped=dropped,
         part_index=part_index,
         total_parts=total_parts,
+        now=now,
     )
     return "\n".join(header) + "\n" + "\n".join(rendered_messages)
 
@@ -309,6 +329,7 @@ def format_history_as_text_multipart(
     rows: Iterable[dict],
     *,
     user_handle: str | None = None,
+    now: datetime | None = None,
 ) -> list[tuple[str, int]]:
     """Render a user's conversation buffer as one or more
     plain-text exports.
@@ -349,9 +370,24 @@ def format_history_as_text_multipart(
     shape, no ``Part:`` line) so callers that flip to the
     multipart entrypoint do not change the user-visible output
     for the common small-buffer case.
+
+    Stage-15-Step-E #10b row 16 bundled fix: ``now`` pins the
+    ``Exported:`` timestamp to a single value across every part.
+    Pre-fix, :func:`_build_header_lines` was called once per part
+    with its own ``datetime.now`` call, so a multi-part export
+    rendered across a second boundary minted a different
+    ``Exported:`` stamp on each part — same export, different
+    times in the headers. Capturing one ``now`` at the top of
+    this function and threading it through fixes the drift
+    without changing any other observable behaviour. ``now=None``
+    keeps the legacy default of "use the wall clock at render
+    time"; tests pin the stamp by passing an explicit
+    ``datetime``.
     """
     rendered = [_format_one_message(r) for r in rows]
     original_count = len(rendered)
+    if now is None:
+        now = datetime.now(timezone.utc)
 
     # Worst-case header size for a multi-part export ever produced
     # — re-rendering with the largest plausible part index /
@@ -365,6 +401,7 @@ def format_history_as_text_multipart(
                 dropped=original_count,
                 part_index=EXPORT_MAX_PARTS,
                 total_parts=EXPORT_MAX_PARTS,
+                now=now,
             ).encode("utf-8")
         )
         + 1
@@ -461,6 +498,7 @@ def format_history_as_text_multipart(
             dropped=part_dropped,
             part_index=part_index,
             total_parts=total_parts,
+            now=now,
         )
         parts.append((text, kept_in_part))
 

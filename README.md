@@ -234,6 +234,32 @@ NowPayments crypto invoices.
   `total_credited_usd` / `total_spent_usd` — pre-fix
   `float(credited or 0)` passed `Decimal('NaN')` through because NaN
   is truthy in Python.
+- **Admin-side conversation export** on
+  `/admin/users/{id}/conversations` (Stage-15-Step-E #10b row 16) —
+  new hub page lists each `.txt` part of a user's persisted
+  conversation buffer with kept-count, byte-count, canonical
+  filename, and a download button per row. Sibling
+  `/admin/users/{id}/conversations.txt?part=N` streams a single part
+  with `Content-Disposition: attachment` and the conventional
+  `meowassist-history-<id>-<date>-part-<N>-of-<M>.txt` filename.
+  Both routes are viewer-readable (same role floor as the existing
+  `/usage` and `/stats` pages — no new data, just a downloadable
+  archive of the same buffer the user can already pull via
+  `/history` on Telegram). Each downloaded part writes one
+  `admin_conversation_export` audit row with `telegram_id`,
+  `part_index`, `total_parts`, `kept_in_part`, `total_kept`, and
+  `bytes`. Re-uses the existing `format_history_as_text_multipart`
+  renderer so the bot side and admin side cannot drift on header
+  shape, trim semantics, or filename. Bundled bug fix:
+  `format_history_as_text_multipart` previously called
+  `datetime.now(timezone.utc)` once *per part* inside
+  `_build_header_lines`, so a multi-part export rendered across a
+  second boundary minted different `Exported:` timestamps on each
+  part of the *same* export. Now the function captures one `now`
+  at entry and threads it through every `_build_part_text` call
+  (also exposed as a public `now=` kwarg so tests can pin the
+  stamp deterministically). Naive `datetime` inputs are coerced to
+  UTC; aware non-UTC inputs are converted to UTC.
 - Telegram-side admin commands (`/admin`, `/admin_metrics`,
   `/admin_credit`, `/admin_broadcast`, …) for ops via DMs.
 - **Canonical slash-command menu** — on every startup the bot

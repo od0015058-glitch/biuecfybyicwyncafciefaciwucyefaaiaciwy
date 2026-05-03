@@ -1,0 +1,162 @@
+{% extends "_layout.html" %}
+
+{% block title %}Conversation · {{ user_id }}{% endblock %}
+
+{% block extra_head %}
+<style>
+  .breadcrumbs { font-size: 13px; color: var(--text-muted); margin-bottom: 12px; }
+  .breadcrumbs a { color: var(--accent); text-decoration: none; }
+  .breadcrumbs a:hover { text-decoration: underline; }
+
+  .conv-aggregates {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(160px, 1fr));
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+  .conv-aggregates .stat {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 16px;
+  }
+  .conv-aggregates .stat .label {
+    font-size: 12px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .conv-aggregates .stat .value {
+    font-size: 22px;
+    font-weight: 600;
+    margin-top: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  td.num, th.num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  code.mono {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  .empty {
+    color: var(--text-muted);
+    padding: 16px;
+    text-align: center;
+  }
+  .download-row {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+  }
+  .download-row .label {
+    flex: 0 0 auto;
+    min-width: 7em;
+    font-weight: 600;
+  }
+  .download-row .meta {
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+</style>
+{% endblock %}
+
+{% block main %}
+<div class="breadcrumbs">
+  <a href="/admin/users">Users</a>
+  &nbsp;›&nbsp;
+  <a href="/admin/users/{{ user_id }}">{{ user_id }}</a>
+  &nbsp;›&nbsp;
+  Conversation history
+</div>
+
+<h1>Conversation history · <code class="mono">{{ user_id }}</code></h1>
+
+<p style="color: var(--text-muted); margin: 0 0 1em 0; font-size: 0.9em;">
+  Stage-15-Step-E #10b row 16. Multi-part <code>.txt</code> export of every
+  message the user has on the persisted conversation buffer (same data
+  the user can pull via the <code>/history</code> command). Each part is
+  capped at <strong>{{ "{:,}".format(part_max_bytes) }}</strong> bytes;
+  the export is hard-capped at <strong>{{ max_parts }}</strong> parts so
+  the download stays under {{ "{:,}".format(part_max_bytes * max_parts) }}
+  bytes total. When the buffer would exceed the total budget, the oldest
+  messages are trimmed first and a header note records how many were
+  dropped.
+</p>
+
+{% if db_error %}
+<div class="panel" style="background: rgba(248, 113, 113, 0.1); border-color: #f87171; color: #f87171;">
+  {{ db_error }}
+</div>
+{% else %}
+
+<div class="conv-aggregates">
+  <div class="stat">
+    <div class="label">Parts</div>
+    <div class="value">{{ parts|length }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Messages exported</div>
+    <div class="value">{{ "{:,}".format(total_kept) }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Total bytes</div>
+    <div class="value">{{ "{:,}".format(total_bytes) }}</div>
+  </div>
+</div>
+
+<div class="panel">
+  {% if total_kept == 0 %}
+  <p class="empty">
+    No persisted conversation buffer for this user.
+    {% if user_memory_off %}
+    Memory is currently disabled — new turns will not be stored.
+    {% endif %}
+  </p>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th>Part</th>
+        <th class="num">Messages</th>
+        <th class="num">Bytes</th>
+        <th>Filename</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in part_rows %}
+      <tr>
+        <td><code class="mono">{{ row.index }}/{{ parts|length }}</code></td>
+        <td class="num">{{ "{:,}".format(row.kept) }}</td>
+        <td class="num">{{ "{:,}".format(row.bytes) }}</td>
+        <td><code class="mono">{{ row.filename }}</code></td>
+        <td>
+          <a class="btn btn-primary"
+             href="/admin/users/{{ user_id }}/conversations.txt?part={{ row.index }}">
+            Download
+          </a>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+
+{% if dropped > 0 %}
+<p class="meta" style="margin-top: 8px; color: var(--text-muted); font-size: 0.85em;">
+  Note: <strong>{{ "{:,}".format(dropped) }}</strong> oldest message(s)
+  were trimmed because the full buffer would have exceeded the
+  <strong>{{ "{:,}".format(part_max_bytes * max_parts) }}</strong>-byte
+  total cap. Part 1's header records the trim count too.
+</p>
+{% endif %}
+
+{% endif %}
+{% endblock %}

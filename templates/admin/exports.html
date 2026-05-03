@@ -43,6 +43,29 @@
 </div>
 
 <div class="panel">
+  <h3>Per-user conversation history (new)</h3>
+  <p style="margin: 0 0 0.5em 0;">
+    Multi-part <code>.txt</code> archive of an individual user's
+    persisted conversation buffer. Same data the user can pull via
+    <code>/history</code> on Telegram; the admin UI just makes it
+    downloadable from a browser for refund / "delete my data"
+    investigations.
+  </p>
+  <p style="margin: 0 0 0.75em 0; color: var(--text-muted); font-size: 0.9em;">
+    The hub for each user is on their detail page —
+    open <code>/admin/users/&lt;telegram_id&gt;</code> and click
+    "Conversation history &rarr;". One audit row is recorded per
+    downloaded part under the slug
+    <code>admin_conversation_export</code>.
+  </p>
+  <p>
+    <a class="btn" href="/admin/users" style="font-size: 0.85em;">
+      Open the user list to pick a user &rarr;
+    </a>
+  </p>
+</div>
+
+<div class="panel">
   <h3>Monetization summary</h3>
   <p style="margin: 0 0 0.5em 0;">
     Lifetime + windowed P&amp;L: revenue, OpenRouter cost, gross
