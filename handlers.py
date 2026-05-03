@@ -56,6 +56,10 @@ from payments import (
     get_min_amount_usd,
 )
 from pricing import apply_markup_to_price
+from abuse_detection import (
+    classify as classify_abuse,
+    maybe_alert_spend_spike,
+)
 from rate_limit import (
     consume_chat_token,
     release_chat_slot,
@@ -3493,6 +3497,22 @@ async def process_chat(message: Message):
         return
     user_id = message.from_user.id
 
+    # Stage-16 row 20: abuse / spam pre-check. Runs BEFORE the
+    # rate-limit token bucket so an oversized / injection-shaped
+    # prompt doesn't burn a rate-limit slot a legitimate user
+    # could otherwise use. Same response as the rate-limit path
+    # (``ai_local_rate_limited``) so an attacker can't probe which
+    # rule fired.
+    abuse_kind = classify_abuse(message.text)
+    if abuse_kind != "ok":
+        lang = await _get_user_language(user_id)
+        log.warning(
+            "abuse pre-check rejected telegram_id=%s kind=%s text=%r",
+            user_id, abuse_kind, (message.text or "")[:200],
+        )
+        await message.answer(t(lang, "ai_local_rate_limited"))
+        return
+
     # Per-user chat rate limit. Scoped to *this* handler (not a
     # dispatcher-wide middleware) so commands, FSM-state inputs
     # (waiting_custom_amount / waiting_promo_code), and reply-keyboard
@@ -3568,6 +3588,12 @@ async def process_chat(message: Message):
     # falls on a natural break when possible.
     for chunk in _split_for_telegram(reply, _TELEGRAM_MAX_MSG_CHARS):
         await message.answer(chunk)
+
+    # Stage-16 row 20: drain the spend-spike alert latch *after*
+    # the user's reply is sent. A transient Telegram 5xx on the
+    # admin DM is swallowed inside ``maybe_alert_spend_spike`` so
+    # it can't surface as a poller crash for the requesting user.
+    await maybe_alert_spend_spike(message.bot, user_id=user_id)
 
 
 # ==========================================
@@ -3698,6 +3724,23 @@ async def process_photo(message: Message):
         return
     user_id = message.from_user.id
 
+    # Stage-16 row 20 bundled fix: abuse pre-check on the photo
+    # CAPTION as well. Pre-fix, ``message.caption`` flowed through
+    # to ``chat_with_model`` unchecked — a 1 MB caption paired with
+    # a single photo upload would burn one rate-limit slot but
+    # cost millions of OpenRouter prompt tokens. Same gate, same
+    # localised reply as the text path.
+    abuse_kind = classify_abuse(message.caption)
+    if abuse_kind != "ok":
+        lang = await _get_user_language(user_id)
+        log.warning(
+            "abuse pre-check rejected (photo caption) "
+            "telegram_id=%s kind=%s caption=%r",
+            user_id, abuse_kind, (message.caption or "")[:200],
+        )
+        await message.answer(t(lang, "ai_local_rate_limited"))
+        return
+
     # Per-user chat rate limit, same bucket as process_chat —
     # photo turns and text turns share the throughput budget.
     if not await consume_chat_token(user_id):
@@ -3798,6 +3841,12 @@ async def process_photo(message: Message):
 
     for chunk in _split_for_telegram(reply, _TELEGRAM_MAX_MSG_CHARS):
         await message.answer(chunk)
+
+    # Stage-16 row 20: drain the spend-spike alert latch (same as
+    # process_chat). Photo turns share the spike tracker with text
+    # turns, so an attacker mixing modalities can't sidestep the
+    # alert.
+    await maybe_alert_spend_spike(message.bot, user_id=user_id)
 
 
 @router.message(F.document)

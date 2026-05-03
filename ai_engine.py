@@ -6,6 +6,7 @@ from email.utils import parsedate_to_datetime
 
 import aiohttp
 
+import abuse_detection
 from admin_toggles import is_model_disabled
 from database import db
 from openrouter_keys import (
@@ -631,6 +632,13 @@ async def chat_with_model(
                 )
             charged = cost if deducted else 0.0
             await db.log_usage(telegram_id, active_model, prompt_tokens, completion_tokens, charged)
+
+            # Stage-16 row 20: feed the spike tracker. Sync — the
+            # tracker holds an in-memory deque, no network or DB
+            # round-trip. The handler drains the alert latch via
+            # ``abuse_detection.maybe_alert_spend_spike`` after
+            # the AI reply is sent.
+            abuse_detection.record_paid_spend(telegram_id, charged)
 
         # Bump the per-key 24h usage tracker + bump
         # ``last_used_at`` on the DB-backed registry row
