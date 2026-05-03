@@ -6632,6 +6632,78 @@ class Database:
         return result.endswith("1")
 
     # ------------------------------------------------------------------
+    # Stage-15-Step-E #10b row 30: per-gateway model disable cross-table.
+    # ------------------------------------------------------------------
+    #
+    # Existing global toggles let the admin block a model entirely
+    # (``disabled_models``) or block a payment gateway entirely
+    # (``disabled_gateways``). The cross-table ``disabled_model_per_gateway``
+    # blocks a *(model, gateway)* pair: e.g. operator says "GPT-4o
+    # is fine on crypto but not on Zarinpal" without disabling either
+    # parent globally. Enforcement: at invoice-creation time the bot
+    # looks up ``(user.active_model, chosen_gateway)`` and refuses
+    # the gateway if the pair is in the disabled set. The user can
+    # still pay via any other gateway, and any other model can still
+    # use Zarinpal — only the specific pair is blocked.
+    #
+    # Append-only style mirrors the parent tables (INSERT to
+    # disable, DELETE to enable, no boolean flips).
+
+    async def get_disabled_model_per_gateway(self) -> set[tuple[str, str]]:
+        """Return the full set of disabled ``(model_id, gateway_key)``
+        pairs."""
+        rows = await self.pool.fetch(
+            "SELECT model_id, gateway_key FROM disabled_model_per_gateway"
+        )
+        return {(r["model_id"], r["gateway_key"]) for r in rows}
+
+    async def disable_model_for_gateway(
+        self, model_id: str, gateway_key: str, *, actor: str = "web",
+    ) -> bool:
+        """Disable a (model, gateway) pair. Returns True if it was
+        newly disabled (False if already in the set)."""
+        result = await self.pool.execute(
+            "INSERT INTO disabled_model_per_gateway "
+            "(model_id, gateway_key, disabled_by) "
+            "VALUES ($1, $2, $3) "
+            "ON CONFLICT (model_id, gateway_key) DO NOTHING",
+            model_id, gateway_key, actor,
+        )
+        return result.endswith("1")
+
+    async def enable_model_for_gateway(
+        self, model_id: str, gateway_key: str,
+    ) -> bool:
+        """Re-enable a (model, gateway) pair. Returns True if a row
+        was actually removed."""
+        result = await self.pool.execute(
+            "DELETE FROM disabled_model_per_gateway "
+            "WHERE model_id = $1 AND gateway_key = $2",
+            model_id, gateway_key,
+        )
+        return result.endswith("1")
+
+    async def list_disabled_model_per_gateway(self) -> list[dict]:
+        """Return a chronologically-ordered (newest first) list of
+        every disabled pair, with ``disabled_by`` and ``disabled_at``
+        for the admin UI's audit-style table.
+        """
+        rows = await self.pool.fetch(
+            "SELECT model_id, gateway_key, disabled_by, disabled_at "
+            "FROM disabled_model_per_gateway "
+            "ORDER BY disabled_at DESC, model_id ASC, gateway_key ASC"
+        )
+        return [
+            {
+                "model_id": r["model_id"],
+                "gateway_key": r["gateway_key"],
+                "disabled_by": r["disabled_by"],
+                "disabled_at": r["disabled_at"],
+            }
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------------
     # Stage-15-Step-E #4 follow-up #2: DB-backed OpenRouter key registry
     # ------------------------------------------------------------------
     #

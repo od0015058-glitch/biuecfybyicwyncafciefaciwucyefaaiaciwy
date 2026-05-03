@@ -464,6 +464,12 @@ msgstr ""
 msgid "gateway_disabled"
 msgstr "⚠️ This payment method is currently disabled."
 
+#. ⚠️ این روش پرداخت برای مدل فعلی شما در دسترس نیست. لطفاً مدل دیگری انتخاب کنید یا از روش پرداخت دیگری استفاده کنید.
+#: strings.py:gateway_disabled_for_model
+msgid "gateway_disabled_for_model"
+msgstr ""
+"⚠️ This payment method isn't available for your current model. Please pick a different model or try another payment method."
+
 #. 🌍 تغییر زبان
 #: strings.py:hub_btn_language
 msgid "hub_btn_language"

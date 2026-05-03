@@ -83,6 +83,11 @@ log = logging.getLogger("bot.admin_toggles")
 
 _disabled_models: set[str] = set()
 _disabled_gateways: set[str] = set()
+# Stage-15-Step-E #10b row 30: per-gateway model disable cross-table.
+# Cached as a frozenset of ``(model_id, gateway_key)`` tuples so the
+# hot path's ``(model, gateway) in _disabled_pairs`` lookup is O(1)
+# without an extra dict layer.
+_disabled_pairs: set[tuple[str, str]] = set()
 
 
 async def load_disabled_models(db) -> None:
@@ -168,3 +173,53 @@ def get_disabled_models() -> frozenset[str]:
 def get_disabled_gateways() -> frozenset[str]:
     """Snapshot of the current disabled-gateways set (for admin UI)."""
     return frozenset(_disabled_gateways)
+
+
+# Stage-15-Step-E #10b row 30: per-gateway model disable cache.
+# ---------------------------------------------------------------------
+
+
+async def load_disabled_pairs(db) -> None:
+    """Warm the in-memory ``(model_id, gateway_key)`` cache from the DB."""
+    global _disabled_pairs
+    try:
+        _disabled_pairs = await db.get_disabled_model_per_gateway()
+        log.info(
+            "Loaded %d disabled (model, gateway) pair(s) from DB.",
+            len(_disabled_pairs),
+        )
+    except Exception:
+        log.exception(
+            "Failed to load disabled model-per-gateway pairs — "
+            "cache stays empty."
+        )
+        _disabled_pairs = set()
+
+
+async def refresh_disabled_pairs(db) -> None:
+    """Re-sync the in-memory cache after an admin toggle.
+
+    Same fail-soft contract as :func:`refresh_disabled_models`: a
+    transient SELECT blip preserves the previous cache rather than
+    falsely re-enabling every blocked pair in the meantime.
+    """
+    global _disabled_pairs
+    try:
+        _disabled_pairs = await db.get_disabled_model_per_gateway()
+    except Exception:
+        log.exception(
+            "refresh_disabled_pairs failed; preserving previous "
+            "in-memory cache (size=%d) until next successful refresh.",
+            len(_disabled_pairs),
+        )
+
+
+def is_pair_disabled(model_id: str, gateway_key: str) -> bool:
+    """Fast check — no DB, no await. Returns True iff the operator
+    has explicitly blocked the (model, gateway) combination."""
+    return (model_id, gateway_key) in _disabled_pairs
+
+
+def get_disabled_pairs() -> frozenset[tuple[str, str]]:
+    """Snapshot of the current disabled-pairs set (for admin UI)."""
+    return frozenset(_disabled_pairs)

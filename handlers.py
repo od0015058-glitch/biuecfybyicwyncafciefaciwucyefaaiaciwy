@@ -18,7 +18,12 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from admin_toggles import is_gateway_disabled, is_model_disabled
+from admin_toggles import (
+    get_disabled_pairs,
+    is_gateway_disabled,
+    is_model_disabled,
+    is_pair_disabled,
+)
 from ai_engine import _resolve_active_model, chat_with_model
 from amount_input import normalize_amount
 from conversation_export import (
@@ -3144,6 +3149,31 @@ async def process_custom_currency_selection(callback: CallbackQuery, state: FSMC
         await callback.answer(t(lang, "gateway_disabled"), show_alert=True)
         return
 
+    # Stage-15-Step-E #10b row 30: per-gateway model disable. The
+    # operator can block specific (model, gateway) pairs from
+    # ``/admin/models`` so e.g. GPT-4o can't be funded via Zarinpal
+    # while leaving every other gateway free. We surface a
+    # model-aware error string so the user knows to switch models
+    # or pick a different payment method (versus the generic
+    # "gateway disabled" copy which implies the gateway is down
+    # for everyone).
+    #
+    # Hot-path optimisation: skip the ``db.get_user`` round-trip
+    # when the operator hasn't configured any pairs at all (the
+    # common case on a fresh deploy and on every deploy where
+    # nobody has used this feature). The cache lookup is O(1) and
+    # avoids touching the connection pool on a code path that's
+    # already paid for one DB round-trip in ``_preflight_min_amount_check``.
+    if get_disabled_pairs():
+        user_row = await db.get_user(callback.from_user.id)
+        active_model = (user_row or {}).get("active_model") or ""
+        if active_model and is_pair_disabled(active_model, currency):
+            await callback.answer(
+                t(lang, "gateway_disabled_for_model"),
+                show_alert=True,
+            )
+            return
+
     data = await state.get_data()
     amount = data.get("custom_amount")
     if not amount:
@@ -3305,6 +3335,41 @@ async def process_final_invoice(callback: CallbackQuery, state: FSMContext):
     if is_gateway_disabled(currency):
         await callback.answer(t(lang, "gateway_disabled"), show_alert=True)
         return
+
+    # Stage-15-Step-E #10b row 30 bundled bug fix: the custom-amount
+    # path (``process_custom_currency_selection``) checks the
+    # NowPayments provider master switch via
+    # ``is_gateway_disabled("nowpayments")`` for non-card currencies
+    # — added in row 14 so a stale keyboard couldn't bypass the
+    # one-click "disable every NowPayments crypto at once" flag.
+    # The fixed-amount preset path (this handler) was missed by the
+    # same patch: an operator who flipped the master switch off
+    # would still see crypto invoice creation succeed for any user
+    # with a stale ``pay_<ticker>_<amount>`` keyboard rendered
+    # before the toggle, because this handler only consulted the
+    # per-currency disable bit. Mirror the row-14 logic here so
+    # the two paths agree by construction.
+    is_card_gateway = currency in {"tetrapay", "zarinpal"}
+    if not is_card_gateway and is_gateway_disabled("nowpayments"):
+        await callback.answer(t(lang, "gateway_disabled"), show_alert=True)
+        return
+
+    # Stage-15-Step-E #10b row 30: per-gateway model disable. Mirror
+    # the check on ``process_custom_currency_selection`` so a user
+    # who clicked a fixed-amount preset is refused with the same
+    # model-aware copy as a user on the custom-amount path. Same
+    # cache-empty short-circuit so the common-case zero-pairs
+    # deploy doesn't pay an extra DB round-trip on every preset
+    # tap.
+    if get_disabled_pairs():
+        user_row = await db.get_user(callback.from_user.id)
+        active_model = (user_row or {}).get("active_model") or ""
+        if active_model and is_pair_disabled(active_model, currency):
+            await callback.answer(
+                t(lang, "gateway_disabled_for_model"),
+                show_alert=True,
+            )
+            return
 
     # Pull any active promo from FSM data and compute the bonus before
     # invoice creation (see process_custom_currency_selection for the
