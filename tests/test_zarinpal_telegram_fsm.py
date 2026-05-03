@@ -247,6 +247,71 @@ async def test_currency_selection_zarinpal_blocked_when_gateway_disabled():
 
 
 @pytest.mark.asyncio
+async def test_currency_selection_crypto_blocked_when_provider_master_disabled():
+    """Stage-15-Step-E #10b row 14: a stale rendered keyboard could
+    let a user click a ``cur_<crypto>`` button after the operator
+    flipped the NowPayments provider master switch off in the panel.
+    The handler must refuse the click with the standard
+    ``gateway_disabled`` toast and never reach the invoice path.
+
+    Card gateways (``cur_tetrapay`` / ``cur_zarinpal``) are NOT
+    covered by the master switch — see the sibling test below.
+    """
+    from handlers import process_custom_currency_selection
+
+    def _stub_disabled(key: str) -> bool:
+        # Per-currency entry is enabled; only the master switch is off.
+        return key == "nowpayments"
+
+    cb = _make_callback(callback_data="cur_btc")
+    state = _make_state(stash={"custom_amount": 4.0})
+    create_mock = AsyncMock()
+    with patch(
+        "handlers._get_user_language", new=AsyncMock(return_value="fa")
+    ), patch(
+        "handlers.is_gateway_disabled", side_effect=_stub_disabled
+    ), patch(
+        "handlers._start_nowpayments_invoice", new=create_mock,
+        create=True,
+    ):
+        await process_custom_currency_selection(cb, state)
+
+    create_mock.assert_not_awaited()
+    cb.answer.assert_awaited_once()
+    answer_kwargs = cb.answer.await_args.kwargs
+    assert answer_kwargs.get("show_alert") is True
+
+
+@pytest.mark.asyncio
+async def test_currency_selection_card_gateway_passes_when_master_disabled():
+    """Stage-15-Step-E #10b row 14: the NowPayments master switch
+    must NOT veto card gateways. ``tetrapay`` / ``zarinpal`` have
+    their own per-gateway toggles (already enforced earlier in the
+    handler) and are unrelated to NowPayments.
+    """
+    from handlers import process_custom_currency_selection
+
+    def _stub_disabled(key: str) -> bool:
+        return key == "nowpayments"
+
+    cb = _make_callback(callback_data="cur_zarinpal")
+    state = _make_state(
+        stash={"custom_amount": 4.0, "toman_rate_at_entry": 100_000.0}
+    )
+    start_mock = AsyncMock()
+    with patch(
+        "handlers._get_user_language", new=AsyncMock(return_value="fa")
+    ), patch(
+        "handlers.is_gateway_disabled", side_effect=_stub_disabled
+    ), patch(
+        "handlers._start_zarinpal_invoice", new=start_mock
+    ):
+        await process_custom_currency_selection(cb, state)
+
+    start_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_currency_selection_zarinpal_lost_amount_shows_error():
     """No ``custom_amount`` in FSM (e.g. user navigated to currency
     picker via stale inline button) → ``charge_amount_lost`` toast,

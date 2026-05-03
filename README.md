@@ -363,10 +363,26 @@ NowPayments crypto invoices.
   from the Telegram model picker and are refused at chat time. Models
   are grouped by provider (OpenAI, Anthropic, Google, xAI, DeepSeek)
   with a live search filter. Toggle actions are audit-logged.
-- **Payment gateway toggles** — admin can disable TetraPay or any
-  NowPayments crypto currency at `${WEBHOOK_BASE_URL}/admin/gateways`.
-  Disabled gateways/currencies disappear from the payment picker.
-  Pending invoices on a disabled gateway are not affected.
+- **Payment gateway toggles** — admin can disable TetraPay, Zarinpal,
+  or any individual NowPayments crypto currency at
+  `${WEBHOOK_BASE_URL}/admin/gateways`. Disabled
+  gateways/currencies disappear from the payment picker. Pending
+  invoices on a disabled gateway are not affected. Stage-15-Step-E
+  #10b row 14 added a **provider master switch** at the top of the
+  panel — flipping `nowpayments` off hides every crypto button in
+  the picker in one click without overwriting the per-currency
+  disable state, so re-enabling the master restores the previous
+  picker layout. The bot-side picker (`_active_pay_currencies`)
+  short-circuits to empty when the master is disabled, and the
+  click handler `process_custom_currency_selection` enforces the
+  master switch defensively so a stale rendered keyboard can't
+  sneak a `cur_<crypto>` callback past it (card gateways
+  `cur_tetrapay` / `cur_zarinpal` are NOT covered by the master —
+  they have their own per-gateway toggles). The toggle-POST
+  handler validates `gateway_key` against the canonical allowlist
+  and rejects unknown / mistyped / uppercase keys with a flash
+  error so a typo can't write a row that looks correct in the DB
+  but never disables the actual ticker the bot checks.
 - **Multi-key OpenRouter load balancing** — set `OPENROUTER_API_KEY_1`
   through `OPENROUTER_API_KEY_10` to spread traffic across multiple
   accounts. Each user sticks to one key (`telegram_id % N`) so

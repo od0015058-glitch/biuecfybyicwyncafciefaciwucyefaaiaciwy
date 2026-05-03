@@ -96,6 +96,39 @@ def test_active_pay_currencies_filters_disabled(monkeypatch):
     _reset()
 
 
+def test_active_pay_currencies_empty_when_nowpayments_master_disabled(monkeypatch):
+    """Stage-15-Step-E #10b row 14: the ``nowpayments`` provider
+    master switch flips every NowPayments crypto off in one click
+    without overwriting the individual per-currency disable state.
+
+    The per-ticker entries in ``_disabled_gateways`` survive the
+    master toggle so flipping the master back on restores the
+    previous picker layout. Pin both halves of that contract here:
+    once with no per-currency disables, once with a partial set.
+    """
+    monkeypatch.setenv("NOWPAYMENTS_API_KEY", "dummy")
+    _reset()
+    from handlers import _active_pay_currencies, SUPPORTED_PAY_CURRENCIES
+
+    # Sanity: with no toggles, the picker shows every supported ticker.
+    assert len(_active_pay_currencies()) == len(SUPPORTED_PAY_CURRENCIES)
+
+    # Disable an individual ticker first, then flip the master switch.
+    admin_toggles._disabled_gateways = {"btc", "nowpayments"}
+    assert _active_pay_currencies() == []
+
+    # Removing only the master leaves the per-currency disable in
+    # place — exactly the "restore previous configuration" semantics
+    # the panel promises.
+    admin_toggles._disabled_gateways = {"btc"}
+    active = _active_pay_currencies()
+    tickers = [ticker for _, ticker in active]
+    assert "btc" not in tickers
+    assert "eth" in tickers
+
+    _reset()
+
+
 def test_active_pay_currencies_empty_when_nowpayments_unset(monkeypatch):
     """Stage-15-Step-D bundled bug fix: the picker must NOT surface
     crypto tickers when ``NOWPAYMENTS_API_KEY`` is unset.
