@@ -1,0 +1,182 @@
+{% extends "_layout.html" %}
+
+{% block title %}Stats · {{ user_id }}{% endblock %}
+
+{% block extra_head %}
+<style>
+  .breadcrumbs { font-size: 13px; color: var(--text-muted); margin-bottom: 12px; }
+  .breadcrumbs a { color: var(--accent); text-decoration: none; }
+  .breadcrumbs a:hover { text-decoration: underline; }
+
+  .stats-aggregates {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(160px, 1fr));
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+  .stats-aggregates .stat {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 16px;
+  }
+  .stats-aggregates .stat .label {
+    font-size: 12px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .stats-aggregates .stat .value {
+    font-size: 22px;
+    font-weight: 600;
+    margin-top: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .bucket-bar {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .bucket-bar a {
+    display: inline-block;
+    padding: 6px 16px;
+    border-radius: 4px;
+    font-size: 13px;
+    font-weight: 600;
+    text-decoration: none;
+    border: 1px solid var(--border);
+    color: var(--text);
+    background: transparent;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  .bucket-bar a:hover { background: var(--panel-2); }
+  .bucket-bar a.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+
+  td.num, th.num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  code.mono {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  .empty {
+    color: var(--text-muted);
+    padding: 16px;
+    text-align: center;
+  }
+  .bar-cell {
+    width: 120px;
+    min-width: 80px;
+  }
+  .bar-track {
+    background: var(--border);
+    border-radius: 3px;
+    height: 10px;
+    overflow: hidden;
+  }
+  .bar-fill {
+    background: var(--accent);
+    height: 100%;
+    border-radius: 3px;
+    min-width: 0;
+  }
+  .window-info {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-left: auto;
+  }
+</style>
+{% endblock %}
+
+{% block main %}
+<div class="breadcrumbs">
+  <a href="/admin/users">Users</a>
+  &nbsp;›&nbsp;
+  <a href="/admin/users/{{ user_id }}">{{ user_id }}</a>
+  &nbsp;›&nbsp;
+  Stats
+</div>
+
+<h1>Spending stats · <code class="mono">{{ user_id }}</code></h1>
+
+{% if db_error %}
+<div class="panel" style="background: rgba(248, 113, 113, 0.1); border-color: #f87171; color: #f87171;">
+  {{ db_error }}
+</div>
+{% else %}
+
+<div class="bucket-bar">
+  {% for b in bucket_choices %}
+  <a href="/admin/users/{{ user_id }}/stats?bucket={{ b }}&days={{ bucket_default_days[b] }}"
+     class="{% if bucket == b %}active{% endif %}">
+    {{ bucket_labels[b] }}
+  </a>
+  {% endfor %}
+  <span class="window-info">Window: {{ days }} days</span>
+</div>
+
+<div class="stats-aggregates">
+  <div class="stat">
+    <div class="label">{{ bucket_labels[bucket] }} buckets</div>
+    <div class="value">{{ series|length }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Total calls</div>
+    <div class="value">{{ "{:,}".format(total_calls) }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Total cost</div>
+    <div class="value">${{ "{:,.4f}".format(total_cost) }}</div>
+  </div>
+</div>
+
+<div class="panel">
+  {% if series %}
+  <table>
+    <thead>
+      <tr>
+        <th>Date</th>
+        <th class="num">Calls</th>
+        <th class="num">Cost USD</th>
+        <th class="bar-cell"></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% set max_cost = namespace(val=0) %}
+      {% for r in series %}
+        {% if r.cost_usd > max_cost.val %}
+          {% set max_cost.val = r.cost_usd %}
+        {% endif %}
+      {% endfor %}
+      {% for r in series %}
+      <tr>
+        <td><code class="mono">{{ r.date }}</code></td>
+        <td class="num">{{ "{:,}".format(r.calls) }}</td>
+        <td class="num">${{ "{:,.4f}".format(r.cost_usd) }}</td>
+        <td class="bar-cell">
+          <div class="bar-track">
+            {% if max_cost.val > 0 %}
+            <div class="bar-fill" style="width: {{ (r.cost_usd / max_cost.val * 100)|round(1) }}%"></div>
+            {% endif %}
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">No spending data for this user in the selected window.</p>
+  {% endif %}
+</div>
+
+{% endif %}
+{% endblock %}

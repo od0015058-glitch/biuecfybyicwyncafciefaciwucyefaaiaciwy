@@ -2147,7 +2147,7 @@ or unblock other work.
 | 14 | **Disable individual gateways** (NowPayments / TetraPay / Zarinpal). | DB row in `disabled_gateways` (already wired via `/admin/gateways`). | Already exposed — but no per-currency granularity. Add per-crypto toggle. | P3 | Partial |
 | 15 | **OpenRouter rate-limit per (key, model)** — currently per-key only. | Code path exists in `openrouter_keys.py`. | Per-(key, model) cooldown viewer on `/admin/openrouter-keys`. | P3 | **Shipped** (PR #165) |
 | 16 | **Conversation-export pagination** — `/conversation_export` cmd dumps full history; large convos OOM. | One-shot dump. | Multi-part export with offset cursor on `/admin/users/<id>/conversations`. | P3 | Pending |
-| 17 | **Stats bucketing** (weekly/monthly) — only daily today. | `get_user_daily_spending` only. | New `bucket=` param + buttons on `/admin/users/<id>/stats`. | P3 | Pending |
+| 17 | **Stats bucketing** (weekly/monthly) — only daily today. | `get_user_daily_spending` only. | New `bucket=` param + buttons on `/admin/users/<id>/stats`. | P3 | **Shipped** (this PR — new `bucket` parameter on `Database.get_user_daily_spending` supporting `day`/`week`/`month` via `date_trunc`. New `/admin/users/{id}/stats` page with bucket selector buttons, aggregate tiles, and spending-series table with inline bars. Link from user-detail page. Bundled bug fix: `get_user_admin_summary` now scrubs NaN/Inf from `total_credited_usd` / `total_spent_usd` — pre-fix `float(credited or 0)` passed `Decimal('NaN')` through because NaN is truthy in Python. 22 new tests. Total suite: 3565 passing.) |
 | 18 | **JSONB conversation_messages** — vision turns can't store image refs. | `content TEXT` only. | Schema migration to JSONB + read/write paths preserve attachments. | P2 | **Shipped** (PR #163) |
 | 19 | **"View as <role>" toggle** — operators can preview viewer/operator views. | None. | Top-bar dropdown on `/admin` that swaps the active role for the current request only. | P3 | **Shipped** (PR #162) |
 | 20 | **Audit retention policy** — audit log grows forever. | No retention. | Editor on `/admin/audit` + nightly delete loop. | P2 | **Shipped** (this PR — DB-backed override layer in new `audit_retention.py` for `AUDIT_RETENTION_DAYS` + background reaper loop that batch-deletes `admin_audit_log` rows older than the retention window (default 90 days, range [7, 3650]). Retention editor card on `/admin/audit` with breakdown table + set/clear form, audit slug `audit_retention_update`. Boot warm-up in `main.py`. Env vars `AUDIT_RETENTION_DAYS`, `AUDIT_RETENTION_INTERVAL_HOURS`, `AUDIT_RETENTION_BATCH` documented in `.env.example`. Bundled bug fix: `list_admin_audit_log` now caps `limit` to 10 000 — previously unbounded, a future caller could OOM the web worker by pulling every audit row.) |
@@ -4264,7 +4264,24 @@ The user's process for this project — **do not deviate**:
     previously a shared workstation leaked the prior operator's
     "viewing as <role>" preview into the next person's session. 116
     new tests. Total suite: 3356 passing.
-31. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
+31. **Stage-15-Step-E #10b row 17 SHIPPED** — Stats bucketing
+    (weekly/monthly) on new `/admin/users/{id}/stats` page.
+    `Database.get_user_daily_spending` gained a `bucket` parameter
+    (`day` / `week` / `month`) that controls `date_trunc` granularity.
+    New `user_stats_get` handler + `user_stats.html` template with
+    bucket-selector buttons (auto-widens the date window: 30d for
+    daily, 90d for weekly, 365d for monthly), aggregate tiles (bucket
+    count, total calls, total cost), and a spending-series table with
+    inline CSS bar chart.  Link from user-detail page ("Spending stats →").
+    Bundled bug fix: `Database.get_user_admin_summary` used
+    `float(credited or 0)` which silently passed `Decimal('NaN')`
+    through because NaN is truthy in Python — the admin user-detail
+    page would render `$nan` for "Lifetime credited / spent" on any
+    user whose transaction history includes a pre-PR-#75 NaN
+    `amount_usd_credited` row.  Now scrubbed through
+    `_is_finite_amount` the same way `get_user_spending_summary`
+    already does.  22 new tests.  Total suite: 3565 passing.
+32. **Working rule:** push PRs sequentially, bundle a real bug fix in each,
     update this doc + README in each, do NOT block on user approval. The
     user merges them when they wake up.
 32. **Read the §11 working agreement before doing anything.**
